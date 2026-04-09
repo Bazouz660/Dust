@@ -19,4 +19,5 @@ namespace SSAORenderer
     void OnResolutionChanged(ID3D11Device* device, UINT newWidth, UINT newHeight);
     bool IsInitialized();
     ID3D11ShaderResourceView* GetAoSRV();
+    float GetLastGpuTimeMs();
 }

@@ -68,7 +68,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>KenshiLib.lib;d3d11.lib;dxgi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>KenshiLib.lib;d3d11.lib;dxgi.lib;d3dcompiler.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -84,7 +84,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>KenshiLib.lib;d3d11.lib;dxgi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>KenshiLib.lib;d3d11.lib;dxgi.lib;d3dcompiler.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -94,16 +94,27 @@
     <ClCompile Include="PipelineDetector.cpp" />
     <ClCompile Include="ResourceRegistry.cpp" />
     <ClCompile Include="EffectLoader.cpp" />
+    <ClCompile Include="DustGUI.cpp" />
+    <ClCompile Include="imgui\imgui.cpp" />
+    <ClCompile Include="imgui\imgui_draw.cpp" />
+    <ClCompile Include="imgui\imgui_tables.cpp" />
+    <ClCompile Include="imgui\imgui_widgets.cpp" />
+    <ClCompile Include="imgui\backends\imgui_impl_win32.cpp" />
+    <ClCompile Include="imgui\backends\imgui_impl_dx11.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="DustAPI.h" />
     <ClInclude Include="DustLog.h" />
+    <ClInclude Include="DustGUI.h" />
     <ClInclude Include="InjectionPoint.h" />
     <ClInclude Include="PipelineDetector.h" />
     <ClInclude Include="ResourceRegistry.h" />
     <ClInclude Include="EffectLoader.h" />
     <ClInclude Include="D3D11Hook.h" />
     <ClInclude Include="D3D11StateBlock.h" />
+    <ClInclude Include="imgui\imgui.h" />
+    <ClInclude Include="imgui\backends\imgui_impl_win32.h" />
+    <ClInclude Include="imgui\backends\imgui_impl_dx11.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

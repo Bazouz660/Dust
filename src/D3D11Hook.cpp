@@ -1,4 +1,5 @@
 #include "D3D11Hook.h"
+#include "DustGUI.h"
 #include "PipelineDetector.h"
 #include "EffectLoader.h"
 #include "ResourceRegistry.h"
@@ -58,11 +59,20 @@ typedef void(STDMETHODCALLTYPE* PFN_OMSetRenderTargets)(
     ID3D11RenderTargetView* const* ppRenderTargetViews,
     ID3D11DepthStencilView* pDepthStencilView);
 
+typedef HRESULT(STDMETHODCALLTYPE* PFN_Present)(
+    IDXGISwapChain* pThis, UINT SyncInterval, UINT Flags);
+
+typedef HRESULT(STDMETHODCALLTYPE* PFN_ResizeBuffers)(
+    IDXGISwapChain* pThis, UINT BufferCount, UINT Width, UINT Height,
+    DXGI_FORMAT NewFormat, UINT SwapChainFlags);
+
 static PFN_CreatePixelShader        oCreatePixelShader = nullptr;
 static PFN_Draw                     oDraw = nullptr;
 static PFN_DrawIndexed              oDrawIndexed = nullptr;
 static PFN_DrawIndexedInstanced     oDrawIndexedInstanced = nullptr;
 static PFN_OMSetRenderTargets       oOMSetRenderTargets = nullptr;
+static PFN_Present                  oPresent = nullptr;
+static PFN_ResizeBuffers            oResizeBuffers = nullptr;
 
 // ==================== Device capture ====================
 
@@ -320,6 +330,39 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
     oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView);
 }
 
+// ==================== Swap chain hooks (ImGui) ====================
+
+static HRESULT STDMETHODCALLTYPE HookedPresent(
+    IDXGISwapChain* pThis, UINT SyncInterval, UINT Flags)
+{
+    static bool guiInitAttempted = false;
+    if (!guiInitAttempted && gDeviceCaptured)
+    {
+        guiInitAttempted = true;
+        DustGUI::Init(pThis, gDevice, gContext);
+    }
+
+    DustGUI::Render();
+
+    return oPresent(pThis, SyncInterval, Flags);
+}
+
+static HRESULT STDMETHODCALLTYPE HookedResizeBuffers(
+    IDXGISwapChain* pThis, UINT BufferCount, UINT Width, UINT Height,
+    DXGI_FORMAT NewFormat, UINT SwapChainFlags)
+{
+    // ImGui holds a reference to the back buffer RTV — must shut down before resize
+    DustGUI::Shutdown();
+
+    HRESULT hr = oResizeBuffers(pThis, BufferCount, Width, Height, NewFormat, SwapChainFlags);
+
+    // Re-init ImGui with the new back buffer
+    if (SUCCEEDED(hr) && gDeviceCaptured)
+        DustGUI::Init(pThis, gDevice, gContext);
+
+    return hr;
+}
+
 // ==================== Install ====================
 
 static const int VTIDX_DEVICE_CreatePixelShader     = 15;
@@ -327,34 +370,61 @@ static const int VTIDX_CTX_DrawIndexed              = 12;
 static const int VTIDX_CTX_Draw                     = 13;
 static const int VTIDX_CTX_DrawIndexedInstanced     = 20;
 static const int VTIDX_CTX_OMSetRenderTargets       = 33;
+static const int VTIDX_SC_Present                   = 8;
+static const int VTIDX_SC_ResizeBuffers             = 13;
 
 bool Install()
 {
-    Log("Creating temporary D3D11 device to discover function addresses...");
+    Log("Creating temporary D3D11 device + swap chain to discover function addresses...");
 
+    // Need a dummy window for the swap chain
+    WNDCLASSEXA wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = DefWindowProcA;
+    wc.lpszClassName = "DustDummy";
+    wc.hInstance = GetModuleHandleA(nullptr);
+    RegisterClassExA(&wc);
+    HWND dummyWnd = CreateWindowExA(0, "DustDummy", "", WS_OVERLAPPED,
+                                     0, 0, 1, 1, nullptr, nullptr, wc.hInstance, nullptr);
+
+    DXGI_SWAP_CHAIN_DESC scd = {};
+    scd.BufferCount = 1;
+    scd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    scd.BufferDesc.Width = 1;
+    scd.BufferDesc.Height = 1;
+    scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    scd.OutputWindow = dummyWnd;
+    scd.SampleDesc.Count = 1;
+    scd.Windowed = TRUE;
+
+    IDXGISwapChain* tmpSwapChain = nullptr;
     ID3D11Device* tmpDevice = nullptr;
     ID3D11DeviceContext* tmpContext = nullptr;
-    D3D_FEATURE_LEVEL featureLevel;
 
-    HRESULT hr = D3D11CreateDevice(
+    HRESULT hr = D3D11CreateDeviceAndSwapChain(
         nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
         nullptr, 0, D3D11_SDK_VERSION,
-        &tmpDevice, &featureLevel, &tmpContext);
+        &scd, &tmpSwapChain, &tmpDevice, nullptr, &tmpContext);
 
     if (FAILED(hr))
     {
         Log("ERROR: Failed to create temporary D3D11 device: 0x%08X", hr);
+        DestroyWindow(dummyWnd);
+        UnregisterClassA("DustDummy", wc.hInstance);
         return false;
     }
 
     void** devVtable = *reinterpret_cast<void***>(tmpDevice);
     void** ctxVtable = *reinterpret_cast<void***>(tmpContext);
+    void** scVtable  = *reinterpret_cast<void***>(tmpSwapChain);
 
     void* addrCreatePS     = devVtable[VTIDX_DEVICE_CreatePixelShader];
     void* addrDraw         = ctxVtable[VTIDX_CTX_Draw];
     void* addrDrawIndexed  = ctxVtable[VTIDX_CTX_DrawIndexed];
     void* addrDrawIdxInst  = ctxVtable[VTIDX_CTX_DrawIndexedInstanced];
     void* addrOMSetRT      = ctxVtable[VTIDX_CTX_OMSetRenderTargets];
+    void* addrPresent      = scVtable[VTIDX_SC_Present];
+    void* addrResizeBuf    = scVtable[VTIDX_SC_ResizeBuffers];
 
     Log("Function addresses discovered:");
     Log("  CreatePixelShader     = %p", addrCreatePS);
@@ -362,9 +432,14 @@ bool Install()
     Log("  DrawIndexed           = %p", addrDrawIndexed);
     Log("  DrawIndexedInstanced  = %p", addrDrawIdxInst);
     Log("  OMSetRenderTargets    = %p", addrOMSetRT);
+    Log("  Present               = %p", addrPresent);
+    Log("  ResizeBuffers         = %p", addrResizeBuf);
 
+    tmpSwapChain->Release();
     tmpContext->Release();
     tmpDevice->Release();
+    DestroyWindow(dummyWnd);
+    UnregisterClassA("DustDummy", wc.hInstance);
 
     Log("Installing D3D11 function hooks...");
 
@@ -390,8 +465,16 @@ bool Install()
                            (void**)&oOMSetRenderTargets) != KenshiLib::SUCCESS)
     { Log("ERROR: Failed to hook OMSetRenderTargets"); ok = false; }
 
+    if (KenshiLib::AddHook(addrPresent, (void*)HookedPresent,
+                           (void**)&oPresent) != KenshiLib::SUCCESS)
+    { Log("ERROR: Failed to hook Present"); ok = false; }
+
+    if (KenshiLib::AddHook(addrResizeBuf, (void*)HookedResizeBuffers,
+                           (void**)&oResizeBuffers) != KenshiLib::SUCCESS)
+    { Log("ERROR: Failed to hook ResizeBuffers"); ok = false; }
+
     if (ok)
-        Log("All D3D11 hooks installed successfully");
+        Log("All D3D11 hooks installed successfully (including Present + ResizeBuffers)");
 
     return ok;
 }

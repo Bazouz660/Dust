@@ -10,6 +10,7 @@
 // Dust framework
 #include "DustLog.h"
 #include "D3D11Hook.h"
+#include "DustGUI.h"
 #include "EffectLoader.h"
 
 static HMODULE gDllModule = nullptr;
@@ -210,6 +211,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
         gDllModule = hModule;
         break;
     case DLL_PROCESS_DETACH:
+        DustGUI::Shutdown();
         gEffectLoader.ShutdownAll();
         RestoreVanillaShader();
         break;

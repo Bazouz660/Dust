@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define DUST_API_VERSION 1
+#define DUST_API_VERSION 2
 
 // Injection points in the rendering pipeline
 typedef enum DustInjectionPoint {
@@ -64,6 +64,22 @@ typedef struct DustHostAPI {
     void (*UnbindSRV)(ID3D11DeviceContext* ctx, uint32_t baseSlot);
 } DustHostAPI;
 
+// Setting types for the GUI settings descriptor (API v2+)
+typedef enum DustSettingType {
+    DUST_SETTING_BOOL  = 0,
+    DUST_SETTING_FLOAT = 1,
+    DUST_SETTING_INT   = 2
+} DustSettingType;
+
+// Describes a single configurable setting exposed to the host GUI
+typedef struct DustSettingDesc {
+    const char*     name;       // Display name
+    DustSettingType type;       // DUST_SETTING_BOOL, FLOAT, or INT
+    void*           valuePtr;   // Pointer to the setting's storage (bool*, float*, or int*)
+    float           minVal;     // Min value (for FLOAT/INT sliders)
+    float           maxVal;     // Max value (for FLOAT/INT sliders)
+} DustSettingDesc;
+
 // Effect callback signature
 typedef void (*DustEffectCallback)(const DustFrameContext* ctx, const DustHostAPI* host);
 
@@ -84,6 +100,19 @@ typedef struct DustEffectDesc {
 
     // Query whether this effect is active
     int (*IsEnabled)(void);
+
+    // GUI settings descriptor (API v2+)
+    // Host auto-generates UI widgets from this array.
+    DustSettingDesc*    settings;        // Array of setting descriptors (NULL if none)
+    uint32_t            settingCount;    // Number of entries in settings array
+    void (*OnSettingChanged)(void);      // Called by host after modifying a value via GUI (for runtime updates like LUT regen)
+    void (*SaveSettings)(void);          // Called when user clicks Save — write current values to disk
+    void (*LoadSettings)(void);          // Called when user clicks Reset All — reload values from disk
+
+    // Performance metrics (API v2+)
+    // Plugin sets this to point to its own float that it updates each frame.
+    // Host reads through the pointer for the performance display.
+    const float*        gpuTimeMsPtr;    // Pointer to plugin's GPU time in ms (NULL if not measured)
 } DustEffectDesc;
 
 // Every effect DLL must export this function.

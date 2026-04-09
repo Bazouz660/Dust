@@ -17,6 +17,13 @@ DustLogFn gLogFn = nullptr;
 static const DustHostAPI* gHost = nullptr;
 static HMODULE gPluginModule = nullptr;
 static ID3D11Device* gDevice = nullptr;
+static float gGpuTimeMs = 0.0f;
+
+// GPU timing queries
+static ID3D11Query* gTimestampDisjoint = nullptr;
+static ID3D11Query* gTimestampBegin = nullptr;
+static ID3D11Query* gTimestampEnd = nullptr;
+static bool gTimingActive = false;
 
 // ==================== Config ====================
 
@@ -99,6 +106,41 @@ static void WriteDefaultConfig()
     WritePrivateProfileStringA("LUT", "HighlightR", "0.03", gConfigPath.c_str());
     WritePrivateProfileStringA("LUT", "HighlightG", "0.01", gConfigPath.c_str());
     WritePrivateProfileStringA("LUT", "HighlightB", "-0.02", gConfigPath.c_str());
+}
+
+static void SaveConfig()
+{
+    char buf[64];
+    WritePrivateProfileStringA("LUT", "Enabled", gConfig.enabled ? "1" : "0", gConfigPath.c_str());
+
+    snprintf(buf, sizeof(buf), "%g", gConfig.intensity);
+    WritePrivateProfileStringA("LUT", "Intensity", buf, gConfigPath.c_str());
+    snprintf(buf, sizeof(buf), "%g", gConfig.lift);
+    WritePrivateProfileStringA("LUT", "Lift", buf, gConfigPath.c_str());
+    snprintf(buf, sizeof(buf), "%g", gConfig.gamma);
+    WritePrivateProfileStringA("LUT", "Gamma", buf, gConfigPath.c_str());
+    snprintf(buf, sizeof(buf), "%g", gConfig.gain);
+    WritePrivateProfileStringA("LUT", "Gain", buf, gConfigPath.c_str());
+    snprintf(buf, sizeof(buf), "%g", gConfig.contrast);
+    WritePrivateProfileStringA("LUT", "Contrast", buf, gConfigPath.c_str());
+    snprintf(buf, sizeof(buf), "%g", gConfig.saturation);
+    WritePrivateProfileStringA("LUT", "Saturation", buf, gConfigPath.c_str());
+    snprintf(buf, sizeof(buf), "%g", gConfig.temperature);
+    WritePrivateProfileStringA("LUT", "Temperature", buf, gConfigPath.c_str());
+    snprintf(buf, sizeof(buf), "%g", gConfig.tint);
+    WritePrivateProfileStringA("LUT", "Tint", buf, gConfigPath.c_str());
+    snprintf(buf, sizeof(buf), "%g", gConfig.shadowR);
+    WritePrivateProfileStringA("LUT", "ShadowR", buf, gConfigPath.c_str());
+    snprintf(buf, sizeof(buf), "%g", gConfig.shadowG);
+    WritePrivateProfileStringA("LUT", "ShadowG", buf, gConfigPath.c_str());
+    snprintf(buf, sizeof(buf), "%g", gConfig.shadowB);
+    WritePrivateProfileStringA("LUT", "ShadowB", buf, gConfigPath.c_str());
+    snprintf(buf, sizeof(buf), "%g", gConfig.highlightR);
+    WritePrivateProfileStringA("LUT", "HighlightR", buf, gConfigPath.c_str());
+    snprintf(buf, sizeof(buf), "%g", gConfig.highlightG);
+    WritePrivateProfileStringA("LUT", "HighlightG", buf, gConfigPath.c_str());
+    snprintf(buf, sizeof(buf), "%g", gConfig.highlightB);
+    WritePrivateProfileStringA("LUT", "HighlightB", buf, gConfigPath.c_str());
 }
 
 // ==================== LUT Generation ====================
@@ -415,6 +457,16 @@ static int LUTInit(ID3D11Device* device, uint32_t width, uint32_t height, const 
     if (!GenerateLUT(device))
         return -12;
 
+    // GPU timing queries
+    {
+        D3D11_QUERY_DESC qd = {};
+        qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+        device->CreateQuery(&qd, &gTimestampDisjoint);
+        qd.Query = D3D11_QUERY_TIMESTAMP;
+        device->CreateQuery(&qd, &gTimestampBegin);
+        device->CreateQuery(&qd, &gTimestampEnd);
+    }
+
     Log("LUT: Initialized (%ux%u)", width, height);
     return 0;
 }
@@ -431,6 +483,9 @@ static void LUTShutdown()
     if (gCB)           { gCB->Release();             gCB = nullptr; }
     if (gPS)           { gPS->Release();             gPS = nullptr; }
     if (gVS)           { gVS->Release();             gVS = nullptr; }
+    if (gTimestampDisjoint) { gTimestampDisjoint->Release(); gTimestampDisjoint = nullptr; }
+    if (gTimestampBegin)   { gTimestampBegin->Release();   gTimestampBegin = nullptr; }
+    if (gTimestampEnd)     { gTimestampEnd->Release();     gTimestampEnd = nullptr; }
     gDevice = nullptr;
     Log("LUT: Shut down");
 }
@@ -449,13 +504,31 @@ static void LUTPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     CheckHotReload();
 
     if (!gConfig.enabled || gConfig.intensity <= 0.0f)
+    {
+        gGpuTimeMs = 0.0f;
         return;
+    }
 
     ID3D11RenderTargetView* hdrRTV = host->GetRTV("hdr_rt");
     if (!hdrRTV || !gSceneCopy || !gSceneCopySRV || !gLutSRV)
         return;
 
     ID3D11DeviceContext* dc = ctx->context;
+
+    // Collect previous frame's GPU timing
+    if (gTimingActive && gTimestampDisjoint)
+    {
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint;
+        UINT64 tsBegin, tsEnd;
+        if (dc->GetData(gTimestampDisjoint, &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK
+            && !disjoint.Disjoint
+            && dc->GetData(gTimestampBegin, &tsBegin, sizeof(tsBegin), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK
+            && dc->GetData(gTimestampEnd, &tsEnd, sizeof(tsEnd), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK)
+        {
+            gGpuTimeMs = (float)((double)(tsEnd - tsBegin) / (double)disjoint.Frequency * 1000.0);
+        }
+        gTimingActive = false;
+    }
 
     // Get the HDR texture from the RTV
     ID3D11Resource* hdrResource = nullptr;
@@ -504,8 +577,21 @@ static void LUTPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     vp.MaxDepth = 1.0f;
     dc->RSSetViewports(1, &vp);
 
-    // Draw fullscreen triangle
+    // Draw fullscreen triangle with GPU timing
+    if (gTimestampDisjoint && gTimestampBegin && gTimestampEnd)
+    {
+        dc->Begin(gTimestampDisjoint);
+        dc->End(gTimestampBegin);
+    }
+
     dc->Draw(3, 0);
+
+    if (gTimestampDisjoint && gTimestampBegin && gTimestampEnd)
+    {
+        dc->End(gTimestampEnd);
+        dc->End(gTimestampDisjoint);
+        gTimingActive = true;
+    }
 
     // Restore GPU state
     host->RestoreState(dc);
@@ -513,10 +599,53 @@ static void LUTPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
 
 static int LUTIsEnabled()
 {
-    return gConfig.enabled ? 1 : 0;
+    // Always return 1 so the framework always calls postExecute.
+    // When disabled, postExecute returns early (and resets GPU timing to 0).
+    return 1;
 }
 
 // ==================== Plugin entry ====================
+
+// ==================== GUI Settings ====================
+
+static DustSettingDesc gLUTSettingsArray[] = {
+    { "Enabled",          DUST_SETTING_BOOL,  &gConfig.enabled,     0.0f,  1.0f },
+    { "Intensity",        DUST_SETTING_FLOAT, &gConfig.intensity,   0.0f,  1.0f },
+    { "Lift (Shadows)",   DUST_SETTING_FLOAT, &gConfig.lift,       -0.1f,  0.1f },
+    { "Gamma (Midtones)", DUST_SETTING_FLOAT, &gConfig.gamma,       0.8f,  1.2f },
+    { "Gain (Highlights)",DUST_SETTING_FLOAT, &gConfig.gain,        0.8f,  1.2f },
+    { "Contrast",         DUST_SETTING_FLOAT, &gConfig.contrast,    0.5f,  1.5f },
+    { "Saturation",       DUST_SETTING_FLOAT, &gConfig.saturation,  0.0f,  2.0f },
+    { "Temperature",      DUST_SETTING_FLOAT, &gConfig.temperature,-1.0f,  1.0f },
+    { "Tint",             DUST_SETTING_FLOAT, &gConfig.tint,       -1.0f,  1.0f },
+    { "Shadow Red",       DUST_SETTING_FLOAT, &gConfig.shadowR,    -0.1f,  0.1f },
+    { "Shadow Green",     DUST_SETTING_FLOAT, &gConfig.shadowG,    -0.1f,  0.1f },
+    { "Shadow Blue",      DUST_SETTING_FLOAT, &gConfig.shadowB,    -0.1f,  0.1f },
+    { "Highlight Red",    DUST_SETTING_FLOAT, &gConfig.highlightR, -0.1f,  0.1f },
+    { "Highlight Green",  DUST_SETTING_FLOAT, &gConfig.highlightG, -0.1f,  0.1f },
+    { "Highlight Blue",   DUST_SETTING_FLOAT, &gConfig.highlightB, -0.1f,  0.1f },
+};
+
+static void LUTOnSettingChanged()
+{
+    // Regenerate LUT from the updated parameters (no disk save)
+    if (gDevice)
+        GenerateLUT(gDevice);
+}
+
+static void LUTSaveSettings()
+{
+    SaveConfig();
+    Log("LUT: Settings saved to disk");
+}
+
+static void LUTLoadSettings()
+{
+    LoadConfig();
+    if (gDevice)
+        GenerateLUT(gDevice);
+    Log("LUT: Settings reloaded from disk");
+}
 
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
 {
@@ -532,6 +661,12 @@ extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
     desc->preExecute        = nullptr;
     desc->postExecute       = LUTPostExecute;
     desc->IsEnabled         = LUTIsEnabled;
+    desc->settings          = gLUTSettingsArray;
+    desc->settingCount      = sizeof(gLUTSettingsArray) / sizeof(gLUTSettingsArray[0]);
+    desc->OnSettingChanged  = LUTOnSettingChanged;
+    desc->SaveSettings      = LUTSaveSettings;
+    desc->LoadSettings      = LUTLoadSettings;
+    desc->gpuTimeMsPtr      = &gGpuTimeMs;
 
     return 0;
 }

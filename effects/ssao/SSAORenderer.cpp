@@ -67,6 +67,8 @@ static ID3D11Query* gTimestampDisjoint = nullptr;
 static int gTimingFrameCount = 0;
 static double gTimingAccumMs = 0.0;
 static const int TIMING_LOG_INTERVAL = 300;
+static float gLastGpuTimeMs = 0.0f;
+static bool gTimingActive = false;
 
 // ==================== Helpers ====================
 
@@ -294,6 +296,11 @@ ID3D11ShaderResourceView* GetAoSRV()
     return gAoSRV;
 }
 
+float GetLastGpuTimeMs()
+{
+    return gLastGpuTimeMs;
+}
+
 ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
                                     ID3D11ShaderResourceView* depthSRV)
 {
@@ -376,6 +383,32 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
     float blendFactor[4] = { 0, 0, 0, 0 };
     ID3D11ShaderResourceView* nullSRVs[2] = { nullptr, nullptr };
 
+    // Collect previous frame's GPU timing
+    if (gTimingActive && gTimestampDisjoint)
+    {
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjointData;
+        UINT64 tsBegin = 0, tsEnd = 0;
+        if (ctx->GetData(gTimestampDisjoint, &disjointData, sizeof(disjointData), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK
+            && !disjointData.Disjoint
+            && ctx->GetData(gTimestampBegin, &tsBegin, sizeof(tsBegin), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK
+            && ctx->GetData(gTimestampEnd, &tsEnd, sizeof(tsEnd), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK)
+        {
+            double ms = (double)(tsEnd - tsBegin) / (double)disjointData.Frequency * 1000.0;
+            gLastGpuTimeMs = (float)ms;
+            gTimingAccumMs += ms;
+            gTimingFrameCount++;
+
+            if (gTimingFrameCount >= TIMING_LOG_INTERVAL)
+            {
+                double avgMs = gTimingAccumMs / gTimingFrameCount;
+                Log("SSAO timing: %.2f ms avg (%d frames, %ux%u)", avgMs, gTimingFrameCount, gWidth, gHeight);
+                gTimingAccumMs = 0.0;
+                gTimingFrameCount = 0;
+            }
+        }
+        gTimingActive = false;
+    }
+
     // Begin GPU timing
     if (gTimestampDisjoint)
     {
@@ -424,34 +457,12 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
         ctx->PSSetShaderResources(0, 2, nullSRVs);
     }
 
-    // End GPU timing and collect results
+    // End GPU timing (results collected next frame)
     if (gTimestampDisjoint)
     {
         ctx->End(gTimestampEnd);
         ctx->End(gTimestampDisjoint);
-
-        // Read back results from the previous frame's queries (non-blocking)
-        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjointData;
-        if (ctx->GetData(gTimestampDisjoint, &disjointData, sizeof(disjointData), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK
-            && !disjointData.Disjoint)
-        {
-            UINT64 tsBegin = 0, tsEnd = 0;
-            if (ctx->GetData(gTimestampBegin, &tsBegin, sizeof(tsBegin), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK
-                && ctx->GetData(gTimestampEnd, &tsEnd, sizeof(tsEnd), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK)
-            {
-                double ms = (double)(tsEnd - tsBegin) / (double)disjointData.Frequency * 1000.0;
-                gTimingAccumMs += ms;
-                gTimingFrameCount++;
-
-                if (gTimingFrameCount >= TIMING_LOG_INTERVAL)
-                {
-                    double avgMs = gTimingAccumMs / gTimingFrameCount;
-                    Log("SSAO timing: %.2f ms avg (%d frames, %ux%u)", avgMs, gTimingFrameCount, gWidth, gHeight);
-                    gTimingAccumMs = 0.0;
-                    gTimingFrameCount = 0;
-                }
-            }
-        }
+        gTimingActive = true;
     }
 
     // Restore the original GPU state (lighting pass state)

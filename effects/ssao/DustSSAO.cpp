@@ -12,6 +12,7 @@
 
 static const DustHostAPI* gHost = nullptr;
 static HMODULE gPluginModule = nullptr;
+static float gGpuTimeMs = 0.0f;
 
 // Log function pointer used by DustLog.h in other translation units
 DustLogFn gLogFn = nullptr;
@@ -90,11 +91,9 @@ static void SSAOPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     // Hot-reload config if changed on disk
     gSSAOConfig.CheckHotReload();
 
-    // Poll settings.cfg toggle
-    gSSAOConfig.enabled = SSAOMenu::PollCompositorEnabled();
-
     if (!gSSAOConfig.enabled)
     {
+        gGpuTimeMs = 0.0f;
         // Bind white (no occlusion) so deferred.hlsl still reads a valid texture
         host->BindSRV(ctx->context, AO_REGISTER, gWhiteSRV, gAoSampler);
         return;
@@ -104,6 +103,9 @@ static void SSAOPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     ID3D11ShaderResourceView* aoSRV = SSAORenderer::RenderAO(ctx->context, depthSRV);
     if (!aoSRV)
         aoSRV = gWhiteSRV;
+
+    // Update GPU timing for performance display
+    gGpuTimeMs = SSAORenderer::GetLastGpuTimeMs();
 
     // Bind AO for deferred.hlsl to sample
     host->BindSRV(ctx->context, AO_REGISTER, aoSRV, gAoSampler);
@@ -166,8 +168,42 @@ static void SSAOOnResolutionChanged(ID3D11Device* device, uint32_t w, uint32_t h
 
 static int SSAOIsEnabled()
 {
-    return gSSAOConfig.enabled ? 1 : 0;
+    // Always return 1 so the framework always calls preExecute/postExecute.
+    // When disabled, preExecute binds a white fallback so the shader reads valid data.
+    return 1;
 }
+
+// ==================== GUI Settings ====================
+
+static void SSAOSaveSettings()
+{
+    gSSAOConfig.Save();
+    Log("SSAO: Settings saved to disk");
+}
+
+static void SSAOLoadSettings()
+{
+    gSSAOConfig.Load();
+    Log("SSAO: Settings reloaded from disk");
+}
+
+static DustSettingDesc gSettingsArray[] = {
+    { "Enabled",            DUST_SETTING_BOOL,  &gSSAOConfig.enabled,            0.0f,    1.0f   },
+    { "Radius",             DUST_SETTING_FLOAT, &gSSAOConfig.aoRadius,           0.0005f, 0.01f  },
+    { "Strength",           DUST_SETTING_FLOAT, &gSSAOConfig.aoStrength,         0.5f,    10.0f  },
+    { "Bias",               DUST_SETTING_FLOAT, &gSSAOConfig.aoBias,             0.0f,    0.2f   },
+    { "Max Depth",          DUST_SETTING_FLOAT, &gSSAOConfig.aoMaxDepth,         0.01f,   1.0f   },
+    { "Filter Radius",      DUST_SETTING_FLOAT, &gSSAOConfig.filterRadius,       0.01f,   1.0f   },
+    { "Foreground Fade",    DUST_SETTING_FLOAT, &gSSAOConfig.foregroundFade,      1.0f,    200.0f },
+    { "Falloff Power",      DUST_SETTING_FLOAT, &gSSAOConfig.falloffPower,       0.5f,    5.0f   },
+    { "Max Screen Radius",  DUST_SETTING_FLOAT, &gSSAOConfig.maxScreenRadius,    0.005f,  0.2f   },
+    { "Min Screen Radius",  DUST_SETTING_FLOAT, &gSSAOConfig.minScreenRadius,    0.0001f, 0.01f  },
+    { "Blur Sharpness",     DUST_SETTING_FLOAT, &gSSAOConfig.blurSharpness,      0.0f,    0.1f   },
+    { "Night Compensation", DUST_SETTING_FLOAT, &gSSAOConfig.nightCompensation,  0.0f,    50.0f  },
+    { "Debug View",         DUST_SETTING_BOOL,  &gSSAOConfig.debugView,          0.0f,    1.0f   },
+};
+
+// No runtime action needed when settings change — values are read live each frame
 
 // Plugin entry point
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
@@ -184,6 +220,12 @@ extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
     desc->preExecute        = SSAOPreExecute;
     desc->postExecute       = SSAOPostExecute;
     desc->IsEnabled         = SSAOIsEnabled;
+    desc->settings          = gSettingsArray;
+    desc->settingCount      = sizeof(gSettingsArray) / sizeof(gSettingsArray[0]);
+    desc->OnSettingChanged  = nullptr;
+    desc->SaveSettings      = SSAOSaveSettings;
+    desc->LoadSettings      = SSAOLoadSettings;
+    desc->gpuTimeMsPtr      = &gGpuTimeMs;
 
     return 0;
 }

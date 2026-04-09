@@ -26,6 +26,7 @@ public:
     void ShutdownAll();
 
     size_t Count() const { return effects_.size(); }
+    const LoadedEffect& GetEffect(size_t index) const { return effects_[index]; }
 
 private:
     std::vector<LoadedEffect> effects_;
