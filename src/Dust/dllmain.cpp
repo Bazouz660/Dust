@@ -156,7 +156,11 @@ void GameWorld__mainLoop_GPUSensitiveStuff_hook(GameWorld* thisptr, float time)
 // Do NOT use extern "C" here.
 __declspec(dllexport) void startPlugin()
 {
-    Log("Dust framework loading...");
+#ifdef DUST_VERSION
+    Log("Dust v" DUST_VERSION " loading...");
+#else
+    Log("Dust (dev) loading...");
+#endif
 
     // Determine game directory from DLL path
     gGameDir = GetGameDir(gDllModule);

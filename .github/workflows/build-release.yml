@@ -16,6 +16,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
       - name: Clone KenshiLib
         run: git clone --depth 1 https://github.com/KenshiReclaimer/KenshiLib.git external/KenshiLib
 
@@ -38,7 +43,11 @@ jobs:
           KENSHILIB_DEPS_DIR: ${{ github.workspace }}\external\KenshiLib_Examples_deps
           BOOST_INCLUDE_PATH: ${{ github.workspace }}\external\KenshiLib_Examples_deps\boost_1_60_0
           BOOST_ROOT: ${{ github.workspace }}\external\KenshiLib_Examples_deps\boost_1_60_0
-        run: msbuild src\Dust\Dust.vcxproj /p:Configuration=Release /p:Platform=x64
+        run: >
+          msbuild src\Dust\Dust.vcxproj
+          /p:Configuration=Release
+          /p:Platform=x64
+          "/p:ExtraDefines=DUST_VERSION=\"${{ steps.version.outputs.value }}\""
 
       - name: Package release
         run: |
