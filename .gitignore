@@ -50,6 +50,9 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 
+# Environment
+.env
+
 # Claude Code
 .claude/settings.local.json
 .openclaude-profile.json

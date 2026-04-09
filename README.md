@@ -105,10 +105,21 @@ SSAO can be toggled at runtime through Kenshi's `settings.cfg` using the key `Du
 
 - **Visual Studio 2022** (v143 toolset)
 - **Windows 10 SDK**
-- **KenshiLib**: Set the following environment variables:
-  - `KENSHILIB_DIR`: Path to KenshiLib (includes headers for Kenshi internals and OGRE)
-  - `KENSHILIB_DEPS_DIR`: Path to KenshiLib dependencies
-- **Boost**: Set `BOOST_INCLUDE_PATH` to your Boost headers directory
+
+### Setup
+
+1. Clone the repository with submodules:
+   ```bash
+   git clone --recurse-submodules https://github.com/Bazouz660/Dust.git
+   ```
+2. Extract Boost headers (one-time setup):
+   ```bash
+   cd external/KenshiLib_Examples_deps/boost_1_60_0
+   unzip boost.zip
+   ```
+3. Copy `.env.template` to `.env` and set your Kenshi install path
+
+All build dependencies ([KenshiLib](https://github.com/KenshiReclaimer/KenshiLib), [KenshiLib_Examples_deps](https://github.com/BFrizzleFoShizzle/KenshiLib_Examples_deps)) are included as git submodules in the `external/` directory. No environment variables needed.
 
 ### Build
 
@@ -116,15 +127,15 @@ SSAO can be toggled at runtime through Kenshi's `settings.cfg` using the key `Du
 2. Select **Release | x64**
 3. Build the solution
 
-The output `Dust.dll` will be placed in the configured output directory.
+The output `Dust.dll` will be placed in `src/Dust/build/Release/`.
 
 ### Deployment
 
 Copy the following to `<Kenshi>/mods/Dust/`:
 
-- `Dust.dll`
-- `RE_Kenshi.json`
-- `shaders/deferred.hlsl`
+- `src/Dust/build/Release/Dust.dll`
+- `mod/RE_Kenshi.json`
+- `mod/shaders/deferred.hlsl`
 
 ## How It Works
 

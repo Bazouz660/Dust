@@ -16,12 +16,6 @@ namespace SSAORenderer
     void RenderDebugOverlay(ID3D11DeviceContext* ctx,
                             ID3D11RenderTargetView* hdrRTV);
 
-    // Legacy full inject (gen + blur + apply + debug).
-    void Inject(ID3D11DeviceContext* ctx,
-                ID3D11ShaderResourceView* depthSRV,
-                ID3D11ShaderResourceView* normalsSRV,
-                ID3D11RenderTargetView* hdrRTV);
-
     void OnResolutionChanged(ID3D11Device* device, UINT newWidth, UINT newHeight);
     bool IsInitialized();
     ID3D11ShaderResourceView* GetAoSRV();

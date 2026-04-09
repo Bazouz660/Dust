@@ -22,20 +22,14 @@ static ID3D11Texture2D*          gAoBlurTex = nullptr;
 static ID3D11RenderTargetView*   gAoBlurRTV = nullptr;
 static ID3D11ShaderResourceView* gAoBlurSRV = nullptr;
 
-// Scene copy (for reading HDR scene color in the apply pass)
-static ID3D11Texture2D*          gSceneCopyTex = nullptr;
-static ID3D11ShaderResourceView* gSceneCopySRV = nullptr;
-
 // Shaders
 static ID3D11VertexShader* gFullscreenVS = nullptr;
 static ID3D11PixelShader*  gSSAOGenPS = nullptr;
 static ID3D11PixelShader*  gSSAOBlurHPS = nullptr;
 static ID3D11PixelShader*  gSSAOBlurVPS = nullptr;
-static ID3D11PixelShader*  gSSAOApplyPS = nullptr;
 static ID3D11PixelShader*  gSSAODebugPS = nullptr;
 
 // Pipeline states
-static ID3D11BlendState*        gMultiplyBlend = nullptr;
 static ID3D11BlendState*        gNoBlend = nullptr;
 static ID3D11DepthStencilState* gNoDepthDSS = nullptr;
 static ID3D11RasterizerState*   gNoCullRS = nullptr;
@@ -65,10 +59,6 @@ struct SSAOCBData
 static ID3D11Buffer* gSSAOCB = nullptr;
 
 static D3D11StateBlock gStateBlock;
-
-// Diagnostic: staging texture for depth readback
-static ID3D11Texture2D* gDepthStagingTex = nullptr;
-static int gDiagFrameCounter = 0;
 
 // ==================== Helpers ====================
 
@@ -127,27 +117,6 @@ static bool CreateR8Texture(ID3D11Device* device, UINT width, UINT height,
     return true;
 }
 
-static bool CreateSceneCopyTexture(ID3D11Device* device, UINT width, UINT height)
-{
-    D3D11_TEXTURE2D_DESC texDesc = {};
-    texDesc.Width = width;
-    texDesc.Height = height;
-    texDesc.MipLevels = 1;
-    texDesc.ArraySize = 1;
-    texDesc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
-    texDesc.SampleDesc.Count = 1;
-    texDesc.Usage = D3D11_USAGE_DEFAULT;
-    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-
-    HRESULT hr = device->CreateTexture2D(&texDesc, nullptr, &gSceneCopyTex);
-    if (FAILED(hr)) { Log("Failed to create scene copy texture: 0x%08X", hr); return false; }
-
-    hr = device->CreateShaderResourceView(gSceneCopyTex, nullptr, &gSceneCopySRV);
-    if (FAILED(hr)) { Log("Failed to create scene copy SRV: 0x%08X", hr); return false; }
-
-    return true;
-}
-
 // ==================== Public API ====================
 
 bool Init(ID3D11Device* device, UINT width, UINT height)
@@ -172,11 +141,8 @@ bool Init(ID3D11Device* device, UINT width, UINT height)
     ID3DBlob* blurVBlob = CompileShader(g_SSAOBlurVPS, "ps_5_0", "main");
     if (!blurVBlob) { vsBlob->Release(); genBlob->Release(); blurHBlob->Release(); return false; }
 
-    ID3DBlob* applyBlob = CompileShader(g_SSAOApplyPS, "ps_5_0", "main");
-    if (!applyBlob) { vsBlob->Release(); genBlob->Release(); blurHBlob->Release(); blurVBlob->Release(); return false; }
-
     ID3DBlob* debugBlob = CompileShader(g_SSAODebugPS, "ps_5_0", "main");
-    if (!debugBlob) { vsBlob->Release(); genBlob->Release(); blurHBlob->Release(); blurVBlob->Release(); applyBlob->Release(); return false; }
+    if (!debugBlob) { vsBlob->Release(); genBlob->Release(); blurHBlob->Release(); blurVBlob->Release(); return false; }
 
     HRESULT hr;
 
@@ -196,10 +162,6 @@ bool Init(ID3D11Device* device, UINT width, UINT height)
     blurVBlob->Release();
     if (FAILED(hr)) { Log("Failed to create blur V PS: 0x%08X", hr); return false; }
 
-    hr = device->CreatePixelShader(applyBlob->GetBufferPointer(), applyBlob->GetBufferSize(), nullptr, &gSSAOApplyPS);
-    applyBlob->Release();
-    if (FAILED(hr)) { Log("Failed to create apply PS: 0x%08X", hr); return false; }
-
     hr = device->CreatePixelShader(debugBlob->GetBufferPointer(), debugBlob->GetBufferSize(), nullptr, &gSSAODebugPS);
     debugBlob->Release();
     if (FAILED(hr)) { Log("Failed to create debug PS: 0x%08X", hr); return false; }
@@ -209,23 +171,6 @@ bool Init(ID3D11Device* device, UINT width, UINT height)
         return false;
     if (!CreateR8Texture(device, width, height, &gAoBlurTex, &gAoBlurRTV, &gAoBlurSRV))
         return false;
-    if (!CreateSceneCopyTexture(device, width, height))
-        return false;
-
-    // Multiply blend
-    {
-        D3D11_BLEND_DESC desc = {};
-        desc.RenderTarget[0].BlendEnable = TRUE;
-        desc.RenderTarget[0].SrcBlend = D3D11_BLEND_DEST_COLOR;
-        desc.RenderTarget[0].DestBlend = D3D11_BLEND_ZERO;
-        desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
-        desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
-        desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
-        desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
-        desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-        hr = device->CreateBlendState(&desc, &gMultiplyBlend);
-        if (FAILED(hr)) { Log("Failed to create multiply blend: 0x%08X", hr); return false; }
-    }
 
     // No blend
     {
@@ -287,265 +232,15 @@ void Shutdown()
 #define SAFE_RELEASE(p) if (p) { (p)->Release(); (p) = nullptr; }
     SAFE_RELEASE(gAoTex);     SAFE_RELEASE(gAoRTV);     SAFE_RELEASE(gAoSRV);
     SAFE_RELEASE(gAoBlurTex); SAFE_RELEASE(gAoBlurRTV); SAFE_RELEASE(gAoBlurSRV);
-    SAFE_RELEASE(gSceneCopyTex); SAFE_RELEASE(gSceneCopySRV);
     SAFE_RELEASE(gFullscreenVS);
     SAFE_RELEASE(gSSAOGenPS);  SAFE_RELEASE(gSSAOBlurHPS);
-    SAFE_RELEASE(gSSAOBlurVPS); SAFE_RELEASE(gSSAOApplyPS); SAFE_RELEASE(gSSAODebugPS);
-    SAFE_RELEASE(gMultiplyBlend); SAFE_RELEASE(gNoBlend);
+    SAFE_RELEASE(gSSAOBlurVPS); SAFE_RELEASE(gSSAODebugPS);
+    SAFE_RELEASE(gNoBlend);
     SAFE_RELEASE(gNoDepthDSS);   SAFE_RELEASE(gNoCullRS);
     SAFE_RELEASE(gPointClampSampler); SAFE_RELEASE(gSSAOCB);
-    SAFE_RELEASE(gDepthStagingTex);
 #undef SAFE_RELEASE
     gInitialized = false;
     Log("SSAORenderer shut down");
-}
-
-void Inject(ID3D11DeviceContext* ctx,
-            ID3D11ShaderResourceView* depthSRV,
-            ID3D11ShaderResourceView* /*normalsSRV*/,
-            ID3D11RenderTargetView* hdrRTV)
-{
-    if (!gInitialized || !ctx || !depthSRV || !hdrRTV)
-        return;
-
-    // Detect resolution from the HDR render target and handle changes
-    {
-        ID3D11Resource* res = nullptr;
-        hdrRTV->GetResource(&res);
-        if (res)
-        {
-            ID3D11Texture2D* tex = nullptr;
-            res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex);
-            if (tex)
-            {
-                D3D11_TEXTURE2D_DESC desc;
-                tex->GetDesc(&desc);
-                if (desc.Width != gWidth || desc.Height != gHeight)
-                {
-                    ID3D11Device* device = nullptr;
-                    ctx->GetDevice(&device);
-                    if (device)
-                    {
-                        OnResolutionChanged(device, desc.Width, desc.Height);
-                        device->Release();
-                    }
-                }
-                tex->Release();
-            }
-            res->Release();
-        }
-    }
-
-    // One-time format diagnostic
-    static bool sFormatLogged = false;
-    if (!sFormatLogged)
-    {
-        sFormatLogged = true;
-        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc;
-        depthSRV->GetDesc(&srvDesc);
-        Log("Depth SRV format: %u", srvDesc.Format);
-        D3D11_RENDER_TARGET_VIEW_DESC rtvDesc;
-        hdrRTV->GetDesc(&rtvDesc);
-        Log("HDR RT format: %u", rtvDesc.Format);
-    }
-
-    // Periodic depth diagnostic (every 300 frames)
-    gDiagFrameCounter++;
-    if (gDiagFrameCounter % 300 == 0)
-    {
-        if (!gDepthStagingTex)
-        {
-            D3D11_TEXTURE2D_DESC desc = {};
-            desc.Width = 1;
-            desc.Height = 1;
-            desc.MipLevels = 1;
-            desc.ArraySize = 1;
-            desc.Format = DXGI_FORMAT_R32_FLOAT;
-            desc.SampleDesc.Count = 1;
-            desc.Usage = D3D11_USAGE_STAGING;
-            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-
-            ID3D11Device* dev = nullptr;
-            ctx->GetDevice(&dev);
-            if (dev)
-            {
-                dev->CreateTexture2D(&desc, nullptr, &gDepthStagingTex);
-                dev->Release();
-            }
-        }
-
-        if (gDepthStagingTex)
-        {
-            ID3D11Resource* depthRes = nullptr;
-            depthSRV->GetResource(&depthRes);
-            if (depthRes)
-            {
-                // Sample 3 points: center, quarter, three-quarter
-                UINT pts[][2] = {
-                    { gWidth / 2, gHeight / 2 },
-                    { gWidth / 4, gHeight / 4 },
-                    { gWidth * 3 / 4, gHeight * 3 / 4 }
-                };
-                float vals[3] = { -1, -1, -1 };
-
-                for (int i = 0; i < 3; i++)
-                {
-                    D3D11_BOX box = {};
-                    box.left = pts[i][0];
-                    box.top = pts[i][1];
-                    box.right = box.left + 1;
-                    box.bottom = box.top + 1;
-                    box.front = 0;
-                    box.back = 1;
-
-                    ctx->CopySubresourceRegion(gDepthStagingTex, 0, 0, 0, 0,
-                                               depthRes, 0, &box);
-
-                    D3D11_MAPPED_SUBRESOURCE mapped;
-                    if (SUCCEEDED(ctx->Map(gDepthStagingTex, 0, D3D11_MAP_READ, 0, &mapped)))
-                    {
-                        vals[i] = *static_cast<float*>(mapped.pData);
-                        ctx->Unmap(gDepthStagingTex, 0);
-                    }
-                }
-
-                Log("DEPTH DIAG: center=%.6f quarter=%.6f 3quarter=%.6f depthRes=%p",
-                    vals[0], vals[1], vals[2], depthRes);
-                depthRes->Release();
-            }
-        }
-    }
-
-    gStateBlock.Capture(ctx);
-
-    // Update constant buffer
-    {
-        D3D11_MAPPED_SUBRESOURCE mapped;
-        HRESULT hr = ctx->Map(gSSAOCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-        if (SUCCEEDED(hr))
-        {
-            SSAOCBData* cb = static_cast<SSAOCBData*>(mapped.pData);
-            cb->viewportSize[0] = (float)gWidth;
-            cb->viewportSize[1] = (float)gHeight;
-            cb->invViewportSize[0] = 1.0f / (float)gWidth;
-            cb->invViewportSize[1] = 1.0f / (float)gHeight;
-
-            cb->tanHalfFov = gSSAOConfig.tanHalfFov;
-            cb->aspectRatio = (float)gWidth / (float)gHeight;
-            cb->filterRadius = gSSAOConfig.filterRadius;
-            cb->debugMode = gSSAOConfig.debugView ? 1.0f : 0.0f;
-
-            cb->aoRadius = gSSAOConfig.aoRadius;
-            cb->aoStrength = gSSAOConfig.aoStrength;
-            cb->aoBias = gSSAOConfig.aoBias;
-            cb->aoMaxDepth = gSSAOConfig.aoMaxDepth;
-            cb->foregroundFade = gSSAOConfig.foregroundFade;
-            cb->falloffPower = gSSAOConfig.falloffPower;
-            cb->maxScreenRadius = gSSAOConfig.maxScreenRadius;
-            cb->minScreenRadius = gSSAOConfig.minScreenRadius;
-            cb->depthFadeStart = gSSAOConfig.depthFadeStart;
-            cb->blurSharpness = gSSAOConfig.blurSharpness;
-            cb->nightCompensation = gSSAOConfig.nightCompensation;
-
-            ctx->Unmap(gSSAOCB, 0);
-        }
-    }
-
-    // Common state
-    ctx->IASetInputLayout(nullptr);
-    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ctx->VSSetShader(gFullscreenVS, nullptr, 0);
-    ctx->RSSetState(gNoCullRS);
-    ctx->OMSetDepthStencilState(gNoDepthDSS, 0);
-
-    D3D11_VIEWPORT vp = {};
-    vp.Width = (float)gWidth;
-    vp.Height = (float)gHeight;
-    vp.MaxDepth = 1.0f;
-    ctx->RSSetViewports(1, &vp);
-
-    float blendFactor[4] = { 0, 0, 0, 0 };
-    ID3D11ShaderResourceView* nullSRVs[2] = { nullptr, nullptr };
-
-    // ============ Pass 1: Generate raw AO → gAoTex ============
-    {
-        float clearColor[4] = { 1, 1, 1, 1 };
-        ctx->ClearRenderTargetView(gAoRTV, clearColor);
-        ctx->OMSetRenderTargets(1, &gAoRTV, nullptr);
-        ctx->OMSetBlendState(gNoBlend, blendFactor, 0xFFFFFFFF);
-        ctx->PSSetShader(gSSAOGenPS, nullptr, 0);
-        ID3D11ShaderResourceView* srvs[2] = { depthSRV, nullptr };
-        ctx->PSSetShaderResources(0, 2, srvs);
-        ctx->PSSetSamplers(0, 1, &gPointClampSampler);
-        ctx->PSSetConstantBuffers(0, 1, &gSSAOCB);
-        ctx->Draw(3, 0);
-        ctx->PSSetShaderResources(0, 2, nullSRVs);
-    }
-
-    // ============ Pass 2: Horizontal blur: gAoTex → gAoBlurTex ============
-    {
-        ctx->OMSetRenderTargets(1, &gAoBlurRTV, nullptr);
-        ctx->OMSetBlendState(gNoBlend, blendFactor, 0xFFFFFFFF);
-        ctx->PSSetShader(gSSAOBlurHPS, nullptr, 0);
-        ID3D11ShaderResourceView* srvs[2] = { gAoSRV, depthSRV };
-        ctx->PSSetShaderResources(0, 2, srvs);
-        ctx->PSSetSamplers(0, 1, &gPointClampSampler);
-        ctx->PSSetConstantBuffers(0, 1, &gSSAOCB);
-        ctx->Draw(3, 0);
-        ctx->PSSetShaderResources(0, 2, nullSRVs);
-    }
-
-    // ============ Pass 3: Vertical blur: gAoBlurTex → gAoTex ============
-    {
-        ctx->OMSetRenderTargets(1, &gAoRTV, nullptr);
-        ctx->OMSetBlendState(gNoBlend, blendFactor, 0xFFFFFFFF);
-        ctx->PSSetShader(gSSAOBlurVPS, nullptr, 0);
-        ID3D11ShaderResourceView* srvs[2] = { gAoBlurSRV, depthSRV };
-        ctx->PSSetShaderResources(0, 2, srvs);
-        ctx->PSSetSamplers(0, 1, &gPointClampSampler);
-        ctx->PSSetConstantBuffers(0, 1, &gSSAOCB);
-        ctx->Draw(3, 0);
-        ctx->PSSetShaderResources(0, 2, nullSRVs);
-    }
-
-    // ============ Pass 4: Apply AO (gamma-space blend onto HDR) ============
-    {
-        // Copy HDR RT so the apply shader can read the scene color
-        ID3D11Resource* hdrRes = nullptr;
-        hdrRTV->GetResource(&hdrRes);
-        if (hdrRes && gSceneCopyTex)
-        {
-            ctx->CopyResource(gSceneCopyTex, hdrRes);
-            hdrRes->Release();
-        }
-        else if (hdrRes)
-            hdrRes->Release();
-
-        ctx->OMSetRenderTargets(1, &hdrRTV, nullptr);
-        ctx->OMSetBlendState(gNoBlend, blendFactor, 0xFFFFFFFF);
-        ctx->PSSetShader(gSSAOApplyPS, nullptr, 0);
-        ID3D11ShaderResourceView* applySRVs[2] = { gAoSRV, gSceneCopySRV };
-        ctx->PSSetShaderResources(0, 2, applySRVs);
-        ctx->PSSetSamplers(0, 1, &gPointClampSampler);
-        ctx->PSSetConstantBuffers(0, 1, &gSSAOCB);
-        ctx->Draw(3, 0);
-        ctx->PSSetShaderResources(0, 2, nullSRVs);
-    }
-
-    // ============ Pass 5: Debug overlay (no-blend, raw AO on left third) ============
-    if (gSSAOConfig.debugView)
-    {
-        ctx->OMSetRenderTargets(1, &hdrRTV, nullptr);
-        ctx->OMSetBlendState(gNoBlend, blendFactor, 0xFFFFFFFF);
-        ctx->PSSetShader(gSSAODebugPS, nullptr, 0);
-        ctx->PSSetShaderResources(0, 1, &gAoSRV);
-        ctx->PSSetSamplers(0, 1, &gPointClampSampler);
-        ctx->Draw(3, 0);
-        ID3D11ShaderResourceView* nullSRV = nullptr;
-        ctx->PSSetShaderResources(0, 1, &nullSRV);
-    }
-
-    gStateBlock.Restore(ctx);
 }
 
 void OnResolutionChanged(ID3D11Device* device, UINT newWidth, UINT newHeight)
@@ -558,14 +253,12 @@ void OnResolutionChanged(ID3D11Device* device, UINT newWidth, UINT newHeight)
 #define SAFE_RELEASE(p) if (p) { (p)->Release(); (p) = nullptr; }
     SAFE_RELEASE(gAoTex);     SAFE_RELEASE(gAoRTV);     SAFE_RELEASE(gAoSRV);
     SAFE_RELEASE(gAoBlurTex); SAFE_RELEASE(gAoBlurRTV); SAFE_RELEASE(gAoBlurSRV);
-    SAFE_RELEASE(gSceneCopyTex); SAFE_RELEASE(gSceneCopySRV);
 #undef SAFE_RELEASE
 
     gWidth = newWidth;
     gHeight = newHeight;
     CreateR8Texture(device, newWidth, newHeight, &gAoTex, &gAoRTV, &gAoSRV);
     CreateR8Texture(device, newWidth, newHeight, &gAoBlurTex, &gAoBlurRTV, &gAoBlurSRV);
-    CreateSceneCopyTexture(device, newWidth, newHeight);
 }
 
 bool IsInitialized()
