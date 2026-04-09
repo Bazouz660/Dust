@@ -10,12 +10,7 @@
 // Dust framework
 #include "DustLog.h"
 #include "D3D11Hook.h"
-#include "EffectManager.h"
-#include "SSAORenderer.h"
-
-// Built-in effects
-#include "SSAOConfig.h"
-#include "SSAOMenu.h"
+#include "EffectLoader.h"
 
 static HMODULE gDllModule = nullptr;
 static std::string gGameDir;
@@ -140,12 +135,6 @@ void GameWorld__mainLoop_GPUSensitiveStuff_hook(GameWorld* thisptr, float time)
     // Reset per-frame state before the game renders
     D3D11Hook::ResetFrameState();
 
-    // Hot-reload config file if it changed on disk
-    gSSAOConfig.CheckHotReload();
-
-    // Poll compositor node enabled state (Graphics menu toggle)
-    gSSAOConfig.enabled = SSAOMenu::PollCompositorEnabled();
-
     // Call original game loop
     GameWorld__mainLoop_GPUSensitiveStuff_orig(thisptr, time);
 }
@@ -171,11 +160,12 @@ __declspec(dllexport) void startPlugin()
     // Install modified deferred.hlsl BEFORE OGRE compiles shaders
     InstallModifiedShader();
 
-    // Load SSAO config (creates defaults if missing)
-    gSSAOConfig.Init(gDllModule);
-
-    // SSAO is managed directly by D3D11Hook (PRE_LIGHTING binding),
-    // not through the generic effect framework.
+    // Load effect plugins from effects/ directory next to the DLL
+    {
+        std::string effectsDir = GetModuleDir(gDllModule) + "effects";
+        int loaded = gEffectLoader.LoadAll(effectsDir.c_str());
+        Log("Loaded %d effect plugin(s) from %s", loaded, effectsDir.c_str());
+    }
 
     // Hook game loop for per-frame state reset
     KenshiLib::HookStatus status = KenshiLib::AddHook(
@@ -202,8 +192,8 @@ __declspec(dllexport) void startPlugin()
         return;
     }
 
-    Log("All hooks installed, %zu effect(s) registered, waiting for first D3D11 call...",
-        gEffectManager.EffectCount());
+    Log("All hooks installed, %zu effect plugin(s) loaded, waiting for first D3D11 call...",
+        gEffectLoader.Count());
 }
 
 // ==================== DllMain ====================
@@ -217,8 +207,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
         gDllModule = hModule;
         break;
     case DLL_PROCESS_DETACH:
-        SSAORenderer::Shutdown();
-        gEffectManager.ShutdownAll();
+        gEffectLoader.ShutdownAll();
         RestoreVanillaShader();
         break;
     }

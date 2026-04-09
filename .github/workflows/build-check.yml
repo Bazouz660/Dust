@@ -25,8 +25,14 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v3
 
-      - name: Build
+      - name: Build host (Dust.dll)
         run: >
           msbuild src\Dust.vcxproj
+          /p:Configuration=Release
+          /p:Platform=x64
+
+      - name: Build SSAO plugin (DustSSAO.dll)
+        run: >
+          msbuild effects\ssao\DustSSAO.vcxproj
           /p:Configuration=Release
           /p:Platform=x64

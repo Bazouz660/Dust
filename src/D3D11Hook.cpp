@@ -1,9 +1,7 @@
 #include "D3D11Hook.h"
 #include "PipelineDetector.h"
-#include "EffectManager.h"
+#include "EffectLoader.h"
 #include "ResourceRegistry.h"
-#include "SSAORenderer.h"
-#include "SSAOConfig.h"
 #include "DustLog.h"
 #include <core/Functions.h>
 #include <d3d11.h>
@@ -22,12 +20,6 @@ static UINT gWidth = 0;
 static UINT gHeight = 0;
 static uint64_t gFrameIndex = 0;
 static bool gDispatchedThisFrame = false;
-
-// White 1x1 fallback texture for AO slot when SSAO is disabled or not ready.
-// The modified deferred.hlsl always samples s8; this ensures ao=1.0 (no darkening).
-static ID3D11Texture2D*          gWhiteTex = nullptr;
-static ID3D11ShaderResourceView* gWhiteSRV = nullptr;
-static ID3D11SamplerState*       gAoSampler = nullptr;
 
 #ifdef DUST_SURVEY
 static bool gResetPending = false;
@@ -123,60 +115,10 @@ static void TryCaptureDevice(ID3D11Device* device)
         Log("Detected resolution: %ux%u", gWidth, gHeight);
     }
 
-    // Create white 1x1 fallback texture for AO slot
-    {
-        D3D11_TEXTURE2D_DESC td = {};
-        td.Width = 1;
-        td.Height = 1;
-        td.MipLevels = 1;
-        td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_R8_UNORM;
-        td.SampleDesc.Count = 1;
-        td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    // Initialize all loaded effect plugins
+    if (!gEffectLoader.InitAll(gDevice, gWidth, gHeight))
+        Log("WARNING: One or more effect plugins failed to initialize");
 
-        UINT8 white = 255;
-        D3D11_SUBRESOURCE_DATA initData = {};
-        initData.pSysMem = &white;
-        initData.SysMemPitch = 1;
-
-        HRESULT hr = gDevice->CreateTexture2D(&td, &initData, &gWhiteTex);
-        if (SUCCEEDED(hr))
-            hr = gDevice->CreateShaderResourceView(gWhiteTex, nullptr, &gWhiteSRV);
-        if (FAILED(hr))
-        {
-            if (gWhiteTex) { gWhiteTex->Release(); gWhiteTex = nullptr; }
-            Log("WARNING: Failed to create white fallback texture");
-        }
-        else
-        {
-            Log("White fallback texture created for AO slot");
-        }
-    }
-
-    // Create point-clamp sampler for AO slot (s8)
-    {
-        D3D11_SAMPLER_DESC sd = {};
-        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
-        sd.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
-        sd.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
-        sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-        HRESULT hr = gDevice->CreateSamplerState(&sd, &gAoSampler);
-        if (FAILED(hr))
-            Log("WARNING: Failed to create AO sampler");
-    }
-
-    // Initialize SSAO renderer
-    if (!SSAORenderer::Init(gDevice, gWidth, gHeight))
-    {
-        Log("WARNING: SSAORenderer failed to initialize");
-    }
-
-    // Initialize remaining effects via the framework
-    if (!gEffectManager.InitAll(gDevice, gWidth, gHeight))
-    {
-        Log("WARNING: One or more effects failed to initialize");
-    }
     Log("Dust fully initialized and active");
 }
 
@@ -294,53 +236,34 @@ static void STDMETHODCALLTYPE HookedDraw(
     SurveyFullscreenDraw(pThis, VertexCount);
 #endif
 
-    // Detect the lighting pass BEFORE executing the draw.
-    // The GPU state (RT, SRVs, shaders) is already set up by the game.
+    // Detect render pass from GPU state
     auto result = gPipelineDetector.OnFullscreenDraw(pThis);
 
-    if (result.detected && result.point == InjectionPoint::POST_LIGHTING)
+    if (result.detected)
     {
-        // === PRE-LIGHTING: Generate AO and bind to s8 ===
-        ID3D11ShaderResourceView* aoSRV = gWhiteSRV;
+        DustInjectionPoint dip = static_cast<DustInjectionPoint>(result.point);
 
-        if (gSSAOConfig.enabled && SSAORenderer::IsInitialized())
-        {
-            auto* depthSRV = gResourceRegistry.GetSRV(ResourceName::DEPTH_SRV);
-            if (depthSRV)
-            {
-                // RenderAO saves/restores GPU state internally,
-                // so the lighting pass state is preserved after this call.
-                ID3D11ShaderResourceView* rendered = SSAORenderer::RenderAO(pThis, depthSRV);
-                if (rendered)
-                    aoSRV = rendered;
-            }
-        }
+        DustFrameContext fctx = {};
+        fctx.device = gDevice;
+        fctx.context = pThis;
+        fctx.point = dip;
+        fctx.width = gWidth;
+        fctx.height = gHeight;
+        fctx.frameIndex = gFrameIndex;
 
-        // Bind AO texture + sampler to slot 8 for the modified deferred.hlsl
-        pThis->PSSetShaderResources(8, 1, &aoSRV);
-        if (gAoSampler)
-            pThis->PSSetSamplers(8, 1, &gAoSampler);
+        // PRE: effects bind resources before the game's draw
+        fctx.timing = DUST_TIMING_PRE;
+        gEffectLoader.DispatchPre(dip, &fctx);
 
-        // Execute the lighting draw — shader reads AO from s8
+        // Execute the game's original draw call
         oDraw(pThis, VertexCount, StartVertexLocation);
 
-        // Unbind AO slot
-        ID3D11ShaderResourceView* nullSRV = nullptr;
-        ID3D11SamplerState* nullSampler = nullptr;
-        pThis->PSSetShaderResources(8, 1, &nullSRV);
-        pThis->PSSetSamplers(8, 1, &nullSampler);
-
-        // === POST-LIGHTING: Debug overlay ===
-        if (gSSAOConfig.debugView && SSAORenderer::IsInitialized())
-        {
-            auto* hdrRTV = gResourceRegistry.GetRTV(ResourceName::HDR_RTV);
-            if (hdrRTV)
-                SSAORenderer::RenderDebugOverlay(pThis, hdrRTV);
-        }
+        // POST: effects that operate after the draw
+        fctx.timing = DUST_TIMING_POST;
+        gEffectLoader.DispatchPost(dip, &fctx);
     }
     else
     {
-        // Not a lighting pass — just execute normally
         oDraw(pThis, VertexCount, StartVertexLocation);
     }
 }

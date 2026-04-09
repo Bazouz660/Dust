@@ -53,13 +53,13 @@ void SSAOConfig::Load()
 {
     enabled        = ReadInt("Enabled", 1) != 0;
     aoRadius       = ReadFloat("Radius", 0.002f);
-    aoStrength     = ReadFloat("Strength", 2.0f);
+    aoStrength     = ReadFloat("Strength", 3.0f);
     aoBias         = ReadFloat("Bias", 0.05f);
     aoMaxDepth     = ReadFloat("MaxDepth", 0.1f);
     filterRadius   = ReadFloat("FilterRadius", 0.15f);
     foregroundFade = ReadFloat("ForegroundFade", 50.0f);
     falloffPower   = ReadFloat("FalloffPower", 2.0f);
-    maxScreenRadius = ReadFloat("MaxScreenRadius", 0.1f);
+    maxScreenRadius = ReadFloat("MaxScreenRadius", 0.03f);
     minScreenRadius = ReadFloat("MinScreenRadius", 0.001f);
     depthFadeStart = ReadFloat("DepthFadeStart", 0.0f);
     blurSharpness  = ReadFloat("BlurSharpness", 0.01f);

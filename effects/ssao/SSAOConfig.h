@@ -10,13 +10,13 @@ struct SSAOConfig
 
     // AO generation
     float aoRadius = 0.002f;
-    float aoStrength = 2.0f;
+    float aoStrength = 3.0f;
     float aoBias = 0.05f;
     float aoMaxDepth = 0.1f;
     float filterRadius = 0.15f;
     float foregroundFade = 50.0f;
     float falloffPower = 2.0f;
-    float maxScreenRadius = 0.1f;
+    float maxScreenRadius = 0.03f;
     float minScreenRadius = 0.001f;
     float depthFadeStart = 0.0f;
 

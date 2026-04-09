@@ -48,17 +48,26 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v3
 
-      - name: Build
+      - name: Build host (Dust.dll)
         run: >
           msbuild src\Dust.vcxproj
           /p:Configuration=Release
           /p:Platform=x64
           /p:ExtraDefines=DUST_VERSION=${{ steps.version.outputs.value }}
 
+      - name: Build SSAO plugin (DustSSAO.dll)
+        run: >
+          msbuild effects\ssao\DustSSAO.vcxproj
+          /p:Configuration=Release
+          /p:Platform=x64
+
       - name: Package release
         run: |
           mkdir release\Dust\shaders
+          mkdir release\Dust\effects
           copy src\build\Release\Dust.dll release\Dust\
+          copy effects\ssao\build\Release\DustSSAO.dll release\Dust\effects\
+          copy mod\Dust.mod release\Dust\
           copy mod\RE_Kenshi.json release\Dust\
           copy mod\shaders\deferred.hlsl release\Dust\shaders\
           cd release
