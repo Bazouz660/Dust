@@ -35,7 +35,7 @@ jobs:
       - name: Build
         env:
           KENSHILIB_DIR: ${{ github.workspace }}\external\KenshiLib
-          KENSHILIB_DEPS_DIR: ${{ github.workspace }}\external\KenshiLib_Examples_deps\KenshiLib
+          KENSHILIB_DEPS_DIR: ${{ github.workspace }}\external\KenshiLib_Examples_deps
           BOOST_INCLUDE_PATH: ${{ github.workspace }}\external\KenshiLib_Examples_deps\boost_1_60_0
           BOOST_ROOT: ${{ github.workspace }}\external\KenshiLib_Examples_deps\boost_1_60_0
         run: msbuild src\Dust\Dust.vcxproj /p:Configuration=Release /p:Platform=x64
