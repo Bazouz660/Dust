@@ -33,11 +33,11 @@ Dust is built as a modular effect framework:
 ### Steps
 
 1. Download the latest release
-2. Extract the `KenshiSSAO` folder into your Kenshi `mods/` directory:
+2. Extract the `Dust` folder into your Kenshi `mods/` directory:
    ```
    <Kenshi>/
    └── mods/
-       └── KenshiSSAO/
+       └── Dust/
            ├── Dust.dll
            ├── RE_Kenshi.json
            └── shaders/
@@ -50,7 +50,7 @@ Dust is built as a modular effect framework:
 
 ### Uninstallation
 
-The vanilla `deferred.hlsl` shader is automatically restored when the DLL unloads. To fully uninstall, simply delete the `KenshiSSAO` folder from `mods/`.
+The vanilla `deferred.hlsl` shader is automatically restored when the DLL unloads. To fully uninstall, simply delete the `Dust` folder from `mods/`.
 
 ## Configuration
 
@@ -120,7 +120,7 @@ The output `Dust.dll` will be placed in the configured output directory.
 
 ### Deployment
 
-Copy the following to `<Kenshi>/mods/KenshiSSAO/`:
+Copy the following to `<Kenshi>/mods/Dust/`:
 
 - `Dust.dll`
 - `RE_Kenshi.json`

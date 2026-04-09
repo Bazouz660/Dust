@@ -53,3 +53,5 @@ Desktop.ini
 # Claude Code
 .claude/settings.local.json
 .openclaude-profile.json
+
+external/

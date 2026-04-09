@@ -33,7 +33,7 @@ static std::string GetModuleDir(HMODULE hModule)
 
 static std::string GetGameDir(HMODULE hModule)
 {
-    // DLL is at <game>/mods/KenshiSSAO/Dust.dll — go up 2 dirs
+    // DLL is at <game>/mods/Dust/Dust.dll -- go up 2 dirs
     std::string modDir = GetModuleDir(hModule);
     // Remove trailing slash, go up once
     auto pos = modDir.find_last_of("\\/", modDir.size() - 2);

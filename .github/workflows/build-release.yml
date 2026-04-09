@@ -42,12 +42,12 @@ jobs:
 
       - name: Package release
         run: |
-          mkdir release\KenshiSSAO\shaders
-          copy src\Dust\build\Release\Dust.dll release\KenshiSSAO\
-          copy mod\RE_Kenshi.json release\KenshiSSAO\
-          copy mod\shaders\deferred.hlsl release\KenshiSSAO\shaders\
+          mkdir release\Dust\shaders
+          copy src\Dust\build\Release\Dust.dll release\Dust\
+          copy mod\RE_Kenshi.json release\Dust\
+          copy mod\shaders\deferred.hlsl release\Dust\shaders\
           cd release
-          tar -acf ..\Dust-${{ github.ref_name }}.zip KenshiSSAO
+          tar -acf ..\Dust-${{ github.ref_name }}.zip Dust
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
