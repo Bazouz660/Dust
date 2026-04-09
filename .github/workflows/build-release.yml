@@ -1,0 +1,49 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clone KenshiLib
+        run: git clone --depth 1 https://github.com/KenshiReclaimer/KenshiLib.git external/KenshiLib
+
+      - name: Clone KenshiLib_Examples_deps
+        run: git clone --depth 1 https://github.com/BFrizzleFoShizzle/KenshiLib_Examples_deps.git external/KenshiLib_Examples_deps
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build
+        env:
+          KENSHILIB_DIR: ${{ github.workspace }}\external\KenshiLib
+          KENSHILIB_DEPS_DIR: ${{ github.workspace }}\external\KenshiLib_Examples_deps\KenshiLib
+          BOOST_INCLUDE_PATH: ${{ github.workspace }}\external\KenshiLib_Examples_deps\boost_1_60_0
+          BOOST_ROOT: ${{ github.workspace }}\external\KenshiLib_Examples_deps\boost_1_60_0
+        run: msbuild src\Dust\Dust.vcxproj /p:Configuration=Release /p:Platform=x64
+
+      - name: Package release
+        run: |
+          mkdir release\KenshiSSAO\shaders
+          copy src\Dust\build\Release\Dust.dll release\KenshiSSAO\
+          copy mod\RE_Kenshi.json release\KenshiSSAO\
+          copy mod\shaders\deferred.hlsl release\KenshiSSAO\shaders\
+          cd release
+          tar -acf ..\Dust-${{ github.ref_name }}.zip KenshiSSAO
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Dust-${{ github.ref_name }}.zip
+          generate_release_notes: true
