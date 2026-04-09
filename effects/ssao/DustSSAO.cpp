@@ -74,6 +74,9 @@ static bool CreateWhiteFallback(ID3D11Device* device)
     return true;
 }
 
+// The register declared in deferred.hlsl for aoMap
+static const uint32_t AO_REGISTER = 8;
+
 // Called BEFORE the game's lighting draw
 static void SSAOPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
 {
@@ -93,8 +96,7 @@ static void SSAOPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     if (!gSSAOConfig.enabled)
     {
         // Bind white (no occlusion) so deferred.hlsl still reads a valid texture
-        ctx->context->PSSetShaderResources(8, 1, &gWhiteSRV);
-        ctx->context->PSSetSamplers(8, 1, &gAoSampler);
+        host->BindSRV(ctx->context, AO_REGISTER, gWhiteSRV, gAoSampler);
         return;
     }
 
@@ -103,19 +105,15 @@ static void SSAOPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     if (!aoSRV)
         aoSRV = gWhiteSRV;
 
-    // Bind AO to slot 8 for the game's deferred.hlsl to sample
-    ctx->context->PSSetShaderResources(8, 1, &aoSRV);
-    ctx->context->PSSetSamplers(8, 1, &gAoSampler);
+    // Bind AO for deferred.hlsl to sample
+    host->BindSRV(ctx->context, AO_REGISTER, aoSRV, gAoSampler);
 }
 
 // Called AFTER the game's lighting draw
 static void SSAOPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
 {
-    // Unbind slot 8
-    ID3D11ShaderResourceView* nullSRV = nullptr;
-    ID3D11SamplerState* nullSampler = nullptr;
-    ctx->context->PSSetShaderResources(8, 1, &nullSRV);
-    ctx->context->PSSetSamplers(8, 1, &nullSampler);
+    // Unbind the AO slot
+    host->UnbindSRV(ctx->context, AO_REGISTER);
 
     // Debug overlay
     if (gSSAOConfig.debugView && gSSAOConfig.enabled)

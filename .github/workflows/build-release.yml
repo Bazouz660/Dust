@@ -68,6 +68,7 @@ jobs:
           copy src\build\Release\Dust.dll release\Dust\
           copy effects\ssao\build\Release\DustSSAO.dll release\Dust\effects\
           copy mod\Dust.mod release\Dust\
+          copy mod\Dust.ini release\Dust\
           copy mod\RE_Kenshi.json release\Dust\
           copy mod\shaders\deferred.hlsl release\Dust\shaders\
           cd release

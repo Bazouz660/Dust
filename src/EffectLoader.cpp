@@ -41,6 +41,48 @@ static void HostRestoreState(ID3D11DeviceContext* ctx)
     gSharedStateBlock.Restore(ctx);
 }
 
+// Resolve the actual D3D11 sampler slot for a given base register.
+// Kenshi's deferred shader has different sampler layouts per variant:
+//   CSM/RTW (shadows on):  s0-s7 used by game, custom registers start at s8+
+//   No shadows:            s0-s5 used by game, compiler remaps higher registers down
+// We detect the variant by checking whether slot 6 has a game texture bound.
+static UINT ResolveSlot(ID3D11DeviceContext* ctx, uint32_t baseSlot)
+{
+    // Only remap slots above the shadow-dependent range
+    if (baseSlot <= 5)
+        return baseSlot;
+
+    ID3D11ShaderResourceView* srv6 = nullptr;
+    ctx->PSGetShaderResources(6, 1, &srv6);
+    if (srv6)
+    {
+        srv6->Release();
+        return baseSlot; // Shadow mode: registers are as declared
+    }
+
+    // No-shadow mode: registers above s5 are shifted down by the gap (s6-s7 absent)
+    // e.g. register(s8) becomes actual slot 6
+    return baseSlot - 2;
+}
+
+static void HostBindSRV(ID3D11DeviceContext* ctx, uint32_t baseSlot,
+                         ID3D11ShaderResourceView* srv, ID3D11SamplerState* sampler)
+{
+    UINT slot = ResolveSlot(ctx, baseSlot);
+    ctx->PSSetShaderResources(slot, 1, &srv);
+    if (sampler)
+        ctx->PSSetSamplers(slot, 1, &sampler);
+}
+
+static void HostUnbindSRV(ID3D11DeviceContext* ctx, uint32_t baseSlot)
+{
+    UINT slot = ResolveSlot(ctx, baseSlot);
+    ID3D11ShaderResourceView* nullSRV = nullptr;
+    ID3D11SamplerState* nullSampler = nullptr;
+    ctx->PSSetShaderResources(slot, 1, &nullSRV);
+    ctx->PSSetSamplers(slot, 1, &nullSampler);
+}
+
 // ==================== EffectLoader ====================
 
 void EffectLoader::BuildHostAPI()
@@ -53,6 +95,8 @@ void EffectLoader::BuildHostAPI()
 #define Log DustLog
     hostAPI_.SaveState    = HostSaveState;
     hostAPI_.RestoreState = HostRestoreState;
+    hostAPI_.BindSRV      = HostBindSRV;
+    hostAPI_.UnbindSRV    = HostUnbindSRV;
 }
 
 int EffectLoader::LoadAll(const char* effectsDir)

@@ -54,6 +54,14 @@ typedef struct DustHostAPI {
     // GPU state save/restore (use around custom rendering passes)
     void (*SaveState)(ID3D11DeviceContext* ctx);
     void (*RestoreState)(ID3D11DeviceContext* ctx);
+
+    // Bind/unbind an SRV+sampler to a named shader register.
+    // The framework resolves the actual D3D11 slot based on the current
+    // shader variant (e.g. shadow mode changes register layout).
+    // 'baseSlot' is the register declared in the shader (e.g. 8 for register(s8)).
+    void (*BindSRV)(ID3D11DeviceContext* ctx, uint32_t baseSlot,
+                    ID3D11ShaderResourceView* srv, ID3D11SamplerState* sampler);
+    void (*UnbindSRV)(ID3D11DeviceContext* ctx, uint32_t baseSlot);
 } DustHostAPI;
 
 // Effect callback signature
