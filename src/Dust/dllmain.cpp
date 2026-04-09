@@ -156,8 +156,10 @@ void GameWorld__mainLoop_GPUSensitiveStuff_hook(GameWorld* thisptr, float time)
 // Do NOT use extern "C" here.
 __declspec(dllexport) void startPlugin()
 {
+#define DUST_STR2(x) #x
+#define DUST_STR(x) DUST_STR2(x)
 #ifdef DUST_VERSION
-    Log("Dust v" DUST_VERSION " loading...");
+    Log("Dust v" DUST_STR(DUST_VERSION) " loading...");
 #else
     Log("Dust (dev) loading...");
 #endif

@@ -47,7 +47,7 @@ jobs:
           msbuild src\Dust\Dust.vcxproj
           /p:Configuration=Release
           /p:Platform=x64
-          "/p:ExtraDefines=DUST_VERSION=\"${{ steps.version.outputs.value }}\""
+          /p:ExtraDefines=DUST_VERSION=${{ steps.version.outputs.value }}
 
       - name: Package release
         run: |
