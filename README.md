@@ -83,7 +83,7 @@ DebugView=0
 | `Radius` | World-space AO sampling radius |
 | `Strength` | AO intensity multiplier |
 | `Bias` | Depth bias to prevent self-occlusion artifacts |
-| `MaxDepth` | Maximum depth threshold — fragments beyond this are skipped |
+| `MaxDepth` | Maximum depth threshold, fragments beyond this are skipped |
 | `FilterRadius` | Bilateral blur radius (higher = smoother, softer AO) |
 | `ForegroundFade` | Distance at which AO fades in for close objects |
 | `FalloffPower` | Controls how quickly AO fades with distance |
@@ -107,7 +107,7 @@ SSAO can be toggled at runtime through Kenshi's `settings.cfg` using the key `Du
 - **Windows 10 SDK**
 - **KenshiLib**: Set the following environment variables:
   - `KENSHILIB_DIR`: Path to KenshiLib (includes headers for Kenshi internals and OGRE)
-  - `KENSHILIB_DEPS_DIR`Pat: h to KenshiLib dependencies
+  - `KENSHILIB_DEPS_DIR`: Path to KenshiLib dependencies
 - **Boost**: Set `BOOST_INCLUDE_PATH` to your Boost headers directory
 
 ### Build
@@ -150,4 +150,4 @@ This approach ensures AO is physically correct (only affects indirect light), im
 
 ## License
 
-TBD
+This project is licensed under the [MIT License](LICENSE).
