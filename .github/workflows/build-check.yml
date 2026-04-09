@@ -27,6 +27,6 @@ jobs:
 
       - name: Build
         run: >
-          msbuild src\Dust\Dust.vcxproj
+          msbuild src\Dust.vcxproj
           /p:Configuration=Release
           /p:Platform=x64

@@ -127,17 +127,17 @@ All build dependencies ([KenshiLib](https://github.com/KenshiReclaimer/KenshiLib
 
 ### Build
 
-1. Open `src/Dust/Dust.vcxproj` in Visual Studio 2022
+1. Open `src/Dust.vcxproj` in Visual Studio 2022
 2. Select **Release | x64**
 3. Build the solution
 
-The output `Dust.dll` will be placed in `src/Dust/build/Release/`.
+The output `Dust.dll` will be placed in `src/build/Release/`.
 
 ### Deployment
 
 Copy the following to `<Kenshi>/mods/Dust/`:
 
-- `src/Dust/build/Release/Dust.dll`
+- `src/build/Release/Dust.dll`
 - `mod/RE_Kenshi.json`
 - `mod/shaders/deferred.hlsl`
 

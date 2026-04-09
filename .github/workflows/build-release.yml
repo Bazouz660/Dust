@@ -50,7 +50,7 @@ jobs:
 
       - name: Build
         run: >
-          msbuild src\Dust\Dust.vcxproj
+          msbuild src\Dust.vcxproj
           /p:Configuration=Release
           /p:Platform=x64
           /p:ExtraDefines=DUST_VERSION=${{ steps.version.outputs.value }}
@@ -58,7 +58,7 @@ jobs:
       - name: Package release
         run: |
           mkdir release\Dust\shaders
-          copy src\Dust\build\Release\Dust.dll release\Dust\
+          copy src\build\Release\Dust.dll release\Dust\
           copy mod\RE_Kenshi.json release\Dust\
           copy mod\shaders\deferred.hlsl release\Dust\shaders\
           cd release

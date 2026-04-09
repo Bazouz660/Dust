@@ -60,6 +60,14 @@ static ID3D11Buffer* gSSAOCB = nullptr;
 
 static D3D11StateBlock gStateBlock;
 
+// GPU timing
+static ID3D11Query* gTimestampBegin = nullptr;
+static ID3D11Query* gTimestampEnd = nullptr;
+static ID3D11Query* gTimestampDisjoint = nullptr;
+static int gTimingFrameCount = 0;
+static double gTimingAccumMs = 0.0;
+static const int TIMING_LOG_INTERVAL = 300;
+
 // ==================== Helpers ====================
 
 static ID3DBlob* CompileShader(const char* source, const char* target, const char* entryPoint)
@@ -222,6 +230,16 @@ bool Init(ID3D11Device* device, UINT width, UINT height)
         if (FAILED(hr)) return false;
     }
 
+    // GPU timestamp queries for performance measurement
+    {
+        D3D11_QUERY_DESC qd = {};
+        qd.Query = D3D11_QUERY_TIMESTAMP;
+        device->CreateQuery(&qd, &gTimestampBegin);
+        device->CreateQuery(&qd, &gTimestampEnd);
+        qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+        device->CreateQuery(&qd, &gTimestampDisjoint);
+    }
+
     gInitialized = true;
     Log("SSAORenderer initialized successfully");
     return true;
@@ -238,6 +256,7 @@ void Shutdown()
     SAFE_RELEASE(gNoBlend);
     SAFE_RELEASE(gNoDepthDSS);   SAFE_RELEASE(gNoCullRS);
     SAFE_RELEASE(gPointClampSampler); SAFE_RELEASE(gSSAOCB);
+    SAFE_RELEASE(gTimestampBegin); SAFE_RELEASE(gTimestampEnd); SAFE_RELEASE(gTimestampDisjoint);
 #undef SAFE_RELEASE
     gInitialized = false;
     Log("SSAORenderer shut down");
@@ -353,6 +372,13 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
     float blendFactor[4] = { 0, 0, 0, 0 };
     ID3D11ShaderResourceView* nullSRVs[2] = { nullptr, nullptr };
 
+    // Begin GPU timing
+    if (gTimestampDisjoint)
+    {
+        ctx->Begin(gTimestampDisjoint);
+        ctx->End(gTimestampBegin);
+    }
+
     // Pass 1: Generate raw AO
     {
         float clearColor[4] = { 1, 1, 1, 1 };
@@ -392,6 +418,36 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
         ctx->PSSetConstantBuffers(0, 1, &gSSAOCB);
         ctx->Draw(3, 0);
         ctx->PSSetShaderResources(0, 2, nullSRVs);
+    }
+
+    // End GPU timing and collect results
+    if (gTimestampDisjoint)
+    {
+        ctx->End(gTimestampEnd);
+        ctx->End(gTimestampDisjoint);
+
+        // Read back results from the previous frame's queries (non-blocking)
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjointData;
+        if (ctx->GetData(gTimestampDisjoint, &disjointData, sizeof(disjointData), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK
+            && !disjointData.Disjoint)
+        {
+            UINT64 tsBegin = 0, tsEnd = 0;
+            if (ctx->GetData(gTimestampBegin, &tsBegin, sizeof(tsBegin), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK
+                && ctx->GetData(gTimestampEnd, &tsEnd, sizeof(tsEnd), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK)
+            {
+                double ms = (double)(tsEnd - tsBegin) / (double)disjointData.Frequency * 1000.0;
+                gTimingAccumMs += ms;
+                gTimingFrameCount++;
+
+                if (gTimingFrameCount >= TIMING_LOG_INTERVAL)
+                {
+                    double avgMs = gTimingAccumMs / gTimingFrameCount;
+                    Log("SSAO timing: %.2f ms avg (%d frames, %ux%u)", avgMs, gTimingFrameCount, gWidth, gHeight);
+                    gTimingAccumMs = 0.0;
+                    gTimingFrameCount = 0;
+                }
+            }
+        }
     }
 
     // Restore the original GPU state (lighting pass state)

@@ -44,15 +44,15 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
-    <IncludePath>$(ProjectDir)..\..\external\KenshiLib_Examples_deps;$(ProjectDir)..\..\external\KenshiLib\Include;$(ProjectDir)..\..\external\KenshiLib\Include\ogre;$(ProjectDir)..\..\external\KenshiLib_Examples_deps\boost_1_60_0;$(IncludePath)</IncludePath>
-    <LibraryPath>$(ProjectDir)..\..\external\KenshiLib_Examples_deps\boost_1_60_0\stage\lib;$(ProjectDir)..\..\external\KenshiLib_Examples_deps\KenshiLib\Libraries;$(LibraryPath)</LibraryPath>
+    <IncludePath>$(ProjectDir)..\external\KenshiLib_Examples_deps;$(ProjectDir)..\external\KenshiLib\Include;$(ProjectDir)..\external\KenshiLib\Include\ogre;$(ProjectDir)..\external\KenshiLib_Examples_deps\boost_1_60_0;$(IncludePath)</IncludePath>
+    <LibraryPath>$(ProjectDir)..\external\KenshiLib_Examples_deps\boost_1_60_0\stage\lib;$(ProjectDir)..\external\KenshiLib_Examples_deps\KenshiLib\Libraries;$(LibraryPath)</LibraryPath>
     <OutDir>$(ProjectDir)build\Debug\</OutDir>
     <IntDir>$(ProjectDir)build\Debug\obj\</IntDir>
     <TargetName>Dust</TargetName>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <IncludePath>$(ProjectDir)..\..\external\KenshiLib_Examples_deps;$(ProjectDir)..\..\external\KenshiLib\Include;$(ProjectDir)..\..\external\KenshiLib\Include\ogre;$(ProjectDir)..\..\external\KenshiLib_Examples_deps\boost_1_60_0;$(IncludePath)</IncludePath>
-    <LibraryPath>$(ProjectDir)..\..\external\KenshiLib_Examples_deps\boost_1_60_0\stage\lib;$(ProjectDir)..\..\external\KenshiLib_Examples_deps\KenshiLib\Libraries;$(LibraryPath)</LibraryPath>
+    <IncludePath>$(ProjectDir)..\external\KenshiLib_Examples_deps;$(ProjectDir)..\external\KenshiLib\Include;$(ProjectDir)..\external\KenshiLib\Include\ogre;$(ProjectDir)..\external\KenshiLib_Examples_deps\boost_1_60_0;$(IncludePath)</IncludePath>
+    <LibraryPath>$(ProjectDir)..\external\KenshiLib_Examples_deps\boost_1_60_0\stage\lib;$(ProjectDir)..\external\KenshiLib_Examples_deps\KenshiLib\Libraries;$(LibraryPath)</LibraryPath>
     <OutDir>$(ProjectDir)build\Release\</OutDir>
     <IntDir>$(ProjectDir)build\Release\obj\</IntDir>
     <TargetName>Dust</TargetName>
