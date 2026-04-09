@@ -1,28 +1,39 @@
 # Dust
 
-Dust is a Kenshi rendering framework that hooks into the game's D3D11 render pipeline to provide a way to implement native shader effects like SSAO, DoF, tonemapping, and more, without compromising on performance or relying on limited post-processing techniques that introduce artifacts or bleed through fog, UI, or other effects.
+Dust is a rendering framework for Kenshi that hooks into the game's D3D11 pipeline, providing injection points where shader effects can be applied natively. Unlike post-processing injectors (ReShade, ENB), Dust intercepts specific render passes and integrates effects directly into the deferred lighting pipeline, enabling physically correct results that are immune to auto-exposure, fog bleed, and UI interference.
 
-Unlike traditional injectors (ReShade, ENB), Dust intercepts specific render passes and integrates effects directly into the game's deferred lighting pipeline. This means effects like ambient occlusion can be applied to indirect lighting only, making them physically correct and immune to issues like auto-exposure compensation.
+The long-term goal is a modular plugin system where effects are loaded as separate modules, allowing anyone to develop and distribute custom effects using a stable API.
 
-## Features
+## Architecture
 
-### Screen-Space Ambient Occlusion (SSAO)
+Dust works by hooking D3D11 at the vtable level and inspecting GPU state on every fullscreen draw call to identify specific render passes:
 
-- **Ground Truth Ambient Occlusion (GTAO)** algorithm: 12 directions, 6 steps per pixel
-- **Ambient-only application**: AO is applied inside the deferred lighting shader to indirect/environment lighting only, not direct sunlight. This keeps AO consistent between day and night
-- **Depth-aware bilateral blur**: Horizontal and vertical blur passes preserve edges using depth comparison
-- **Hot-reloadable configuration**: Edit `Dust.ini` while the game is running, changes apply instantly
-- **In-game toggle**: Enable/disable via Kenshi's settings menu
-- **Debug visualization**: Overlay mode to see the raw AO buffer
+```
+Game Render Pipeline:
+  GBuffer Fill -> Deferred Lighting -> Fog -> Post-Processing -> Tonemapping -> Present
+                        |                                             |
+                    POST_LIGHTING                                POST_TONEMAP
+```
 
-### Framework Architecture
+Effects register at specific injection points in the pipeline. When Dust detects a matching render pass, it dispatches registered effects with full access to the relevant GPU resources (depth buffer, HDR target, etc.).
 
-Dust is built as a modular effect framework:
+### Core components
 
-- **D3D11 vtable hooking**: Hooks `Draw`, `CreateTexture2D`, `Present`, `ClearRenderTargetView`, and `RSSetViewports` to intercept rendering without engine modifications
-- **Hash-free pipeline detection**: Identifies render passes by inspecting GPU state (render target formats, shader resource bindings) rather than fragile shader hashes
+- **Pipeline detection**: Identifies render passes by inspecting GPU state (render target formats, shader resource bindings) rather than fragile shader hashes
 - **State save/restore**: Full D3D11 pipeline state capture ensures effects don't interfere with the game's rendering
-- **Plugin system**: Effects register at specific injection points in the pipeline (`POST_GBUFFER`, `POST_LIGHTING`, `POST_FOG`, `POST_TONEMAP`, `PRE_PRESENT`)
+- **Effect dispatch**: Effects register at injection points (`POST_GBUFFER`, `POST_LIGHTING`, `POST_FOG`, `POST_TONEMAP`, `PRE_PRESENT`) and receive a `FrameContext` with device, depth SRV, HDR RTV, resolution, etc.
+- **Shader integration**: Effects can bind resources to shader registers before the game's own draw calls execute, enabling modifications to the lighting shader itself
+
+## Current Effects
+
+### SSAO (Screen-Space Ambient Occlusion)
+
+- **GTAO algorithm**: 12 directions, 6 steps per pixel
+- **Ambient-only AO**: Applied inside the deferred lighting shader to indirect/environment lighting only, not direct sunlight. Consistent between day and night, immune to auto-exposure
+- **Depth-aware bilateral blur**: Horizontal and vertical passes preserve edges
+- **Hot-reloadable configuration**: Edit `Dust.ini` while the game is running
+- **In-game toggle**: Enable/disable via Kenshi's `settings.cfg` (`Dust_SSAO=1`)
+- **Debug visualization**: Overlay mode to see the raw AO buffer
 
 ## Installation
 
@@ -43,20 +54,17 @@ Dust is built as a modular effect framework:
            └── shaders/
                └── deferred.hlsl
    ```
-3. Launch the game: Dust will automatically:
-   - Install the modified lighting shader (backing up the vanilla version)
-   - Generate a default `Dust.ini` configuration file
-   - Begin rendering SSAO
+3. Launch the game. Dust will automatically install the modified lighting shader (backing up the vanilla version), generate a default `Dust.ini`, and begin rendering
 
 ### Uninstallation
 
-The vanilla `deferred.hlsl` shader is automatically restored when the DLL unloads. To fully uninstall, simply delete the `Dust` folder from `mods/`.
+The vanilla shader is automatically restored when the DLL unloads. To fully uninstall, delete the `Dust` folder from `mods/`.
 
 ## Configuration
 
 ### Dust.ini
 
-Located in the mod directory alongside the DLL. Created automatically on first run with sensible defaults. Supports hot-reload: save the file and changes apply immediately.
+Located in the mod directory alongside the DLL. Created automatically on first run. Supports hot-reload.
 
 ```ini
 [SSAO]
@@ -95,10 +103,6 @@ DebugView=0
 | `TanHalfFov` | Camera field-of-view parameter (default matches Kenshi's FOV) |
 | `DebugView` | Shows raw AO buffer as a screen overlay (1 = on) |
 
-### In-Game Toggle
-
-SSAO can be toggled at runtime through Kenshi's `settings.cfg` using the key `Dust_SSAO` (1 = enabled, 0 = disabled).
-
 ## Building from Source
 
 ### Prerequisites
@@ -136,28 +140,6 @@ Copy the following to `<Kenshi>/mods/Dust/`:
 - `src/Dust/build/Release/Dust.dll`
 - `mod/RE_Kenshi.json`
 - `mod/shaders/deferred.hlsl`
-
-## How It Works
-
-Dust hooks into D3D11 at the vtable level and inspects GPU state on every fullscreen draw call to identify specific render passes:
-
-```
-Game Render Pipeline:
-  GBuffer Fill → Deferred Lighting → Fog → Post-Processing → Tonemapping → Present
-                        ↑
-                    Dust hooks here
-```
-
-For SSAO specifically:
-
-1. **Startup**: The DLL installs a modified `deferred.hlsl` that adds an AO texture sampler on register `s8`
-2. **Detection**: On each frame, Dust identifies the lighting pass by checking render target format (`R11G11B10_FLOAT`) and bound shader resources (`R32_FLOAT` depth in slot 2)
-3. **AO Generation**: Before the lighting draw executes, Dust renders 3 passes: GTAO generation from the depth buffer, then horizontal and vertical bilateral blur
-4. **Binding**: The blurred AO texture is bound to shader slot 8. A white 1x1 fallback texture is used when SSAO is disabled
-5. **Lighting**: The game's lighting shader executes and reads AO from `s8`, applying it only to ambient/indirect lighting terms
-6. **Cleanup**: Slot 8 is unbound, GPU state is fully restored
-
-This approach ensures AO is physically correct (only affects indirect light), immune to auto-exposure compensation, and invisible to fog and UI rendering.
 
 ## Credits
 
