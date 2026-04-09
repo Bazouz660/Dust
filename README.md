@@ -141,6 +141,28 @@ Copy the following to `<Kenshi>/mods/Dust/`:
 - `mod/RE_Kenshi.json`
 - `mod/shaders/deferred.hlsl`
 
+## Performance
+
+### Framework overhead
+
+The framework itself adds near-zero overhead. Per frame, it:
+
+- Checks vertex count on every `Draw` call (single integer comparison, skips non-fullscreen draws)
+- On fullscreen draws (~10-15 per frame), queries RT format and SRV bindings to identify the render pass. These are lightweight D3D11 API calls that read cached driver state
+- Once the lighting pass is detected, no further detection runs for that frame
+
+With no effects enabled, the framework's cost is unmeasurable.
+
+### SSAO cost
+
+When SSAO is active, three additional fullscreen passes run before the lighting draw:
+
+1. **AO generation**: GTAO sampling (12 directions x 6 steps) from the depth buffer
+2. **Horizontal blur**: Bilateral depth-aware filter
+3. **Vertical blur**: Bilateral depth-aware filter
+
+All passes render to R8_UNORM textures (1 byte/pixel), which is significantly cheaper than full RGBA. GPU state is saved and restored around the AO passes to avoid redundant state changes in the game's pipeline.
+
 ## Credits
 
 - [**BFrizzleFoShizzle**](https://github.com/BFrizzleFoShizzle) for [RE_Kenshi](https://github.com/BFrizzleFoShizzle/RE_Kenshi) (plugin loader) and [KenshiLib](https://github.com/KenshiReclaimer/KenshiLib) (game structure library)
