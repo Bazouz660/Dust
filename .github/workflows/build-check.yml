@@ -1,0 +1,37 @@
+name: Build Check
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          submodules: true
+          lfs: true
+
+      - name: Extract Boost headers
+        run: |
+          cd external\KenshiLib_Examples_deps\boost_1_60_0
+          tar -xf boost.zip
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Build
+        env:
+          KENSHILIB_DIR: ${{ github.workspace }}\external\KenshiLib
+          KENSHILIB_DEPS_DIR: ${{ github.workspace }}\external\KenshiLib_Examples_deps
+          BOOST_INCLUDE_PATH: ${{ github.workspace }}\external\KenshiLib_Examples_deps\boost_1_60_0
+          BOOST_ROOT: ${{ github.workspace }}\external\KenshiLib_Examples_deps\boost_1_60_0
+        run: >
+          msbuild src\Dust\Dust.vcxproj
+          /p:Configuration=Release
+          /p:Platform=x64

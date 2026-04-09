@@ -54,4 +54,7 @@ Desktop.ini
 .claude/settings.local.json
 .openclaude-profile.json
 
-external/
+# External dependencies (non-submodule)
+external/*
+!external/KenshiLib
+!external/KenshiLib_Examples_deps

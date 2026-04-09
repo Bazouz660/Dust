@@ -1,0 +1,6 @@
+[submodule "external/KenshiLib"]
+	path = external/KenshiLib
+	url = https://github.com/KenshiReclaimer/KenshiLib.git
+[submodule "external/KenshiLib_Examples_deps"]
+	path = external/KenshiLib_Examples_deps
+	url = https://github.com/BFrizzleFoShizzle/KenshiLib_Examples_deps.git
