@@ -4,23 +4,25 @@
 
 namespace SSAORenderer
 {
-    // Initialize AO resources (shaders, textures, states).
-    // Must be called once after obtaining the D3D11 device.
     bool Init(ID3D11Device* device, UINT width, UINT height);
-
-    // Release all AO resources.
     void Shutdown();
 
-    // Inject the AO pass: generate AO from depth/normals, then multiply onto HDR target.
-    // Called from the Draw hook just before the fog pass.
+    // Generate AO texture (gen + blur only). Saves/restores GPU state.
+    // Returns the AO SRV (R8_UNORM, white=unoccluded, dark=occluded).
+    ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
+                                        ID3D11ShaderResourceView* depthSRV);
+
+    // Render debug overlay onto HDR target. Called after the lighting draw.
+    void RenderDebugOverlay(ID3D11DeviceContext* ctx,
+                            ID3D11RenderTargetView* hdrRTV);
+
+    // Legacy full inject (gen + blur + apply + debug).
     void Inject(ID3D11DeviceContext* ctx,
                 ID3D11ShaderResourceView* depthSRV,
                 ID3D11ShaderResourceView* normalsSRV,
                 ID3D11RenderTargetView* hdrRTV);
 
-    // Check if resources need recreation (e.g., resolution change).
     void OnResolutionChanged(ID3D11Device* device, UINT newWidth, UINT newHeight);
-
-    // Whether the renderer has been initialized.
     bool IsInitialized();
+    ID3D11ShaderResourceView* GetAoSRV();
 }

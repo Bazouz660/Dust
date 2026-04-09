@@ -573,4 +573,171 @@ bool IsInitialized()
     return gInitialized;
 }
 
+ID3D11ShaderResourceView* GetAoSRV()
+{
+    return gAoSRV;
+}
+
+ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
+                                    ID3D11ShaderResourceView* depthSRV)
+{
+    if (!gInitialized || !ctx || !depthSRV)
+        return nullptr;
+
+    // Detect resolution from depth texture
+    {
+        ID3D11Resource* res = nullptr;
+        depthSRV->GetResource(&res);
+        if (res)
+        {
+            ID3D11Texture2D* tex = nullptr;
+            res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex);
+            if (tex)
+            {
+                D3D11_TEXTURE2D_DESC desc;
+                tex->GetDesc(&desc);
+                if (desc.Width != gWidth || desc.Height != gHeight)
+                {
+                    ID3D11Device* device = nullptr;
+                    ctx->GetDevice(&device);
+                    if (device)
+                    {
+                        OnResolutionChanged(device, desc.Width, desc.Height);
+                        device->Release();
+                    }
+                }
+                tex->Release();
+            }
+            res->Release();
+        }
+    }
+
+    gStateBlock.Capture(ctx);
+
+    // Update constant buffer
+    {
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        HRESULT hr = ctx->Map(gSSAOCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+        if (SUCCEEDED(hr))
+        {
+            SSAOCBData* cb = static_cast<SSAOCBData*>(mapped.pData);
+            cb->viewportSize[0] = (float)gWidth;
+            cb->viewportSize[1] = (float)gHeight;
+            cb->invViewportSize[0] = 1.0f / (float)gWidth;
+            cb->invViewportSize[1] = 1.0f / (float)gHeight;
+            cb->tanHalfFov = gSSAOConfig.tanHalfFov;
+            cb->aspectRatio = (float)gWidth / (float)gHeight;
+            cb->filterRadius = gSSAOConfig.filterRadius;
+            cb->debugMode = gSSAOConfig.debugView ? 1.0f : 0.0f;
+            cb->aoRadius = gSSAOConfig.aoRadius;
+            cb->aoStrength = gSSAOConfig.aoStrength;
+            cb->aoBias = gSSAOConfig.aoBias;
+            cb->aoMaxDepth = gSSAOConfig.aoMaxDepth;
+            cb->foregroundFade = gSSAOConfig.foregroundFade;
+            cb->falloffPower = gSSAOConfig.falloffPower;
+            cb->maxScreenRadius = gSSAOConfig.maxScreenRadius;
+            cb->minScreenRadius = gSSAOConfig.minScreenRadius;
+            cb->depthFadeStart = gSSAOConfig.depthFadeStart;
+            cb->blurSharpness = gSSAOConfig.blurSharpness;
+            cb->nightCompensation = gSSAOConfig.nightCompensation;
+            ctx->Unmap(gSSAOCB, 0);
+        }
+    }
+
+    // Common state for AO passes
+    ctx->IASetInputLayout(nullptr);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx->VSSetShader(gFullscreenVS, nullptr, 0);
+    ctx->RSSetState(gNoCullRS);
+    ctx->OMSetDepthStencilState(gNoDepthDSS, 0);
+
+    D3D11_VIEWPORT vp = {};
+    vp.Width = (float)gWidth;
+    vp.Height = (float)gHeight;
+    vp.MaxDepth = 1.0f;
+    ctx->RSSetViewports(1, &vp);
+
+    float blendFactor[4] = { 0, 0, 0, 0 };
+    ID3D11ShaderResourceView* nullSRVs[2] = { nullptr, nullptr };
+
+    // Pass 1: Generate raw AO
+    {
+        float clearColor[4] = { 1, 1, 1, 1 };
+        ctx->ClearRenderTargetView(gAoRTV, clearColor);
+        ctx->OMSetRenderTargets(1, &gAoRTV, nullptr);
+        ctx->OMSetBlendState(gNoBlend, blendFactor, 0xFFFFFFFF);
+        ctx->PSSetShader(gSSAOGenPS, nullptr, 0);
+        ID3D11ShaderResourceView* srvs[2] = { depthSRV, nullptr };
+        ctx->PSSetShaderResources(0, 2, srvs);
+        ctx->PSSetSamplers(0, 1, &gPointClampSampler);
+        ctx->PSSetConstantBuffers(0, 1, &gSSAOCB);
+        ctx->Draw(3, 0);
+        ctx->PSSetShaderResources(0, 2, nullSRVs);
+    }
+
+    // Pass 2: Horizontal blur
+    {
+        ctx->OMSetRenderTargets(1, &gAoBlurRTV, nullptr);
+        ctx->OMSetBlendState(gNoBlend, blendFactor, 0xFFFFFFFF);
+        ctx->PSSetShader(gSSAOBlurHPS, nullptr, 0);
+        ID3D11ShaderResourceView* srvs[2] = { gAoSRV, depthSRV };
+        ctx->PSSetShaderResources(0, 2, srvs);
+        ctx->PSSetSamplers(0, 1, &gPointClampSampler);
+        ctx->PSSetConstantBuffers(0, 1, &gSSAOCB);
+        ctx->Draw(3, 0);
+        ctx->PSSetShaderResources(0, 2, nullSRVs);
+    }
+
+    // Pass 3: Vertical blur
+    {
+        ctx->OMSetRenderTargets(1, &gAoRTV, nullptr);
+        ctx->OMSetBlendState(gNoBlend, blendFactor, 0xFFFFFFFF);
+        ctx->PSSetShader(gSSAOBlurVPS, nullptr, 0);
+        ID3D11ShaderResourceView* srvs[2] = { gAoBlurSRV, depthSRV };
+        ctx->PSSetShaderResources(0, 2, srvs);
+        ctx->PSSetSamplers(0, 1, &gPointClampSampler);
+        ctx->PSSetConstantBuffers(0, 1, &gSSAOCB);
+        ctx->Draw(3, 0);
+        ctx->PSSetShaderResources(0, 2, nullSRVs);
+    }
+
+    // Restore the original GPU state (lighting pass state)
+    gStateBlock.Restore(ctx);
+
+    return gAoSRV;
+}
+
+void RenderDebugOverlay(ID3D11DeviceContext* ctx,
+                        ID3D11RenderTargetView* hdrRTV)
+{
+    if (!gInitialized || !ctx || !hdrRTV || !gSSAOConfig.debugView)
+        return;
+
+    gStateBlock.Capture(ctx);
+
+    ctx->IASetInputLayout(nullptr);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx->VSSetShader(gFullscreenVS, nullptr, 0);
+    ctx->RSSetState(gNoCullRS);
+    ctx->OMSetDepthStencilState(gNoDepthDSS, 0);
+
+    D3D11_VIEWPORT vp = {};
+    vp.Width = (float)gWidth;
+    vp.Height = (float)gHeight;
+    vp.MaxDepth = 1.0f;
+    ctx->RSSetViewports(1, &vp);
+
+    float blendFactor[4] = { 0, 0, 0, 0 };
+    ctx->OMSetRenderTargets(1, &hdrRTV, nullptr);
+    ctx->OMSetBlendState(gNoBlend, blendFactor, 0xFFFFFFFF);
+    ctx->PSSetShader(gSSAODebugPS, nullptr, 0);
+    ctx->PSSetShaderResources(0, 1, &gAoSRV);
+    ctx->PSSetSamplers(0, 1, &gPointClampSampler);
+    ctx->Draw(3, 0);
+    ID3D11ShaderResourceView* nullSRV = nullptr;
+    ctx->PSSetShaderResources(0, 1, &nullSRV);
+
+    gStateBlock.Restore(ctx);
+}
+
 } // namespace SSAORenderer
