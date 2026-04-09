@@ -1,0 +1,55 @@
+# Build outputs
+build/
+*/build/
+**/build/
+*.obj
+*.o
+*.pdb
+*.iobj
+*.ipdb
+*.exp
+*.lib
+*.dll
+*.exe
+*.ilk
+*.log
+*.tlog/
+*.lastbuildstate
+*.recipe
+
+# Visual Studio
+.vs/
+*.vcxproj.user
+*.suo
+*.sdf
+*.opensdf
+*.ncb
+*.opendb
+*.VC.db
+*.VC.opendb
+Debug/
+Release/
+x64/
+x86/
+ipch/
+
+# RenderDoc captures
+captures/*.rdc
+captures/*.xml
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Tools output
+tools/results*.txt
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Claude Code
+.claude/settings.local.json
+.openclaude-profile.json
