@@ -26,6 +26,9 @@ private:
 
     bool IsLightingPass(ID3D11DeviceContext* ctx);
     void CaptureLightingResources(ID3D11DeviceContext* ctx);
+
+    bool IsTonemapPass(ID3D11DeviceContext* ctx);
+    void CaptureTonemapResources(ID3D11DeviceContext* ctx);
 };
 
 extern PipelineDetector gPipelineDetector;

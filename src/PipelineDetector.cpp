@@ -24,9 +24,18 @@ PipelineDetector::DetectionResult PipelineDetector::OnFullscreenDraw(ID3D11Devic
         }
     }
 
-    // Future: fog, tonemap detection here
-    // if (lightingDetected_ && !fogDetected_) { ... }
-    // if (fogDetected_ && !tonemapDetected_) { ... }
+    // Detect tonemap pass (after lighting, writes B8G8R8A8_UNORM with HDR input)
+    if (lightingDetected_ && !tonemapDetected_)
+    {
+        if (IsTonemapPass(ctx))
+        {
+            CaptureTonemapResources(ctx);
+            tonemapDetected_ = true;
+            result.detected = true;
+            result.point = InjectionPoint::POST_TONEMAP;
+            return result;
+        }
+    }
 
     return result;
 }
@@ -107,5 +116,86 @@ void PipelineDetector::CaptureLightingResources(ID3D11DeviceContext* ctx)
             gResourceRegistry.GetSRV(ResourceName::DEPTH_SRV),
             gResourceRegistry.GetRTV(ResourceName::HDR_RTV));
         sFirstDetectLogged = true;
+    }
+}
+
+// Detect tonemap pass: fullscreen draw where:
+//   1. RT format = B8G8R8A8_UNORM (LDR output) at full resolution
+//   2. SRV[0] = R11G11B10_FLOAT (HDR scene — the same target lighting wrote to)
+// This distinguishes tonemap from FXAA/heat haze which read B8G8R8A8_UNORM, not R11G11B10.
+bool PipelineDetector::IsTonemapPass(ID3D11DeviceContext* ctx)
+{
+    // Check RT format is B8G8R8A8_UNORM
+    ID3D11RenderTargetView* rt = nullptr;
+    ctx->OMGetRenderTargets(1, &rt, nullptr);
+    if (!rt)
+        return false;
+
+    D3D11_RENDER_TARGET_VIEW_DESC rtDesc;
+    rt->GetDesc(&rtDesc);
+
+    // Also check the RT is at full resolution (not a downscale pass)
+    ID3D11Resource* rtResource = nullptr;
+    rt->GetResource(&rtResource);
+    rt->Release();
+
+    if (rtDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM)
+    {
+        if (rtResource) rtResource->Release();
+        return false;
+    }
+
+    if (rtResource)
+    {
+        ID3D11Texture2D* tex = nullptr;
+        rtResource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex);
+        rtResource->Release();
+        if (tex)
+        {
+            D3D11_TEXTURE2D_DESC texDesc;
+            tex->GetDesc(&texDesc);
+            tex->Release();
+
+            // Must be at reasonable resolution (not a downscale/bloom pass).
+            // Luminance chain goes down to 1x1, bloom is quarter-res.
+            // Tonemap is always at native res, so 640 is a safe lower bound.
+            if (texDesc.Width < 640 || texDesc.Height < 360)
+                return false;
+        }
+    }
+
+    // Check SRV[0] is R11G11B10_FLOAT (the HDR scene)
+    ID3D11ShaderResourceView* srv0 = nullptr;
+    ctx->PSGetShaderResources(0, 1, &srv0);
+    if (!srv0)
+        return false;
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc;
+    srv0->GetDesc(&srvDesc);
+    srv0->Release();
+
+    if (srvDesc.Format != DXGI_FORMAT_R11G11B10_FLOAT)
+        return false;
+
+    return true;
+}
+
+void PipelineDetector::CaptureTonemapResources(ID3D11DeviceContext* ctx)
+{
+    // Capture LDR RTV (tonemap output)
+    ID3D11RenderTargetView* rtv = nullptr;
+    ctx->OMGetRenderTargets(1, &rtv, nullptr);
+    if (rtv)
+    {
+        gResourceRegistry.SetRTV(ResourceName::LDR_RTV, rtv);
+        rtv->Release();
+    }
+
+    static bool sLogged = false;
+    if (!sLogged)
+    {
+        Log("Pipeline: Tonemap pass detected (ldrRT=%p)",
+            gResourceRegistry.GetRTV(ResourceName::LDR_RTV));
+        sLogged = true;
     }
 }

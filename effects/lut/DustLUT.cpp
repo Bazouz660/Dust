@@ -294,7 +294,7 @@ static bool CreateSceneCopy(ID3D11Device* device, UINT w, UINT h)
     desc.Height = h;
     desc.MipLevels = 1;
     desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     desc.SampleDesc.Count = 1;
     desc.Usage = D3D11_USAGE_DEFAULT;
     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -509,8 +509,8 @@ static void LUTPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
         return;
     }
 
-    ID3D11RenderTargetView* hdrRTV = host->GetRTV("hdr_rt");
-    if (!hdrRTV || !gSceneCopy || !gSceneCopySRV || !gLutSRV)
+    ID3D11RenderTargetView* ldrRTV = host->GetRTV("ldr_rt");
+    if (!ldrRTV || !gSceneCopy || !gSceneCopySRV || !gLutSRV)
         return;
 
     ID3D11DeviceContext* dc = ctx->context;
@@ -530,14 +530,14 @@ static void LUTPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
         gTimingActive = false;
     }
 
-    // Get the HDR texture from the RTV
-    ID3D11Resource* hdrResource = nullptr;
-    hdrRTV->GetResource(&hdrResource);
-    if (!hdrResource) return;
+    // Get the LDR texture from the RTV
+    ID3D11Resource* ldrResource = nullptr;
+    ldrRTV->GetResource(&ldrResource);
+    if (!ldrResource) return;
 
     // Copy scene to staging texture
-    dc->CopyResource(gSceneCopy, hdrResource);
-    hdrResource->Release();
+    dc->CopyResource(gSceneCopy, ldrResource);
+    ldrResource->Release();
 
     // Save GPU state
     host->SaveState(dc);
@@ -566,7 +566,7 @@ static void LUTPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     ID3D11SamplerState* samplers[] = { gPointSampler, gLinearSampler };
     dc->PSSetSamplers(0, 2, samplers);
 
-    dc->OMSetRenderTargets(1, &hdrRTV, nullptr);
+    dc->OMSetRenderTargets(1, &ldrRTV, nullptr);
     dc->OMSetBlendState(gNoBlend, nullptr, 0xFFFFFFFF);
     dc->OMSetDepthStencilState(gNoDepth, 0);
     dc->RSSetState(gRasterState);
@@ -654,7 +654,7 @@ extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
     memset(desc, 0, sizeof(*desc));
     desc->apiVersion        = DUST_API_VERSION;
     desc->name              = "LUT";
-    desc->injectionPoint    = DUST_INJECT_POST_LIGHTING;
+    desc->injectionPoint    = DUST_INJECT_POST_TONEMAP;
     desc->Init              = LUTInit;
     desc->Shutdown          = LUTShutdown;
     desc->OnResolutionChanged = LUTOnResolutionChanged;
