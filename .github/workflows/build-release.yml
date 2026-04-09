@@ -19,8 +19,15 @@ jobs:
       - name: Clone KenshiLib
         run: git clone --depth 1 https://github.com/KenshiReclaimer/KenshiLib.git external/KenshiLib
 
-      - name: Clone KenshiLib_Examples_deps
-        run: git clone --depth 1 https://github.com/BFrizzleFoShizzle/KenshiLib_Examples_deps.git external/KenshiLib_Examples_deps
+      - name: Clone KenshiLib_Examples_deps (with LFS)
+        run: |
+          git lfs install
+          git clone --depth 1 https://github.com/BFrizzleFoShizzle/KenshiLib_Examples_deps.git external/KenshiLib_Examples_deps
+
+      - name: Extract Boost headers
+        run: |
+          cd external\KenshiLib_Examples_deps\boost_1_60_0
+          tar -xf boost.zip
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
