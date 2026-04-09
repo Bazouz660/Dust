@@ -148,6 +148,11 @@ For SSAO specifically:
 
 This approach ensures AO is physically correct (only affects indirect light), immune to auto-exposure compensation, and invisible to fog and UI rendering.
 
+## Credits
+
+- [**BFrizzleFoShizzle**](https://github.com/BFrizzleFoShizzle) for [RE_Kenshi](https://github.com/BFrizzleFoShizzle/RE_Kenshi) (plugin loader) and [KenshiLib](https://github.com/KenshiReclaimer/KenshiLib) (game structure library)
+- [**disi30**](https://www.nexusmods.com/kenshi/mods/215) for [ShaderSSAO](https://www.nexusmods.com/kenshi/mods/215), the original Kenshi SSAO mod that inspired this project
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
