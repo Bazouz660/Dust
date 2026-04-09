@@ -121,9 +121,10 @@ void SSAOConfig::Save()
 
 void SSAOConfig::WriteDefaults()
 {
-    // Reset to defaults
+    // Reset to defaults but preserve filePath
+    std::string savedPath = filePath;
     *this = SSAOConfig();
-    // Keep the filePath
+    filePath = savedPath;
     Save();
 }
 

@@ -142,12 +142,16 @@ static void TryCaptureDevice(ID3D11Device* device)
 
         HRESULT hr = gDevice->CreateTexture2D(&td, &initData, &gWhiteTex);
         if (SUCCEEDED(hr))
-            gDevice->CreateShaderResourceView(gWhiteTex, nullptr, &gWhiteSRV);
-
-        if (gWhiteSRV)
-            Log("White fallback texture created for AO slot");
-        else
+            hr = gDevice->CreateShaderResourceView(gWhiteTex, nullptr, &gWhiteSRV);
+        if (FAILED(hr))
+        {
+            if (gWhiteTex) { gWhiteTex->Release(); gWhiteTex = nullptr; }
             Log("WARNING: Failed to create white fallback texture");
+        }
+        else
+        {
+            Log("White fallback texture created for AO slot");
+        }
     }
 
     // Create point-clamp sampler for AO slot (s8)
@@ -157,7 +161,9 @@ static void TryCaptureDevice(ID3D11Device* device)
         sd.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
         sd.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
         sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-        gDevice->CreateSamplerState(&sd, &gAoSampler);
+        HRESULT hr = gDevice->CreateSamplerState(&sd, &gAoSampler);
+        if (FAILED(hr))
+            Log("WARNING: Failed to create AO sampler");
     }
 
     // Initialize SSAO renderer
@@ -320,7 +326,9 @@ static void STDMETHODCALLTYPE HookedDraw(
 
         // Unbind AO slot
         ID3D11ShaderResourceView* nullSRV = nullptr;
+        ID3D11SamplerState* nullSampler = nullptr;
         pThis->PSSetShaderResources(8, 1, &nullSRV);
+        pThis->PSSetSamplers(8, 1, &nullSampler);
 
         // === POST-LIGHTING: Debug overlay ===
         if (gSSAOConfig.debugView && SSAORenderer::IsInitialized())

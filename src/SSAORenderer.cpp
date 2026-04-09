@@ -276,8 +276,12 @@ void OnResolutionChanged(ID3D11Device* device, UINT newWidth, UINT newHeight)
 
     gWidth = newWidth;
     gHeight = newHeight;
-    CreateR8Texture(device, newWidth, newHeight, &gAoTex, &gAoRTV, &gAoSRV);
-    CreateR8Texture(device, newWidth, newHeight, &gAoBlurTex, &gAoBlurRTV, &gAoBlurSRV);
+    if (!CreateR8Texture(device, newWidth, newHeight, &gAoTex, &gAoRTV, &gAoSRV)
+        || !CreateR8Texture(device, newWidth, newHeight, &gAoBlurTex, &gAoBlurRTV, &gAoBlurSRV))
+    {
+        Log("WARNING: Failed to recreate AO textures after resolution change");
+        gInitialized = false;
+    }
 }
 
 bool IsInitialized()
