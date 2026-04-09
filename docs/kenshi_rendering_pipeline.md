@@ -2,6 +2,9 @@
 
 Reverse-engineered from RenderDoc captures of Kenshi (D3D11, OGRE engine).
 Date: 2026-04-07
+Updated: 2026-04-09
+
+> This document describes the raw pipeline as seen in RenderDoc. For the Dust framework's injection point system and plugin API built on top of this analysis, see the main [README](../README.md) and [`src/DustAPI.h`](../src/DustAPI.h).
 
 ## Overview
 
@@ -286,28 +289,30 @@ Final post-process: animated heat haze distortion effect. Writes to the swap cha
 
 ## Injection Points for Graphics Enhancements
 
-### AO Injection (Strategy A — before fog)
+Dust defines injection points as `DustInjectionPoint` values in `DustAPI.h`. Effects register at a point and receive pre/post callbacks around the game's draw call.
 
-**Insert between**: Deferred Lighting (PS `3b5a62cd`) and Fog (PS `0940e67e`)
+### Currently implemented
 
-At this point:
-- RT 1049 (R11G11B10_FLOAT) contains the clean lit scene without fog
-- Depth buffer (ResourceId::1046, R32_FLOAT) is fully populated
-- Normals (ResourceId::1043, B8G8R8A8_UNORM) are available from GBuffer
+| Injection Point      | Pipeline Location         | Available Resources         | Current Effects |
+|----------------------|---------------------------|-----------------------------|-----------------|
+| `POST_LIGHTING`      | After deferred lighting   | Depth SRV, HDR RTV          | SSAO, LUT       |
 
-**Approach**: Detect fog pass by PS hash `0940e67e`, inject AO multiply pass just before it.
-Fog will naturally attenuate the AO at distance.
+### SSAO Injection (ambient-only AO)
 
-### Other Potential Injection Points
+SSAO runs at `POST_LIGHTING` with `preExecute` — it generates an AO texture from the depth buffer and binds it to shader register 8 **before** the game's lighting draw executes. The modified `deferred.hlsl` reads this AO map and applies it only to indirect/ambient lighting, not direct sunlight.
 
-| Enhancement          | Inject Before  | Why |
-|----------------------|----------------|-----|
-| Screen-space shadows | Fog pass       | Needs depth, should be fogged |
-| Color grading / LUT  | Heat haze (#13)| After tone mapping, before final output |
-| Depth of field       | Tone mapping (#11) | Needs HDR scene + depth |
-| Sharpening           | Heat haze (#13)| After FXAA, before final output |
-| Improved bloom       | Replace #9-10  | Custom bloom with better quality |
-| SSR (reflections)    | Fog pass       | Needs depth + normals + lit scene |
+### LUT Injection (color grading)
+
+LUT runs at `POST_LIGHTING` with `postExecute` — it copies the HDR scene, applies a parametric 32^3 color LUT via a fullscreen pass, and writes back to the HDR target. This happens before fog, so atmospheric scattering naturally blends the graded colors at distance.
+
+### Planned injection points
+
+| Injection Point   | Pipeline Location         | Potential Effects                      |
+|-------------------|---------------------------|----------------------------------------|
+| `POST_GBUFFER`    | After GBuffer fill        | (reserved for future use)              |
+| `POST_FOG`        | After fog/atmosphere      | Screen-space shadows, SSR              |
+| `POST_TONEMAP`    | After tone mapping        | Sharpening, film grain                 |
+| `PRE_PRESENT`     | After all post-processing | Debug overlays, capture                |
 
 ---
 
