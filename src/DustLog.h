@@ -13,35 +13,37 @@ inline bool& DustLogEnabled()
     return enabled;
 }
 
+// Directory where Dust.log is written (next to the DLL)
+inline std::string& DustLogDir()
+{
+    static std::string dir;
+    return dir;
+}
+
 // Call once at startup with the DLL module handle.
 // Reads Logging=1/0 from [Dust] section in Dust.ini next to the DLL.
 inline void DustLogInit(HMODULE hModule)
 {
     char path[MAX_PATH];
     GetModuleFileNameA(hModule, path, MAX_PATH);
-    std::string s(path);
-    auto pos = s.find_last_of("\\/");
+    std::string dir(path);
+    auto pos = dir.find_last_of("\\/");
     if (pos != std::string::npos)
-        s = s.substr(0, pos + 1);
-    s += "Dust.ini";
+        dir = dir.substr(0, pos + 1);
 
-    DustLogEnabled() = GetPrivateProfileIntA("Dust", "Logging", 0, s.c_str()) != 0;
+    DustLogDir() = dir;
+
+    std::string ini = dir + "Dust.ini";
+    DustLogEnabled() = GetPrivateProfileIntA("Dust", "Logging", 0, ini.c_str()) != 0;
 }
 
-// File log — opens on first use next to the game exe
 inline FILE* DustLogFile()
 {
     static FILE* f = nullptr;
-    if (!f)
+    if (!f && !DustLogDir().empty())
     {
-        char path[MAX_PATH];
-        GetModuleFileNameA(nullptr, path, MAX_PATH);
-        std::string s(path);
-        auto pos = s.find_last_of("\\/");
-        if (pos != std::string::npos)
-            s = s.substr(0, pos + 1);
-        s += "Dust.log";
-        f = fopen(s.c_str(), "w");
+        std::string path = DustLogDir() + "Dust.log";
+        f = fopen(path.c_str(), "w");
     }
     return f;
 }

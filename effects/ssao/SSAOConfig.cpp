@@ -17,7 +17,7 @@ void SSAOConfig::Init(HMODULE hModule)
     if (pos != std::string::npos)
         dir = dir.substr(0, pos);
 
-    filePath = dir + "\\Dust.ini";
+    filePath = dir + "\\SSAO.ini";
 
     // Check if file exists
     DWORD attr = GetFileAttributesA(filePath.c_str());

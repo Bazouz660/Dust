@@ -241,6 +241,35 @@ static void STDMETHODCALLTYPE HookedDraw(
 
     if (result.detected)
     {
+        // Detect real resolution from the HDR render target
+        ID3D11RenderTargetView* rtv = nullptr;
+        pThis->OMGetRenderTargets(1, &rtv, nullptr);
+        if (rtv)
+        {
+            ID3D11Resource* res = nullptr;
+            rtv->GetResource(&res);
+            if (res)
+            {
+                ID3D11Texture2D* tex = nullptr;
+                res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex);
+                if (tex)
+                {
+                    D3D11_TEXTURE2D_DESC desc;
+                    tex->GetDesc(&desc);
+                    if (desc.Width != gWidth || desc.Height != gHeight)
+                    {
+                        Log("Resolution changed: %ux%u -> %ux%u", gWidth, gHeight, desc.Width, desc.Height);
+                        gWidth = desc.Width;
+                        gHeight = desc.Height;
+                        gEffectLoader.OnResolutionChanged(gDevice, gWidth, gHeight);
+                    }
+                    tex->Release();
+                }
+                res->Release();
+            }
+            rtv->Release();
+        }
+
         DustInjectionPoint dip = static_cast<DustInjectionPoint>(result.point);
 
         DustFrameContext fctx = {};

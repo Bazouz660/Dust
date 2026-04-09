@@ -36,3 +36,9 @@ jobs:
           msbuild effects\ssao\DustSSAO.vcxproj
           /p:Configuration=Release
           /p:Platform=x64
+
+      - name: Build LUT plugin (DustLUT.dll)
+        run: >
+          msbuild effects\lut\DustLUT.vcxproj
+          /p:Configuration=Release
+          /p:Platform=x64

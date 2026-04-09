@@ -61,12 +61,19 @@ jobs:
           /p:Configuration=Release
           /p:Platform=x64
 
+      - name: Build LUT plugin (DustLUT.dll)
+        run: >
+          msbuild effects\lut\DustLUT.vcxproj
+          /p:Configuration=Release
+          /p:Platform=x64
+
       - name: Package release
         run: |
           mkdir release\Dust\shaders
           mkdir release\Dust\effects
           copy src\build\Release\Dust.dll release\Dust\
           copy effects\ssao\build\Release\DustSSAO.dll release\Dust\effects\
+          copy effects\lut\build\Release\DustLUT.dll release\Dust\effects\
           copy mod\Dust.mod release\Dust\
           copy mod\Dust.ini release\Dust\
           copy mod\RE_Kenshi.json release\Dust\
