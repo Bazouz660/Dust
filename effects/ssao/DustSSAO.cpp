@@ -132,12 +132,30 @@ static const uint32_t AO_PARAMS_REGISTER = 9;
 // Called BEFORE the game's lighting draw
 static void SSAOPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
 {
+    static bool sFirstRun = true;
+    if (sFirstRun)
+    {
+        Log("[SSAO] First preExecute: res=%ux%u, frame=%llu",
+            ctx->width, ctx->height, ctx->frameIndex);
+        sFirstRun = false;
+    }
+
     ID3D11ShaderResourceView* depthSRV = host->GetSRV(DUST_RESOURCE_DEPTH);
     if (!depthSRV)
+    {
+        static bool sWarnedNoDepth = false;
+        if (!sWarnedNoDepth) { Log("[SSAO] WARNING: No depth SRV available"); sWarnedNoDepth = true; }
         return;
+    }
 
     if (!SSAORenderer::IsInitialized())
+    {
+        static bool sWarnedNoInit = false;
+        if (!sWarnedNoInit) { Log("[SSAO] WARNING: Renderer not initialized, binding white fallback"); sWarnedNoInit = true; }
+        host->BindSRV(ctx->context, AO_REGISTER, gWhiteSRV, gAoSampler);
+        host->BindSRV(ctx->context, AO_PARAMS_REGISTER, gParamsSRV, gAoSampler);
         return;
+    }
 
     // Update and bind the direct-light occlusion parameter (slot 9)
     UpdateParamsTexture(ctx->context);
@@ -153,7 +171,10 @@ static void SSAOPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     // Generate AO (saves/restores GPU state internally)
     ID3D11ShaderResourceView* aoSRV = SSAORenderer::RenderAO(ctx->context, depthSRV);
     if (!aoSRV)
+    {
+        Log("[SSAO] WARNING: RenderAO returned null, binding white fallback");
         aoSRV = gWhiteSRV;
+    }
 
     // Bind AO for deferred.hlsl to sample
     host->BindSRV(ctx->context, AO_REGISTER, aoSRV, gAoSampler);

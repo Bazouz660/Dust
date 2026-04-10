@@ -343,6 +343,36 @@ static void STDMETHODCALLTYPE HookedDraw(
 
     if (result.detected)
     {
+        // Verify the context's device matches our captured device
+        {
+            static bool sDeviceChecked = false;
+            if (!sDeviceChecked)
+            {
+                ID3D11Device* ctxDevice = nullptr;
+                pThis->GetDevice(&ctxDevice);
+                if (ctxDevice)
+                {
+                    if (ctxDevice != gDevice)
+                        Log("WARNING: Context device=%p differs from captured device=%p!", ctxDevice, gDevice);
+                    else
+                        Log("Device pointer verified OK (device=%p)", gDevice);
+                    ctxDevice->Release();
+                }
+                sDeviceChecked = true;
+            }
+        }
+
+        // Check device health
+        bool deviceHealthy = true;
+        {
+            HRESULT removeReason = gDevice->GetDeviceRemovedReason();
+            if (removeReason != S_OK)
+            {
+                deviceHealthy = false;
+                Log("Device removed (0x%08X), current resolution=%ux%u", removeReason, gWidth, gHeight);
+            }
+        }
+
         // Detect real resolution from the HDR render target
         ID3D11RenderTargetView* rtv = nullptr;
         pThis->OMGetRenderTargets(1, &rtv, nullptr);
@@ -360,14 +390,10 @@ static void STDMETHODCALLTYPE HookedDraw(
                     tex->GetDesc(&desc);
                     if (desc.Width != gWidth || desc.Height != gHeight)
                     {
-                        // Check if device is still alive before recreating resources.
-                        // DEVICE_REMOVED can happen during screen/monitor switches;
-                        // skip the update so we naturally retry on the next valid frame.
-                        HRESULT removeReason = gDevice->GetDeviceRemovedReason();
-                        if (removeReason != S_OK)
+                        if (!deviceHealthy)
                         {
-                            Log("Device removed (0x%08X), deferring resolution change %ux%u -> %ux%u",
-                                removeReason, gWidth, gHeight, desc.Width, desc.Height);
+                            Log("Deferring resolution change %ux%u -> %ux%u (device unhealthy)",
+                                gWidth, gHeight, desc.Width, desc.Height);
                         }
                         else
                         {
@@ -384,7 +410,27 @@ static void STDMETHODCALLTYPE HookedDraw(
             rtv->Release();
         }
 
+        // Skip effect dispatch when device is unhealthy or resolution not yet detected.
+        // Effects initialized at 1x1 must not render into full-resolution targets.
+        if (!deviceHealthy || gWidth <= 1 || gHeight <= 1)
+        {
+            Log("Skipping effect dispatch (healthy=%d, res=%ux%u)", deviceHealthy, gWidth, gHeight);
+            oDraw(pThis, VertexCount, StartVertexLocation);
+            return;
+        }
+
         DustInjectionPoint dip = static_cast<DustInjectionPoint>(result.point);
+
+        // Log first successful dispatch
+        {
+            static bool sFirstDispatch = true;
+            if (sFirstDispatch)
+            {
+                Log("First effect dispatch: point=%d, res=%ux%u, frame=%llu",
+                    (int)dip, gWidth, gHeight, gFrameIndex);
+                sFirstDispatch = false;
+            }
+        }
 
         DustFrameContext fctx = {};
         fctx.device = gDevice;
