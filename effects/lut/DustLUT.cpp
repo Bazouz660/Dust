@@ -31,7 +31,7 @@ static std::string GetPluginDir()
 struct LUTConfig {
     bool enabled       = true;
     float intensity    = 1.0f;
-    float exposure     = 0.0f;    // EV stops (-3 to 3)
+    float exposure     = -0.7f;   // EV stops (-3 to 3)
 
     // Lift / Gamma / Gain (applied in log space)
     float lift         = 0.0f;    // Shadows offset (-0.1 to 0.1)
