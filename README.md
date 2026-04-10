@@ -23,7 +23,7 @@ Game Render Pipeline:
   GBuffer Fill -> Deferred Lighting -> Fog -> Post-Processing -> Tonemapping -> Present
                         |                                              |
                   POST_LIGHTING                                  POST_TONEMAP
-                  (SSAO, SSIL)                                   (LUT, Bloom)
+                  (SSAO, SSIL, SSS)                              (LUT, Bloom)
 ```
 
 Effects register at specific injection points. When Dust detects a matching render pass, it dispatches registered effects (in priority order) with full access to the relevant GPU resources.
@@ -95,6 +95,15 @@ The host provides a `DustHostAPI` struct with functions for logging, resource ac
 - **Triangular dithering**: Applied at the final 8-bit write to break up gradient banding
 - **Ships with a cinematic desert preset** tuned for Kenshi's aesthetic
 
+### Screen Space Shadows (SSS) — `POST_LIGHTING`, priority 20
+
+- **Contact shadows**: Ray marches the depth buffer toward the sun direction to add sharp, detailed close-range shadows that mask the low-res shadow map
+- **Automatic sun tracking**: Extracts the sun direction and view matrix from the game's constant buffer each frame — shadows follow the in-game day/night cycle
+- **Quadratic step distribution**: More samples near the surface for fine contact detail, fewer far away
+- **Per-pixel jitter**: Interleaved gradient noise breaks up banding artifacts
+- **Depth-aware bilateral blur**: Smooths the shadow mask without bleeding across depth edges
+- **Debug visualization**: Overlay mode to inspect the raw shadow mask
+
 ### Bloom — `POST_TONEMAP`, priority 100
 
 - **Physically-motivated bloom**: Runs after LUT so bloom is applied to graded colors
@@ -142,11 +151,13 @@ A startup toast notification appears for 30 seconds indicating the mod is active
            └── effects/
                ├── DustSSAO.dll
                ├── DustSSIL.dll
+               ├── DustSSS.dll
                ├── DustLUT.dll
                ├── DustBloom.dll
                └── shaders/
                    ├── ssao_*.hlsl
                    ├── ssil_*.hlsl
+                   ├── sss_*.hlsl
                    ├── lut_ps.hlsl
                    ├── bloom_*.hlsl
                    └── fullscreen_vs.hlsl
@@ -226,6 +237,21 @@ HighlightG=0.01
 HighlightB=-0.02
 ```
 
+### SSS.ini
+
+```ini
+[SSS]
+Enabled=1
+Strength=0.7
+MaxDistance=0.005
+StepCount=16
+Thickness=0.001
+DepthBias=0.0001
+MaxDepth=0.1
+BlurSharpness=0.01
+DebugView=0
+```
+
 ### Bloom.ini
 
 ```ini
@@ -271,6 +297,7 @@ msbuild effects\ssao\DustSSAO.vcxproj /p:Configuration=Release /p:Platform=x64
 msbuild effects\ssil\DustSSIL.vcxproj /p:Configuration=Release /p:Platform=x64
 msbuild effects\lut\DustLUT.vcxproj   /p:Configuration=Release /p:Platform=x64
 msbuild effects\bloom\DustBloom.vcxproj /p:Configuration=Release /p:Platform=x64
+msbuild effects\sss\DustSSS.vcxproj   /p:Configuration=Release /p:Platform=x64
 ```
 
 ### Deployment
@@ -288,6 +315,7 @@ Copy the following into `<Kenshi>/mods/Dust/`:
 | `effects/ssil/build/Release/DustSSIL.dll` | `effects/DustSSIL.dll` |
 | `effects/lut/build/Release/DustLUT.dll` | `effects/DustLUT.dll` |
 | `effects/bloom/build/Release/DustBloom.dll` | `effects/DustBloom.dll` |
+| `effects/sss/build/Release/DustSSS.dll` | `effects/DustSSS.dll` |
 | `effects/*/shaders/*.hlsl` | `effects/shaders/` |
 
 ### Creating a New Effect Plugin
@@ -324,6 +352,7 @@ GPU costs are measured via D3D11 timestamp queries and displayed in the in-game 
 |--------|--------|----------|
 | SSAO   | 3 (generate + blur H + blur V) | ~1–3 ms |
 | SSIL   | 3 (generate + blur H + blur V) | ~2–5 ms |
+| SSS    | 3 (generate + blur H + blur V) + 1 composite | ~1–3 ms |
 | LUT    | 1 (HDR → ACES → LUT → dither) | ~0.1–0.3 ms |
 | Bloom  | ~6 (extract + downsample × 2 + upsample × 2 + composite) | ~0.5–1.5 ms |
 

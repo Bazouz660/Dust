@@ -79,6 +79,12 @@ jobs:
           /p:Configuration=Release
           /p:Platform=x64
 
+      - name: Build SSS plugin (DustSSS.dll)
+        run: >
+          msbuild effects\sss\DustSSS.vcxproj
+          /p:Configuration=Release
+          /p:Platform=x64
+
       - name: Package release
         run: |
           mkdir release\Dust\shaders
@@ -90,10 +96,12 @@ jobs:
           copy effects\lut\build\Release\DustLUT.dll release\Dust\effects\
           copy effects\bloom\build\Release\DustBloom.dll release\Dust\effects\
           copy effects\ssil\build\Release\DustSSIL.dll release\Dust\effects\
+          copy effects\sss\build\Release\DustSSS.dll release\Dust\effects\
           xcopy /Y effects\ssao\shaders\* release\Dust\effects\shaders\
           xcopy /Y effects\lut\shaders\* release\Dust\effects\shaders\
           xcopy /Y effects\bloom\shaders\* release\Dust\effects\shaders\
           xcopy /Y effects\ssil\shaders\* release\Dust\effects\shaders\
+          xcopy /Y effects\sss\shaders\* release\Dust\effects\shaders\
           copy mod\Dust.mod release\Dust\
           copy mod\Dust.ini release\Dust\
           copy mod\RE_Kenshi.json release\Dust\

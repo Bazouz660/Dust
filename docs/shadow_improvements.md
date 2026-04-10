@@ -26,8 +26,8 @@ Replace the shadow sampling in the lighting shader with higher-quality PCF, Pois
 ### Bias Adjustment
 Tweak the depth bias in the shadow sampling to reduce acne (though can't make it per-cascade since there are no cascades).
 
-### Screen-Space Contact Shadows (High Priority)
-Add a post-process pass that ray-marches in screen space along the light direction using the depth buffer. Adds sharp, detailed close-range shadows that mask the low-res shadow map quality up close. **Highest bang-for-buck improvement.**
+### Screen-Space Contact Shadows (Implemented)
+~~Add a post-process pass that ray-marches in screen space along the light direction using the depth buffer. Adds sharp, detailed close-range shadows that mask the low-res shadow map quality up close.~~ **Implemented as the SSS (Screen Space Shadows) effect** in `effects/sss/`. Runs at `POST_LIGHTING` (priority 20), extracts the sun direction from the game's constant buffer each frame, ray marches the depth buffer toward the sun with quadratic step distribution and per-pixel jitter, applies bilateral blur, and composites multiplicatively onto the HDR target.
 
 ### Shadow Map Resolution Override
 Intercept the shadow map render target creation via D3D11 and force a higher resolution texture. Directly improves quality at the cost of GPU performance.
@@ -47,3 +47,5 @@ The flickering comes from the warp tree recomputation on the CPU side, before an
 ## Recommended Approach
 
 **Screen-space contact shadows + better filtering + shadow map resolution bump.** This combo would meaningfully improve the close-range experience without touching the engine's shadow architecture.
+
+Screen-space contact shadows are now implemented — see `effects/sss/`. Better filtering and shadow map resolution override remain as future work.

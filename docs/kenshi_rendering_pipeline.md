@@ -295,7 +295,7 @@ Dust defines injection points as `DustInjectionPoint` values in `DustAPI.h`. Eff
 
 | Injection Point | Pipeline Location              | Available Resources                    | Current Effects             |
 |-----------------|--------------------------------|----------------------------------------|-----------------------------|
-| `POST_LIGHTING` | Around deferred lighting draw  | Depth SRV, albedo SRV, normals SRV, HDR RTV | SSAO (pri 0), SSIL (pri 10) |
+| `POST_LIGHTING` | Around deferred lighting draw  | Depth SRV, albedo SRV, normals SRV, HDR RTV | SSAO (pri 0), SSIL (pri 10), SSS (pri 20) |
 | `POST_TONEMAP`  | Around tone mapping draw       | HDR RTV (pre), LDR RTV (post)          | LUT (pri 0), Bloom (pri 100)|
 
 ### SSAO — ambient-only occlusion (`POST_LIGHTING`, priority 0)
@@ -310,6 +310,10 @@ Runs in `preExecute`: samples albedo and depth in 8 directions × 4 steps per pi
 
 Runs in `preExecute`: captures a copy of the R11G11B10_FLOAT HDR render target before the game's tonemapper executes via `host->GetSceneCopy("hdr_rt")`. Runs in `postExecute`: overwrites the LDR output entirely — applies exposure, ACES filmic tonemapping, a float-precision 32³ LUT, and triangular dithering in a single pass. This is the only 8-bit quantization step in the chain, eliminating the double-quantization banding of the vanilla pipeline.
 
+### SSS — screen-space contact shadows (`POST_LIGHTING`, priority 20)
+
+Runs in `preExecute`: extracts the sun direction and inverse view matrix from the game's PS constant buffer (CB0) — `sunDirection` at register c0, `inverseView` at c8–c11 — and computes a view-space light direction. Runs in `postExecute`: ray marches each pixel toward the sun in view space using the depth buffer with quadratic step distribution and per-pixel jitter, blurs the shadow mask with a bilateral filter, then composites multiplicatively onto the HDR render target. Adds sharp contact shadows that complement the game's low-resolution shadow map.
+
 ### Bloom — physically-motivated bloom (`POST_TONEMAP`, priority 100)
 
 Runs after LUT so bloom is applied to graded colors. Threshold-extracts bright areas from the LDR scene, progressively downsamples, upsamples with scatter control, and composites additively.
@@ -319,7 +323,7 @@ Runs after LUT so bloom is applied to graded colors. Threshold-extracts bright a
 | Injection Point | Pipeline Location              | Potential Future Effects               |
 |-----------------|--------------------------------|----------------------------------------|
 | `POST_GBUFFER`  | After GBuffer fill             | (reserved)                             |
-| `POST_FOG`      | After fog/atmosphere           | Screen-space shadows, SSR              |
+| `POST_FOG`      | After fog/atmosphere           | SSR                                    |
 | `PRE_PRESENT`   | After all post-processing      | Debug overlays, capture                |
 
 ---

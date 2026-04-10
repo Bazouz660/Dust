@@ -54,3 +54,9 @@ jobs:
           msbuild effects\ssil\DustSSIL.vcxproj
           /p:Configuration=Release
           /p:Platform=x64
+
+      - name: Build SSS plugin (DustSSS.dll)
+        run: >
+          msbuild effects\sss\DustSSS.vcxproj
+          /p:Configuration=Release
+          /p:Platform=x64
