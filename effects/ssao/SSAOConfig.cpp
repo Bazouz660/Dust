@@ -52,12 +52,12 @@ int SSAOConfig::ReadInt(const char* key, int def)
 void SSAOConfig::Load()
 {
     enabled        = ReadInt("Enabled", 1) != 0;
-    aoRadius       = ReadFloat("Radius", 0.002f);
-    aoStrength     = ReadFloat("Strength", 3.0f);
-    aoBias         = ReadFloat("Bias", 0.05f);
+    aoRadius       = ReadFloat("Radius", 0.003f);
+    aoStrength     = ReadFloat("Strength", 1.991f);
+    aoBias         = ReadFloat("Bias", 0.001f);
     aoMaxDepth     = ReadFloat("MaxDepth", 0.1f);
     filterRadius   = ReadFloat("FilterRadius", 0.15f);
-    foregroundFade = ReadFloat("ForegroundFade", 50.0f);
+    foregroundFade = ReadFloat("ForegroundFade", 26.644f);
     falloffPower   = ReadFloat("FalloffPower", 2.0f);
     maxScreenRadius = ReadFloat("MaxScreenRadius", 0.03f);
     minScreenRadius = ReadFloat("MinScreenRadius", 0.001f);

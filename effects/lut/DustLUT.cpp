@@ -33,14 +33,14 @@ struct LUTConfig {
 
     // Lift / Gamma / Gain (applied in log space)
     float lift         = 0.0f;    // Shadows offset (-0.1 to 0.1)
-    float gamma        = 1.0f;    // Midtone power (0.8 to 1.2)
-    float gain         = 1.0f;    // Highlight multiplier (0.8 to 1.2)
+    float gamma        = 1.035f;  // Midtone power (0.8 to 1.2)
+    float gain         = 0.985f;  // Highlight multiplier (0.8 to 1.2)
 
     // Color balance
     float contrast     = 1.0f;    // 0.5 to 1.5
     float saturation   = 1.0f;    // 0.0 to 2.0
     float temperature  = 0.0f;    // -1.0 (cool) to 1.0 (warm)
-    float tint         = 0.0f;    // -1.0 (green) to 1.0 (magenta)
+    float tint         = -0.19f;  // -1.0 (green) to 1.0 (magenta)
 
     // Split toning
     float shadowR      = 0.0f;    // Shadow color offset (-0.1 to 0.1)
@@ -68,12 +68,12 @@ static void LoadConfig()
     gConfig.enabled     = GetPrivateProfileIntA("LUT", "Enabled", 1, gConfigPath.c_str()) != 0;
     gConfig.intensity   = ReadFloat("Intensity", 1.0f);
     gConfig.lift        = ReadFloat("Lift", 0.0f);
-    gConfig.gamma       = ReadFloat("Gamma", 1.0f);
-    gConfig.gain        = ReadFloat("Gain", 1.0f);
+    gConfig.gamma       = ReadFloat("Gamma", 1.035f);
+    gConfig.gain        = ReadFloat("Gain", 0.985f);
     gConfig.contrast    = ReadFloat("Contrast", 1.0f);
     gConfig.saturation  = ReadFloat("Saturation", 1.0f);
     gConfig.temperature = ReadFloat("Temperature", 0.0f);
-    gConfig.tint        = ReadFloat("Tint", 0.0f);
+    gConfig.tint        = ReadFloat("Tint", -0.19f);
     gConfig.shadowR     = ReadFloat("ShadowR", 0.0f);
     gConfig.shadowG     = ReadFloat("ShadowG", 0.0f);
     gConfig.shadowB     = ReadFloat("ShadowB", 0.0f);
@@ -92,13 +92,13 @@ static void WriteDefaultConfig()
     WritePrivateProfileStringA("LUT", "Intensity", "0.7", gConfigPath.c_str());
     WritePrivateProfileStringA("LUT", "; Lift/Gamma/Gain", nullptr, gConfigPath.c_str());
     WritePrivateProfileStringA("LUT", "Lift", "0.02", gConfigPath.c_str());
-    WritePrivateProfileStringA("LUT", "Gamma", "0.97", gConfigPath.c_str());
-    WritePrivateProfileStringA("LUT", "Gain", "1.05", gConfigPath.c_str());
+    WritePrivateProfileStringA("LUT", "Gamma", "1.035", gConfigPath.c_str());
+    WritePrivateProfileStringA("LUT", "Gain", "0.985", gConfigPath.c_str());
     WritePrivateProfileStringA("LUT", "; Color balance", nullptr, gConfigPath.c_str());
     WritePrivateProfileStringA("LUT", "Contrast", "1.08", gConfigPath.c_str());
     WritePrivateProfileStringA("LUT", "Saturation", "0.85", gConfigPath.c_str());
     WritePrivateProfileStringA("LUT", "Temperature", "0.08", gConfigPath.c_str());
-    WritePrivateProfileStringA("LUT", "Tint", "0", gConfigPath.c_str());
+    WritePrivateProfileStringA("LUT", "Tint", "-0.19", gConfigPath.c_str());
     WritePrivateProfileStringA("LUT", "; Split toning (shadow/highlight color offsets)", nullptr, gConfigPath.c_str());
     WritePrivateProfileStringA("LUT", "ShadowR", "-0.02", gConfigPath.c_str());
     WritePrivateProfileStringA("LUT", "ShadowG", "0.01", gConfigPath.c_str());
