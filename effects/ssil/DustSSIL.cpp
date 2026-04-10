@@ -38,8 +38,8 @@ static std::string GetPluginDir()
 // Called BEFORE the game's lighting draw
 static void SSILPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
 {
-    ID3D11ShaderResourceView* depthSRV = host->GetSRV("depth");
-    ID3D11ShaderResourceView* albedoSRV = host->GetSRV("albedo");
+    ID3D11ShaderResourceView* depthSRV = host->GetSRV(DUST_RESOURCE_DEPTH);
+    ID3D11ShaderResourceView* albedoSRV = host->GetSRV(DUST_RESOURCE_ALBEDO);
     if (!depthSRV || !albedoSRV)
         return;
 
@@ -50,7 +50,7 @@ static void SSILPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
         return;
 
     // Normals are optional (we reconstruct from depth if not available)
-    ID3D11ShaderResourceView* normalsSRV = host->GetSRV("normals");
+    ID3D11ShaderResourceView* normalsSRV = host->GetSRV(DUST_RESOURCE_NORMALS);
 
     // Generate IL texture (saves/restores GPU state internally)
     SSILRenderer::RenderIL(ctx->context, depthSRV, albedoSRV, normalsSRV);
@@ -67,7 +67,7 @@ static void SSILPostExecute(const DustFrameContext* ctx, const DustHostAPI* host
         return;
 
     // Composite IL additively onto HDR RT
-    ID3D11RenderTargetView* hdrRTV = host->GetRTV("hdr_rt");
+    ID3D11RenderTargetView* hdrRTV = host->GetRTV(DUST_RESOURCE_HDR_RT);
     if (!hdrRTV)
         return;
 

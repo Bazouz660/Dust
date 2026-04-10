@@ -132,7 +132,7 @@ static const uint32_t AO_PARAMS_REGISTER = 9;
 // Called BEFORE the game's lighting draw
 static void SSAOPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
 {
-    ID3D11ShaderResourceView* depthSRV = host->GetSRV("depth");
+    ID3D11ShaderResourceView* depthSRV = host->GetSRV(DUST_RESOURCE_DEPTH);
     if (!depthSRV)
         return;
 
@@ -169,7 +169,7 @@ static void SSAOPostExecute(const DustFrameContext* ctx, const DustHostAPI* host
     // Debug overlay
     if (gSSAOConfig.debugView && gSSAOConfig.enabled)
     {
-        ID3D11RenderTargetView* hdrRTV = host->GetRTV("hdr_rt");
+        ID3D11RenderTargetView* hdrRTV = host->GetRTV(DUST_RESOURCE_HDR_RT);
         if (hdrRTV)
             SSAORenderer::RenderDebugOverlay(ctx->context, hdrRTV);
     }

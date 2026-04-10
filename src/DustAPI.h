@@ -100,11 +100,18 @@ typedef struct DustFrameContext {
     uint64_t                frameIndex;
 } DustFrameContext;
 
+// Resource name constants for GetSRV / GetRTV / GetSceneCopy
+#define DUST_RESOURCE_DEPTH     "depth"
+#define DUST_RESOURCE_ALBEDO    "albedo"
+#define DUST_RESOURCE_NORMALS   "normals"
+#define DUST_RESOURCE_HDR_RT    "hdr_rt"
+#define DUST_RESOURCE_LDR_RT    "ldr_rt"
+
 // Host API - function pointers provided by Dust to plugins
 typedef struct DustHostAPI {
     uint32_t apiVersion;
 
-    // Resource access (names: "depth", "hdr_rt")
+    // Resource access (use DUST_RESOURCE_* constants)
     ID3D11ShaderResourceView* (*GetSRV)(const char* name);
     ID3D11RenderTargetView*   (*GetRTV)(const char* name);
 

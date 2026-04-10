@@ -290,7 +290,7 @@ static void LUTPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     if (!gConfig.enabled)
         return;
 
-    gHdrCopySRV = host->GetSceneCopy(ctx->context, "hdr_rt");
+    gHdrCopySRV = host->GetSceneCopy(ctx->context, DUST_RESOURCE_HDR_RT);
 }
 
 // postExecute: fires AFTER the game's tonemap draw.
@@ -303,7 +303,7 @@ static void LUTPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
         return;
     }
 
-    ID3D11RenderTargetView* ldrRTV = host->GetRTV("ldr_rt");
+    ID3D11RenderTargetView* ldrRTV = host->GetRTV(DUST_RESOURCE_LDR_RT);
     if (!ldrRTV)
     {
         gHdrCopySRV = nullptr;
