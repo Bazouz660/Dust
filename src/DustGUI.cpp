@@ -349,6 +349,11 @@ static void DrawEffectSection(size_t idx)
         const DustSettingDesc& s = le.desc.settings[i];
         if (!s.name || !s.valuePtr) continue;
 
+        // Skip hidden settings (persisted in INI but not shown in GUI)
+        if (s.type == DUST_SETTING_HIDDEN_FLOAT || s.type == DUST_SETTING_HIDDEN_INT
+            || s.type == DUST_SETTING_HIDDEN_BOOL)
+            continue;
+
         ImGui::PushID((int)i);
 
         bool changed = false;
@@ -362,6 +367,8 @@ static void DrawEffectSection(size_t idx)
             break;
         case DUST_SETTING_INT:
             changed = ImGui::SliderInt(s.name, (int*)s.valuePtr, (int)s.minVal, (int)s.maxVal);
+            break;
+        default:
             break;
         }
 
@@ -380,18 +387,23 @@ static void DrawEffectSection(size_t idx)
     ImGui::Separator();
     ImGui::Spacing();
 
+    bool canSave = (le.desc.apiVersion >= 3 && (le.desc.flags & DUST_FLAG_FRAMEWORK_CONFIG))
+                || le.desc.SaveSettings;
+    bool canLoad = (le.desc.apiVersion >= 3 && (le.desc.flags & DUST_FLAG_FRAMEWORK_CONFIG))
+                || le.desc.LoadSettings;
+
     if (dirty)
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.2f, 1.0f));
-    if (ImGui::Button("Save", ImVec2(80, 0)) && dirty && le.desc.SaveSettings)
+    if (ImGui::Button("Save", ImVec2(80, 0)) && dirty && canSave)
     {
-        le.desc.SaveSettings();
+        gEffectLoader.SaveEffectConfig(idx);
         SnapshotEffect(idx); // update disk values
     }
     if (dirty)
         ImGui::PopStyleColor();
     if (ImGui::IsItemHovered())
     {
-        if (!le.desc.SaveSettings)
+        if (!canSave)
             ImGui::SetTooltip("This effect does not support saving");
         else if (!dirty)
             ImGui::SetTooltip("No changes to save");
@@ -400,9 +412,9 @@ static void DrawEffectSection(size_t idx)
     ImGui::SameLine();
     if (ImGui::Button("Reset All", ImVec2(80, 0)) && dirty)
     {
-        if (le.desc.LoadSettings)
+        if (canLoad)
         {
-            le.desc.LoadSettings();
+            gEffectLoader.LoadEffectConfig(idx);
             SnapshotEffect(idx);
         }
         else
@@ -481,10 +493,9 @@ static void DrawPerformanceSection()
         if (!le.initialized) continue;
 
         const char* name = le.desc.name ? le.desc.name : "Unnamed";
-        float gpuMs = 0.0f;
-
-        if (le.desc.gpuTimeMsPtr)
-            gpuMs = *le.desc.gpuTimeMsPtr;
+        float gpuMs = gEffectLoader.GetEffectGpuTime(i);
+        bool hasTiming = (le.desc.apiVersion >= 3 && (le.desc.flags & DUST_FLAG_FRAMEWORK_TIMING))
+                      || le.desc.gpuTimeMsPtr;
 
         totalEffectMs += gpuMs;
 
@@ -493,7 +504,7 @@ static void DrawPerformanceSection()
         if (gpuMs > 2.0f) color = ImVec4(1.0f, 1.0f, 0.4f, 1.0f); // yellow
         if (gpuMs > 5.0f) color = ImVec4(1.0f, 0.4f, 0.4f, 1.0f); // red
 
-        if (le.desc.gpuTimeMsPtr)
+        if (hasTiming)
         {
             ImGui::TextColored(color, "  %-12s %.2f ms", name, gpuMs);
         }

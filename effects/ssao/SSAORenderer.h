@@ -1,13 +1,14 @@
 #pragma once
 
+#include "../../src/DustAPI.h"
 #include <d3d11.h>
 
 namespace SSAORenderer
 {
-    bool Init(ID3D11Device* device, UINT width, UINT height);
+    bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host);
     void Shutdown();
 
-    // Generate AO texture (gen + blur only). Saves/restores GPU state.
+    // Generate AO texture (gen + blur only). Saves/restores GPU state via host API.
     // Returns the AO SRV (R8_UNORM, white=unoccluded, dark=occluded).
     ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
                                         ID3D11ShaderResourceView* depthSRV);

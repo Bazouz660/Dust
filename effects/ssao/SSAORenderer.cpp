@@ -1,9 +1,7 @@
 #include "SSAORenderer.h"
 #include "SSAOShaders.h"
 #include "SSAOConfig.h"
-#include "D3D11StateBlock.h"
 #include "DustLog.h"
-#include <d3dcompiler.h>
 #include <cstring>
 
 namespace SSAORenderer
@@ -12,6 +10,7 @@ namespace SSAORenderer
 static bool gInitialized = false;
 static UINT gWidth = 0;
 static UINT gHeight = 0;
+static const DustHostAPI* gHost = nullptr;
 
 // AO textures (ping-pong for gen + blur)
 static ID3D11Texture2D*          gAoTex = nullptr;
@@ -58,8 +57,6 @@ struct SSAOCBData
 };
 static ID3D11Buffer* gSSAOCB = nullptr;
 
-static D3D11StateBlock gStateBlock;
-
 // GPU timing
 static ID3D11Query* gTimestampBegin = nullptr;
 static ID3D11Query* gTimestampEnd = nullptr;
@@ -71,34 +68,6 @@ static float gLastGpuTimeMs = 0.0f;
 static bool gTimingActive = false;
 
 // ==================== Helpers ====================
-
-static ID3DBlob* CompileShader(const char* source, const char* target, const char* entryPoint)
-{
-    ID3DBlob* blob = nullptr;
-    ID3DBlob* errorBlob = nullptr;
-
-    HRESULT hr = D3DCompile(
-        source, strlen(source), nullptr, nullptr, nullptr,
-        entryPoint, target,
-        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
-        &blob, &errorBlob);
-
-    if (FAILED(hr))
-    {
-        if (errorBlob)
-        {
-            Log("Shader compile error (%s): %s", target,
-                (const char*)errorBlob->GetBufferPointer());
-            errorBlob->Release();
-        }
-        return nullptr;
-    }
-
-    if (errorBlob)
-        errorBlob->Release();
-
-    return blob;
-}
 
 static bool CreateR8Texture(ID3D11Device* device, UINT width, UINT height,
                             ID3D11Texture2D** outTex,
@@ -129,29 +98,30 @@ static bool CreateR8Texture(ID3D11Device* device, UINT width, UINT height,
 
 // ==================== Public API ====================
 
-bool Init(ID3D11Device* device, UINT width, UINT height)
+bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host)
 {
     if (gInitialized)
         return true;
 
+    gHost = host;
     Log("Initializing SSAORenderer (%ux%u)", width, height);
     gWidth = width;
     gHeight = height;
 
-    // Compile all shaders
-    ID3DBlob* vsBlob = CompileShader(g_FullscreenVS, "vs_5_0", "main");
+    // Compile all shaders via host API
+    ID3DBlob* vsBlob = host->CompileShader(g_FullscreenVS, "main", "vs_5_0");
     if (!vsBlob) return false;
 
-    ID3DBlob* genBlob = CompileShader(g_SSAOGenPS, "ps_5_0", "main");
+    ID3DBlob* genBlob = host->CompileShader(g_SSAOGenPS, "main", "ps_5_0");
     if (!genBlob) { vsBlob->Release(); return false; }
 
-    ID3DBlob* blurHBlob = CompileShader(g_SSAOBlurHPS, "ps_5_0", "main");
+    ID3DBlob* blurHBlob = host->CompileShader(g_SSAOBlurHPS, "main", "ps_5_0");
     if (!blurHBlob) { vsBlob->Release(); genBlob->Release(); return false; }
 
-    ID3DBlob* blurVBlob = CompileShader(g_SSAOBlurVPS, "ps_5_0", "main");
+    ID3DBlob* blurVBlob = host->CompileShader(g_SSAOBlurVPS, "main", "ps_5_0");
     if (!blurVBlob) { vsBlob->Release(); genBlob->Release(); blurHBlob->Release(); return false; }
 
-    ID3DBlob* debugBlob = CompileShader(g_SSAODebugPS, "ps_5_0", "main");
+    ID3DBlob* debugBlob = host->CompileShader(g_SSAODebugPS, "main", "ps_5_0");
     if (!debugBlob) { vsBlob->Release(); genBlob->Release(); blurHBlob->Release(); blurVBlob->Release(); return false; }
 
     HRESULT hr;
@@ -222,17 +192,10 @@ bool Init(ID3D11Device* device, UINT width, UINT height)
     }
 
     // Constant buffer
-    {
-        D3D11_BUFFER_DESC desc = {};
-        desc.ByteWidth = (sizeof(SSAOCBData) + 15) & ~15;
-        desc.Usage = D3D11_USAGE_DYNAMIC;
-        desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-        hr = device->CreateBuffer(&desc, nullptr, &gSSAOCB);
-        if (FAILED(hr)) return false;
-    }
+    gSSAOCB = host->CreateConstantBuffer(device, sizeof(SSAOCBData));
+    if (!gSSAOCB) return false;
 
-    // GPU timestamp queries for performance measurement
+    // GPU timestamp queries for internal performance logging
     {
         D3D11_QUERY_DESC qd = {};
         qd.Query = D3D11_QUERY_TIMESTAMP;
@@ -261,6 +224,7 @@ void Shutdown()
     SAFE_RELEASE(gTimestampBegin); SAFE_RELEASE(gTimestampEnd); SAFE_RELEASE(gTimestampDisjoint);
 #undef SAFE_RELEASE
     gInitialized = false;
+    gHost = nullptr;
     Log("SSAORenderer shut down");
 }
 
@@ -304,7 +268,7 @@ float GetLastGpuTimeMs()
 ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
                                     ID3D11ShaderResourceView* depthSRV)
 {
-    if (!gInitialized || !ctx || !depthSRV)
+    if (!gInitialized || !ctx || !depthSRV || !gHost)
         return nullptr;
 
     // Detect resolution from depth texture
@@ -335,36 +299,31 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
         }
     }
 
-    gStateBlock.Capture(ctx);
+    gHost->SaveState(ctx);
 
     // Update constant buffer
     {
-        D3D11_MAPPED_SUBRESOURCE mapped;
-        HRESULT hr = ctx->Map(gSSAOCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-        if (SUCCEEDED(hr))
-        {
-            SSAOCBData* cb = static_cast<SSAOCBData*>(mapped.pData);
-            cb->viewportSize[0] = (float)gWidth;
-            cb->viewportSize[1] = (float)gHeight;
-            cb->invViewportSize[0] = 1.0f / (float)gWidth;
-            cb->invViewportSize[1] = 1.0f / (float)gHeight;
-            cb->tanHalfFov = gSSAOConfig.tanHalfFov;
-            cb->aspectRatio = (float)gWidth / (float)gHeight;
-            cb->filterRadius = gSSAOConfig.filterRadius;
-            cb->debugMode = gSSAOConfig.debugView ? 1.0f : 0.0f;
-            cb->aoRadius = gSSAOConfig.aoRadius;
-            cb->aoStrength = gSSAOConfig.aoStrength;
-            cb->aoBias = gSSAOConfig.aoBias;
-            cb->aoMaxDepth = gSSAOConfig.aoMaxDepth;
-            cb->foregroundFade = gSSAOConfig.foregroundFade;
-            cb->falloffPower = gSSAOConfig.falloffPower;
-            cb->maxScreenRadius = gSSAOConfig.maxScreenRadius;
-            cb->minScreenRadius = gSSAOConfig.minScreenRadius;
-            cb->depthFadeStart = gSSAOConfig.depthFadeStart;
-            cb->blurSharpness = gSSAOConfig.blurSharpness;
-            cb->nightCompensation = gSSAOConfig.nightCompensation;
-            ctx->Unmap(gSSAOCB, 0);
-        }
+        SSAOCBData cb = {};
+        cb.viewportSize[0] = (float)gWidth;
+        cb.viewportSize[1] = (float)gHeight;
+        cb.invViewportSize[0] = 1.0f / (float)gWidth;
+        cb.invViewportSize[1] = 1.0f / (float)gHeight;
+        cb.tanHalfFov = gSSAOConfig.tanHalfFov;
+        cb.aspectRatio = (float)gWidth / (float)gHeight;
+        cb.filterRadius = gSSAOConfig.filterRadius;
+        cb.debugMode = gSSAOConfig.debugView ? 1.0f : 0.0f;
+        cb.aoRadius = gSSAOConfig.aoRadius;
+        cb.aoStrength = gSSAOConfig.aoStrength;
+        cb.aoBias = gSSAOConfig.aoBias;
+        cb.aoMaxDepth = gSSAOConfig.aoMaxDepth;
+        cb.foregroundFade = gSSAOConfig.foregroundFade;
+        cb.falloffPower = gSSAOConfig.falloffPower;
+        cb.maxScreenRadius = gSSAOConfig.maxScreenRadius;
+        cb.minScreenRadius = gSSAOConfig.minScreenRadius;
+        cb.depthFadeStart = gSSAOConfig.depthFadeStart;
+        cb.blurSharpness = gSSAOConfig.blurSharpness;
+        cb.nightCompensation = gSSAOConfig.nightCompensation;
+        gHost->UpdateConstantBuffer(ctx, gSSAOCB, &cb, sizeof(cb));
     }
 
     // Common state for AO passes
@@ -465,8 +424,8 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
         gTimingActive = true;
     }
 
-    // Restore the original GPU state (lighting pass state)
-    gStateBlock.Restore(ctx);
+    // Restore state via host API
+    gHost->RestoreState(ctx);
 
     return gAoSRV;
 }
@@ -474,10 +433,10 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
 void RenderDebugOverlay(ID3D11DeviceContext* ctx,
                         ID3D11RenderTargetView* hdrRTV)
 {
-    if (!gInitialized || !ctx || !hdrRTV || !gSSAOConfig.debugView)
+    if (!gInitialized || !ctx || !hdrRTV || !gSSAOConfig.debugView || !gHost)
         return;
 
-    gStateBlock.Capture(ctx);
+    gHost->SaveState(ctx);
 
     ctx->IASetInputLayout(nullptr);
     ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -501,7 +460,7 @@ void RenderDebugOverlay(ID3D11DeviceContext* ctx,
     ID3D11ShaderResourceView* nullSRV = nullptr;
     ctx->PSSetShaderResources(0, 1, &nullSRV);
 
-    gStateBlock.Restore(ctx);
+    gHost->RestoreState(ctx);
 }
 
 } // namespace SSAORenderer

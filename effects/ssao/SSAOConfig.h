@@ -1,7 +1,7 @@
 #pragma once
 
-#include <windows.h>
-#include <string>
+// SSAOConfig — plain data struct for SSAO parameters.
+// Values are populated by the framework via DustSettingDesc array.
 
 struct SSAOConfig
 {
@@ -31,26 +31,6 @@ struct SSAOConfig
 
     // Debug
     bool debugView = false;
-
-    // Initialize from DLL module handle — finds .ini next to the DLL
-    void Init(HMODULE hModule);
-
-    // Load settings from the .ini file. Creates the file with defaults if missing.
-    void Load();
-
-    // Check file modification time and reload if changed. Call once per frame.
-    void CheckHotReload();
-
-    // Write current values back to the .ini file.
-    void Save();
-
-private:
-    std::string filePath;
-    FILETIME lastWriteTime = {};
-
-    void WriteDefaults();
-    float ReadFloat(const char* key, float def);
-    int ReadInt(const char* key, int def);
 };
 
 extern SSAOConfig gSSAOConfig;

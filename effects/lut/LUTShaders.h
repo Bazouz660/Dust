@@ -1,21 +1,7 @@
 #pragma once
 
-// Fullscreen triangle vertex shader (no vertex buffer needed)
-static const char* LUT_VS = R"(
-struct VSOut {
-    float4 pos : SV_Position;
-    float2 uv  : TEXCOORD0;
-};
-
-VSOut main(uint id : SV_VertexID) {
-    VSOut o;
-    o.uv  = float2((id << 1) & 2, id & 2);
-    o.pos = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1);
-    return o;
-}
-)";
-
 // LUT apply pixel shader (post-tonemap, operates on LDR B8G8R8A8_UNORM)
+// Vertex shader is provided by the framework via host->DrawFullscreenTriangle()
 // Expects a 1024x32 strip texture (32 slices of 32x32 for a 32^3 LUT)
 static const char* LUT_PS = R"(
 Texture2D sceneTex : register(t0);

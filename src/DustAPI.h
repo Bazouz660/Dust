@@ -1,18 +1,78 @@
 // DustAPI.h - Stable C API for Dust effect plugins.
 // This is the only header effect authors need to include.
 // Do NOT use C++ types or virtuals here - pure C for ABI stability.
+//
+// === Minimal v3 Post-Process Effect Example ===
+//
+//   #include "DustAPI.h"
+//   #include <d3d11.h>
+//
+//   static const char* PS = R"(
+//   Texture2D sceneTex : register(t0);
+//   SamplerState samp : register(s0);
+//   cbuffer P : register(b0) { float strength; float3 pad; };
+//   float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
+//       float3 c = sceneTex.SampleLevel(samp, uv, 0).rgb;
+//       float luma = dot(c, float3(0.299, 0.587, 0.114));
+//       return float4(lerp(c, luma.xxx, strength), 1);
+//   })";
+//
+//   static float gStrength = 0.5f;
+//   static bool gEnabled = true;
+//   static ID3D11PixelShader* gPS = NULL;
+//   static ID3D11Buffer* gCB = NULL;
+//
+//   static DustSettingDesc gSettings[] = {
+//       { "Enabled",  DUST_SETTING_BOOL,  &gEnabled,  0, 1, "Enabled" },
+//       { "Strength", DUST_SETTING_FLOAT, &gStrength, 0, 1, "Strength" },
+//   };
+//
+//   static int MyInit(ID3D11Device* dev, uint32_t w, uint32_t h, const DustHostAPI* host) {
+//       ID3DBlob* blob = host->CompileShader(PS, "main", "ps_5_0");
+//       if (!blob) return -1;
+//       dev->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), NULL, &gPS);
+//       blob->Release();
+//       gCB = host->CreateConstantBuffer(dev, 16);
+//       return 0;
+//   }
+//
+//   static void MyPost(const DustFrameContext* ctx, const DustHostAPI* host) {
+//       if (!gEnabled) return;
+//       ID3D11ShaderResourceView* scene = host->GetSceneCopy(ctx->context, "ldr_rt");
+//       if (!scene) return;
+//       host->SaveState(ctx->context);
+//       host->UpdateConstantBuffer(ctx->context, gCB, &gStrength, 4);
+//       // ... bind scene SRV, CB, sampler, set RTV + viewport ...
+//       host->DrawFullscreenTriangle(ctx->context, gPS);
+//       host->RestoreState(ctx->context);
+//   }
+//
+//   extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc) {
+//       memset(desc, 0, sizeof(*desc));
+//       desc->apiVersion     = DUST_API_VERSION;
+//       desc->name           = "Desaturate";
+//       desc->injectionPoint = DUST_INJECT_POST_TONEMAP;
+//       desc->flags          = DUST_FLAG_FRAMEWORK_CONFIG | DUST_FLAG_FRAMEWORK_TIMING;
+//       desc->Init           = MyInit;
+//       desc->postExecute    = MyPost;
+//       desc->IsEnabled      = []() -> int { return 1; };
+//       desc->settings       = gSettings;
+//       desc->settingCount   = 2;
+//       return 0;
+//   }
 
 #ifndef DUST_API_H
 #define DUST_API_H
 
 #include <d3d11.h>
+#include <d3dcommon.h>  // ID3DBlob (ID3D10Blob)
 #include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define DUST_API_VERSION 2
+#define DUST_API_VERSION 3
 
 // Injection points in the rendering pipeline
 typedef enum DustInjectionPoint {
@@ -62,23 +122,53 @@ typedef struct DustHostAPI {
     void (*BindSRV)(ID3D11DeviceContext* ctx, uint32_t baseSlot,
                     ID3D11ShaderResourceView* srv, ID3D11SamplerState* sampler);
     void (*UnbindSRV)(ID3D11DeviceContext* ctx, uint32_t baseSlot);
+
+    // === API v3 additions ===
+
+    // Shader compilation — plugins no longer need to link d3dcompiler.lib.
+    // Returns ID3DBlob* on success (caller must Release), NULL on failure.
+    ID3DBlob* (*CompileShader)(const char* hlslSource, const char* entryPoint, const char* target);
+    ID3DBlob* (*CompileShaderFromFile)(const char* filePath, const char* entryPoint, const char* target);
+
+    // Fullscreen draw helper — framework owns the VS and IA setup.
+    // Sets topology, null input layout, framework's fullscreen VS, the given PS, draws 3 vertices.
+    void (*DrawFullscreenTriangle)(ID3D11DeviceContext* ctx, ID3D11PixelShader* ps);
+
+    // Scene copy — copies the named RTV to a framework-managed texture.
+    // Returns an SRV to the copy. Texture is reused within the same frame.
+    // Recreated automatically on resolution change.
+    ID3D11ShaderResourceView* (*GetSceneCopy)(ID3D11DeviceContext* ctx, const char* rtvName);
+
+    // Constant buffer helpers
+    ID3D11Buffer* (*CreateConstantBuffer)(ID3D11Device* device, uint32_t sizeBytes);
+    void (*UpdateConstantBuffer)(ID3D11DeviceContext* ctx, ID3D11Buffer* cb,
+                                 const void* data, uint32_t sizeBytes);
 } DustHostAPI;
 
 // Setting types for the GUI settings descriptor (API v2+)
 typedef enum DustSettingType {
     DUST_SETTING_BOOL  = 0,
     DUST_SETTING_FLOAT = 1,
-    DUST_SETTING_INT   = 2
+    DUST_SETTING_INT   = 2,
+    // Hidden types (API v3+): persisted in INI but not shown in GUI
+    DUST_SETTING_HIDDEN_FLOAT = 3,
+    DUST_SETTING_HIDDEN_INT   = 4,
+    DUST_SETTING_HIDDEN_BOOL  = 5
 } DustSettingType;
 
 // Describes a single configurable setting exposed to the host GUI
 typedef struct DustSettingDesc {
     const char*     name;       // Display name
-    DustSettingType type;       // DUST_SETTING_BOOL, FLOAT, or INT
+    DustSettingType type;       // DUST_SETTING_BOOL, FLOAT, or INT (or HIDDEN_ variants)
     void*           valuePtr;   // Pointer to the setting's storage (bool*, float*, or int*)
     float           minVal;     // Min value (for FLOAT/INT sliders)
     float           maxVal;     // Max value (for FLOAT/INT sliders)
+    const char*     iniKey;     // INI key name (API v3+, NULL = use display name)
 } DustSettingDesc;
+
+// Effect descriptor flags (API v3+)
+#define DUST_FLAG_FRAMEWORK_CONFIG  1   // Framework handles INI load/save/hot-reload from settings array
+#define DUST_FLAG_FRAMEWORK_TIMING  2   // Framework handles GPU timestamp queries automatically
 
 // Effect callback signature
 typedef void (*DustEffectCallback)(const DustFrameContext* ctx, const DustHostAPI* host);
@@ -112,7 +202,13 @@ typedef struct DustEffectDesc {
     // Performance metrics (API v2+)
     // Plugin sets this to point to its own float that it updates each frame.
     // Host reads through the pointer for the performance display.
+    // Ignored for v3 plugins with DUST_FLAG_FRAMEWORK_TIMING.
     const float*        gpuTimeMsPtr;    // Pointer to plugin's GPU time in ms (NULL if not measured)
+
+    // === API v3 additions ===
+    uint32_t            flags;           // DUST_FLAG_* bitmask (0 for v2 behavior)
+    const char*         configSection;   // INI section name (NULL = use effect name)
+    const char*         _effectDir;      // Set by framework after DustEffectCreate — DLL directory (read-only)
 } DustEffectDesc;
 
 // Every effect DLL must export this function.

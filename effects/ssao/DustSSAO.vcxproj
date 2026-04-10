@@ -64,7 +64,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>d3d11.lib;d3dcompiler.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -80,15 +80,12 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>d3d11.lib;d3dcompiler.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="DustSSAO.cpp" />
     <ClCompile Include="SSAORenderer.cpp" />
-    <ClCompile Include="SSAOConfig.cpp" />
-    <ClCompile Include="SSAOMenu.cpp" />
-    <ClCompile Include="D3D11StateBlock.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\src\DustAPI.h" />
@@ -96,8 +93,6 @@
     <ClInclude Include="SSAORenderer.h" />
     <ClInclude Include="SSAOShaders.h" />
     <ClInclude Include="SSAOConfig.h" />
-    <ClInclude Include="SSAOMenu.h" />
-    <ClInclude Include="D3D11StateBlock.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
