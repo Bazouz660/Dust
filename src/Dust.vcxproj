@@ -116,6 +116,9 @@
     <ClInclude Include="imgui\backends\imgui_impl_win32.h" />
     <ClInclude Include="imgui\backends\imgui_impl_dx11.h" />
   </ItemGroup>
+  <ItemGroup>
+    <None Include="shaders\fullscreen_vs.hlsl" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

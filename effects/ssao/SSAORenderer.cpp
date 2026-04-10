@@ -1,8 +1,8 @@
 #include "SSAORenderer.h"
-#include "SSAOShaders.h"
 #include "SSAOConfig.h"
 #include "DustLog.h"
 #include <cstring>
+#include <string>
 
 namespace SSAORenderer
 {
@@ -11,6 +11,7 @@ static bool gInitialized = false;
 static UINT gWidth = 0;
 static UINT gHeight = 0;
 static const DustHostAPI* gHost = nullptr;
+static std::string gShaderDir;
 
 // AO textures (ping-pong for gen + blur)
 static ID3D11Texture2D*          gAoTex = nullptr;
@@ -98,30 +99,31 @@ static bool CreateR8Texture(ID3D11Device* device, UINT width, UINT height,
 
 // ==================== Public API ====================
 
-bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host)
+bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host, const char* effectDir)
 {
     if (gInitialized)
         return true;
 
     gHost = host;
-    Log("Initializing SSAORenderer (%ux%u)", width, height);
+    gShaderDir = std::string(effectDir) + "\\shaders\\";
+    Log("Initializing SSAORenderer (%ux%u), shaders: %s", width, height, gShaderDir.c_str());
     gWidth = width;
     gHeight = height;
 
-    // Compile all shaders via host API
-    ID3DBlob* vsBlob = host->CompileShader(g_FullscreenVS, "main", "vs_5_0");
+    // Compile all shaders from .hlsl files
+    ID3DBlob* vsBlob = host->CompileShaderFromFile((gShaderDir + "fullscreen_vs.hlsl").c_str(), "main", "vs_5_0");
     if (!vsBlob) return false;
 
-    ID3DBlob* genBlob = host->CompileShader(g_SSAOGenPS, "main", "ps_5_0");
+    ID3DBlob* genBlob = host->CompileShaderFromFile((gShaderDir + "ssao_gen_ps.hlsl").c_str(), "main", "ps_5_0");
     if (!genBlob) { vsBlob->Release(); return false; }
 
-    ID3DBlob* blurHBlob = host->CompileShader(g_SSAOBlurHPS, "main", "ps_5_0");
+    ID3DBlob* blurHBlob = host->CompileShaderFromFile((gShaderDir + "ssao_blur_h_ps.hlsl").c_str(), "main", "ps_5_0");
     if (!blurHBlob) { vsBlob->Release(); genBlob->Release(); return false; }
 
-    ID3DBlob* blurVBlob = host->CompileShader(g_SSAOBlurVPS, "main", "ps_5_0");
+    ID3DBlob* blurVBlob = host->CompileShaderFromFile((gShaderDir + "ssao_blur_v_ps.hlsl").c_str(), "main", "ps_5_0");
     if (!blurVBlob) { vsBlob->Release(); genBlob->Release(); blurHBlob->Release(); return false; }
 
-    ID3DBlob* debugBlob = host->CompileShader(g_SSAODebugPS, "main", "ps_5_0");
+    ID3DBlob* debugBlob = host->CompileShaderFromFile((gShaderDir + "ssao_debug_ps.hlsl").c_str(), "main", "ps_5_0");
     if (!debugBlob) { vsBlob->Release(); genBlob->Release(); blurHBlob->Release(); blurVBlob->Release(); return false; }
 
     HRESULT hr;

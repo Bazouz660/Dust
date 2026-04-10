@@ -13,8 +13,8 @@
   <PropertyGroup Label="Globals">
     <VCProjectVersion>17.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
-    <ProjectGuid>{D4E5F6A7-B8C9-0123-DEFA-234567890123}</ProjectGuid>
-    <RootNamespace>DustBloom</RootNamespace>
+    <ProjectGuid>{E5F6A7B8-C9D0-1234-EFAB-345678901234}</ProjectGuid>
+    <RootNamespace>DustSSIL</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -46,12 +46,12 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <OutDir>$(ProjectDir)build\Debug\</OutDir>
     <IntDir>$(ProjectDir)build\Debug\obj\</IntDir>
-    <TargetName>DustBloom</TargetName>
+    <TargetName>DustSSIL</TargetName>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <OutDir>$(ProjectDir)build\Release\</OutDir>
     <IntDir>$(ProjectDir)build\Release\obj\</IntDir>
-    <TargetName>DustBloom</TargetName>
+    <TargetName>DustSSIL</TargetName>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
@@ -84,15 +84,22 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="DustBloom.cpp" />
+    <ClCompile Include="DustSSIL.cpp" />
+    <ClCompile Include="SSILRenderer.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\src\DustAPI.h" />
     <ClInclude Include="DustLog.h" />
-    <None Include="shaders\bloom_extract_ps.hlsl" />
-    <None Include="shaders\bloom_downsample_ps.hlsl" />
-    <None Include="shaders\bloom_upsample_ps.hlsl" />
-    <None Include="shaders\bloom_composite_ps.hlsl" />
+    <ClInclude Include="SSILRenderer.h" />
+    <ClInclude Include="SSILConfig.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="shaders\fullscreen_vs.hlsl" />
+    <None Include="shaders\ssil_gen_ps.hlsl" />
+    <None Include="shaders\ssil_blur_h_ps.hlsl" />
+    <None Include="shaders\ssil_blur_v_ps.hlsl" />
+    <None Include="shaders\ssil_composite_ps.hlsl" />
+    <None Include="shaders\ssil_debug_ps.hlsl" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

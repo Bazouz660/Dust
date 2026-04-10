@@ -8,6 +8,7 @@
 
 #include <d3d11.h>
 #include <cstring>
+#include <string>
 
 static const DustHostAPI* gHost = nullptr;
 
@@ -174,6 +175,17 @@ static void SSAOPostExecute(const DustFrameContext* ctx, const DustHostAPI* host
     }
 }
 
+static HMODULE gPluginModule = nullptr;
+
+static std::string GetPluginDir()
+{
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(gPluginModule, path, MAX_PATH);
+    std::string s(path);
+    auto pos = s.find_last_of("\\/");
+    return (pos != std::string::npos) ? s.substr(0, pos) : s;
+}
+
 static int SSAOInit(ID3D11Device* device, uint32_t width, uint32_t height, const DustHostAPI* host)
 {
     gHost = host;
@@ -190,7 +202,8 @@ static int SSAOInit(ID3D11Device* device, uint32_t width, uint32_t height, const
     if (!CreateParamsTexture(device))
         return -3;
 
-    if (!SSAORenderer::Init(device, width, height, host))
+    std::string pluginDir = GetPluginDir();
+    if (!SSAORenderer::Init(device, width, height, host, pluginDir.c_str()))
         return -3;
 
     Log("SSAO: Initialized (%ux%u)", width, height);
@@ -276,6 +289,9 @@ extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
 {
     if (reason == DLL_PROCESS_ATTACH)
+    {
         DisableThreadLibraryCalls(hModule);
+        gPluginModule = hModule;
+    }
     return TRUE;
 }

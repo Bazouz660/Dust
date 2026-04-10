@@ -5,16 +5,26 @@
 
 #include "../../src/DustAPI.h"
 #include "DustLog.h"
-#include "LUTShaders.h"
 
 #include <d3d11.h>
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <string>
 
 DustLogFn gLogFn = nullptr;
 static const DustHostAPI* gHost = nullptr;
 static ID3D11Device* gDevice = nullptr;
+static HMODULE gPluginModule = nullptr;
+
+static std::string GetPluginDir()
+{
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(gPluginModule, path, MAX_PATH);
+    std::string s(path);
+    auto pos = s.find_last_of("\\/");
+    return (pos != std::string::npos) ? s.substr(0, pos) : s;
+}
 
 // ==================== Config ====================
 
@@ -197,8 +207,9 @@ static int LUTInit(ID3D11Device* device, uint32_t width, uint32_t height, const 
 #define Log DustLog
     gDevice = device;
 
-    // Compile pixel shader via framework
-    ID3DBlob* psBlob = host->CompileShader(LUT_PS, "main", "ps_5_0");
+    // Compile pixel shader from file
+    std::string shaderPath = GetPluginDir() + "\\shaders\\lut_ps.hlsl";
+    ID3DBlob* psBlob = host->CompileShaderFromFile(shaderPath.c_str(), "main", "ps_5_0");
     if (!psBlob) return -1;
 
     HRESULT hr = device->CreatePixelShader(psBlob->GetBufferPointer(),
@@ -397,6 +408,9 @@ extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
 {
     if (reason == DLL_PROCESS_ATTACH)
+    {
         DisableThreadLibraryCalls(hModule);
+        gPluginModule = hModule;
+    }
     return TRUE;
 }

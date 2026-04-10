@@ -42,3 +42,15 @@ jobs:
           msbuild effects\lut\DustLUT.vcxproj
           /p:Configuration=Release
           /p:Platform=x64
+
+      - name: Build Bloom plugin (DustBloom.dll)
+        run: >
+          msbuild effects\bloom\DustBloom.vcxproj
+          /p:Configuration=Release
+          /p:Platform=x64
+
+      - name: Build SSIL plugin (DustSSIL.dll)
+        run: >
+          msbuild effects\ssil\DustSSIL.vcxproj
+          /p:Configuration=Release
+          /p:Platform=x64

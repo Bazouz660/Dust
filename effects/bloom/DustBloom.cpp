@@ -4,14 +4,24 @@
 
 #include "../../src/DustAPI.h"
 #include "DustLog.h"
-#include "BloomShaders.h"
 
 #include <d3d11.h>
 #include <cstring>
+#include <string>
 
 DustLogFn gLogFn = nullptr;
 static const DustHostAPI* gHost = nullptr;
 static ID3D11Device* gDevice = nullptr;
+static HMODULE gPluginModule = nullptr;
+
+static std::string GetPluginDir()
+{
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(gPluginModule, path, MAX_PATH);
+    std::string s(path);
+    auto pos = s.find_last_of("\\/");
+    return (pos != std::string::npos) ? s.substr(0, pos) : s;
+}
 
 // ==================== Config ====================
 
@@ -120,10 +130,13 @@ static ID3D11ShaderResourceView* gHdrCopySRV = nullptr;
 
 // ==================== Init / Shutdown ====================
 
-static ID3D11PixelShader* CompilePS(const char* source, const char* name)
+static std::string gShaderDir;
+
+static ID3D11PixelShader* CompilePS(const char* filename, const char* name)
 {
-    ID3DBlob* blob = gHost->CompileShader(source, "main", "ps_5_0");
-    if (!blob) { Log("Bloom: Failed to compile %s", name); return nullptr; }
+    std::string path = gShaderDir + filename;
+    ID3DBlob* blob = gHost->CompileShaderFromFile(path.c_str(), "main", "ps_5_0");
+    if (!blob) { Log("Bloom: Failed to compile %s from %s", name, path.c_str()); return nullptr; }
 
     ID3D11PixelShader* ps = nullptr;
     HRESULT hr = gDevice->CreatePixelShader(blob->GetBufferPointer(),
@@ -140,12 +153,13 @@ static int BloomInit(ID3D11Device* device, uint32_t width, uint32_t height, cons
     gLogFn = host->Log;
 #define Log DustLog
     gDevice = device;
+    gShaderDir = GetPluginDir() + "\\shaders\\";
 
-    // Compile shaders
-    gExtractPS    = CompilePS(BLOOM_EXTRACT_PS,    "extract");
-    gDownsamplePS = CompilePS(BLOOM_DOWNSAMPLE_PS, "downsample");
-    gUpsamplePS   = CompilePS(BLOOM_UPSAMPLE_PS,   "upsample");
-    gCompositePS  = CompilePS(BLOOM_COMPOSITE_PS,   "composite");
+    // Compile shaders from .hlsl files
+    gExtractPS    = CompilePS("bloom_extract_ps.hlsl",    "extract");
+    gDownsamplePS = CompilePS("bloom_downsample_ps.hlsl", "downsample");
+    gUpsamplePS   = CompilePS("bloom_upsample_ps.hlsl",   "upsample");
+    gCompositePS  = CompilePS("bloom_composite_ps.hlsl",   "composite");
     if (!gExtractPS || !gDownsamplePS || !gUpsamplePS || !gCompositePS)
         return -1;
 
@@ -386,6 +400,9 @@ extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
 {
     if (reason == DLL_PROCESS_ATTACH)
+    {
         DisableThreadLibraryCalls(hModule);
+        gPluginModule = hModule;
+    }
     return TRUE;
 }

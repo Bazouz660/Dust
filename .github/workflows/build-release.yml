@@ -67,17 +67,36 @@ jobs:
           /p:Configuration=Release
           /p:Platform=x64
 
+      - name: Build Bloom plugin (DustBloom.dll)
+        run: >
+          msbuild effects\bloom\DustBloom.vcxproj
+          /p:Configuration=Release
+          /p:Platform=x64
+
+      - name: Build SSIL plugin (DustSSIL.dll)
+        run: >
+          msbuild effects\ssil\DustSSIL.vcxproj
+          /p:Configuration=Release
+          /p:Platform=x64
+
       - name: Package release
         run: |
           mkdir release\Dust\shaders
           mkdir release\Dust\effects
+          mkdir release\Dust\effects\shaders
           copy src\build\Release\Dust.dll release\Dust\
+          copy src\shaders\fullscreen_vs.hlsl release\Dust\shaders\
           copy effects\ssao\build\Release\DustSSAO.dll release\Dust\effects\
           copy effects\lut\build\Release\DustLUT.dll release\Dust\effects\
+          copy effects\bloom\build\Release\DustBloom.dll release\Dust\effects\
+          copy effects\ssil\build\Release\DustSSIL.dll release\Dust\effects\
+          xcopy /Y effects\ssao\shaders\* release\Dust\effects\shaders\
+          xcopy /Y effects\lut\shaders\* release\Dust\effects\shaders\
+          xcopy /Y effects\bloom\shaders\* release\Dust\effects\shaders\
+          xcopy /Y effects\ssil\shaders\* release\Dust\effects\shaders\
           copy mod\Dust.mod release\Dust\
           copy mod\Dust.ini release\Dust\
           copy mod\RE_Kenshi.json release\Dust\
-          copy mod\shaders\deferred.hlsl release\Dust\shaders\
           cd release
           tar -acf ..\Dust-${{ steps.version.outputs.label }}.zip Dust
 
