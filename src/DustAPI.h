@@ -209,6 +209,7 @@ typedef struct DustEffectDesc {
     uint32_t            flags;           // DUST_FLAG_* bitmask (0 for v2 behavior)
     const char*         configSection;   // INI section name (NULL = use effect name)
     const char*         _effectDir;      // Set by framework after DustEffectCreate — DLL directory (read-only)
+    int32_t             priority;        // Dispatch order within same injection point (lower = earlier, default 0)
 } DustEffectDesc;
 
 // Every effect DLL must export this function.

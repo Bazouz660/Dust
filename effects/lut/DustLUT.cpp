@@ -1,6 +1,7 @@
-// DustLUT.cpp - Color grading LUT effect plugin for Dust (API v3)
-// Generates a 32^3 LUT from parametric color grading settings,
-// then applies it as a post-process on the LDR target.
+// DustLUT.cpp - HDR color pipeline for Dust (API v3)
+// Captures HDR scene before game tonemaps, then applies:
+//   exposure -> ACES tonemap -> LUT color grading -> dither
+// in a single full-precision pass. Only quantization is the final 8-bit write.
 
 #include "../../src/DustAPI.h"
 #include "DustLog.h"
@@ -20,6 +21,7 @@ static ID3D11Device* gDevice = nullptr;
 struct LUTConfig {
     bool enabled       = true;
     float intensity    = 1.0f;
+    float exposure     = 0.0f;    // EV stops (-3 to 3)
 
     // Lift / Gamma / Gain (applied in log space)
     float lift         = 0.0f;    // Shadows offset (-0.1 to 0.1)
@@ -104,7 +106,8 @@ static bool GenerateLUT(ID3D11Device* device)
     const UINT stripWidth = LUT_SIZE * LUT_SIZE;
     const UINT stripHeight = LUT_SIZE;
 
-    uint32_t* pixels = new uint32_t[stripWidth * stripHeight];
+    // Full float precision — no 8-bit quantization in the LUT itself
+    float* pixels = new float[stripWidth * stripHeight * 4];
 
     for (UINT bIdx = 0; bIdx < LUT_SIZE; bIdx++)
     {
@@ -121,10 +124,11 @@ static bool GenerateLUT(ID3D11Device* device)
 
                 UINT x = bIdx * LUT_SIZE + rIdx;
                 UINT y = gIdx;
-                uint8_t rr = (uint8_t)(outR * 255.0f + 0.5f);
-                uint8_t gg = (uint8_t)(outG * 255.0f + 0.5f);
-                uint8_t bb = (uint8_t)(outB * 255.0f + 0.5f);
-                pixels[y * stripWidth + x] = (255u << 24) | (bb << 16) | (gg << 8) | rr;
+                UINT idx = (y * stripWidth + x) * 4;
+                pixels[idx + 0] = outR;
+                pixels[idx + 1] = outG;
+                pixels[idx + 2] = outB;
+                pixels[idx + 3] = 1.0f;
             }
         }
     }
@@ -134,14 +138,14 @@ static bool GenerateLUT(ID3D11Device* device)
     desc.Height = stripHeight;
     desc.MipLevels = 1;
     desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
     desc.SampleDesc.Count = 1;
     desc.Usage = D3D11_USAGE_DEFAULT;
     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
     D3D11_SUBRESOURCE_DATA init = {};
     init.pSysMem = pixels;
-    init.SysMemPitch = stripWidth * 4;
+    init.SysMemPitch = stripWidth * 16;  // 4 floats * 4 bytes
 
     HRESULT hr = device->CreateTexture2D(&desc, &init, &gLutTex);
     delete[] pixels;
@@ -176,8 +180,12 @@ static ID3D11RasterizerState* gRasterState = nullptr;
 struct LUTParams {
     float intensity;
     float lutSize;
-    float pad[2];
+    float exposure;
+    float pad;
 };
+
+// HDR scene captured in preExecute, used in postExecute
+static ID3D11ShaderResourceView* gHdrCopySRV = nullptr;
 
 // ==================== Init / Shutdown ====================
 
@@ -264,33 +272,44 @@ static void LUTOnResolutionChanged(ID3D11Device* device, uint32_t w, uint32_t h)
 
 // ==================== Per-frame ====================
 
+// preExecute: fires BEFORE the game's tonemap draw.
+// HDR RT is still intact — capture it for our own tonemap pass.
+static void LUTPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
+{
+    if (!gConfig.enabled)
+        return;
+
+    gHdrCopySRV = host->GetSceneCopy(ctx->context, "hdr_rt");
+}
+
+// postExecute: fires AFTER the game's tonemap draw.
+// Overwrite the LDR target with our HDR -> tonemap -> LUT -> dither pipeline.
 static void LUTPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
 {
-    if (!gConfig.enabled || gConfig.intensity <= 0.0f)
+    if (!gConfig.enabled || !gHdrCopySRV || !gLutSRV)
+    {
+        gHdrCopySRV = nullptr;
         return;
+    }
 
     ID3D11RenderTargetView* ldrRTV = host->GetRTV("ldr_rt");
-    if (!ldrRTV || !gLutSRV)
+    if (!ldrRTV)
+    {
+        gHdrCopySRV = nullptr;
         return;
-
-    // Get scene copy via framework
-    ID3D11ShaderResourceView* sceneSRV = host->GetSceneCopy(ctx->context, "ldr_rt");
-    if (!sceneSRV)
-        return;
+    }
 
     ID3D11DeviceContext* dc = ctx->context;
 
-    // Save GPU state
     host->SaveState(dc);
 
-    // Update constant buffer via framework
-    LUTParams params = { gConfig.intensity, (float)LUT_SIZE, {0, 0} };
+    LUTParams params = { gConfig.intensity, (float)LUT_SIZE, gConfig.exposure, 0.0f };
     host->UpdateConstantBuffer(dc, gCB, &params, sizeof(params));
 
-    // Set pipeline state
     dc->PSSetConstantBuffers(0, 1, &gCB);
 
-    ID3D11ShaderResourceView* srvs[] = { sceneSRV, gLutSRV };
+    // t0 = HDR scene copy, t1 = float LUT
+    ID3D11ShaderResourceView* srvs[] = { gHdrCopySRV, gLutSRV };
     dc->PSSetShaderResources(0, 2, srvs);
 
     ID3D11SamplerState* samplers[] = { gPointSampler, gLinearSampler };
@@ -307,11 +326,10 @@ static void LUTPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     vp.MaxDepth = 1.0f;
     dc->RSSetViewports(1, &vp);
 
-    // Draw fullscreen triangle via framework
     host->DrawFullscreenTriangle(dc, gPS);
 
-    // Restore GPU state
     host->RestoreState(dc);
+    gHdrCopySRV = nullptr;
 }
 
 static int LUTIsEnabled()
@@ -325,6 +343,7 @@ static int LUTIsEnabled()
 
 static DustSettingDesc gLUTSettingsArray[] = {
     { "Enabled",          DUST_SETTING_BOOL,  &gConfig.enabled,     0.0f,  1.0f, "Enabled" },
+    { "Exposure",         DUST_SETTING_FLOAT, &gConfig.exposure,   -3.0f,  3.0f, "Exposure" },
     { "Intensity",        DUST_SETTING_FLOAT, &gConfig.intensity,   0.0f,  1.0f, "Intensity" },
     { "Lift (Shadows)",   DUST_SETTING_FLOAT, &gConfig.lift,       -0.1f,  0.1f, "Lift" },
     { "Gamma (Midtones)", DUST_SETTING_FLOAT, &gConfig.gamma,       0.8f,  1.2f, "Gamma" },
@@ -361,7 +380,7 @@ extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
     desc->Init              = LUTInit;
     desc->Shutdown          = LUTShutdown;
     desc->OnResolutionChanged = LUTOnResolutionChanged;
-    desc->preExecute        = nullptr;
+    desc->preExecute        = LUTPreExecute;
     desc->postExecute       = LUTPostExecute;
     desc->IsEnabled         = LUTIsEnabled;
     desc->settings          = gLUTSettingsArray;

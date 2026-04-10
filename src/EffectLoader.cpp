@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <unordered_map>
+#include <algorithm>
 
 EffectLoader gEffectLoader;
 
@@ -587,6 +588,15 @@ int EffectLoader::LoadAll(const char* effectsDir)
     } while (FindNextFileA(hFind, &fd));
 
     FindClose(hFind);
+
+    // Sort by (injectionPoint, priority) so effects dispatch in the right order
+    std::stable_sort(effects_.begin(), effects_.end(),
+        [](const LoadedEffect& a, const LoadedEffect& b) {
+            if (a.desc.injectionPoint != b.desc.injectionPoint)
+                return a.desc.injectionPoint < b.desc.injectionPoint;
+            return a.desc.priority < b.desc.priority;
+        });
+
     Log("Loaded %d effect plugin(s)", loaded);
     return loaded;
 }
