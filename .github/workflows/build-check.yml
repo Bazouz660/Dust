@@ -60,3 +60,9 @@ jobs:
           msbuild effects\sss\DustSSS.vcxproj
           /p:Configuration=Release
           /p:Platform=x64
+
+      - name: Build Clarity plugin (DustClarity.dll)
+        run: >
+          msbuild effects\clarity\DustClarity.vcxproj
+          /p:Configuration=Release
+          /p:Platform=x64

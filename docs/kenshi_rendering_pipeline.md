@@ -296,7 +296,7 @@ Dust defines injection points as `DustInjectionPoint` values in `DustAPI.h`. Eff
 | Injection Point | Pipeline Location              | Available Resources                    | Current Effects             |
 |-----------------|--------------------------------|----------------------------------------|-----------------------------|
 | `POST_LIGHTING` | Around deferred lighting draw  | Depth SRV, albedo SRV, normals SRV, HDR RTV | SSAO (pri 0), SSIL (pri 10), SSS (pri 20) |
-| `POST_TONEMAP`  | Around tone mapping draw       | HDR RTV (pre), LDR RTV (post)          | LUT (pri 0), Bloom (pri 100)|
+| `POST_TONEMAP`  | Around tone mapping draw       | HDR RTV (pre), LDR RTV (post)          | LUT (pri 0), Clarity (pri 50), Bloom (pri 100)|
 
 ### SSAO — ambient-only occlusion (`POST_LIGHTING`, priority 0)
 
@@ -313,6 +313,10 @@ Runs in `preExecute`: captures a copy of the R11G11B10_FLOAT HDR render target b
 ### SSS — screen-space contact shadows (`POST_LIGHTING`, priority 20)
 
 Runs in `preExecute`: extracts the sun direction and inverse view matrix from the game's PS constant buffer (CB0) — `sunDirection` at register c0, `inverseView` at c8–c11 — and computes a view-space light direction. Runs in `postExecute`: ray marches each pixel toward the sun in view space using the depth buffer with quadratic step distribution and per-pixel jitter, blurs the shadow mask with a bilateral filter, then composites multiplicatively onto the HDR render target. Adds sharp contact shadows that complement the game's low-resolution shadow map.
+
+### Clarity — local contrast enhancement (`POST_TONEMAP`, priority 50)
+
+Runs in `postExecute`: copies the current LDR scene (after LUT), applies a large-radius separable Gaussian blur (configurable, default 8px) to extract low-frequency content, then composites `original + (original - blurred) * strength` back onto the LDR target. A luminance-based midtone mask protects shadows and highlights from clipping. Runs after LUT so it enhances already-graded colors, and before Bloom so bloom responds to the clarity-enhanced image.
 
 ### Bloom — physically-motivated bloom (`POST_TONEMAP`, priority 100)
 

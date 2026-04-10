@@ -23,7 +23,7 @@ Game Render Pipeline:
   GBuffer Fill -> Deferred Lighting -> Fog -> Post-Processing -> Tonemapping -> Present
                         |                                              |
                   POST_LIGHTING                                  POST_TONEMAP
-                  (SSAO, SSIL, SSS)                              (LUT, Bloom)
+                  (SSAO, SSIL, SSS)                              (LUT, Clarity, Bloom)
 ```
 
 Effects register at specific injection points. When Dust detects a matching render pass, it dispatches registered effects (in priority order) with full access to the relevant GPU resources.
@@ -104,6 +104,13 @@ The host provides a `DustHostAPI` struct with functions for logging, resource ac
 - **Depth-aware bilateral blur**: Smooths the shadow mask without bleeding across depth edges
 - **Debug visualization**: Overlay mode to inspect the raw shadow mask
 
+### Clarity / Local Contrast — `POST_TONEMAP`, priority 50
+
+- **Midtone detail enhancement**: Extracts and amplifies local contrast by subtracting a large-radius Gaussian blur from the original scene
+- **Midtone protection**: Luminance-based mask focuses the effect on midtones, preventing clipping in shadows and highlights
+- **Variable blur radius**: Configurable Gaussian kernel radius controls the spatial scale of "local" contrast (small = fine detail, large = broad structure)
+- **Debug visualization**: Overlay mode shows the extracted detail layer (gray = neutral, bright = positive detail, dark = negative)
+
 ### Bloom — `POST_TONEMAP`, priority 100
 
 - **Physically-motivated bloom**: Runs after LUT so bloom is applied to graded colors
@@ -152,12 +159,14 @@ A startup toast notification appears for 30 seconds indicating the mod is active
                ├── DustSSAO.dll
                ├── DustSSIL.dll
                ├── DustSSS.dll
+               ├── DustClarity.dll
                ├── DustLUT.dll
                ├── DustBloom.dll
                └── shaders/
                    ├── ssao_*.hlsl
                    ├── ssil_*.hlsl
                    ├── sss_*.hlsl
+                   ├── clarity_*.hlsl
                    ├── lut_ps.hlsl
                    ├── bloom_*.hlsl
                    └── fullscreen_vs.hlsl
@@ -252,6 +261,17 @@ BlurSharpness=0.01
 DebugView=0
 ```
 
+### Clarity.ini
+
+```ini
+[Clarity]
+Enabled=1
+Strength=0.4
+MidtoneProtect=0.5
+BlurRadius=8
+DebugView=0
+```
+
 ### Bloom.ini
 
 ```ini
@@ -298,6 +318,7 @@ msbuild effects\ssil\DustSSIL.vcxproj /p:Configuration=Release /p:Platform=x64
 msbuild effects\lut\DustLUT.vcxproj   /p:Configuration=Release /p:Platform=x64
 msbuild effects\bloom\DustBloom.vcxproj /p:Configuration=Release /p:Platform=x64
 msbuild effects\sss\DustSSS.vcxproj   /p:Configuration=Release /p:Platform=x64
+msbuild effects\clarity\DustClarity.vcxproj /p:Configuration=Release /p:Platform=x64
 ```
 
 ### Deployment
@@ -316,6 +337,7 @@ Copy the following into `<Kenshi>/mods/Dust/`:
 | `effects/lut/build/Release/DustLUT.dll` | `effects/DustLUT.dll` |
 | `effects/bloom/build/Release/DustBloom.dll` | `effects/DustBloom.dll` |
 | `effects/sss/build/Release/DustSSS.dll` | `effects/DustSSS.dll` |
+| `effects/clarity/build/Release/DustClarity.dll` | `effects/DustClarity.dll` |
 | `effects/*/shaders/*.hlsl` | `effects/shaders/` |
 
 ### Creating a New Effect Plugin
@@ -353,6 +375,7 @@ GPU costs are measured via D3D11 timestamp queries and displayed in the in-game 
 | SSAO   | 3 (generate + blur H + blur V) | ~1–3 ms |
 | SSIL   | 3 (generate + blur H + blur V) | ~2–5 ms |
 | SSS    | 3 (generate + blur H + blur V) + 1 composite | ~1–3 ms |
+| Clarity| 3 (blur H + blur V + composite) | ~0.3–1 ms |
 | LUT    | 1 (HDR → ACES → LUT → dither) | ~0.1–0.3 ms |
 | Bloom  | ~6 (extract + downsample × 2 + upsample × 2 + composite) | ~0.5–1.5 ms |
 
