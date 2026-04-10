@@ -129,6 +129,8 @@ float4 main_fs (
 
 	// [Dust] Ambient occlusion texture — bound by Dust framework at runtime
 	uniform sampler aoMap 				: register(s8),
+	// [Dust] AO params — .r = direct light occlusion factor (0 = ambient only, 1 = full AO on direct)
+	uniform sampler aoParams 			: register(s9),
 
 	uniform float4 ambientParams,
 	uniform float4x4 proj,
@@ -220,12 +222,16 @@ float4 main_fs (
 	envLight.diffuse *= ambientMult.rgb * envColour.w;
 	envLight.specular *= ambientMult.rgb * envColour.w;
 
-	// [Dust] Apply ambient occlusion to indirect/environment lighting only.
-	// AO does not affect direct sunlight — only ambient and IBL contributions.
-	// This ensures AO visibility is consistent regardless of auto-exposure.
+	// [Dust] Apply ambient occlusion — always to indirect light, optionally to direct light.
+	// directAO controls how much AO bleeds into direct sunlight (0 = ambient only, 1 = full).
 	float ao = tex2D(aoMap, texCoord).r;
+	float directAO = tex2D(aoParams, texCoord).r;
+
 	envLight.diffuse *= ao;
 	envLight.specular *= ao;
+	float directFade = lerp(1.0, ao, directAO);
+	sunLight.diffuse *= directFade;
+	sunLight.specular *= directFade;
 
 	LightingData ld = (LightingData)0.0f;
 	ld.diffuse = sunLight.diffuse + envLight.diffuse;

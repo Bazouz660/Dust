@@ -22,6 +22,10 @@ static ID3D11SamplerState* gAoSampler = nullptr;
 static ID3D11Texture2D* gWhiteTex = nullptr;
 static ID3D11ShaderResourceView* gWhiteSRV = nullptr;
 
+// 1x1 dynamic texture for passing directLightOcclusion to deferred.hlsl (slot 9)
+static ID3D11Texture2D* gParamsTex = nullptr;
+static ID3D11ShaderResourceView* gParamsSRV = nullptr;
+
 static bool CreateAoSampler(ID3D11Device* device)
 {
     D3D11_SAMPLER_DESC sd = {};
@@ -75,8 +79,54 @@ static bool CreateWhiteFallback(ID3D11Device* device)
     return true;
 }
 
+static bool CreateParamsTexture(ID3D11Device* device)
+{
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = 1;
+    desc.Height = 1;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DYNAMIC;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+
+    HRESULT hr = device->CreateTexture2D(&desc, nullptr, &gParamsTex);
+    if (FAILED(hr))
+    {
+        Log("SSAO: Failed to create params texture: 0x%08X", hr);
+        return false;
+    }
+
+    hr = device->CreateShaderResourceView(gParamsTex, nullptr, &gParamsSRV);
+    if (FAILED(hr))
+    {
+        Log("SSAO: Failed to create params SRV: 0x%08X", hr);
+        gParamsTex->Release();
+        gParamsTex = nullptr;
+        return false;
+    }
+    return true;
+}
+
+static void UpdateParamsTexture(ID3D11DeviceContext* ctx)
+{
+    if (!gParamsTex) return;
+
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT hr = ctx->Map(gParamsTex, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (SUCCEEDED(hr))
+    {
+        uint8_t val = (uint8_t)(gSSAOConfig.directLightOcclusion * 255.0f + 0.5f);
+        *(uint8_t*)mapped.pData = val;
+        ctx->Unmap(gParamsTex, 0);
+    }
+}
+
 // The register declared in deferred.hlsl for aoMap
 static const uint32_t AO_REGISTER = 8;
+static const uint32_t AO_PARAMS_REGISTER = 9;
 
 // Called BEFORE the game's lighting draw
 static void SSAOPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
@@ -87,6 +137,10 @@ static void SSAOPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
 
     if (!SSAORenderer::IsInitialized())
         return;
+
+    // Update and bind the direct-light occlusion parameter (slot 9)
+    UpdateParamsTexture(ctx->context);
+    host->BindSRV(ctx->context, AO_PARAMS_REGISTER, gParamsSRV, gAoSampler);
 
     if (!gSSAOConfig.enabled)
     {
@@ -107,8 +161,9 @@ static void SSAOPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
 // Called AFTER the game's lighting draw
 static void SSAOPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
 {
-    // Unbind the AO slot
+    // Unbind AO and params slots
     host->UnbindSRV(ctx->context, AO_REGISTER);
+    host->UnbindSRV(ctx->context, AO_PARAMS_REGISTER);
 
     // Debug overlay
     if (gSSAOConfig.debugView && gSSAOConfig.enabled)
@@ -132,6 +187,9 @@ static int SSAOInit(ID3D11Device* device, uint32_t width, uint32_t height, const
     if (!CreateWhiteFallback(device))
         return -2;
 
+    if (!CreateParamsTexture(device))
+        return -3;
+
     if (!SSAORenderer::Init(device, width, height, host))
         return -3;
 
@@ -143,9 +201,11 @@ static void SSAOShutdown()
 {
     SSAORenderer::Shutdown();
 
-    if (gAoSampler) { gAoSampler->Release(); gAoSampler = nullptr; }
-    if (gWhiteSRV)  { gWhiteSRV->Release();  gWhiteSRV = nullptr; }
-    if (gWhiteTex)  { gWhiteTex->Release();   gWhiteTex = nullptr; }
+    if (gAoSampler)  { gAoSampler->Release();  gAoSampler = nullptr; }
+    if (gWhiteSRV)   { gWhiteSRV->Release();  gWhiteSRV = nullptr; }
+    if (gWhiteTex)   { gWhiteTex->Release();   gWhiteTex = nullptr; }
+    if (gParamsSRV)  { gParamsSRV->Release();  gParamsSRV = nullptr; }
+    if (gParamsTex)  { gParamsTex->Release();  gParamsTex = nullptr; }
 
     Log("SSAO: Shut down");
 }
@@ -178,6 +238,7 @@ static DustSettingDesc gSettingsArray[] = {
     { "Min Screen Radius",  DUST_SETTING_FLOAT, &gSSAOConfig.minScreenRadius,    0.0001f, 0.01f,  "MinScreenRadius" },
     { "Blur Sharpness",     DUST_SETTING_FLOAT, &gSSAOConfig.blurSharpness,      0.0f,    0.1f,   "BlurSharpness" },
     { "Night Compensation", DUST_SETTING_FLOAT, &gSSAOConfig.nightCompensation,  0.0f,    50.0f,  "NightCompensation" },
+    { "Direct Light AO",   DUST_SETTING_FLOAT, &gSSAOConfig.directLightOcclusion, 0.0f,  1.0f,   "DirectLightAO" },
     { "Debug View",         DUST_SETTING_BOOL,  &gSSAOConfig.debugView,          0.0f,    1.0f,   "DebugView" },
     // Hidden settings: not shown in GUI but persisted in INI
     { "Depth Fade Start",   DUST_SETTING_HIDDEN_FLOAT, &gSSAOConfig.depthFadeStart, 0.0f, 1.0f,   "DepthFadeStart" },

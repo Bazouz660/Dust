@@ -29,6 +29,9 @@ struct SSAOConfig
     // Camera
     float tanHalfFov = 0.5218f;
 
+    // Direct light occlusion — how much AO affects direct sunlight (0 = ambient only, 1 = full)
+    float directLightOcclusion = 0.0f;
+
     // Debug
     bool debugView = false;
 };

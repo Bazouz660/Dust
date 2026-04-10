@@ -84,8 +84,13 @@ static bool InstallModifiedShader()
 
         if (tgtContent.find("[Dust]") != std::string::npos)
         {
-            Log("Modified deferred.hlsl already installed");
-            return true;
+            // Already modified — check if content matches (allows shader updates)
+            if (tgtContent == srcContent)
+            {
+                Log("Modified deferred.hlsl already installed and up to date");
+                return true;
+            }
+            Log("Modified deferred.hlsl outdated, updating...");
         }
 
         // Back up original (only if no backup exists yet)
