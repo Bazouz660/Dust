@@ -154,9 +154,28 @@ static HRESULT WINAPI HookedD3DCompile(
             {
                 Log("ShaderPatch: patched deferred main_fs (%zu -> %zu bytes)",
                     src.size(), patched.size());
-                return oD3DCompile(patched.c_str(), patched.size(), pSourceName,
-                                    pDefines, pInclude, pEntrypoint, pTarget,
-                                    Flags1, Flags2, ppCode, ppErrorMsgs);
+
+                ID3DBlob* patchedCode = nullptr;
+                ID3DBlob* patchedErrors = nullptr;
+                HRESULT hr2 = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
+                                           pDefines, pInclude, pEntrypoint, pTarget,
+                                           Flags1, Flags2, &patchedCode, &patchedErrors);
+                if (SUCCEEDED(hr2))
+                {
+                    *ppCode = patchedCode;
+                    if (ppErrorMsgs) *ppErrorMsgs = patchedErrors;
+                    else if (patchedErrors) patchedErrors->Release();
+                    return hr2;
+                }
+
+                // Patched compile failed — log it and fall back to original source.
+                // This keeps the game functional (just without SSAO) rather than going black.
+                Log("ShaderPatch: patched compile FAILED — reverting to original source");
+                if (patchedErrors)
+                {
+                    Log("ShaderPatch: error: %s", (const char*)patchedErrors->GetBufferPointer());
+                    patchedErrors->Release();
+                }
             }
         }
     }
@@ -467,6 +486,13 @@ static const int VTIDX_SC_ResizeBuffers             = 13;
 
 bool Install()
 {
+    // Detect Wine/Proton — wine_get_version is always exported by ntdll under Wine
+    {
+        HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+        if (ntdll && GetProcAddress(ntdll, "wine_get_version"))
+            Log("Wine/Proton environment detected (DXVK D3D11 path)");
+    }
+
     Log("Creating temporary D3D11 device + swap chain to discover function addresses...");
 
     // Need a dummy window for the swap chain
@@ -497,6 +523,15 @@ bool Install()
         nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
         nullptr, 0, D3D11_SDK_VERSION,
         &scd, &tmpSwapChain, &tmpDevice, nullptr, &tmpContext);
+
+    if (FAILED(hr))
+    {
+        Log("Hardware device failed (0x%08X), trying WARP...", hr);
+        hr = D3D11CreateDeviceAndSwapChain(
+            nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0,
+            nullptr, 0, D3D11_SDK_VERSION,
+            &scd, &tmpSwapChain, &tmpDevice, nullptr, &tmpContext);
+    }
 
     if (FAILED(hr))
     {

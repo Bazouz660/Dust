@@ -75,27 +75,18 @@ static void HostRestoreState(ID3D11DeviceContext* ctx)
 }
 
 // Resolve the actual D3D11 sampler slot for a given base register.
-// Kenshi's deferred shader has different sampler layouts per variant:
-//   CSM/RTW (shadows on):  s0-s7 used by game, custom registers start at s8+
-//   No shadows:            s0-s5 used by game, compiler remaps higher registers down
-// We detect the variant by checking whether slot 6 has a game texture bound.
+// The AO registers (s8, s9) are injected into the deferred shader source with
+// explicit register(sN) declarations. The HLSL compiler never remaps explicit
+// declarations, so the D3D11 slot is always what's declared.
+//
+// Note: the old approach patched compiled bytecode where the no-shadow variant
+// had compacted register assignments (s8 → actual slot 6). With source-level
+// patching, explicit registers are always 1:1. Using PSGetShaderResources() to
+// detect shadow mode is also unreliable under DXVK (Wine/Proton).
 static UINT ResolveSlot(ID3D11DeviceContext* ctx, uint32_t baseSlot)
 {
-    // Only remap slots above the shadow-dependent range
-    if (baseSlot <= 5)
-        return baseSlot;
-
-    ID3D11ShaderResourceView* srv6 = nullptr;
-    ctx->PSGetShaderResources(6, 1, &srv6);
-    if (srv6)
-    {
-        srv6->Release();
-        return baseSlot; // Shadow mode: registers are as declared
-    }
-
-    // No-shadow mode: registers above s5 are shifted down by the gap (s6-s7 absent)
-    // e.g. register(s8) becomes actual slot 6
-    return baseSlot - 2;
+    (void)ctx;
+    return baseSlot;
 }
 
 static void HostBindSRV(ID3D11DeviceContext* ctx, uint32_t baseSlot,
