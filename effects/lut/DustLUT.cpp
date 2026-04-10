@@ -5,16 +5,26 @@
 
 #include "../../src/DustAPI.h"
 #include "DustLog.h"
-#include "LUTShaders.h"
 
 #include <d3d11.h>
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <string>
 
 DustLogFn gLogFn = nullptr;
 static const DustHostAPI* gHost = nullptr;
 static ID3D11Device* gDevice = nullptr;
+static HMODULE gPluginModule = nullptr;
+
+static std::string GetPluginDir()
+{
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(gPluginModule, path, MAX_PATH);
+    std::string s(path);
+    auto pos = s.find_last_of("\\/");
+    return (pos != std::string::npos) ? s.substr(0, pos) : s;
+}
 
 // ==================== Config ====================
 
@@ -25,20 +35,20 @@ struct LUTConfig {
 
     // Lift / Gamma / Gain (applied in log space)
     float lift         = 0.0f;    // Shadows offset (-0.1 to 0.1)
-    float gamma        = 1.035f;  // Midtone power (0.8 to 1.2)
+    float gamma        = 0.9f;    // Midtone power (0.8 to 1.2)
     float gain         = 0.985f;  // Highlight multiplier (0.8 to 1.2)
 
     // Color balance
-    float contrast     = 1.0f;    // 0.5 to 1.5
-    float saturation   = 1.0f;    // 0.0 to 2.0
-    float temperature  = 0.0f;    // -1.0 (cool) to 1.0 (warm)
+    float contrast     = 0.934f;  // 0.5 to 1.5
+    float saturation   = 1.116f;  // 0.0 to 2.0
+    float temperature  = 0.085f;  // -1.0 (cool) to 1.0 (warm)
     float tint         = -0.19f;  // -1.0 (green) to 1.0 (magenta)
 
     // Split toning
-    float shadowR      = 0.0f;    // Shadow color offset (-0.1 to 0.1)
+    float shadowR      = 0.015f;  // Shadow color offset (-0.1 to 0.1)
     float shadowG      = 0.0f;
     float shadowB      = 0.0f;
-    float highlightR   = 0.0f;    // Highlight color offset
+    float highlightR   = 0.01f;   // Highlight color offset
     float highlightG   = 0.0f;
     float highlightB   = 0.0f;
 };
@@ -197,8 +207,9 @@ static int LUTInit(ID3D11Device* device, uint32_t width, uint32_t height, const 
 #define Log DustLog
     gDevice = device;
 
-    // Compile pixel shader via framework
-    ID3DBlob* psBlob = host->CompileShader(LUT_PS, "main", "ps_5_0");
+    // Compile pixel shader from file
+    std::string shaderPath = GetPluginDir() + "\\shaders\\lut_ps.hlsl";
+    ID3DBlob* psBlob = host->CompileShaderFromFile(shaderPath.c_str(), "main", "ps_5_0");
     if (!psBlob) return -1;
 
     HRESULT hr = device->CreatePixelShader(psBlob->GetBufferPointer(),
@@ -279,7 +290,7 @@ static void LUTPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     if (!gConfig.enabled)
         return;
 
-    gHdrCopySRV = host->GetSceneCopy(ctx->context, "hdr_rt");
+    gHdrCopySRV = host->GetSceneCopy(ctx->context, DUST_RESOURCE_HDR_RT);
 }
 
 // postExecute: fires AFTER the game's tonemap draw.
@@ -292,7 +303,7 @@ static void LUTPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
         return;
     }
 
-    ID3D11RenderTargetView* ldrRTV = host->GetRTV("ldr_rt");
+    ID3D11RenderTargetView* ldrRTV = host->GetRTV(DUST_RESOURCE_LDR_RT);
     if (!ldrRTV)
     {
         gHdrCopySRV = nullptr;
@@ -397,6 +408,9 @@ extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
 {
     if (reason == DLL_PROCESS_ATTACH)
+    {
         DisableThreadLibraryCalls(hModule);
+        gPluginModule = hModule;
+    }
     return TRUE;
 }

@@ -1,6 +1,4 @@
 #include <d3d11.h>
-#include <memory>
-#include <cstdio>
 #include <string>
 
 // KenshiLib headers
@@ -14,9 +12,8 @@
 #include "EffectLoader.h"
 
 static HMODULE gDllModule = nullptr;
-static std::string gGameDir;
 
-// ==================== Shader file management ====================
+// ==================== Utility ====================
 
 static std::string GetModuleDir(HMODULE hModule)
 {
@@ -31,7 +28,6 @@ static std::string GetGameDir(HMODULE hModule)
 {
     // DLL is at <game>/mods/Dust/Dust.dll -- go up 2 dirs
     std::string modDir = GetModuleDir(hModule);
-    // Remove trailing slash, go up once
     auto pos = modDir.find_last_of("\\/", modDir.size() - 2);
     if (pos != std::string::npos)
     {
@@ -43,93 +39,14 @@ static std::string GetGameDir(HMODULE hModule)
     return modDir;
 }
 
-// Install modified deferred.hlsl into the game's shader directory.
-// Backs up the original as deferred.hlsl.vanilla if not already backed up.
-static bool InstallModifiedShader()
+// Invalidate RE_Kenshi's shader cache so D3DCompile is called for all shaders,
+// allowing our runtime hook to patch the deferred shader. Without this, cached
+// bytecode would bypass D3DCompile entirely.
+static void InvalidateShaderCache(const std::string& gameDir)
 {
-    std::string shaderDir = gGameDir + "data\\materials\\deferred\\";
-    std::string target = shaderDir + "deferred.hlsl";
-    std::string backup = shaderDir + "deferred.hlsl.vanilla";
-    std::string modDir = GetModuleDir(gDllModule);
-    // The modified shader is shipped alongside the DLL in shaders/
-    std::string source = modDir + "shaders\\deferred.hlsl";
-
-    // Check if source exists
-    FILE* srcFile = fopen(source.c_str(), "rb");
-    if (!srcFile)
-    {
-        Log("WARNING: Modified shader not found at %s", source.c_str());
-        Log("  AO will use post-lighting fallback (no day/night consistency)");
-        return false;
-    }
-
-    // Read source
-    fseek(srcFile, 0, SEEK_END);
-    long srcSize = ftell(srcFile);
-    fseek(srcFile, 0, SEEK_SET);
-    std::string srcContent(srcSize, '\0');
-    fread(&srcContent[0], 1, srcSize, srcFile);
-    fclose(srcFile);
-
-    // Check if target already has our marker
-    FILE* tgtFile = fopen(target.c_str(), "rb");
-    if (tgtFile)
-    {
-        fseek(tgtFile, 0, SEEK_END);
-        long tgtSize = ftell(tgtFile);
-        fseek(tgtFile, 0, SEEK_SET);
-        std::string tgtContent(tgtSize, '\0');
-        fread(&tgtContent[0], 1, tgtSize, tgtFile);
-        fclose(tgtFile);
-
-        if (tgtContent.find("[Dust]") != std::string::npos)
-        {
-            // Already modified — check if content matches (allows shader updates)
-            if (tgtContent == srcContent)
-            {
-                Log("Modified deferred.hlsl already installed and up to date");
-                return true;
-            }
-            Log("Modified deferred.hlsl outdated, updating...");
-        }
-
-        // Back up original (only if no backup exists yet)
-        FILE* bkFile = fopen(backup.c_str(), "rb");
-        if (bkFile)
-        {
-            fclose(bkFile);
-        }
-        else
-        {
-            if (CopyFileA(target.c_str(), backup.c_str(), TRUE))
-                Log("Backed up vanilla deferred.hlsl -> deferred.hlsl.vanilla");
-            else
-                Log("WARNING: Could not back up vanilla deferred.hlsl");
-        }
-    }
-
-    // Write modified shader
-    FILE* outFile = fopen(target.c_str(), "wb");
-    if (!outFile)
-    {
-        Log("ERROR: Could not write to %s", target.c_str());
-        return false;
-    }
-    fwrite(srcContent.data(), 1, srcContent.size(), outFile);
-    fclose(outFile);
-
-    Log("Installed modified deferred.hlsl for ambient-only AO");
-    return true;
-}
-
-static void RestoreVanillaShader()
-{
-    std::string shaderDir = gGameDir + "data\\materials\\deferred\\";
-    std::string target = shaderDir + "deferred.hlsl";
-    std::string backup = shaderDir + "deferred.hlsl.vanilla";
-
-    if (CopyFileA(backup.c_str(), target.c_str(), FALSE))
-        Log("Restored vanilla deferred.hlsl");
+    std::string cachePath = gameDir + "RE_Kenshi\\shader_cache.sc";
+    if (DeleteFileA(cachePath.c_str()))
+        Log("Invalidated RE_Kenshi shader cache (will recompile shaders this launch)");
 }
 
 // ==================== Game loop hook ====================
@@ -162,12 +79,9 @@ __declspec(dllexport) void startPlugin()
     Log("Dust (dev) loading...");
 #endif
 
-    // Determine game directory from DLL path
-    gGameDir = GetGameDir(gDllModule);
-    Log("Game directory: %s", gGameDir.c_str());
-
-    // Install modified deferred.hlsl BEFORE OGRE compiles shaders
-    InstallModifiedShader();
+    // Invalidate shader cache so our D3DCompile hook can patch shaders at runtime
+    std::string gameDir = GetGameDir(gDllModule);
+    InvalidateShaderCache(gameDir);
 
     // Load effect plugins from effects/ directory next to the DLL
     {
@@ -218,7 +132,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
     case DLL_PROCESS_DETACH:
         DustGUI::Shutdown();
         gEffectLoader.ShutdownAll();
-        RestoreVanillaShader();
         break;
     }
     return TRUE;

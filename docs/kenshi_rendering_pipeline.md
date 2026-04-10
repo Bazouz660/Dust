@@ -289,30 +289,46 @@ Final post-process: animated heat haze distortion effect. Writes to the swap cha
 
 ## Injection Points for Graphics Enhancements
 
-Dust defines injection points as `DustInjectionPoint` values in `DustAPI.h`. Effects register at a point and receive pre/post callbacks around the game's draw call.
+Dust defines injection points as `DustInjectionPoint` values in `DustAPI.h`. Effects register at a point and receive pre/post callbacks around the game's draw call. Multiple effects at the same injection point are dispatched in ascending `priority` order.
 
 ### Currently implemented
 
-| Injection Point      | Pipeline Location         | Available Resources         | Current Effects |
-|----------------------|---------------------------|-----------------------------|-----------------|
-| `POST_LIGHTING`      | After deferred lighting   | Depth SRV, HDR RTV          | SSAO, LUT       |
+| Injection Point | Pipeline Location              | Available Resources                    | Current Effects             |
+|-----------------|--------------------------------|----------------------------------------|-----------------------------|
+| `POST_LIGHTING` | Around deferred lighting draw  | Depth SRV, albedo SRV, normals SRV, HDR RTV | SSAO (pri 0), SSIL (pri 10), SSS (pri 20) |
+| `POST_TONEMAP`  | Around tone mapping draw       | HDR RTV (pre), LDR RTV (post)          | LUT (pri 0), Clarity (pri 50), Bloom (pri 100)|
 
-### SSAO Injection (ambient-only AO)
+### SSAO — ambient-only occlusion (`POST_LIGHTING`, priority 0)
 
-SSAO runs at `POST_LIGHTING` with `preExecute` — it generates an AO texture from the depth buffer and binds it to shader register 8 **before** the game's lighting draw executes. The modified `deferred.hlsl` reads this AO map and applies it only to indirect/ambient lighting, not direct sunlight.
+Runs in `preExecute`: generates an R8_UNORM AO texture from the depth and normal buffers using GTAO (12 directions, 6 steps), blurs it with a depth-aware bilateral filter, then binds it to shader register 8 before the game's lighting draw executes. The deferred lighting shader is patched in memory at startup to read this AO map and apply it only to indirect/ambient light, not direct sunlight.
 
-### LUT Injection (color grading)
+### SSIL — screen-space indirect lighting (`POST_LIGHTING`, priority 10)
 
-LUT runs at `POST_LIGHTING` with `postExecute` — it copies the HDR scene, applies a parametric 32^3 color LUT via a fullscreen pass, and writes back to the HDR target. This happens before fog, so atmospheric scattering naturally blends the graded colors at distance.
+Runs in `preExecute`: samples albedo and depth in 8 directions × 4 steps per pixel to accumulate albedo-weighted indirect light into an R11G11B10_FLOAT texture, blurs it with a bilateral filter, then stores the result. Runs in `postExecute`: additively blends the IL texture onto the HDR render target after the game's lighting draw. Composited before fog so indirect light is naturally attenuated at distance.
 
-### Planned injection points
+### LUT — color grading + tonemapping (`POST_TONEMAP`, priority 0)
 
-| Injection Point   | Pipeline Location         | Potential Effects                      |
-|-------------------|---------------------------|----------------------------------------|
-| `POST_GBUFFER`    | After GBuffer fill        | (reserved for future use)              |
-| `POST_FOG`        | After fog/atmosphere      | Screen-space shadows, SSR              |
-| `POST_TONEMAP`    | After tone mapping        | Sharpening, film grain                 |
-| `PRE_PRESENT`     | After all post-processing | Debug overlays, capture                |
+Runs in `preExecute`: captures a copy of the R11G11B10_FLOAT HDR render target before the game's tonemapper executes via `host->GetSceneCopy("hdr_rt")`. Runs in `postExecute`: overwrites the LDR output entirely — applies exposure, ACES filmic tonemapping, a float-precision 32³ LUT, and triangular dithering in a single pass. This is the only 8-bit quantization step in the chain, eliminating the double-quantization banding of the vanilla pipeline.
+
+### SSS — screen-space contact shadows (`POST_LIGHTING`, priority 20)
+
+Runs in `preExecute`: extracts the sun direction and inverse view matrix from the game's PS constant buffer (CB0) — `sunDirection` at register c0, `inverseView` at c8–c11 — and computes a view-space light direction. Runs in `postExecute`: ray marches each pixel toward the sun in view space using the depth buffer with quadratic step distribution and per-pixel jitter, blurs the shadow mask with a bilateral filter, then composites multiplicatively onto the HDR render target. Adds sharp contact shadows that complement the game's low-resolution shadow map.
+
+### Clarity — local contrast enhancement (`POST_TONEMAP`, priority 50)
+
+Runs in `postExecute`: copies the current LDR scene (after LUT), applies a large-radius separable Gaussian blur (configurable, default 8px) to extract low-frequency content, then composites `original + (original - blurred) * strength` back onto the LDR target. A luminance-based midtone mask protects shadows and highlights from clipping. Runs after LUT so it enhances already-graded colors, and before Bloom so bloom responds to the clarity-enhanced image.
+
+### Bloom — physically-motivated bloom (`POST_TONEMAP`, priority 100)
+
+Runs after LUT so bloom is applied to graded colors. Threshold-extracts bright areas from the LDR scene, progressively downsamples, upsamples with scatter control, and composites additively.
+
+### Available injection points
+
+| Injection Point | Pipeline Location              | Potential Future Effects               |
+|-----------------|--------------------------------|----------------------------------------|
+| `POST_GBUFFER`  | After GBuffer fill             | (reserved)                             |
+| `POST_FOG`      | After fog/atmosphere           | SSR                                    |
+| `PRE_PRESENT`   | After all post-processing      | Debug overlays, capture                |
 
 ---
 

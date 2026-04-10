@@ -5,7 +5,7 @@
 
 namespace SSAORenderer
 {
-    bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host);
+    bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host, const char* effectDir);
     void Shutdown();
 
     // Generate AO texture (gen + blur only). Saves/restores GPU state via host API.

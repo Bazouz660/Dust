@@ -89,7 +89,10 @@
   <ItemGroup>
     <ClInclude Include="..\..\src\DustAPI.h" />
     <ClInclude Include="DustLog.h" />
-    <ClInclude Include="BloomShaders.h" />
+    <None Include="shaders\bloom_extract_ps.hlsl" />
+    <None Include="shaders\bloom_downsample_ps.hlsl" />
+    <None Include="shaders\bloom_upsample_ps.hlsl" />
+    <None Include="shaders\bloom_composite_ps.hlsl" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

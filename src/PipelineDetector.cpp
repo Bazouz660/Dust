@@ -101,7 +101,24 @@ void PipelineDetector::CaptureLightingResources(ID3D11DeviceContext* ctx)
         rtv->Release();
     }
 
-    // Capture depth SRV (slot 2)
+    // Capture GBuffer SRVs (slots 0-2 during lighting pass)
+    // slot 0 = albedo (B8G8R8A8_UNORM), slot 1 = normals (B8G8R8A8_UNORM), slot 2 = depth (R32_FLOAT)
+    ID3D11ShaderResourceView* albedoSRV = nullptr;
+    ctx->PSGetShaderResources(0, 1, &albedoSRV);
+    if (albedoSRV)
+    {
+        gResourceRegistry.SetSRV(ResourceName::ALBEDO_SRV, albedoSRV);
+        albedoSRV->Release();
+    }
+
+    ID3D11ShaderResourceView* normalsSRV = nullptr;
+    ctx->PSGetShaderResources(1, 1, &normalsSRV);
+    if (normalsSRV)
+    {
+        gResourceRegistry.SetSRV(ResourceName::NORMALS_SRV, normalsSRV);
+        normalsSRV->Release();
+    }
+
     ID3D11ShaderResourceView* depthSRV = nullptr;
     ctx->PSGetShaderResources(2, 1, &depthSRV);
     if (depthSRV)
@@ -112,7 +129,9 @@ void PipelineDetector::CaptureLightingResources(ID3D11DeviceContext* ctx)
 
     if (!sFirstDetectLogged)
     {
-        Log("Pipeline: Lighting pass detected (depth=%p, hdrRT=%p)",
+        Log("Pipeline: Lighting pass detected (albedo=%p, normals=%p, depth=%p, hdrRT=%p)",
+            gResourceRegistry.GetSRV(ResourceName::ALBEDO_SRV),
+            gResourceRegistry.GetSRV(ResourceName::NORMALS_SRV),
             gResourceRegistry.GetSRV(ResourceName::DEPTH_SRV),
             gResourceRegistry.GetRTV(ResourceName::HDR_RTV));
         sFirstDetectLogged = true;

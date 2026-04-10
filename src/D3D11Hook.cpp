@@ -6,7 +6,10 @@
 #include "DustLog.h"
 #include <core/Functions.h>
 #include <d3d11.h>
+#include <d3dcompiler.h>
 #include <dxgi.h>
+#include <string>
+#include <cstring>
 
 namespace D3D11Hook
 {
@@ -73,6 +76,95 @@ static PFN_DrawIndexedInstanced     oDrawIndexedInstanced = nullptr;
 static PFN_OMSetRenderTargets       oOMSetRenderTargets = nullptr;
 static PFN_Present                  oPresent = nullptr;
 static PFN_ResizeBuffers            oResizeBuffers = nullptr;
+
+// ==================== D3DCompile hook (runtime shader patching) ====================
+
+typedef HRESULT(WINAPI* PFN_D3DCompileHook)(
+    LPCVOID pSrcData, SIZE_T SrcDataSize, LPCSTR pSourceName,
+    const D3D_SHADER_MACRO* pDefines, ID3DInclude* pInclude,
+    LPCSTR pEntrypoint, LPCSTR pTarget,
+    UINT Flags1, UINT Flags2,
+    ID3DBlob** ppCode, ID3DBlob** ppErrorMsgs);
+
+static PFN_D3DCompileHook oD3DCompile = nullptr;
+
+// Patch vanilla deferred.hlsl source to add AO support.
+// Returns the modified source, or the original if patterns weren't found.
+static std::string PatchDeferredShader(const std::string& src)
+{
+    std::string result = src;
+
+    // Injection 1: Add aoMap + aoParams sampler declarations.
+    // Anchor: "uniform float4 ambientParams," exists in all variants.
+    const char* anchor1 = "uniform float4 ambientParams,";
+    size_t pos1 = result.find(anchor1);
+    if (pos1 == std::string::npos)
+    {
+        Log("ShaderPatch: anchor 'ambientParams' not found, skipping");
+        return src;
+    }
+
+    std::string inject1 =
+        "uniform sampler aoMap : register(s8),\n"
+        "\tuniform sampler aoParams : register(s9),\n\n\t";
+    result.insert(pos1, inject1);
+
+    // Injection 2: Add AO application code.
+    // Anchor: "LightingData ld = (LightingData)0.0f;" — right after env light calculation.
+    const char* anchor2 = "LightingData ld = (LightingData)0.0f;";
+    size_t pos2 = result.find(anchor2);
+    if (pos2 == std::string::npos)
+    {
+        Log("ShaderPatch: anchor 'LightingData ld' not found, skipping");
+        return src;
+    }
+
+    std::string inject2 =
+        "// [Dust] Ambient occlusion\n"
+        "\tfloat ao = tex2D(aoMap, texCoord).r;\n"
+        "\tfloat directAO = tex2D(aoParams, texCoord).r;\n"
+        "\tenvLight.diffuse *= ao;\n"
+        "\tenvLight.specular *= ao;\n"
+        "\tfloat directFade = lerp(1.0, ao, directAO);\n"
+        "\tsunLight.diffuse *= directFade;\n"
+        "\tsunLight.specular *= directFade;\n\n\t";
+    result.insert(pos2, inject2);
+
+    return result;
+}
+
+static HRESULT WINAPI HookedD3DCompile(
+    LPCVOID pSrcData, SIZE_T SrcDataSize, LPCSTR pSourceName,
+    const D3D_SHADER_MACRO* pDefines, ID3DInclude* pInclude,
+    LPCSTR pEntrypoint, LPCSTR pTarget,
+    UINT Flags1, UINT Flags2,
+    ID3DBlob** ppCode, ID3DBlob** ppErrorMsgs)
+{
+    // Detect the deferred lighting pixel shader: entry point is "main_fs"
+    // and source contains deferred-specific identifiers.
+    if (pEntrypoint && pSrcData && SrcDataSize > 0 &&
+        strcmp(pEntrypoint, "main_fs") == 0)
+    {
+        std::string src((const char*)pSrcData, SrcDataSize);
+        if (src.find("CalcEnvironmentLight") != std::string::npos &&
+            src.find("aoMap") == std::string::npos)  // not already patched
+        {
+            std::string patched = PatchDeferredShader(src);
+            if (patched.size() != src.size())
+            {
+                Log("ShaderPatch: patched deferred main_fs (%zu -> %zu bytes)",
+                    src.size(), patched.size());
+                return oD3DCompile(patched.c_str(), patched.size(), pSourceName,
+                                    pDefines, pInclude, pEntrypoint, pTarget,
+                                    Flags1, Flags2, ppCode, ppErrorMsgs);
+            }
+        }
+    }
+
+    return oD3DCompile(pSrcData, SrcDataSize, pSourceName,
+                        pDefines, pInclude, pEntrypoint, pTarget,
+                        Flags1, Flags2, ppCode, ppErrorMsgs);
+}
 
 // ==================== Device capture ====================
 
@@ -268,10 +360,22 @@ static void STDMETHODCALLTYPE HookedDraw(
                     tex->GetDesc(&desc);
                     if (desc.Width != gWidth || desc.Height != gHeight)
                     {
-                        Log("Resolution changed: %ux%u -> %ux%u", gWidth, gHeight, desc.Width, desc.Height);
-                        gWidth = desc.Width;
-                        gHeight = desc.Height;
-                        gEffectLoader.OnResolutionChanged(gDevice, gWidth, gHeight);
+                        // Check if device is still alive before recreating resources.
+                        // DEVICE_REMOVED can happen during screen/monitor switches;
+                        // skip the update so we naturally retry on the next valid frame.
+                        HRESULT removeReason = gDevice->GetDeviceRemovedReason();
+                        if (removeReason != S_OK)
+                        {
+                            Log("Device removed (0x%08X), deferring resolution change %ux%u -> %ux%u",
+                                removeReason, gWidth, gHeight, desc.Width, desc.Height);
+                        }
+                        else
+                        {
+                            Log("Resolution changed: %ux%u -> %ux%u", gWidth, gHeight, desc.Width, desc.Height);
+                            gWidth = desc.Width;
+                            gHeight = desc.Height;
+                            gEffectLoader.OnResolutionChanged(gDevice, gWidth, gHeight);
+                        }
                     }
                     tex->Release();
                 }
@@ -441,9 +545,40 @@ bool Install()
     DestroyWindow(dummyWnd);
     UnregisterClassA("DustDummy", wc.hInstance);
 
+    // Hook D3DCompile for runtime shader patching (no disk writes).
+    // Kenshi ships D3DCompiler_43.dll (used by OGRE's RenderSystem_Direct3D11).
+    // Must hook before OGRE compiles any shaders.
     Log("Installing D3D11 function hooks...");
 
     bool ok = true;
+
+    {
+        const char* compilerDlls[] = { "D3DCompiler_43.dll", "d3dcompiler_47.dll" };
+        bool hooked = false;
+        for (const char* dllName : compilerDlls)
+        {
+            // GetModuleHandle first (already loaded by RenderSystem), LoadLibrary as fallback
+            HMODULE hD3DCompiler = GetModuleHandleA(dllName);
+            if (!hD3DCompiler)
+                hD3DCompiler = LoadLibraryA(dllName);
+            if (!hD3DCompiler)
+                continue;
+
+            void* addrD3DCompile = (void*)GetProcAddress(hD3DCompiler, "D3DCompile");
+            if (!addrD3DCompile)
+                continue;
+
+            if (KenshiLib::AddHook(addrD3DCompile, (void*)HookedD3DCompile,
+                                   (void**)&oD3DCompile) == KenshiLib::SUCCESS)
+            {
+                Log("  D3DCompile hook installed via %s (runtime shader patching enabled)", dllName);
+                hooked = true;
+                break;
+            }
+        }
+        if (!hooked)
+        { Log("WARNING: Could not hook D3DCompile, shader patching disabled"); }
+    }
 
     if (KenshiLib::AddHook(addrCreatePS, (void*)HookedCreatePixelShader,
                            (void**)&oCreatePixelShader) != KenshiLib::SUCCESS)

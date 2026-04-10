@@ -17,18 +17,8 @@ static D3D11StateBlock gSharedStateBlock;
 
 static ID3D11VertexShader* gFullscreenVS = nullptr;
 
-static const char* FULLSCREEN_VS_SOURCE = R"(
-struct VSOut {
-    float4 pos : SV_Position;
-    float2 uv  : TEXCOORD0;
-};
-VSOut main(uint id : SV_VertexID) {
-    VSOut o;
-    o.uv  = float2((id << 1) & 2, id & 2);
-    o.pos = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1);
-    return o;
-}
-)";
+// Framework shader directory (derived from effects dir parent)
+static std::string gFrameworkShaderDir;
 
 // ==================== v3: Scene copy cache ====================
 
@@ -496,6 +486,17 @@ int EffectLoader::LoadAll(const char* effectsDir)
 {
     BuildHostAPI();
 
+    // Derive framework shader directory: effectsDir is <modDir>/effects,
+    // framework shaders are at <modDir>/shaders/
+    {
+        std::string eDir(effectsDir);
+        size_t pos = eDir.find_last_of("\\/");
+        if (pos != std::string::npos)
+            gFrameworkShaderDir = eDir.substr(0, pos) + "\\shaders\\";
+        else
+            gFrameworkShaderDir = "shaders\\";
+    }
+
     char searchPath[MAX_PATH];
     snprintf(searchPath, sizeof(searchPath), "%s\\*.dll", effectsDir);
 
@@ -608,14 +609,15 @@ bool EffectLoader::InitAll(ID3D11Device* device, uint32_t w, uint32_t h)
     // Compile and cache fullscreen VS if not already done
     if (!gFullscreenVS)
     {
-        ID3DBlob* vsBlob = HostCompileShader(FULLSCREEN_VS_SOURCE, "main", "vs_5_0");
+        std::string vsPath = gFrameworkShaderDir + "fullscreen_vs.hlsl";
+        ID3DBlob* vsBlob = HostCompileShaderFromFile(vsPath.c_str(), "main", "vs_5_0");
         if (vsBlob)
         {
             device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(),
                                        nullptr, &gFullscreenVS);
             vsBlob->Release();
             if (gFullscreenVS)
-                Log("Framework fullscreen VS compiled and cached");
+                Log("Framework fullscreen VS compiled from %s", vsPath.c_str());
         }
     }
 
@@ -719,6 +721,15 @@ void EffectLoader::DispatchPost(DustInjectionPoint point, const DustFrameContext
 
 void EffectLoader::OnResolutionChanged(ID3D11Device* device, uint32_t w, uint32_t h)
 {
+    // Safety net: verify device is still alive before recreating GPU resources.
+    // The primary check is in D3D11Hook, but guard here too in case of other callers.
+    HRESULT removeReason = device->GetDeviceRemovedReason();
+    if (removeReason != S_OK)
+    {
+        Log("OnResolutionChanged: device removed (0x%08X), skipping resource recreation", removeReason);
+        return;
+    }
+
     // Release scene copies — they'll be recreated on demand
     ReleaseSceneCopies();
 

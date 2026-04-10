@@ -91,7 +91,12 @@
     <ClInclude Include="..\..\src\DustAPI.h" />
     <ClInclude Include="DustLog.h" />
     <ClInclude Include="SSAORenderer.h" />
-    <ClInclude Include="SSAOShaders.h" />
+    <None Include="shaders\fullscreen_vs.hlsl" />
+    <None Include="shaders\ssao_gen_ps.hlsl" />
+    <None Include="shaders\ssao_blur_h_ps.hlsl" />
+    <None Include="shaders\ssao_blur_v_ps.hlsl" />
+    <None Include="shaders\ssao_apply_ps.hlsl" />
+    <None Include="shaders\ssao_debug_ps.hlsl" />
     <ClInclude Include="SSAOConfig.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

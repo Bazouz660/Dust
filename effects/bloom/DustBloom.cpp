@@ -4,23 +4,34 @@
 
 #include "../../src/DustAPI.h"
 #include "DustLog.h"
-#include "BloomShaders.h"
 
 #include <d3d11.h>
 #include <cstring>
+#include <string>
 
 DustLogFn gLogFn = nullptr;
 static const DustHostAPI* gHost = nullptr;
 static ID3D11Device* gDevice = nullptr;
+static HMODULE gPluginModule = nullptr;
+
+static std::string GetPluginDir()
+{
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(gPluginModule, path, MAX_PATH);
+    std::string s(path);
+    auto pos = s.find_last_of("\\/");
+    return (pos != std::string::npos) ? s.substr(0, pos) : s;
+}
 
 // ==================== Config ====================
 
 struct BloomConfig {
     bool  enabled   = true;
-    float intensity = 0.5f;
-    float threshold = 1.0f;
-    float softKnee  = 0.5f;
+    float intensity = 0.155f;
+    float threshold = 1.576f;
+    float softKnee  = 0.537f;
     float scatter   = 0.7f;
+    float radius    = 1.0f;
     bool  debugView = false;
 };
 
@@ -47,7 +58,8 @@ struct BloomCB {
     float softKnee;
     float intensity;
     float scatter;
-    float pad[2];
+    float radius;
+    float pad;
 };
 
 // ==================== Mip Chain ====================
@@ -120,10 +132,13 @@ static ID3D11ShaderResourceView* gHdrCopySRV = nullptr;
 
 // ==================== Init / Shutdown ====================
 
-static ID3D11PixelShader* CompilePS(const char* source, const char* name)
+static std::string gShaderDir;
+
+static ID3D11PixelShader* CompilePS(const char* filename, const char* name)
 {
-    ID3DBlob* blob = gHost->CompileShader(source, "main", "ps_5_0");
-    if (!blob) { Log("Bloom: Failed to compile %s", name); return nullptr; }
+    std::string path = gShaderDir + filename;
+    ID3DBlob* blob = gHost->CompileShaderFromFile(path.c_str(), "main", "ps_5_0");
+    if (!blob) { Log("Bloom: Failed to compile %s from %s", name, path.c_str()); return nullptr; }
 
     ID3D11PixelShader* ps = nullptr;
     HRESULT hr = gDevice->CreatePixelShader(blob->GetBufferPointer(),
@@ -140,12 +155,13 @@ static int BloomInit(ID3D11Device* device, uint32_t width, uint32_t height, cons
     gLogFn = host->Log;
 #define Log DustLog
     gDevice = device;
+    gShaderDir = GetPluginDir() + "\\shaders\\";
 
-    // Compile shaders
-    gExtractPS    = CompilePS(BLOOM_EXTRACT_PS,    "extract");
-    gDownsamplePS = CompilePS(BLOOM_DOWNSAMPLE_PS, "downsample");
-    gUpsamplePS   = CompilePS(BLOOM_UPSAMPLE_PS,   "upsample");
-    gCompositePS  = CompilePS(BLOOM_COMPOSITE_PS,   "composite");
+    // Compile shaders from .hlsl files
+    gExtractPS    = CompilePS("bloom_extract_ps.hlsl",    "extract");
+    gDownsamplePS = CompilePS("bloom_downsample_ps.hlsl", "downsample");
+    gUpsamplePS   = CompilePS("bloom_upsample_ps.hlsl",   "upsample");
+    gCompositePS  = CompilePS("bloom_composite_ps.hlsl",   "composite");
     if (!gExtractPS || !gDownsamplePS || !gUpsamplePS || !gCompositePS)
         return -1;
 
@@ -224,7 +240,7 @@ static void BloomPreExecute(const DustFrameContext* ctx, const DustHostAPI* host
     if (!gConfig.enabled)
         return;
 
-    gHdrCopySRV = host->GetSceneCopy(ctx->context, "hdr_rt");
+    gHdrCopySRV = host->GetSceneCopy(ctx->context, DUST_RESOURCE_HDR_RT);
 }
 
 // postExecute: full bloom pipeline
@@ -236,7 +252,7 @@ static void BloomPostExecute(const DustFrameContext* ctx, const DustHostAPI* hos
         return;
     }
 
-    ID3D11RenderTargetView* ldrRTV = host->GetRTV("ldr_rt");
+    ID3D11RenderTargetView* ldrRTV = host->GetRTV(DUST_RESOURCE_LDR_RT);
     if (!ldrRTV) { gHdrCopySRV = nullptr; return; }
 
     ID3D11DeviceContext* dc = ctx->context;
@@ -297,6 +313,7 @@ static void BloomPostExecute(const DustFrameContext* ctx, const DustHostAPI* hos
         cb.texelSizeX = 1.0f / (float)gMips[i].width;
         cb.texelSizeY = 1.0f / (float)gMips[i].height;
         cb.scatter    = gConfig.scatter;
+        cb.radius     = gConfig.radius;
         host->UpdateConstantBuffer(dc, gCB, &cb, sizeof(cb));
 
         // Set target first to unbind any previous RTV binding
@@ -354,6 +371,7 @@ static DustSettingDesc gBloomSettingsArray[] = {
     { "Threshold",  DUST_SETTING_FLOAT, &gConfig.threshold,  0.0f, 5.0f, "Threshold" },
     { "Soft Knee",  DUST_SETTING_FLOAT, &gConfig.softKnee,   0.0f, 1.0f, "SoftKnee" },
     { "Scatter",    DUST_SETTING_FLOAT, &gConfig.scatter,    0.0f, 1.0f, "Scatter" },
+    { "Radius",     DUST_SETTING_FLOAT, &gConfig.radius,    0.5f, 3.0f, "Radius" },
     { "Debug View", DUST_SETTING_BOOL,  &gConfig.debugView,  0.0f, 1.0f, "DebugView" },
 };
 
@@ -386,6 +404,9 @@ extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
 {
     if (reason == DLL_PROCESS_ATTACH)
+    {
         DisableThreadLibraryCalls(hModule);
+        gPluginModule = hModule;
+    }
     return TRUE;
 }
