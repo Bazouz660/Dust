@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<ModData xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <id>3703458265</id>
+  <mod>Dust</mod>
+  <title>Dust - A Kenshi Rendering Framework</title>
+  <tags>
+    <string>Graphical</string>
+  </tags>
+  <visibility>0</visibility>
+  <lastUpdate>2026-04-10T00:44:40+02:00</lastUpdate>
+</ModData>
