@@ -10,7 +10,7 @@ struct SSAOConfig
 
     // AO generation
     float aoRadius = 0.003f;
-    float aoStrength = 1.991f;
+    float aoStrength = 2.537f;
     float aoBias = 0.001f;
     float aoMaxDepth = 0.1f;
     float filterRadius = 0.15f;
@@ -30,7 +30,7 @@ struct SSAOConfig
     float tanHalfFov = 0.5218f;
 
     // Direct light occlusion — how much AO affects direct sunlight (0 = ambient only, 1 = full)
-    float directLightOcclusion = 0.0f;
+    float directLightOcclusion = 0.3f;
 
     // Debug
     bool debugView = false;

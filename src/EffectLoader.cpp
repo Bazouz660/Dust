@@ -721,6 +721,15 @@ void EffectLoader::DispatchPost(DustInjectionPoint point, const DustFrameContext
 
 void EffectLoader::OnResolutionChanged(ID3D11Device* device, uint32_t w, uint32_t h)
 {
+    // Safety net: verify device is still alive before recreating GPU resources.
+    // The primary check is in D3D11Hook, but guard here too in case of other callers.
+    HRESULT removeReason = device->GetDeviceRemovedReason();
+    if (removeReason != S_OK)
+    {
+        Log("OnResolutionChanged: device removed (0x%08X), skipping resource recreation", removeReason);
+        return;
+    }
+
     // Release scene copies — they'll be recreated on demand
     ReleaseSceneCopies();
 

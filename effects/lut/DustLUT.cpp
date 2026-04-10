@@ -35,20 +35,20 @@ struct LUTConfig {
 
     // Lift / Gamma / Gain (applied in log space)
     float lift         = 0.0f;    // Shadows offset (-0.1 to 0.1)
-    float gamma        = 1.035f;  // Midtone power (0.8 to 1.2)
+    float gamma        = 0.9f;    // Midtone power (0.8 to 1.2)
     float gain         = 0.985f;  // Highlight multiplier (0.8 to 1.2)
 
     // Color balance
-    float contrast     = 1.0f;    // 0.5 to 1.5
-    float saturation   = 1.0f;    // 0.0 to 2.0
-    float temperature  = 0.0f;    // -1.0 (cool) to 1.0 (warm)
+    float contrast     = 0.934f;  // 0.5 to 1.5
+    float saturation   = 1.116f;  // 0.0 to 2.0
+    float temperature  = 0.085f;  // -1.0 (cool) to 1.0 (warm)
     float tint         = -0.19f;  // -1.0 (green) to 1.0 (magenta)
 
     // Split toning
-    float shadowR      = 0.0f;    // Shadow color offset (-0.1 to 0.1)
+    float shadowR      = 0.015f;  // Shadow color offset (-0.1 to 0.1)
     float shadowG      = 0.0f;
     float shadowB      = 0.0f;
-    float highlightR   = 0.0f;    // Highlight color offset
+    float highlightR   = 0.01f;   // Highlight color offset
     float highlightG   = 0.0f;
     float highlightB   = 0.0f;
 };

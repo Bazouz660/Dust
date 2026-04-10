@@ -9,11 +9,12 @@ cbuffer BloomParams : register(b0) {
     float softKnee;
     float intensity;
     float scatter;
-    float2 padding;
+    float radius;
+    float padding;
 };
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
-    float2 d = texelSize;
+    float2 d = texelSize * radius;
 
     // 3x3 tent filter (weights: 1 2 1 / 2 4 2 / 1 2 1, sum = 16)
     float3 s;

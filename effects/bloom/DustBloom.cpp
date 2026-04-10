@@ -27,10 +27,11 @@ static std::string GetPluginDir()
 
 struct BloomConfig {
     bool  enabled   = true;
-    float intensity = 0.5f;
-    float threshold = 1.0f;
-    float softKnee  = 0.5f;
+    float intensity = 0.155f;
+    float threshold = 1.576f;
+    float softKnee  = 0.537f;
     float scatter   = 0.7f;
+    float radius    = 1.0f;
     bool  debugView = false;
 };
 
@@ -57,7 +58,8 @@ struct BloomCB {
     float softKnee;
     float intensity;
     float scatter;
-    float pad[2];
+    float radius;
+    float pad;
 };
 
 // ==================== Mip Chain ====================
@@ -311,6 +313,7 @@ static void BloomPostExecute(const DustFrameContext* ctx, const DustHostAPI* hos
         cb.texelSizeX = 1.0f / (float)gMips[i].width;
         cb.texelSizeY = 1.0f / (float)gMips[i].height;
         cb.scatter    = gConfig.scatter;
+        cb.radius     = gConfig.radius;
         host->UpdateConstantBuffer(dc, gCB, &cb, sizeof(cb));
 
         // Set target first to unbind any previous RTV binding
@@ -368,6 +371,7 @@ static DustSettingDesc gBloomSettingsArray[] = {
     { "Threshold",  DUST_SETTING_FLOAT, &gConfig.threshold,  0.0f, 5.0f, "Threshold" },
     { "Soft Knee",  DUST_SETTING_FLOAT, &gConfig.softKnee,   0.0f, 1.0f, "SoftKnee" },
     { "Scatter",    DUST_SETTING_FLOAT, &gConfig.scatter,    0.0f, 1.0f, "Scatter" },
+    { "Radius",     DUST_SETTING_FLOAT, &gConfig.radius,    0.5f, 3.0f, "Radius" },
     { "Debug View", DUST_SETTING_BOOL,  &gConfig.debugView,  0.0f, 1.0f, "DebugView" },
 };
 

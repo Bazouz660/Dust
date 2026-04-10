@@ -9,7 +9,8 @@ cbuffer BloomParams : register(b0) {
     float softKnee;
     float intensity;
     float scatter;
-    float2 padding;
+    float radius;
+    float padding;
 };
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {

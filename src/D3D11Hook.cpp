@@ -360,10 +360,22 @@ static void STDMETHODCALLTYPE HookedDraw(
                     tex->GetDesc(&desc);
                     if (desc.Width != gWidth || desc.Height != gHeight)
                     {
-                        Log("Resolution changed: %ux%u -> %ux%u", gWidth, gHeight, desc.Width, desc.Height);
-                        gWidth = desc.Width;
-                        gHeight = desc.Height;
-                        gEffectLoader.OnResolutionChanged(gDevice, gWidth, gHeight);
+                        // Check if device is still alive before recreating resources.
+                        // DEVICE_REMOVED can happen during screen/monitor switches;
+                        // skip the update so we naturally retry on the next valid frame.
+                        HRESULT removeReason = gDevice->GetDeviceRemovedReason();
+                        if (removeReason != S_OK)
+                        {
+                            Log("Device removed (0x%08X), deferring resolution change %ux%u -> %ux%u",
+                                removeReason, gWidth, gHeight, desc.Width, desc.Height);
+                        }
+                        else
+                        {
+                            Log("Resolution changed: %ux%u -> %ux%u", gWidth, gHeight, desc.Width, desc.Height);
+                            gWidth = desc.Width;
+                            gHeight = desc.Height;
+                            gEffectLoader.OnResolutionChanged(gDevice, gWidth, gHeight);
+                        }
                     }
                     tex->Release();
                 }
