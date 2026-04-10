@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: [Build]
+    types: [completed]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
+
+    steps:
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          TAG="${{ github.event.workflow_run.head_branch }}"
+          echo "label=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Download artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: Dust-${{ steps.version.outputs.label }}
+          path: release/Dust
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create zip
+        run: |
+          cd release
+          zip -r ../Dust-${{ steps.version.outputs.label }}.zip Dust
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.label }}
+          files: Dust-${{ steps.version.outputs.label }}.zip
+          generate_release_notes: true
