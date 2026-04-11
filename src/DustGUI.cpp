@@ -62,6 +62,10 @@ static float gFpsAccum = 0.0f;
 static int gFpsCount = 0;
 static float gDisplayFps = 0.0f;
 
+// Global effects toggle
+static bool gAllEffectsOn = true;
+static std::vector<bool> gEffectWasEnabled; // remembers which effects were on before global disable
+
 // Double-click to input mode
 static ImGuiID gInputModeID = 0;
 static int gInputModeFrames = 0;
@@ -120,6 +124,26 @@ static bool IsEffectDirty(size_t idx)
         if (IsDirty(le.desc.settings[i], gEffectStates[idx].diskValues[i]))
             return true;
     return false;
+}
+
+// ==================== Effect enabled helpers ====================
+
+// Find the "Enabled" bool pointer in an effect's settings array (first DUST_SETTING_BOOL)
+static bool* FindEnabledPtr(const LoadedEffect& le)
+{
+    for (uint32_t i = 0; i < le.desc.settingCount; i++)
+    {
+        const DustSettingDesc& s = le.desc.settings[i];
+        if (s.type == DUST_SETTING_BOOL && s.valuePtr)
+            return (bool*)s.valuePtr;
+    }
+    return nullptr;
+}
+
+static bool IsEffectEnabled(const LoadedEffect& le)
+{
+    bool* p = FindEnabledPtr(le);
+    return p ? *p : true; // default to true if no enabled setting found
 }
 
 // ==================== Custom slider with double-click-to-input ====================
@@ -314,17 +338,10 @@ static void DrawEffectSection(size_t idx)
 
     // Build header label with enabled status and dirty indicator
     bool dirty = IsEffectDirty(idx);
+    bool enabled = IsEffectEnabled(le);
     char headerLabel[256];
-    if (le.desc.IsEnabled)
-    {
-        bool enabled = le.desc.IsEnabled() != 0;
-        snprintf(headerLabel, sizeof(headerLabel), "%s  %s%s",
-                 name, enabled ? "[ON]" : "[OFF]", dirty ? "  *" : "");
-    }
-    else
-    {
-        snprintf(headerLabel, sizeof(headerLabel), "%s%s", name, dirty ? "  *" : "");
-    }
+    snprintf(headerLabel, sizeof(headerLabel), "%s  %s%s",
+             name, enabled ? "[ON]" : "[OFF]", dirty ? "  *" : "");
 
     // Color the header text
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f, 0.85f, 1.0f, 1.0f));
@@ -677,6 +694,45 @@ void Render()
         }
         else
         {
+            // Global effects toggle
+            {
+                bool prev = gAllEffectsOn;
+                if (ImGui::Checkbox("Toggle Effects", &gAllEffectsOn))
+                {
+                    if (!gAllEffectsOn)
+                    {
+                        // Save which effects are currently enabled, then disable all
+                        gEffectWasEnabled.resize(count);
+                        for (size_t i = 0; i < count; i++)
+                        {
+                            const LoadedEffect& le = gEffectLoader.GetEffect(i);
+                            if (!le.initialized) { gEffectWasEnabled[i] = false; continue; }
+                            bool* p = FindEnabledPtr(le);
+                            gEffectWasEnabled[i] = p ? *p : false;
+                            if (p) *p = false;
+                            if (le.desc.OnSettingChanged) le.desc.OnSettingChanged();
+                        }
+                    }
+                    else
+                    {
+                        // Restore only effects that were previously enabled
+                        for (size_t i = 0; i < count && i < gEffectWasEnabled.size(); i++)
+                        {
+                            const LoadedEffect& le = gEffectLoader.GetEffect(i);
+                            if (!le.initialized) continue;
+                            if (!gEffectWasEnabled[i]) continue;
+                            bool* p = FindEnabledPtr(le);
+                            if (p) *p = true;
+                            if (le.desc.OnSettingChanged) le.desc.OnSettingChanged();
+                        }
+                    }
+                }
+            }
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+
             for (size_t i = 0; i < count; i++)
             {
                 const LoadedEffect& le = gEffectLoader.GetEffect(i);
