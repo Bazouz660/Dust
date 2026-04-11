@@ -106,10 +106,20 @@ jobs:
             .github/workshop.vdf > workshop_upload.vdf
           cat workshop_upload.vdf
 
+      - name: Install SteamCMD
+        run: |
+          mkdir -p ~/steamcmd && cd ~/steamcmd
+          curl -sqL "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz" | tar xz
+          echo "$HOME/steamcmd" >> "$GITHUB_PATH"
+
+      - name: Restore Steam config
+        run: |
+          mkdir -p ~/steamcmd/config
+          mkdir -p ~/.steam/steam/config
+          echo "${{ secrets.STEAM_CONFIG_VDF }}" | base64 -d | tee ~/steamcmd/config/config.vdf ~/.steam/steam/config/config.vdf > /dev/null
+
       - name: Upload to Steam Workshop
-        uses: game-ci/steam-deploy@v3
-        with:
-          appId: 233860
-          username: ${{ secrets.STEAM_USERNAME }}
-          configVdf: ${{ secrets.STEAM_CONFIG_VDF }}
-          workshopVdf: workshop_upload.vdf
+        run: |
+          echo "=== Uploading to Steam Workshop ==="
+          cat workshop_upload.vdf
+          ~/steamcmd/steamcmd.sh +login ${{ secrets.STEAM_USERNAME }} +workshop_build_item "$PWD/workshop_upload.vdf" +quit
