@@ -24,23 +24,27 @@ jobs:
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update
-          sudo apt-get install -y lib32gcc-s1 steamcmd
+          sudo apt-get install -y lib32gcc-s1
+          mkdir -p ~/steamcmd && cd ~/steamcmd
+          curl -sqL "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz" | tar xz
+          echo "$HOME/steamcmd" >> "$GITHUB_PATH"
 
       - name: Restore Steam config
         run: |
+          mkdir -p ~/steamcmd/config
           mkdir -p ~/.steam/steam/config
-          echo "${{ secrets.STEAM_CONFIG_VDF }}" | base64 -d > ~/.steam/steam/config/config.vdf
+          echo "${{ secrets.STEAM_CONFIG_VDF }}" | base64 -d | tee ~/steamcmd/config/config.vdf ~/.steam/steam/config/config.vdf > /dev/null
 
       - name: Verify Steam login
         run: |
           echo "=== Testing Steam authentication ==="
-          steamcmd +login ${{ secrets.STEAM_USERNAME }} +quit
+          ~/steamcmd/steamcmd.sh +login ${{ secrets.STEAM_USERNAME }} +quit
           echo "Steam login successful"
 
       - name: Query Workshop item
         run: |
           echo "=== Querying Workshop item 3703458265 ==="
-          steamcmd +login ${{ secrets.STEAM_USERNAME }} \
+          ~/steamcmd/steamcmd.sh +login ${{ secrets.STEAM_USERNAME }} \
             +workshop_item_info 233860 3703458265 \
             +quit 2>&1 | tee /tmp/workshop_info.txt
 
