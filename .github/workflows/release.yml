@@ -107,16 +107,7 @@ jobs:
             .github/workshop.vdf > workshop_upload.vdf
 
           # Inline the description file contents into the VDF
-          python3 - <<'PYEOF'
-with open('mod/workshop_description.txt') as f:
-    desc = f.read().strip()
-desc = desc.replace('\\', '\\\\').replace('"', '\\"')
-with open('workshop_upload.vdf') as f:
-    vdf = f.read()
-vdf = vdf.replace('DESCRIPTION_FILE_PLACEHOLDER', desc)
-with open('workshop_upload.vdf', 'w') as f:
-    f.write(vdf)
-PYEOF
+          python3 .github/inline_description.py workshop_upload.vdf mod/workshop_description.txt
           echo "=== Generated VDF ==="
           cat workshop_upload.vdf
 
