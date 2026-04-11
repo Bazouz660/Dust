@@ -330,6 +330,8 @@ void EffectLoader::EffectConfigLoad(LoadedEffect& le)
     const char* section = le.desc.configSection ? le.desc.configSection : le.desc.name;
     if (!section) return;
 
+    bool anyMissing = false;
+
     for (uint32_t i = 0; i < le.desc.settingCount; i++)
     {
         const DustSettingDesc& s = le.desc.settings[i];
@@ -338,31 +340,47 @@ void EffectLoader::EffectConfigLoad(LoadedEffect& le)
         const char* key = s.iniKey ? s.iniKey : s.name;
         if (!key) continue;
 
+        // Check if key exists in INI (sentinel-based: if we get the sentinel back, key is missing)
+        char probe[64];
+        const char* sentinel = "\x01\x02MISSING";
+        GetPrivateProfileStringA(section, key, sentinel, probe, sizeof(probe), le.configPath.c_str());
+        bool missing = (strcmp(probe, sentinel) == 0);
+        if (missing) anyMissing = true;
+
         switch (s.type)
         {
         case DUST_SETTING_BOOL:
         case DUST_SETTING_HIDDEN_BOOL:
         {
-            int def = *(bool*)s.valuePtr ? 1 : 0;
-            *(bool*)s.valuePtr = GetPrivateProfileIntA(section, key, def, le.configPath.c_str()) != 0;
+            if (!missing)
+                *(bool*)s.valuePtr = GetPrivateProfileIntA(section, key, 0, le.configPath.c_str()) != 0;
+            // else: keep default
             break;
         }
         case DUST_SETTING_FLOAT:
         case DUST_SETTING_HIDDEN_FLOAT:
         {
-            char buf[64], defStr[64];
-            snprintf(defStr, sizeof(defStr), "%g", *(float*)s.valuePtr);
-            GetPrivateProfileStringA(section, key, defStr, buf, sizeof(buf), le.configPath.c_str());
-            *(float*)s.valuePtr = (float)atof(buf);
+            if (!missing)
+                *(float*)s.valuePtr = (float)atof(probe);
+            // else: keep default
             break;
         }
         case DUST_SETTING_INT:
         case DUST_SETTING_HIDDEN_INT:
         {
-            *(int*)s.valuePtr = GetPrivateProfileIntA(section, key, *(int*)s.valuePtr, le.configPath.c_str());
+            if (!missing)
+                *(int*)s.valuePtr = GetPrivateProfileIntA(section, key, 0, le.configPath.c_str());
+            // else: keep default
             break;
         }
         }
+    }
+
+    // Write missing keys to INI so new settings are persisted immediately
+    if (anyMissing)
+    {
+        Log("Config for '%s' has new settings, updating INI", le.desc.name);
+        EffectConfigSave(le);
     }
 
     Log("Config loaded for '%s' from %s", le.desc.name, le.configPath.c_str());
