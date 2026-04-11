@@ -569,6 +569,8 @@ static void RenderToast()
 
 bool Init(IDXGISwapChain* swapChain, ID3D11Device* device, ID3D11DeviceContext* context)
 {
+    if (gInitialized) return true;  // Already initialized (e.g. ResizeBuffers ran before first Present)
+
     gDevice = device;
     gContext = context;
 
