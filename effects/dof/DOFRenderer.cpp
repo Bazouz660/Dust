@@ -99,24 +99,34 @@ static void ReleaseTextures()
 #undef SAFE_RELEASE
 }
 
+static UINT gBlurW = 0;
+static UINT gBlurH = 0;
+static int gLastDownscale = 0;
+
 static bool CreateSizedResources(ID3D11Device* device, UINT w, UINT h)
 {
-    UINT hw = w / 2;
-    UINT hh = h / 2;
-    if (hw < 1) hw = 1;
-    if (hh < 1) hh = 1;
+    int divisor = gDOFConfig.blurDownscale;
+    if (divisor < 2) divisor = 2;
+    if (divisor > 4) divisor = 4;
+
+    UINT bw = w / divisor;
+    UINT bh = h / divisor;
+    if (bw < 1) bw = 1;
+    if (bh < 1) bh = 1;
+    gBlurW = bw;
+    gBlurH = bh;
 
     // CoC map at full resolution (R16_FLOAT for smooth gradients)
     if (!CreateTexture(device, w, h, DXGI_FORMAT_R16_FLOAT,
                        &gCocTex, &gCocRTV, &gCocSRV))
         return false;
 
-    // Half-res scene + blur temp (B8G8R8A8 to match LDR scene)
-    if (!CreateTexture(device, hw, hh, DXGI_FORMAT_B8G8R8A8_UNORM,
+    // Downscaled scene + blur temp (B8G8R8A8 to match LDR scene)
+    if (!CreateTexture(device, bw, bh, DXGI_FORMAT_B8G8R8A8_UNORM,
                        &gHalfTex, &gHalfRTV, &gHalfSRV))
         return false;
 
-    if (!CreateTexture(device, hw, hh, DXGI_FORMAT_B8G8R8A8_UNORM,
+    if (!CreateTexture(device, bw, bh, DXGI_FORMAT_B8G8R8A8_UNORM,
                        &gBlurTempTex, &gBlurTempRTV, &gBlurTempSRV))
         return false;
 
@@ -159,6 +169,7 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
     }
 
     // Textures
+    gLastDownscale = gDOFConfig.blurDownscale;
     if (!CreateSizedResources(device, width, height))
         return false;
 
@@ -250,12 +261,36 @@ void OnResolutionChanged(ID3D11Device* device, UINT newWidth, UINT newHeight)
     ReleaseTextures();
     gWidth = newWidth;
     gHeight = newHeight;
+    gLastDownscale = gDOFConfig.blurDownscale;
 
     if (!CreateSizedResources(device, newWidth, newHeight))
     {
         Log("DOF: WARNING: Failed to recreate textures");
         gInitialized = false;
     }
+}
+
+// Recreate blur textures if downscale factor changed at runtime
+void CheckDownscaleChanged(ID3D11DeviceContext* ctx)
+{
+    int cur = gDOFConfig.blurDownscale;
+    if (cur < 2) cur = 2;
+    if (cur > 4) cur = 4;
+    if (cur == gLastDownscale) return;
+
+    ID3D11Device* device = nullptr;
+    ctx->GetDevice(&device);
+    if (!device) return;
+
+    Log("DOF: Blur downscale changed %d -> %d, recreating textures", gLastDownscale, cur);
+    ReleaseTextures();
+    gLastDownscale = cur;
+    if (!CreateSizedResources(device, gWidth, gHeight))
+    {
+        Log("DOF: WARNING: Failed to recreate textures after downscale change");
+        gInitialized = false;
+    }
+    device->Release();
 }
 
 bool IsInitialized()
@@ -271,10 +306,13 @@ void Render(ID3D11DeviceContext* ctx,
     if (!gInitialized || !ctx || !sceneCopySRV || !depthSRV || !ldrRTV || !gHost)
         return;
 
+    CheckDownscaleChanged(ctx);
+    if (!gInitialized) return;
+
     gHost->SaveState(ctx);
 
-    UINT hw = gWidth / 2;
-    UINT hh = gHeight / 2;
+    UINT bw = gBlurW;
+    UINT bh = gBlurH;
 
     // Common state
     ctx->OMSetDepthStencilState(gNoDepthDSS, 0);
@@ -310,11 +348,11 @@ void Render(ID3D11DeviceContext* ctx,
         ctx->PSSetShaderResources(0, 1, &nullSRV);
     }
 
-    // --- Pass 2: Downsample scene to half resolution ---
+    // --- Pass 2: Downsample scene ---
     // Reuses CB from pass 1 (full-res texelSize is correct for source sampling)
     {
         ctx->OMSetRenderTargets(1, &gHalfRTV, nullptr);
-        D3D11_VIEWPORT vp = { 0, 0, (float)hw, (float)hh, 0, 1 };
+        D3D11_VIEWPORT vp = { 0, 0, (float)bw, (float)bh, 0, 1 };
         ctx->RSSetViewports(1, &vp);
         ctx->PSSetShaderResources(0, 1, &sceneCopySRV);
         ctx->PSSetSamplers(0, 1, &gLinearClampSampler);
@@ -323,16 +361,16 @@ void Render(ID3D11DeviceContext* ctx,
         ctx->PSSetShaderResources(0, 1, &nullSRV);
     }
 
-    // --- Pass 3: Horizontal blur at half resolution ---
+    // --- Pass 3: Horizontal blur ---
     {
         DOFCBData cb = {};
-        cb.texelSize[0] = 1.0f / (float)hw;
-        cb.texelSize[1] = 1.0f / (float)hh;
+        cb.texelSize[0] = 1.0f / (float)bw;
+        cb.texelSize[1] = 1.0f / (float)bh;
         cb.blurRadius = gDOFConfig.blurRadius;
         gHost->UpdateConstantBuffer(ctx, gDOFCB, &cb, sizeof(cb));
 
         ctx->OMSetRenderTargets(1, &gBlurTempRTV, nullptr);
-        D3D11_VIEWPORT vp = { 0, 0, (float)hw, (float)hh, 0, 1 };
+        D3D11_VIEWPORT vp = { 0, 0, (float)bw, (float)bh, 0, 1 };
         ctx->RSSetViewports(1, &vp);
         ctx->PSSetShaderResources(0, 1, &gHalfSRV);
         ctx->PSSetSamplers(0, 1, &gLinearClampSampler);
@@ -341,10 +379,10 @@ void Render(ID3D11DeviceContext* ctx,
         ctx->PSSetShaderResources(0, 1, &nullSRV);
     }
 
-    // --- Pass 4: Vertical blur at half resolution ---
+    // --- Pass 4: Vertical blur ---
     {
         ctx->OMSetRenderTargets(1, &gHalfRTV, nullptr);
-        D3D11_VIEWPORT vp = { 0, 0, (float)hw, (float)hh, 0, 1 };
+        D3D11_VIEWPORT vp = { 0, 0, (float)bw, (float)bh, 0, 1 };
         ctx->RSSetViewports(1, &vp);
         ctx->PSSetShaderResources(0, 1, &gBlurTempSRV);
         ctx->PSSetSamplers(0, 1, &gLinearClampSampler);

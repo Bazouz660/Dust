@@ -20,8 +20,11 @@ DOFConfig gDOFConfig;
 static HMODULE gPluginModule = nullptr;
 static const DustHostAPI* gHost = nullptr;
 
-// Auto-focus resources
-static ID3D11Texture2D* gFocusStagingTex = nullptr;
+// Auto-focus resources (double-buffered to avoid GPU pipeline stalls)
+static const int FOCUS_BUFFER_COUNT = 2;
+static ID3D11Texture2D* gFocusStagingTex[FOCUS_BUFFER_COUNT] = {};
+static int gFocusWriteIdx = 0;   // which staging texture to write into this frame
+static bool gFocusHasData[FOCUS_BUFFER_COUNT] = {}; // whether a valid copy exists
 static float gCurrentFocusDepth = 0.02f;
 static LARGE_INTEGER gLastFrameTime = {};
 static LARGE_INTEGER gPerfFreq = {};
@@ -37,9 +40,14 @@ static std::string GetPluginDir()
 
 static bool CreateFocusResources(ID3D11Device* device)
 {
-    if (gFocusStagingTex) { gFocusStagingTex->Release(); gFocusStagingTex = nullptr; }
+    for (int i = 0; i < FOCUS_BUFFER_COUNT; i++)
+    {
+        if (gFocusStagingTex[i]) { gFocusStagingTex[i]->Release(); gFocusStagingTex[i] = nullptr; }
+        gFocusHasData[i] = false;
+    }
+    gFocusWriteIdx = 0;
 
-    // 1x1 staging texture to read center depth
+    // 1x1 staging textures to read center depth (double-buffered)
     D3D11_TEXTURE2D_DESC desc = {};
     desc.Width = 1;
     desc.Height = 1;
@@ -50,26 +58,57 @@ static bool CreateFocusResources(ID3D11Device* device)
     desc.Usage = D3D11_USAGE_STAGING;
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
 
-    HRESULT hr = device->CreateTexture2D(&desc, nullptr, &gFocusStagingTex);
-    if (FAILED(hr))
+    for (int i = 0; i < FOCUS_BUFFER_COUNT; i++)
     {
-        Log("DOF: Failed to create focus staging texture: 0x%08X", hr);
-        return false;
+        HRESULT hr = device->CreateTexture2D(&desc, nullptr, &gFocusStagingTex[i]);
+        if (FAILED(hr))
+        {
+            Log("DOF: Failed to create focus staging texture %d: 0x%08X", i, hr);
+            return false;
+        }
     }
     return true;
 }
 
-// Read the depth at screen center for auto-focus
+// Read the depth at screen center for auto-focus.
+// Double-buffered: read from the staging texture written LAST frame (no stall),
+// then issue a copy into the other staging texture for next frame to read.
 static void UpdateAutoFocus(const DustFrameContext* ctx, const DustHostAPI* host)
 {
-    if (!gDOFConfig.autoFocus || !gFocusStagingTex)
+    if (!gDOFConfig.autoFocus || !gFocusStagingTex[0])
         return;
 
+    // Step 1: Read back from the OTHER buffer (written last frame) — should be ready, no stall
+    int readIdx = 1 - gFocusWriteIdx;
+    if (gFocusHasData[readIdx])
+    {
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        HRESULT hr = ctx->context->Map(gFocusStagingTex[readIdx], 0, D3D11_MAP_READ, 0, &mapped);
+        if (SUCCEEDED(hr))
+        {
+            float centerDepth = *(float*)mapped.pData;
+            ctx->context->Unmap(gFocusStagingTex[readIdx], 0);
+
+            // Skip invalid depth (sky, zero)
+            if (centerDepth > 0.0001f && centerDepth <= gDOFConfig.maxDepth)
+            {
+                LARGE_INTEGER now;
+                QueryPerformanceCounter(&now);
+                float dt = (float)(now.QuadPart - gLastFrameTime.QuadPart) / (float)gPerfFreq.QuadPart;
+                gLastFrameTime = now;
+                dt = dt < 0.001f ? 0.001f : (dt > 0.5f ? 0.5f : dt);
+
+                float alpha = 1.0f - expf(-dt * gDOFConfig.autoFocusSpeed);
+                gCurrentFocusDepth += (centerDepth - gCurrentFocusDepth) * alpha;
+            }
+        }
+    }
+
+    // Step 2: Issue copy into the WRITE buffer for next frame to read
     ID3D11ShaderResourceView* depthSRV = host->GetSRV(DUST_RESOURCE_DEPTH);
     if (!depthSRV)
         return;
 
-    // Get the underlying depth texture from the SRV
     ID3D11Resource* depthResource = nullptr;
     depthSRV->GetResource(&depthResource);
     if (!depthResource)
@@ -81,36 +120,15 @@ static void UpdateAutoFocus(const DustFrameContext* ctx, const DustHostAPI* host
     if (FAILED(hr) || !depthTex)
         return;
 
-    // Copy a 1x1 region from screen center
     UINT cx = ctx->width / 2;
     UINT cy = ctx->height / 2;
     D3D11_BOX srcBox = { cx, cy, 0, cx + 1, cy + 1, 1 };
-    ctx->context->CopySubresourceRegion(gFocusStagingTex, 0, 0, 0, 0,
+    ctx->context->CopySubresourceRegion(gFocusStagingTex[gFocusWriteIdx], 0, 0, 0, 0,
                                          depthTex, 0, &srcBox);
     depthTex->Release();
 
-    // Read back
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    hr = ctx->context->Map(gFocusStagingTex, 0, D3D11_MAP_READ, 0, &mapped);
-    if (SUCCEEDED(hr))
-    {
-        float centerDepth = *(float*)mapped.pData;
-        ctx->context->Unmap(gFocusStagingTex, 0);
-
-        // Skip invalid depth (sky, zero)
-        if (centerDepth > 0.0001f && centerDepth <= gDOFConfig.maxDepth)
-        {
-            // Temporal smoothing
-            LARGE_INTEGER now;
-            QueryPerformanceCounter(&now);
-            float dt = (float)(now.QuadPart - gLastFrameTime.QuadPart) / (float)gPerfFreq.QuadPart;
-            gLastFrameTime = now;
-            dt = dt < 0.001f ? 0.001f : (dt > 0.5f ? 0.5f : dt);
-
-            float alpha = 1.0f - expf(-dt * gDOFConfig.autoFocusSpeed);
-            gCurrentFocusDepth += (centerDepth - gCurrentFocusDepth) * alpha;
-        }
-    }
+    gFocusHasData[gFocusWriteIdx] = true;
+    gFocusWriteIdx = 1 - gFocusWriteIdx;  // swap for next frame
 }
 
 // Get the resolved focus distance (auto or manual)
@@ -180,7 +198,11 @@ static int DOFInit(ID3D11Device* device, uint32_t width, uint32_t height, const 
 static void DOFShutdown()
 {
     DOFRenderer::Shutdown();
-    if (gFocusStagingTex) { gFocusStagingTex->Release(); gFocusStagingTex = nullptr; }
+    for (int i = 0; i < FOCUS_BUFFER_COUNT; i++)
+    {
+        if (gFocusStagingTex[i]) { gFocusStagingTex[i]->Release(); gFocusStagingTex[i] = nullptr; }
+        gFocusHasData[i] = false;
+    }
     Log("DOF: Shut down");
 }
 
@@ -209,6 +231,7 @@ static DustSettingDesc gSettingsArray[] = {
     { "Far End",          DUST_SETTING_FLOAT, &gDOFConfig.farEnd,          0.001f,  0.1f,   "FarEnd" },
     { "Far Strength",     DUST_SETTING_FLOAT, &gDOFConfig.farStrength,     0.0f,    1.0f,   "FarStrength" },
     { "Blur Radius",      DUST_SETTING_FLOAT, &gDOFConfig.blurRadius,      1.0f,    32.0f,  "BlurRadius" },
+    { "Blur Downscale",   DUST_SETTING_INT,   &gDOFConfig.blurDownscale,   2.0f,    4.0f,   "BlurDownscale" },
     { "Max Depth",        DUST_SETTING_FLOAT, &gDOFConfig.maxDepth,        0.01f,   1.0f,   "MaxDepth" },
     { "Debug View",       DUST_SETTING_BOOL,  &gDOFConfig.debugView,       0.0f,    1.0f,   "DebugView" },
 };
