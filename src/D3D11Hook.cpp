@@ -230,8 +230,9 @@ static HRESULT STDMETHODCALLTYPE HookedCreatePixelShader(
     ID3D11Device* pThis, const void* pShaderBytecode, SIZE_T BytecodeLength,
     ID3D11ClassLinkage* pClassLinkage, ID3D11PixelShader** ppPixelShader)
 {
-    if (!gDeviceCaptured)
-        TryCaptureDevice(pThis);
+    // NOTE: Do NOT capture device here.  OGRE (and other middleware) may create
+    // temporary enumeration devices that are destroyed before rendering begins.
+    // Device capture happens in HookedDraw from the actual rendering context.
 
     return oCreatePixelShader(pThis, pShaderBytecode, BytecodeLength,
                                pClassLinkage, ppPixelShader);
@@ -328,10 +329,29 @@ static void SurveyFullscreenDraw(ID3D11DeviceContext* ctx, UINT vertexCount)
 static void STDMETHODCALLTYPE HookedDraw(
     ID3D11DeviceContext* pThis, UINT VertexCount, UINT StartVertexLocation)
 {
-    if (!gDeviceCaptured || (VertexCount != 3 && VertexCount != 4))
+    if (VertexCount != 3 && VertexCount != 4)
     {
         oDraw(pThis, VertexCount, StartVertexLocation);
         return;
+    }
+
+    // Capture device from the rendering context on first fullscreen draw.
+    // This is the actual game device, not a temporary enumeration device.
+    if (!gDeviceCaptured)
+    {
+        ID3D11Device* ctxDevice = nullptr;
+        pThis->GetDevice(&ctxDevice);
+        if (ctxDevice)
+        {
+            TryCaptureDevice(ctxDevice);
+            ctxDevice->Release();
+        }
+
+        if (!gDeviceCaptured)
+        {
+            oDraw(pThis, VertexCount, StartVertexLocation);
+            return;
+        }
     }
 
 #ifdef DUST_SURVEY
@@ -343,7 +363,7 @@ static void STDMETHODCALLTYPE HookedDraw(
 
     if (result.detected)
     {
-        // Verify the context's device matches our captured device
+        // Verify the context's device matches our captured device (one-time check)
         {
             static bool sDeviceChecked = false;
             if (!sDeviceChecked)

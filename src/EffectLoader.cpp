@@ -683,6 +683,51 @@ bool EffectLoader::InitAll(ID3D11Device* device, uint32_t w, uint32_t h)
     return allOk;
 }
 
+// ==================== ReinitAll ====================
+
+bool EffectLoader::ReinitAll(ID3D11Device* device, uint32_t w, uint32_t h)
+{
+    Log("Reinitializing all effects on device=%p at %ux%u", device, w, h);
+
+    for (auto& le : effects_)
+    {
+        if (le.initialized && le.desc.Shutdown)
+            le.desc.Shutdown();
+
+        // Release framework timing queries
+        for (int phase = 0; phase < 2; phase++)
+        for (int slot = 0; slot < 2; slot++)
+        {
+            if (le.tsDisjoint[phase][slot]) { le.tsDisjoint[phase][slot]->Release(); le.tsDisjoint[phase][slot] = nullptr; }
+            if (le.tsBegin[phase][slot])    { le.tsBegin[phase][slot]->Release();    le.tsBegin[phase][slot] = nullptr; }
+            if (le.tsEnd[phase][slot])      { le.tsEnd[phase][slot]->Release();      le.tsEnd[phase][slot] = nullptr; }
+        }
+        le.timingSlot[0] = le.timingSlot[1] = 0;
+        le.timingWarmup[0] = le.timingWarmup[1] = 0;
+        le.gpuTimePre = le.gpuTimePost = le.gpuTimeMs = 0.0f;
+
+        le.initialized = false;
+    }
+
+    // Release scene copies (they belong to the old device)
+    ReleaseSceneCopies();
+
+    // Recompile fullscreen VS on the new device
+    if (gFullscreenVS) { gFullscreenVS->Release(); gFullscreenVS = nullptr; }
+    {
+        std::string vsPath = gFrameworkShaderDir + "fullscreen_vs.hlsl";
+        ID3DBlob* vsBlob = HostCompileShaderFromFile(vsPath.c_str(), "main", "vs_5_0");
+        if (vsBlob)
+        {
+            device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(),
+                                        nullptr, &gFullscreenVS);
+            vsBlob->Release();
+        }
+    }
+
+    return InitAll(device, w, h);
+}
+
 // ==================== Dispatch ====================
 
 void EffectLoader::DispatchPre(DustInjectionPoint point, const DustFrameContext* ctx)

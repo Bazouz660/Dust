@@ -35,6 +35,10 @@ public:
     // Initialize all loaded plugins (call after device capture)
     bool InitAll(ID3D11Device* device, uint32_t w, uint32_t h);
 
+    // Shut down and re-initialize all plugins on a (possibly different) device.
+    // Used when the captured device turns out to be wrong (multi-monitor).
+    bool ReinitAll(ID3D11Device* device, uint32_t w, uint32_t h);
+
     // Dispatch callbacks for a given injection point
     void DispatchPre(DustInjectionPoint point, const DustFrameContext* ctx);
     void DispatchPost(DustInjectionPoint point, const DustFrameContext* ctx);
