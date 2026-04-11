@@ -96,6 +96,7 @@
     <None Include="shaders\ssao_blur_h_ps.hlsl" />
     <None Include="shaders\ssao_blur_v_ps.hlsl" />
     <None Include="shaders\ssao_apply_ps.hlsl" />
+    <None Include="shaders\ssao_upsample_ps.hlsl" />
     <None Include="shaders\ssao_debug_ps.hlsl" />
     <ClInclude Include="SSAOConfig.h" />
   </ItemGroup>

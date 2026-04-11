@@ -1,6 +1,6 @@
 // HDR -> Tonemap -> LUT -> Dither in a single pass.
 // Input:  HDR scene copy (R11G11B10_FLOAT)
-// LUT:    R32G32B32A32_FLOAT (full float precision, no quantization in lookup)
+// LUT:    R16G16B16A16_FLOAT (half-float precision, more than enough for 8-bit output)
 // Output: LDR (B8G8R8A8_UNORM) — the ONLY quantization step in the entire chain.
 // Vertex shader is provided by the framework via host->DrawFullscreenTriangle()
 
@@ -64,7 +64,7 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
     // Tonemap: HDR -> [0,1] entirely in float precision (no 8-bit step)
     float3 ldr = ACESFilm(hdr);
 
-    // LUT color grading (still float — LUT texture is R32F)
+    // LUT color grading (half-float LUT, sampled as float by GPU)
     float3 graded = SampleLUT(ldr, lutTex, linearSamp, lutSize);
     float3 result = lerp(ldr, graded, intensity);
 

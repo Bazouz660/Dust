@@ -22,6 +22,8 @@ cbuffer SSILParams : register(b0)
     float  colorBleeding;
     float  debugMode;
     float  blurSharpness;
+    float  numDirections;
+    float  numSteps;
 };
 
 static const int BLUR_RADIUS = 4;

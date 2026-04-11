@@ -186,6 +186,7 @@ static DustSettingDesc gSettingsArray[] = {
     { "Max Screen Radius",  DUST_SETTING_FLOAT, &gSSILConfig.maxScreenRadius,  0.005f,  0.2f,   "MaxScreenRadius" },
     { "Min Screen Radius",  DUST_SETTING_FLOAT, &gSSILConfig.minScreenRadius,  0.0001f, 0.01f,  "MinScreenRadius" },
     { "Color Bleeding",     DUST_SETTING_FLOAT, &gSSILConfig.colorBleeding,    0.0f,    2.0f,   "ColorBleeding" },
+    { "Samples",            DUST_SETTING_FLOAT, &gSSILConfig.sampleCount,      4.0f,    12.0f,  "Samples" },
     { "Blur Sharpness",     DUST_SETTING_FLOAT, &gSSILConfig.blurSharpness,    0.0f,    0.1f,   "BlurSharpness" },
     { "Debug View",         DUST_SETTING_BOOL,  &gSSILConfig.debugView,        0.0f,    1.0f,   "DebugView" },
     // Hidden settings

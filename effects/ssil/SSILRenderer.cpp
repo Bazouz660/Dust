@@ -53,6 +53,8 @@ struct SSILCBData
     float colorBleeding;
     float debugMode;
     float blurSharpness;
+    float numDirections;
+    float numSteps;
 };
 static ID3D11Buffer* gSSILCB = nullptr;
 
@@ -298,6 +300,10 @@ ID3D11ShaderResourceView* RenderIL(ID3D11DeviceContext* ctx,
         cb.colorBleeding = gSSILConfig.colorBleeding;
         cb.debugMode = gSSILConfig.debugView ? 1.0f : 0.0f;
         cb.blurSharpness = gSSILConfig.blurSharpness;
+        int numDirs = (int)(gSSILConfig.sampleCount + 0.5f);
+        if (numDirs < 1) numDirs = 1;
+        cb.numDirections = (float)numDirs;
+        cb.numSteps = 4.0f;
         gHost->UpdateConstantBuffer(ctx, gSSILCB, &cb, sizeof(cb));
     }
 

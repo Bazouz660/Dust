@@ -24,12 +24,12 @@ cbuffer SSILParams : register(b0)
     float  depthFadeStart;
     float  colorBleeding;
     float  debugMode;
-    float  _pad;
+    float  blurSharpness;
+    float  numDirections;
+    float  numSteps;
 };
 
 static const float PI = 3.14159265;
-static const int NUM_DIRECTIONS = 8;
-static const int NUM_STEPS = 4;
 
 float3 ReconstructViewPos(float2 uv, float depth)
 {
@@ -80,19 +80,22 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     float screenRadius = viewSpaceRadius / (depth * tanHalfFov * 2.0);
     screenRadius = clamp(screenRadius, minScreenRadius, maxScreenRadius);
 
+    int iNumDirs = (int)numDirections;
+    int iNumSteps = (int)numSteps;
+
     float3 indirectLight = float3(0, 0, 0);
     float totalWeight = 0.0;
 
-    [unroll]
-    for (int dir = 0; dir < NUM_DIRECTIONS; dir++)
+    [loop]
+    for (int dir = 0; dir < iNumDirs; dir++)
     {
-        float angle = (float(dir) / float(NUM_DIRECTIONS)) * PI + noiseAngle;
+        float angle = (float(dir) / numDirections) * PI + noiseAngle;
         float2 direction = float2(cos(angle), sin(angle));
 
-        [unroll]
-        for (int step = 1; step <= NUM_STEPS; step++)
+        [loop]
+        for (int step = 1; step <= iNumSteps; step++)
         {
-            float t = float(step) / float(NUM_STEPS);
+            float t = float(step) / numSteps;
             float2 offset = direction * screenRadius * t;
 
             // Sample in positive direction

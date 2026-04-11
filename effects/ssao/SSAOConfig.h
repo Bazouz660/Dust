@@ -32,6 +32,9 @@ struct SSAOConfig
     // Direct light occlusion — how much AO affects direct sunlight (0 = ambient only, 1 = full)
     float directLightOcclusion = 0.3f;
 
+    // Performance — sample count (12 = full quality, 6 = performance, range 4–12)
+    float sampleCount = 4.0f;
+
     // Debug
     bool debugView = false;
 };

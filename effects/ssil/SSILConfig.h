@@ -20,6 +20,9 @@ struct SSILConfig
     float depthFadeStart = 0.0f;
     float colorBleeding = 1.0f;
 
+    // Sampling
+    float sampleCount = 8.0f;
+
     // Blur
     float blurSharpness = 0.01f;
 

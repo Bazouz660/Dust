@@ -13,7 +13,7 @@ static UINT gHeight = 0;
 static const DustHostAPI* gHost = nullptr;
 static std::string gShaderDir;
 
-// AO textures (ping-pong for gen + blur)
+// Full-res AO textures (ping-pong for gen + blur)
 static ID3D11Texture2D*          gAoTex = nullptr;
 static ID3D11RenderTargetView*   gAoRTV = nullptr;
 static ID3D11ShaderResourceView* gAoSRV = nullptr;
@@ -22,11 +22,23 @@ static ID3D11Texture2D*          gAoBlurTex = nullptr;
 static ID3D11RenderTargetView*   gAoBlurRTV = nullptr;
 static ID3D11ShaderResourceView* gAoBlurSRV = nullptr;
 
+// Half-res AO textures (used when halfResolution is enabled)
+static UINT gHalfWidth = 0;
+static UINT gHalfHeight = 0;
+static ID3D11Texture2D*          gAoHalfTex = nullptr;
+static ID3D11RenderTargetView*   gAoHalfRTV = nullptr;
+static ID3D11ShaderResourceView* gAoHalfSRV = nullptr;
+
+static ID3D11Texture2D*          gAoHalfBlurTex = nullptr;
+static ID3D11RenderTargetView*   gAoHalfBlurRTV = nullptr;
+static ID3D11ShaderResourceView* gAoHalfBlurSRV = nullptr;
+
 // Shaders
 static ID3D11VertexShader* gFullscreenVS = nullptr;
 static ID3D11PixelShader*  gSSAOGenPS = nullptr;
 static ID3D11PixelShader*  gSSAOBlurHPS = nullptr;
 static ID3D11PixelShader*  gSSAOBlurVPS = nullptr;
+static ID3D11PixelShader*  gSSAOUpsamplePS = nullptr;
 static ID3D11PixelShader*  gSSAODebugPS = nullptr;
 
 // Pipeline states
@@ -34,6 +46,7 @@ static ID3D11BlendState*        gNoBlend = nullptr;
 static ID3D11DepthStencilState* gNoDepthDSS = nullptr;
 static ID3D11RasterizerState*   gNoCullRS = nullptr;
 static ID3D11SamplerState*      gPointClampSampler = nullptr;
+static ID3D11SamplerState*      gLinearClampSampler = nullptr;
 
 struct SSAOCBData
 {
@@ -54,19 +67,11 @@ struct SSAOCBData
     float depthFadeStart;
     float blurSharpness;
     float nightCompensation;
-    float _pad[1]; // pad to 16-byte alignment
+    float noiseScale;
+    float numDirections;
+    float numSteps;
 };
 static ID3D11Buffer* gSSAOCB = nullptr;
-
-// GPU timing
-static ID3D11Query* gTimestampBegin = nullptr;
-static ID3D11Query* gTimestampEnd = nullptr;
-static ID3D11Query* gTimestampDisjoint = nullptr;
-static int gTimingFrameCount = 0;
-static double gTimingAccumMs = 0.0;
-static const int TIMING_LOG_INTERVAL = 300;
-static float gLastGpuTimeMs = 0.0f;
-static bool gTimingActive = false;
 
 // ==================== Helpers ====================
 
@@ -123,8 +128,11 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
     ID3DBlob* blurVBlob = host->CompileShaderFromFile((gShaderDir + "ssao_blur_v_ps.hlsl").c_str(), "main", "ps_5_0");
     if (!blurVBlob) { vsBlob->Release(); genBlob->Release(); blurHBlob->Release(); return false; }
 
+    ID3DBlob* upsampleBlob = host->CompileShaderFromFile((gShaderDir + "ssao_upsample_ps.hlsl").c_str(), "main", "ps_5_0");
+    if (!upsampleBlob) { vsBlob->Release(); genBlob->Release(); blurHBlob->Release(); blurVBlob->Release(); return false; }
+
     ID3DBlob* debugBlob = host->CompileShaderFromFile((gShaderDir + "ssao_debug_ps.hlsl").c_str(), "main", "ps_5_0");
-    if (!debugBlob) { vsBlob->Release(); genBlob->Release(); blurHBlob->Release(); blurVBlob->Release(); return false; }
+    if (!debugBlob) { vsBlob->Release(); genBlob->Release(); blurHBlob->Release(); blurVBlob->Release(); upsampleBlob->Release(); return false; }
 
     HRESULT hr;
 
@@ -144,14 +152,26 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
     blurVBlob->Release();
     if (FAILED(hr)) { Log("Failed to create blur V PS: 0x%08X", hr); return false; }
 
+    hr = device->CreatePixelShader(upsampleBlob->GetBufferPointer(), upsampleBlob->GetBufferSize(), nullptr, &gSSAOUpsamplePS);
+    upsampleBlob->Release();
+    if (FAILED(hr)) { Log("Failed to create upsample PS: 0x%08X", hr); return false; }
+
     hr = device->CreatePixelShader(debugBlob->GetBufferPointer(), debugBlob->GetBufferSize(), nullptr, &gSSAODebugPS);
     debugBlob->Release();
     if (FAILED(hr)) { Log("Failed to create debug PS: 0x%08X", hr); return false; }
 
-    // Textures
+    // Full-res textures (always needed)
     if (!CreateR8Texture(device, width, height, &gAoTex, &gAoRTV, &gAoSRV))
         return false;
     if (!CreateR8Texture(device, width, height, &gAoBlurTex, &gAoBlurRTV, &gAoBlurSRV))
+        return false;
+
+    // Half-res textures (for optional half-res mode)
+    gHalfWidth = (width + 1) / 2;
+    gHalfHeight = (height + 1) / 2;
+    if (!CreateR8Texture(device, gHalfWidth, gHalfHeight, &gAoHalfTex, &gAoHalfRTV, &gAoHalfSRV))
+        return false;
+    if (!CreateR8Texture(device, gHalfWidth, gHalfHeight, &gAoHalfBlurTex, &gAoHalfBlurRTV, &gAoHalfBlurSRV))
         return false;
 
     // No blend
@@ -193,19 +213,20 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
         if (FAILED(hr)) return false;
     }
 
+    // Linear-clamp sampler (for half-res upsample)
+    {
+        D3D11_SAMPLER_DESC desc = {};
+        desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+        desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+        desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        hr = device->CreateSamplerState(&desc, &gLinearClampSampler);
+        if (FAILED(hr)) return false;
+    }
+
     // Constant buffer
     gSSAOCB = host->CreateConstantBuffer(device, sizeof(SSAOCBData));
     if (!gSSAOCB) return false;
-
-    // GPU timestamp queries for internal performance logging
-    {
-        D3D11_QUERY_DESC qd = {};
-        qd.Query = D3D11_QUERY_TIMESTAMP;
-        device->CreateQuery(&qd, &gTimestampBegin);
-        device->CreateQuery(&qd, &gTimestampEnd);
-        qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
-        device->CreateQuery(&qd, &gTimestampDisjoint);
-    }
 
     gInitialized = true;
     Log("SSAORenderer initialized successfully");
@@ -215,15 +236,16 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
 void Shutdown()
 {
 #define SAFE_RELEASE(p) if (p) { (p)->Release(); (p) = nullptr; }
-    SAFE_RELEASE(gAoTex);     SAFE_RELEASE(gAoRTV);     SAFE_RELEASE(gAoSRV);
-    SAFE_RELEASE(gAoBlurTex); SAFE_RELEASE(gAoBlurRTV); SAFE_RELEASE(gAoBlurSRV);
+    SAFE_RELEASE(gAoTex);         SAFE_RELEASE(gAoRTV);         SAFE_RELEASE(gAoSRV);
+    SAFE_RELEASE(gAoBlurTex);     SAFE_RELEASE(gAoBlurRTV);     SAFE_RELEASE(gAoBlurSRV);
+    SAFE_RELEASE(gAoHalfTex);     SAFE_RELEASE(gAoHalfRTV);     SAFE_RELEASE(gAoHalfSRV);
+    SAFE_RELEASE(gAoHalfBlurTex); SAFE_RELEASE(gAoHalfBlurRTV); SAFE_RELEASE(gAoHalfBlurSRV);
     SAFE_RELEASE(gFullscreenVS);
     SAFE_RELEASE(gSSAOGenPS);  SAFE_RELEASE(gSSAOBlurHPS);
-    SAFE_RELEASE(gSSAOBlurVPS); SAFE_RELEASE(gSSAODebugPS);
+    SAFE_RELEASE(gSSAOBlurVPS); SAFE_RELEASE(gSSAOUpsamplePS); SAFE_RELEASE(gSSAODebugPS);
     SAFE_RELEASE(gNoBlend);
     SAFE_RELEASE(gNoDepthDSS);   SAFE_RELEASE(gNoCullRS);
-    SAFE_RELEASE(gPointClampSampler); SAFE_RELEASE(gSSAOCB);
-    SAFE_RELEASE(gTimestampBegin); SAFE_RELEASE(gTimestampEnd); SAFE_RELEASE(gTimestampDisjoint);
+    SAFE_RELEASE(gPointClampSampler); SAFE_RELEASE(gLinearClampSampler); SAFE_RELEASE(gSSAOCB);
 #undef SAFE_RELEASE
     gInitialized = false;
     gHost = nullptr;
@@ -238,14 +260,20 @@ void OnResolutionChanged(ID3D11Device* device, UINT newWidth, UINT newHeight)
     Log("Resolution changed: %ux%u -> %ux%u", gWidth, gHeight, newWidth, newHeight);
 
 #define SAFE_RELEASE(p) if (p) { (p)->Release(); (p) = nullptr; }
-    SAFE_RELEASE(gAoTex);     SAFE_RELEASE(gAoRTV);     SAFE_RELEASE(gAoSRV);
-    SAFE_RELEASE(gAoBlurTex); SAFE_RELEASE(gAoBlurRTV); SAFE_RELEASE(gAoBlurSRV);
+    SAFE_RELEASE(gAoTex);         SAFE_RELEASE(gAoRTV);         SAFE_RELEASE(gAoSRV);
+    SAFE_RELEASE(gAoBlurTex);     SAFE_RELEASE(gAoBlurRTV);     SAFE_RELEASE(gAoBlurSRV);
+    SAFE_RELEASE(gAoHalfTex);     SAFE_RELEASE(gAoHalfRTV);     SAFE_RELEASE(gAoHalfSRV);
+    SAFE_RELEASE(gAoHalfBlurTex); SAFE_RELEASE(gAoHalfBlurRTV); SAFE_RELEASE(gAoHalfBlurSRV);
 #undef SAFE_RELEASE
 
     gWidth = newWidth;
     gHeight = newHeight;
+    gHalfWidth = (newWidth + 1) / 2;
+    gHalfHeight = (newHeight + 1) / 2;
     if (!CreateR8Texture(device, newWidth, newHeight, &gAoTex, &gAoRTV, &gAoSRV)
-        || !CreateR8Texture(device, newWidth, newHeight, &gAoBlurTex, &gAoBlurRTV, &gAoBlurSRV))
+        || !CreateR8Texture(device, newWidth, newHeight, &gAoBlurTex, &gAoBlurRTV, &gAoBlurSRV)
+        || !CreateR8Texture(device, gHalfWidth, gHalfHeight, &gAoHalfTex, &gAoHalfRTV, &gAoHalfSRV)
+        || !CreateR8Texture(device, gHalfWidth, gHalfHeight, &gAoHalfBlurTex, &gAoHalfBlurRTV, &gAoHalfBlurSRV))
     {
         Log("WARNING: Failed to recreate AO textures after resolution change");
         gInitialized = false;
@@ -264,7 +292,7 @@ ID3D11ShaderResourceView* GetAoSRV()
 
 float GetLastGpuTimeMs()
 {
-    return gLastGpuTimeMs;
+    return 0.0f;  // Framework handles timing via DUST_FLAG_FRAMEWORK_TIMING
 }
 
 ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
@@ -303,6 +331,11 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
 
     gHost->SaveState(ctx);
 
+    // Directions slider (4–12), steps always 6 for consistent AO intensity
+    int numDirs = (int)(gSSAOConfig.sampleCount + 0.5f);
+    if (numDirs < 4) numDirs = 4;
+    if (numDirs > 12) numDirs = 12;
+
     // Update constant buffer
     {
         SSAOCBData cb = {};
@@ -325,15 +358,23 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
         cb.depthFadeStart = gSSAOConfig.depthFadeStart;
         cb.blurSharpness = gSSAOConfig.blurSharpness;
         cb.nightCompensation = gSSAOConfig.nightCompensation;
+        cb.noiseScale = 1.0f;
+        cb.numDirections = (float)numDirs;
+        cb.numSteps = 6.0f;
         gHost->UpdateConstantBuffer(ctx, gSSAOCB, &cb, sizeof(cb));
     }
 
-    // Common state for AO passes
+    // Common state for all passes (set once)
     ctx->IASetInputLayout(nullptr);
     ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ctx->VSSetShader(gFullscreenVS, nullptr, 0);
     ctx->RSSetState(gNoCullRS);
     ctx->OMSetDepthStencilState(gNoDepthDSS, 0);
+
+    float blendFactor[4] = { 0, 0, 0, 0 };
+    ctx->OMSetBlendState(gNoBlend, blendFactor, 0xFFFFFFFF);
+    ctx->PSSetSamplers(0, 1, &gPointClampSampler);
+    ctx->PSSetConstantBuffers(0, 1, &gSSAOCB);
 
     D3D11_VIEWPORT vp = {};
     vp.Width = (float)gWidth;
@@ -341,53 +382,14 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
     vp.MaxDepth = 1.0f;
     ctx->RSSetViewports(1, &vp);
 
-    float blendFactor[4] = { 0, 0, 0, 0 };
     ID3D11ShaderResourceView* nullSRVs[2] = { nullptr, nullptr };
 
-    // Collect previous frame's GPU timing
-    if (gTimingActive && gTimestampDisjoint)
+    // Pass 1: Generate raw AO (fullscreen triangle covers all pixels, no clear needed)
     {
-        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjointData;
-        UINT64 tsBegin = 0, tsEnd = 0;
-        if (ctx->GetData(gTimestampDisjoint, &disjointData, sizeof(disjointData), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK
-            && !disjointData.Disjoint
-            && ctx->GetData(gTimestampBegin, &tsBegin, sizeof(tsBegin), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK
-            && ctx->GetData(gTimestampEnd, &tsEnd, sizeof(tsEnd), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK)
-        {
-            double ms = (double)(tsEnd - tsBegin) / (double)disjointData.Frequency * 1000.0;
-            gLastGpuTimeMs = (float)ms;
-            gTimingAccumMs += ms;
-            gTimingFrameCount++;
-
-            if (gTimingFrameCount >= TIMING_LOG_INTERVAL)
-            {
-                double avgMs = gTimingAccumMs / gTimingFrameCount;
-                Log("SSAO timing: %.2f ms avg (%d frames, %ux%u)", avgMs, gTimingFrameCount, gWidth, gHeight);
-                gTimingAccumMs = 0.0;
-                gTimingFrameCount = 0;
-            }
-        }
-        gTimingActive = false;
-    }
-
-    // Begin GPU timing
-    if (gTimestampDisjoint)
-    {
-        ctx->Begin(gTimestampDisjoint);
-        ctx->End(gTimestampBegin);
-    }
-
-    // Pass 1: Generate raw AO
-    {
-        float clearColor[4] = { 1, 1, 1, 1 };
-        ctx->ClearRenderTargetView(gAoRTV, clearColor);
         ctx->OMSetRenderTargets(1, &gAoRTV, nullptr);
-        ctx->OMSetBlendState(gNoBlend, blendFactor, 0xFFFFFFFF);
         ctx->PSSetShader(gSSAOGenPS, nullptr, 0);
         ID3D11ShaderResourceView* srvs[2] = { depthSRV, nullptr };
         ctx->PSSetShaderResources(0, 2, srvs);
-        ctx->PSSetSamplers(0, 1, &gPointClampSampler);
-        ctx->PSSetConstantBuffers(0, 1, &gSSAOCB);
         ctx->Draw(3, 0);
         ctx->PSSetShaderResources(0, 2, nullSRVs);
     }
@@ -395,12 +397,9 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
     // Pass 2: Horizontal blur
     {
         ctx->OMSetRenderTargets(1, &gAoBlurRTV, nullptr);
-        ctx->OMSetBlendState(gNoBlend, blendFactor, 0xFFFFFFFF);
         ctx->PSSetShader(gSSAOBlurHPS, nullptr, 0);
         ID3D11ShaderResourceView* srvs[2] = { gAoSRV, depthSRV };
         ctx->PSSetShaderResources(0, 2, srvs);
-        ctx->PSSetSamplers(0, 1, &gPointClampSampler);
-        ctx->PSSetConstantBuffers(0, 1, &gSSAOCB);
         ctx->Draw(3, 0);
         ctx->PSSetShaderResources(0, 2, nullSRVs);
     }
@@ -408,22 +407,11 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
     // Pass 3: Vertical blur
     {
         ctx->OMSetRenderTargets(1, &gAoRTV, nullptr);
-        ctx->OMSetBlendState(gNoBlend, blendFactor, 0xFFFFFFFF);
         ctx->PSSetShader(gSSAOBlurVPS, nullptr, 0);
         ID3D11ShaderResourceView* srvs[2] = { gAoBlurSRV, depthSRV };
         ctx->PSSetShaderResources(0, 2, srvs);
-        ctx->PSSetSamplers(0, 1, &gPointClampSampler);
-        ctx->PSSetConstantBuffers(0, 1, &gSSAOCB);
         ctx->Draw(3, 0);
         ctx->PSSetShaderResources(0, 2, nullSRVs);
-    }
-
-    // End GPU timing (results collected next frame)
-    if (gTimestampDisjoint)
-    {
-        ctx->End(gTimestampEnd);
-        ctx->End(gTimestampDisjoint);
-        gTimingActive = true;
     }
 
     // Restore state via host API

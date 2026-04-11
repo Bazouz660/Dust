@@ -22,10 +22,14 @@ cbuffer SSAOParams : register(b0)
     float  minScreenRadius;
     float  depthFadeStart;
     float  blurSharpness;
+    float  nightCompensation;
+    float  noiseScale;
+    float  numDirections;
+    float  numSteps;
 };
 
-static const int BLUR_RADIUS = 6;
 static const float REFERENCE_HEIGHT = 1080.0;
+static const int BLUR_RADIUS = 6;
 static const float weights[13] = {
     0.0044, 0.0115, 0.0257, 0.0488, 0.0799, 0.1122, 0.1350,
     0.1122, 0.0799, 0.0488, 0.0257, 0.0115, 0.0044

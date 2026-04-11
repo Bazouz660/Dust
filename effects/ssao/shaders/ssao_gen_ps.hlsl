@@ -22,20 +22,13 @@ cbuffer SSAOParams : register(b0)
     float  minScreenRadius;
     float  depthFadeStart;
     float  blurSharpness;
+    float  nightCompensation;
+    float  noiseScale;
+    float  numDirections;
+    float  numSteps;
 };
 
 static const float PI = 3.14159265;
-static const int NUM_DIRECTIONS = 12;
-static const int NUM_STEPS = 6;
-
-float3 ReconstructViewPos(float2 uv, float depth)
-{
-    float3 pos;
-    pos.x = (uv.x * 2.0 - 1.0) * aspectRatio * tanHalfFov * depth;
-    pos.y = (1.0 - uv.y * 2.0) * tanHalfFov * depth;
-    pos.z = depth;
-    return pos;
-}
 
 // Interleaved gradient noise — better spatial distribution than sin hash
 float InterleavedGradientNoise(float2 screenPos)
@@ -50,7 +43,14 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     if (depth <= 0.0001 || depth > aoMaxDepth)
         return float4(1, 1, 1, 1);
 
-    float3 viewPos = ReconstructViewPos(uv, depth);
+    // Precompute UV-to-view-space scale factors (constant across all samples)
+    float2 uvScale = float2(aspectRatio * tanHalfFov, tanHalfFov);
+
+    // Center view position
+    float3 viewPos;
+    viewPos.x = (uv.x * 2.0 - 1.0) * uvScale.x * depth;
+    viewPos.y = (1.0 - uv.y * 2.0) * uvScale.y * depth;
+    viewPos.z = depth;
 
     // Normal from depth cross-derivatives (smallest-delta method)
     float depthR = depthTex.Sample(pointClamp, uv + float2( invViewportSize.x, 0));
@@ -58,45 +58,72 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     float depthU = depthTex.Sample(pointClamp, uv + float2(0, -invViewportSize.y));
     float depthD = depthTex.Sample(pointClamp, uv + float2(0,  invViewportSize.y));
 
+    // Use precomputed UV offsets for neighbor reconstruction
     float3 ddxPos, ddyPos;
     if (abs(depthR - depth) < abs(depthL - depth))
-        ddxPos = ReconstructViewPos(uv + float2(invViewportSize.x, 0), depthR) - viewPos;
+    {
+        float2 nUV = uv + float2(invViewportSize.x, 0);
+        ddxPos = float3((nUV.x * 2.0 - 1.0) * uvScale.x * depthR,
+                        (1.0 - nUV.y * 2.0) * uvScale.y * depthR,
+                        depthR) - viewPos;
+    }
     else
-        ddxPos = viewPos - ReconstructViewPos(uv - float2(invViewportSize.x, 0), depthL);
+    {
+        float2 nUV = uv - float2(invViewportSize.x, 0);
+        ddxPos = viewPos - float3((nUV.x * 2.0 - 1.0) * uvScale.x * depthL,
+                                   (1.0 - nUV.y * 2.0) * uvScale.y * depthL,
+                                   depthL);
+    }
 
     if (abs(depthD - depth) < abs(depthU - depth))
-        ddyPos = ReconstructViewPos(uv + float2(0, invViewportSize.y), depthD) - viewPos;
+    {
+        float2 nUV = uv + float2(0, invViewportSize.y);
+        ddyPos = float3((nUV.x * 2.0 - 1.0) * uvScale.x * depthD,
+                        (1.0 - nUV.y * 2.0) * uvScale.y * depthD,
+                        depthD) - viewPos;
+    }
     else
-        ddyPos = viewPos - ReconstructViewPos(uv - float2(0, invViewportSize.y), depthU);
+    {
+        float2 nUV = uv - float2(0, invViewportSize.y);
+        ddyPos = viewPos - float3((nUV.x * 2.0 - 1.0) * uvScale.x * depthU,
+                                   (1.0 - nUV.y * 2.0) * uvScale.y * depthU,
+                                   depthU);
+    }
 
     float3 normal = normalize(cross(ddxPos, ddyPos));
 
     // Per-pixel rotation using interleaved gradient noise
-    float noiseAngle = InterleavedGradientNoise(pos.xy) * PI;
+    float noiseAngle = InterleavedGradientNoise(pos.xy * noiseScale) * PI;
 
-    // View-space AO radius, projected to UV space.
-    // Resolution-independent: same view-space radius always covers
-    // the same world-space area regardless of screen resolution.
+    // View-space AO radius, projected to UV space
     float viewSpaceRadius = aoRadius;
     float screenRadius = viewSpaceRadius / (depth * tanHalfFov * 2.0);
     screenRadius = clamp(screenRadius, minScreenRadius, maxScreenRadius);
 
-    float ao = 0.0;
+    // Precompute loop invariants
+    float invRadius = 1.0 / viewSpaceRadius;
+    float biasVal = sin(aoBias);
+    float invDirCount = 1.0 / numDirections;
+    float invStepCount = 1.0 / numSteps;
+    float invDepth = 1.0 / (depth + 0.00001);
 
-    [unroll]
-    for (int dir = 0; dir < NUM_DIRECTIONS; dir++)
+    float ao = 0.0;
+    int iNumDirs = (int)numDirections;
+    int iNumSteps = (int)numSteps;
+
+    [loop]
+    for (int dir = 0; dir < iNumDirs; dir++)
     {
-        float angle = (float(dir) / float(NUM_DIRECTIONS)) * PI + noiseAngle;
+        float angle = (float(dir) * invDirCount) * PI + noiseAngle;
         float2 direction = float2(cos(angle), sin(angle));
 
-        float maxCosPos = sin(aoBias);
-        float maxCosNeg = sin(aoBias);
+        float maxCosPos = biasVal;
+        float maxCosNeg = biasVal;
 
-        [unroll]
-        for (int step = 1; step <= NUM_STEPS; step++)
+        [loop]
+        for (int step = 1; step <= iNumSteps; step++)
         {
-            float t = float(step) / float(NUM_STEPS);
-            float2 offset = direction * screenRadius * t;
+            float2 offset = direction * (screenRadius * (float(step) * invStepCount));
 
             // Positive direction
             {
@@ -104,17 +131,19 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 float sDepth = depthTex.Sample(pointClamp, sUV);
                 if (sDepth > 0.0001)
                 {
-                    float3 sPos = ReconstructViewPos(sUV, sDepth);
-                    float3 diff = sPos - viewPos;
-                    float dist = length(diff);
-                    if (dist > 0.00001)
+                    float3 diff = float3(
+                        (sUV.x * 2.0 - 1.0) * uvScale.x * sDepth - viewPos.x,
+                        (1.0 - sUV.y * 2.0) * uvScale.y * sDepth - viewPos.y,
+                        sDepth - viewPos.z);
+                    float distSq = dot(diff, diff);
+                    if (distSq > 1e-10)
                     {
-                        float cosH = dot(diff / dist, normal);
-                        float falloff = saturate(1.0 - dist / viewSpaceRadius);
+                        float invDist = rsqrt(distSq);
+                        float cosH = dot(diff * invDist, normal);
+                        float dist = distSq * invDist;
+                        float falloff = saturate(1.0 - dist * invRadius);
                         falloff = pow(falloff, falloffPower);
-                        // Foreground rejection
-                        float relFG = max(depth - sDepth, 0.0) / (depth + 0.00001);
-                        float fgAtten = exp(-relFG * foregroundFade);
+                        float fgAtten = exp(-max(depth - sDepth, 0.0) * invDepth * foregroundFade);
                         cosH *= falloff * fgAtten;
                         maxCosPos = max(maxCosPos, cosH);
                     }
@@ -127,16 +156,19 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 float sDepth = depthTex.Sample(pointClamp, sUV);
                 if (sDepth > 0.0001)
                 {
-                    float3 sPos = ReconstructViewPos(sUV, sDepth);
-                    float3 diff = sPos - viewPos;
-                    float dist = length(diff);
-                    if (dist > 0.00001)
+                    float3 diff = float3(
+                        (sUV.x * 2.0 - 1.0) * uvScale.x * sDepth - viewPos.x,
+                        (1.0 - sUV.y * 2.0) * uvScale.y * sDepth - viewPos.y,
+                        sDepth - viewPos.z);
+                    float distSq = dot(diff, diff);
+                    if (distSq > 1e-10)
                     {
-                        float cosH = dot(diff / dist, normal);
-                        float falloff = saturate(1.0 - dist / viewSpaceRadius);
+                        float invDist = rsqrt(distSq);
+                        float cosH = dot(diff * invDist, normal);
+                        float dist = distSq * invDist;
+                        float falloff = saturate(1.0 - dist * invRadius);
                         falloff = pow(falloff, falloffPower);
-                        float relFG = max(depth - sDepth, 0.0) / (depth + 0.00001);
-                        float fgAtten = exp(-relFG * foregroundFade);
+                        float fgAtten = exp(-max(depth - sDepth, 0.0) * invDepth * foregroundFade);
                         cosH *= falloff * fgAtten;
                         maxCosNeg = max(maxCosNeg, cosH);
                     }
@@ -147,7 +179,7 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         ao += saturate(maxCosPos) + saturate(maxCosNeg);
     }
 
-    ao = (ao / float(NUM_DIRECTIONS * 2)) * aoStrength;
+    ao = (ao * invDirCount * 0.5) * aoStrength;
     ao = saturate(1.0 - ao);
 
     // Depth-based fade (fades from depthFadeStart to aoMaxDepth)

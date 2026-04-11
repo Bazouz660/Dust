@@ -1,7 +1,8 @@
 // DustLUT.cpp - HDR color pipeline for Dust (API v3)
 // Captures HDR scene before game tonemaps, then applies:
 //   exposure -> ACES tonemap -> LUT color grading -> dither
-// in a single full-precision pass. Only quantization is the final 8-bit write.
+// in a single pass. LUT is R16G16B16A16_FLOAT (half-float).
+// Auto-exposure uses async double-buffered readback (1-frame delay, no GPU stall).
 
 #include "../../src/DustAPI.h"
 #include "DustLog.h"
@@ -65,6 +66,18 @@ static LUTConfig gConfig;
 
 static float Clamp01(float x) { return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x); }
 
+static uint16_t FloatToHalf(float f)
+{
+    uint32_t x;
+    memcpy(&x, &f, 4);
+    uint32_t sign = (x >> 16) & 0x8000;
+    int32_t exp = ((x >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = x & 0x007FFFFF;
+    if (exp <= 0) return (uint16_t)sign;
+    if (exp >= 31) return (uint16_t)(sign | 0x7C00);
+    return (uint16_t)(sign | (exp << 10) | (mant >> 13));
+}
+
 static void GradeColor(float r, float g, float b, float& outR, float& outG, float& outB)
 {
     // Temperature / tint (simple approximation)
@@ -122,8 +135,8 @@ static bool GenerateLUT(ID3D11Device* device)
     const UINT stripWidth = LUT_SIZE * LUT_SIZE;
     const UINT stripHeight = LUT_SIZE;
 
-    // Full float precision — no 8-bit quantization in the LUT itself
-    float* pixels = new float[stripWidth * stripHeight * 4];
+    // Half-float precision — more than enough for color grading into 8-bit output
+    uint16_t* pixels = new uint16_t[stripWidth * stripHeight * 4];
 
     for (UINT bIdx = 0; bIdx < LUT_SIZE; bIdx++)
     {
@@ -141,10 +154,10 @@ static bool GenerateLUT(ID3D11Device* device)
                 UINT x = bIdx * LUT_SIZE + rIdx;
                 UINT y = gIdx;
                 UINT idx = (y * stripWidth + x) * 4;
-                pixels[idx + 0] = outR;
-                pixels[idx + 1] = outG;
-                pixels[idx + 2] = outB;
-                pixels[idx + 3] = 1.0f;
+                pixels[idx + 0] = FloatToHalf(outR);
+                pixels[idx + 1] = FloatToHalf(outG);
+                pixels[idx + 2] = FloatToHalf(outB);
+                pixels[idx + 3] = FloatToHalf(1.0f);
             }
         }
     }
@@ -154,14 +167,14 @@ static bool GenerateLUT(ID3D11Device* device)
     desc.Height = stripHeight;
     desc.MipLevels = 1;
     desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
     desc.SampleDesc.Count = 1;
     desc.Usage = D3D11_USAGE_DEFAULT;
     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
     D3D11_SUBRESOURCE_DATA init = {};
     init.pSysMem = pixels;
-    init.SysMemPitch = stripWidth * 16;  // 4 floats * 4 bytes
+    init.SysMemPitch = stripWidth * 8;  // 4 halfs * 2 bytes
 
     HRESULT hr = device->CreateTexture2D(&desc, &init, &gLutTex);
     delete[] pixels;
@@ -209,7 +222,9 @@ static ID3D11PixelShader* gLumPS = nullptr;          // Log-luminance extraction
 static ID3D11Texture2D* gLumTex = nullptr;            // Mipmap chain for luminance averaging
 static ID3D11ShaderResourceView* gLumSRV = nullptr;
 static ID3D11RenderTargetView* gLumRTV = nullptr;     // RTV for mip 0
-static ID3D11Texture2D* gLumStagingTex = nullptr;     // 1x1 staging for CPU readback
+static ID3D11Texture2D* gLumStagingTex[2] = { nullptr, nullptr };  // Double-buffered 1x1 staging
+static int gLumStagingWrite = 0;                       // Index to copy INTO this frame
+static bool gLumStagingReady = false;                  // True once first frame has been copied
 static uint32_t gLumMipCount = 0;
 static float gAdaptedExposure = -0.7f;                // Current smoothed auto-exposure EV
 static LARGE_INTEGER gLastFrameTime = {};
@@ -217,10 +232,13 @@ static LARGE_INTEGER gPerfFreq = {};
 
 static void ReleaseAutoExposure()
 {
-    if (gLumRTV)        { gLumRTV->Release();        gLumRTV = nullptr; }
-    if (gLumSRV)        { gLumSRV->Release();        gLumSRV = nullptr; }
-    if (gLumTex)        { gLumTex->Release();         gLumTex = nullptr; }
-    if (gLumStagingTex) { gLumStagingTex->Release();  gLumStagingTex = nullptr; }
+    if (gLumRTV)           { gLumRTV->Release();           gLumRTV = nullptr; }
+    if (gLumSRV)           { gLumSRV->Release();           gLumSRV = nullptr; }
+    if (gLumTex)           { gLumTex->Release();            gLumTex = nullptr; }
+    if (gLumStagingTex[0]) { gLumStagingTex[0]->Release(); gLumStagingTex[0] = nullptr; }
+    if (gLumStagingTex[1]) { gLumStagingTex[1]->Release(); gLumStagingTex[1] = nullptr; }
+    gLumStagingWrite = 0;
+    gLumStagingReady = false;
 }
 
 static uint32_t CalcMipCount(uint32_t w, uint32_t h)
@@ -231,16 +249,20 @@ static uint32_t CalcMipCount(uint32_t w, uint32_t h)
     return mips;
 }
 
-static bool CreateLuminanceResources(ID3D11Device* device, uint32_t width, uint32_t height)
+// Fixed small size for luminance — average luminance doesn't need full-res precision.
+// Hardware bilinear sampling downscales the HDR scene during the log-luminance pass.
+static const uint32_t LUM_SIZE = 256;
+
+static bool CreateLuminanceResources(ID3D11Device* device, uint32_t /*width*/, uint32_t /*height*/)
 {
     ReleaseAutoExposure();
 
-    gLumMipCount = CalcMipCount(width, height);
+    gLumMipCount = CalcMipCount(LUM_SIZE, LUM_SIZE);
 
-    // Luminance texture with full mip chain
+    // Small luminance texture with mip chain
     D3D11_TEXTURE2D_DESC desc = {};
-    desc.Width = width;
-    desc.Height = height;
+    desc.Width = LUM_SIZE;
+    desc.Height = LUM_SIZE;
     desc.MipLevels = gLumMipCount;
     desc.ArraySize = 1;
     desc.Format = DXGI_FORMAT_R32_FLOAT;
@@ -264,7 +286,7 @@ static bool CreateLuminanceResources(ID3D11Device* device, uint32_t width, uint3
     hr = device->CreateRenderTargetView(gLumTex, &rtvDesc, &gLumRTV);
     if (FAILED(hr)) { Log("LUT: Failed to create luminance RTV: 0x%08X", hr); return false; }
 
-    // 1x1 staging texture for CPU readback
+    // Double-buffered 1x1 staging textures for async CPU readback
     D3D11_TEXTURE2D_DESC stagingDesc = {};
     stagingDesc.Width = 1;
     stagingDesc.Height = 1;
@@ -275,8 +297,11 @@ static bool CreateLuminanceResources(ID3D11Device* device, uint32_t width, uint3
     stagingDesc.Usage = D3D11_USAGE_STAGING;
     stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
 
-    hr = device->CreateTexture2D(&stagingDesc, nullptr, &gLumStagingTex);
-    if (FAILED(hr)) { Log("LUT: Failed to create luminance staging texture: 0x%08X", hr); return false; }
+    for (int i = 0; i < 2; i++)
+    {
+        hr = device->CreateTexture2D(&stagingDesc, nullptr, &gLumStagingTex[i]);
+        if (FAILED(hr)) { Log("LUT: Failed to create luminance staging texture %d: 0x%08X", i, hr); return false; }
+    }
 
     return true;
 }
@@ -404,20 +429,20 @@ static void LUTPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
         ID3D11DeviceContext* dc = ctx->context;
         host->SaveState(dc);
 
-        // Render log-luminance to mip 0 of luminance texture
+        // Render log-luminance to small luminance texture (bilinear downscale from HDR)
         dc->OMSetRenderTargets(1, &gLumRTV, nullptr);
         dc->OMSetBlendState(gNoBlend, nullptr, 0xFFFFFFFF);
         dc->OMSetDepthStencilState(gNoDepth, 0);
         dc->RSSetState(gRasterState);
 
         D3D11_VIEWPORT vp = {};
-        vp.Width = (float)ctx->width;
-        vp.Height = (float)ctx->height;
+        vp.Width = (float)LUM_SIZE;
+        vp.Height = (float)LUM_SIZE;
         vp.MaxDepth = 1.0f;
         dc->RSSetViewports(1, &vp);
 
         dc->PSSetShaderResources(0, 1, &gHdrCopySRV);
-        dc->PSSetSamplers(0, 1, &gPointSampler);
+        dc->PSSetSamplers(0, 1, &gLinearSampler);
         host->DrawFullscreenTriangle(dc, gLumPS);
 
         // Unbind RTV before GenerateMips (it needs SRV access to all mips)
@@ -427,43 +452,51 @@ static void LUTPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
         // Average via mipmap generation (bilinear on log values = geometric mean)
         dc->GenerateMips(gLumSRV);
 
-        // Copy 1x1 mip (lowest) to staging for CPU readback
+        // Async readback: copy this frame's result to staging[write],
+        // read PREVIOUS frame's result from staging[read] (no GPU stall).
+        int writeIdx = gLumStagingWrite;
+        int readIdx = 1 - writeIdx;
+
         D3D11_BOX srcBox = { 0, 0, 0, 1, 1, 1 };
-        dc->CopySubresourceRegion(gLumStagingTex, 0, 0, 0, 0,
+        dc->CopySubresourceRegion(gLumStagingTex[writeIdx], 0, 0, 0, 0,
                                    gLumTex, gLumMipCount - 1, &srcBox);
 
-        // Read average log-luminance
-        D3D11_MAPPED_SUBRESOURCE mapped;
-        HRESULT hr = dc->Map(gLumStagingTex, 0, D3D11_MAP_READ, 0, &mapped);
-        if (SUCCEEDED(hr))
+        // Read previous frame's staging (GPU finished with it by now)
+        if (gLumStagingReady)
         {
-            float avgLogLum = *(float*)mapped.pData;
-            dc->Unmap(gLumStagingTex, 0);
-
-            // Convert back from log space
-            float avgLum = exp2f(avgLogLum);
-
-            // Auto-exposure adaptation
-            if (gConfig.autoExposure)
+            D3D11_MAPPED_SUBRESOURCE mapped;
+            HRESULT hr = dc->Map(gLumStagingTex[readIdx], 0, D3D11_MAP_READ,
+                                  D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+            if (SUCCEEDED(hr))
             {
-                // Compute target exposure: how many EV stops to reach 18% gray
-                float targetEV = log2f(0.18f / (avgLum + 0.001f)) + gConfig.exposure;
+                float avgLogLum = *(float*)mapped.pData;
+                dc->Unmap(gLumStagingTex[readIdx], 0);
 
-                // Clamp to user-defined range
-                if (targetEV < gConfig.minAutoExposure) targetEV = gConfig.minAutoExposure;
-                if (targetEV > gConfig.maxAutoExposure) targetEV = gConfig.maxAutoExposure;
+                float avgLum = exp2f(avgLogLum);
 
-                // Temporal smoothing
-                LARGE_INTEGER now;
-                QueryPerformanceCounter(&now);
-                float dt = (float)(now.QuadPart - gLastFrameTime.QuadPart) / (float)gPerfFreq.QuadPart;
-                gLastFrameTime = now;
-                dt = dt < 0.001f ? 0.001f : (dt > 0.5f ? 0.5f : dt);
+                if (gConfig.autoExposure)
+                {
+                    float targetEV = log2f(0.18f / (avgLum + 0.001f)) + gConfig.exposure;
 
-                float alpha = 1.0f - expf(-dt * gConfig.adaptationSpeed);
-                gAdaptedExposure += (targetEV - gAdaptedExposure) * alpha;
+                    if (targetEV < gConfig.minAutoExposure) targetEV = gConfig.minAutoExposure;
+                    if (targetEV > gConfig.maxAutoExposure) targetEV = gConfig.maxAutoExposure;
+
+                    LARGE_INTEGER now;
+                    QueryPerformanceCounter(&now);
+                    float dt = (float)(now.QuadPart - gLastFrameTime.QuadPart) / (float)gPerfFreq.QuadPart;
+                    gLastFrameTime = now;
+                    dt = dt < 0.001f ? 0.001f : (dt > 0.5f ? 0.5f : dt);
+
+                    float alpha = 1.0f - expf(-dt * gConfig.adaptationSpeed);
+                    gAdaptedExposure += (targetEV - gAdaptedExposure) * alpha;
+                }
             }
+            // If DO_NOT_WAIT returns DXGI_ERROR_WAS_STILL_DRAWING, skip —
+            // use last known exposure. No stall, no visible artifact.
         }
+
+        gLumStagingWrite = readIdx;  // Flip for next frame
+        gLumStagingReady = true;
 
         host->RestoreState(dc);
     }

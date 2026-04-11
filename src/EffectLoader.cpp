@@ -433,35 +433,42 @@ void EffectLoader::EffectConfigCheckHotReload(LoadedEffect& le)
 
 // ==================== v3: GPU Timing ====================
 
-void EffectLoader::CollectTiming(LoadedEffect& le, ID3D11DeviceContext* ctx)
+void EffectLoader::CollectTiming(LoadedEffect& le, ID3D11DeviceContext* ctx, int phase)
 {
-    if (!le.timingActive || !le.tsDisjoint) return;
+    if (le.timingWarmup[phase] < 2 || !le.tsDisjoint[phase][0]) return;
+
+    int readSlot = 1 - le.timingSlot[phase];
 
     D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint;
     UINT64 tsBegin, tsEnd;
-    if (ctx->GetData(le.tsDisjoint, &disjoint, sizeof(disjoint), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK
+    if (ctx->GetData(le.tsDisjoint[phase][readSlot], &disjoint, sizeof(disjoint), 0) == S_OK
         && !disjoint.Disjoint
-        && ctx->GetData(le.tsBegin, &tsBegin, sizeof(tsBegin), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK
-        && ctx->GetData(le.tsEnd, &tsEnd, sizeof(tsEnd), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK)
+        && ctx->GetData(le.tsBegin[phase][readSlot], &tsBegin, sizeof(tsBegin), 0) == S_OK
+        && ctx->GetData(le.tsEnd[phase][readSlot], &tsEnd, sizeof(tsEnd), 0) == S_OK)
     {
-        le.gpuTimeMs = (float)((double)(tsEnd - tsBegin) / (double)disjoint.Frequency * 1000.0);
+        float ms = (float)((double)(tsEnd - tsBegin) / (double)disjoint.Frequency * 1000.0);
+        if (phase == 0) le.gpuTimePre = ms;
+        else            le.gpuTimePost = ms;
+        le.gpuTimeMs = le.gpuTimePre + le.gpuTimePost;
     }
-    le.timingActive = false;
 }
 
-void EffectLoader::BeginTiming(LoadedEffect& le, ID3D11DeviceContext* ctx)
+void EffectLoader::BeginTiming(LoadedEffect& le, ID3D11DeviceContext* ctx, int phase)
 {
-    if (!le.tsDisjoint) return;
-    ctx->Begin(le.tsDisjoint);
-    ctx->End(le.tsBegin);
+    if (!le.tsDisjoint[phase][0]) return;
+    int slot = le.timingSlot[phase];
+    ctx->Begin(le.tsDisjoint[phase][slot]);
+    ctx->End(le.tsBegin[phase][slot]);
 }
 
-void EffectLoader::EndTiming(LoadedEffect& le, ID3D11DeviceContext* ctx)
+void EffectLoader::EndTiming(LoadedEffect& le, ID3D11DeviceContext* ctx, int phase)
 {
-    if (!le.tsDisjoint) return;
-    ctx->End(le.tsEnd);
-    ctx->End(le.tsDisjoint);
-    le.timingActive = true;
+    if (!le.tsDisjoint[phase][0]) return;
+    int slot = le.timingSlot[phase];
+    ctx->End(le.tsEnd[phase][slot]);
+    ctx->End(le.tsDisjoint[phase][slot]);
+    le.timingSlot[phase] = 1 - le.timingSlot[phase];
+    if (le.timingWarmup[phase] < 2) le.timingWarmup[phase]++;
 }
 
 float EffectLoader::GetEffectGpuTime(size_t index) const
@@ -638,15 +645,19 @@ bool EffectLoader::InitAll(ID3D11Device* device, uint32_t w, uint32_t h)
 
         le.initialized = true;
 
-        // v3: Create GPU timing queries
+        // v3: Create GPU timing queries (2 phases × 2 double-buffer slots)
         if (le.desc.apiVersion >= 3 && (le.desc.flags & DUST_FLAG_FRAMEWORK_TIMING))
         {
             D3D11_QUERY_DESC qd = {};
-            qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
-            device->CreateQuery(&qd, &le.tsDisjoint);
-            qd.Query = D3D11_QUERY_TIMESTAMP;
-            device->CreateQuery(&qd, &le.tsBegin);
-            device->CreateQuery(&qd, &le.tsEnd);
+            for (int phase = 0; phase < 2; phase++)
+            for (int slot = 0; slot < 2; slot++)
+            {
+                qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+                device->CreateQuery(&qd, &le.tsDisjoint[phase][slot]);
+                qd.Query = D3D11_QUERY_TIMESTAMP;
+                device->CreateQuery(&qd, &le.tsBegin[phase][slot]);
+                device->CreateQuery(&qd, &le.tsEnd[phase][slot]);
+            }
         }
 
         Log("Initialized effect: %s", le.desc.name ? le.desc.name : "unnamed");
@@ -671,18 +682,18 @@ void EffectLoader::DispatchPre(DustInjectionPoint point, const DustFrameContext*
         if (le.desc.apiVersion >= 3 && (le.desc.flags & DUST_FLAG_FRAMEWORK_CONFIG))
             EffectConfigCheckHotReload(le);
 
-        // v3: Collect previous frame timing, then start new timing
+        // v3: Collect previous frame timing, then start new timing (phase 0 = pre)
         bool frameworkTiming = (le.desc.apiVersion >= 3 && (le.desc.flags & DUST_FLAG_FRAMEWORK_TIMING));
         if (frameworkTiming)
         {
-            CollectTiming(le, ctx->context);
-            BeginTiming(le, ctx->context);
+            CollectTiming(le, ctx->context, 0);
+            BeginTiming(le, ctx->context, 0);
         }
 
         le.desc.preExecute(ctx, &hostAPI_);
 
         if (frameworkTiming)
-            EndTiming(le, ctx->context);
+            EndTiming(le, ctx->context, 0);
     }
 }
 
@@ -702,18 +713,18 @@ void EffectLoader::DispatchPost(DustInjectionPoint point, const DustFrameContext
             && !le.desc.preExecute)
             EffectConfigCheckHotReload(le);
 
-        // v3: Collect previous frame timing, then start new timing
+        // v3: Time postExecute (phase 1 = post)
         bool frameworkTiming = (le.desc.apiVersion >= 3 && (le.desc.flags & DUST_FLAG_FRAMEWORK_TIMING));
         if (frameworkTiming)
         {
-            CollectTiming(le, ctx->context);
-            BeginTiming(le, ctx->context);
+            CollectTiming(le, ctx->context, 1);
+            BeginTiming(le, ctx->context, 1);
         }
 
         le.desc.postExecute(ctx, &hostAPI_);
 
         if (frameworkTiming)
-            EndTiming(le, ctx->context);
+            EndTiming(le, ctx->context, 1);
     }
 }
 
@@ -751,9 +762,13 @@ void EffectLoader::ShutdownAll()
         }
 
         // Release framework timing queries
-        if (le.tsDisjoint) { le.tsDisjoint->Release(); le.tsDisjoint = nullptr; }
-        if (le.tsBegin)    { le.tsBegin->Release();    le.tsBegin = nullptr; }
-        if (le.tsEnd)      { le.tsEnd->Release();      le.tsEnd = nullptr; }
+        for (int phase = 0; phase < 2; phase++)
+        for (int slot = 0; slot < 2; slot++)
+        {
+            if (le.tsDisjoint[phase][slot]) { le.tsDisjoint[phase][slot]->Release(); le.tsDisjoint[phase][slot] = nullptr; }
+            if (le.tsBegin[phase][slot])    { le.tsBegin[phase][slot]->Release();    le.tsBegin[phase][slot] = nullptr; }
+            if (le.tsEnd[phase][slot])      { le.tsEnd[phase][slot]->Release();      le.tsEnd[phase][slot] = nullptr; }
+        }
 
         if (le.hModule)
             FreeLibrary(le.hModule);

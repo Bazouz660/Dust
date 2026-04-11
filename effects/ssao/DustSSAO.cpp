@@ -273,6 +273,7 @@ static DustSettingDesc gSettingsArray[] = {
     { "Blur Sharpness",     DUST_SETTING_FLOAT, &gSSAOConfig.blurSharpness,      0.0f,    0.1f,   "BlurSharpness" },
     { "Night Compensation", DUST_SETTING_FLOAT, &gSSAOConfig.nightCompensation,  0.0f,    50.0f,  "NightCompensation" },
     { "Direct Light AO",   DUST_SETTING_FLOAT, &gSSAOConfig.directLightOcclusion, 0.0f,  1.0f,   "DirectLightAO" },
+    { "Samples",            DUST_SETTING_FLOAT, &gSSAOConfig.sampleCount,        4.0f,    12.0f,  "Samples" },
     { "Debug View",         DUST_SETTING_BOOL,  &gSSAOConfig.debugView,          0.0f,    1.0f,   "DebugView" },
     // Hidden settings: not shown in GUI but persisted in INI
     { "Depth Fade Start",   DUST_SETTING_HIDDEN_FLOAT, &gSSAOConfig.depthFadeStart, 0.0f, 1.0f,   "DepthFadeStart" },

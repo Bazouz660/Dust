@@ -11,11 +11,15 @@ struct LoadedEffect {
     bool            initialized;
 
     // v3: Framework-managed GPU timing
-    ID3D11Query*    tsDisjoint  = nullptr;
-    ID3D11Query*    tsBegin     = nullptr;
-    ID3D11Query*    tsEnd       = nullptr;
-    bool            timingActive = false;
-    float           gpuTimeMs   = 0.0f;
+    // Phase 0 = preExecute, phase 1 = postExecute; each double-buffered [slot 0/1]
+    ID3D11Query*    tsDisjoint[2][2]  = {};
+    ID3D11Query*    tsBegin[2][2]     = {};
+    ID3D11Query*    tsEnd[2][2]       = {};
+    int             timingSlot[2]     = {};   // per-phase: which buffer to record into
+    int             timingWarmup[2]   = {};   // per-phase: counts up to 2 before valid read
+    float           gpuTimePre        = 0.0f;
+    float           gpuTimePost       = 0.0f;
+    float           gpuTimeMs         = 0.0f; // combined
 
     // v3: Framework-managed config
     std::string     effectDir;      // directory containing the DLL
@@ -60,10 +64,10 @@ private:
     static void EffectConfigWriteDefaults(LoadedEffect& le);
     static void EffectConfigCheckHotReload(LoadedEffect& le);
 
-    // v3: GPU timing helpers
-    void CollectTiming(LoadedEffect& le, ID3D11DeviceContext* ctx);
-    void BeginTiming(LoadedEffect& le, ID3D11DeviceContext* ctx);
-    void EndTiming(LoadedEffect& le, ID3D11DeviceContext* ctx);
+    // v3: GPU timing helpers (phase: 0=pre, 1=post)
+    void CollectTiming(LoadedEffect& le, ID3D11DeviceContext* ctx, int phase);
+    void BeginTiming(LoadedEffect& le, ID3D11DeviceContext* ctx, int phase);
+    void EndTiming(LoadedEffect& le, ID3D11DeviceContext* ctx, int phase);
 };
 
 extern EffectLoader gEffectLoader;
