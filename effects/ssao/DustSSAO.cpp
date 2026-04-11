@@ -271,9 +271,9 @@ static DustSettingDesc gSettingsArray[] = {
     { "Max Screen Radius",  DUST_SETTING_FLOAT, &gSSAOConfig.maxScreenRadius,    0.005f,  0.2f,   "MaxScreenRadius" },
     { "Min Screen Radius",  DUST_SETTING_FLOAT, &gSSAOConfig.minScreenRadius,    0.0001f, 0.01f,  "MinScreenRadius" },
     { "Blur Sharpness",     DUST_SETTING_FLOAT, &gSSAOConfig.blurSharpness,      0.0f,    0.1f,   "BlurSharpness" },
-    { "Night Compensation", DUST_SETTING_FLOAT, &gSSAOConfig.nightCompensation,  0.0f,    50.0f,  "NightCompensation" },
     { "Direct Light AO",   DUST_SETTING_FLOAT, &gSSAOConfig.directLightOcclusion, 0.0f,  1.0f,   "DirectLightAO" },
-    { "Samples",            DUST_SETTING_FLOAT, &gSSAOConfig.sampleCount,        4.0f,    12.0f,  "Samples" },
+    { "Samples",            DUST_SETTING_INT,   &gSSAOConfig.sampleCount,        4.0f,    12.0f,  "Samples" },
+    { "Steps",              DUST_SETTING_INT,   &gSSAOConfig.stepCount,          2.0f,    6.0f,   "Steps" },
     { "Debug View",         DUST_SETTING_BOOL,  &gSSAOConfig.debugView,          0.0f,    1.0f,   "DebugView" },
     // Hidden settings: not shown in GUI but persisted in INI
     { "Depth Fade Start",   DUST_SETTING_HIDDEN_FLOAT, &gSSAOConfig.depthFadeStart, 0.0f, 1.0f,   "DepthFadeStart" },

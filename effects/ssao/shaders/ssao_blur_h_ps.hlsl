@@ -23,7 +23,6 @@ cbuffer SSAOParams : register(b0)
     float  minScreenRadius;
     float  depthFadeStart;
     float  blurSharpness;
-    float  nightCompensation;
     float  noiseScale;
     float  numDirections;
     float  numSteps;

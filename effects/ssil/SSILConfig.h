@@ -21,7 +21,7 @@ struct SSILConfig
     float colorBleeding = 1.0f;
 
     // Sampling
-    float sampleCount = 8.0f;
+    int sampleCount = 8;
 
     // Blur
     float blurSharpness = 0.01f;

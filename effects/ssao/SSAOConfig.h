@@ -23,17 +23,15 @@ struct SSAOConfig
     // Blur
     float blurSharpness = 0.01f;
 
-    // Exposure compensation — boosts AO in dark scenes to counteract auto-exposure
-    float nightCompensation = 10.0f;
-
     // Camera
     float tanHalfFov = 0.5218f;
 
     // Direct light occlusion — how much AO affects direct sunlight (0 = ambient only, 1 = full)
     float directLightOcclusion = 0.3f;
 
-    // Performance — sample count (12 = full quality, 6 = performance, range 4–12)
-    float sampleCount = 4.0f;
+    // Performance
+    int sampleCount = 4;    // Directions (4–12)
+    int stepCount = 4;      // Steps per direction (2–6)
 
     // Debug
     bool debugView = false;

@@ -66,7 +66,6 @@ struct SSAOCBData
     float minScreenRadius;
     float depthFadeStart;
     float blurSharpness;
-    float nightCompensation;
     float noiseScale;
     float numDirections;
     float numSteps;
@@ -331,10 +330,12 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
 
     gHost->SaveState(ctx);
 
-    // Directions slider (4–12), steps always 6 for consistent AO intensity
-    int numDirs = (int)(gSSAOConfig.sampleCount + 0.5f);
+    int numDirs = gSSAOConfig.sampleCount;
     if (numDirs < 4) numDirs = 4;
     if (numDirs > 12) numDirs = 12;
+    int numSteps = gSSAOConfig.stepCount;
+    if (numSteps < 2) numSteps = 2;
+    if (numSteps > 6) numSteps = 6;
 
     // Update constant buffer
     {
@@ -348,7 +349,7 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
         cb.filterRadius = gSSAOConfig.filterRadius;
         cb.debugMode = gSSAOConfig.debugView ? 1.0f : 0.0f;
         cb.aoRadius = gSSAOConfig.aoRadius;
-        cb.aoStrength = gSSAOConfig.aoStrength;
+        cb.aoStrength = gSSAOConfig.aoStrength * powf(6.0f / (float)numSteps, 0.3f);
         cb.aoBias = gSSAOConfig.aoBias;
         cb.aoMaxDepth = gSSAOConfig.aoMaxDepth;
         cb.foregroundFade = gSSAOConfig.foregroundFade;
@@ -357,10 +358,9 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
         cb.minScreenRadius = gSSAOConfig.minScreenRadius;
         cb.depthFadeStart = gSSAOConfig.depthFadeStart;
         cb.blurSharpness = gSSAOConfig.blurSharpness;
-        cb.nightCompensation = gSSAOConfig.nightCompensation;
         cb.noiseScale = 1.0f;
         cb.numDirections = (float)numDirs;
-        cb.numSteps = 6.0f;
+        cb.numSteps = (float)numSteps;
         gHost->UpdateConstantBuffer(ctx, gSSAOCB, &cb, sizeof(cb));
     }
 

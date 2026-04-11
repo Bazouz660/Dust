@@ -113,7 +113,7 @@ static DustSettingDesc gSettingsArray[] = {
     { "Enabled",        DUST_SETTING_BOOL,  &gSSSConfig.enabled,        0.0f,    1.0f,     "Enabled" },
     { "Strength",       DUST_SETTING_FLOAT, &gSSSConfig.strength,       0.0f,    1.0f,     "Strength" },
     { "Max Distance",   DUST_SETTING_FLOAT, &gSSSConfig.maxDistance,    0.0005f, 0.05f,    "MaxDistance" },
-    { "Step Count",     DUST_SETTING_FLOAT, &gSSSConfig.stepCount,      4.0f,    64.0f,    "StepCount" },
+    { "Step Count",     DUST_SETTING_INT,   &gSSSConfig.stepCount,      4.0f,    64.0f,    "StepCount" },
     { "Thickness",      DUST_SETTING_FLOAT, &gSSSConfig.thickness,      0.0001f, 0.01f,    "Thickness" },
     { "Depth Bias",     DUST_SETTING_FLOAT, &gSSSConfig.depthBias,      0.0f,    0.001f,   "DepthBias" },
     { "Max Depth",      DUST_SETTING_FLOAT, &gSSSConfig.maxDepth,       0.01f,   1.0f,     "MaxDepth" },

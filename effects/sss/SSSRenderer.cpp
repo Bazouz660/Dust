@@ -447,7 +447,7 @@ ID3D11ShaderResourceView* RenderSSS(ID3D11DeviceContext* ctx,
         cb.sunDirView[1] = gSunDirView[1];
         cb.sunDirView[2] = gSunDirView[2];
         cb.strength = gSSSConfig.strength;
-        cb.stepCount = gSSSConfig.stepCount;
+        cb.stepCount = (float)gSSSConfig.stepCount;
         cb.maxDepth = gSSSConfig.maxDepth;
         cb.depthBias = gSSSConfig.depthBias;
         cb.blurSharpness = gSSSConfig.blurSharpness;

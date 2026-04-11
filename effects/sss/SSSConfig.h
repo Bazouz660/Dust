@@ -11,7 +11,7 @@ struct SSSConfig
     // Ray marching
     float maxDistance   = 0.005f;   // Max march distance in view space
     float thickness     = 0.001f;   // Thickness threshold for occlusion
-    float stepCount     = 16.0f;    // Number of ray march steps
+    int   stepCount     = 16;       // Number of ray march steps
     float depthBias     = 0.0001f;  // Bias to avoid self-shadowing
     float maxDepth      = 0.1f;     // Max depth to process (skip distant pixels)
 
