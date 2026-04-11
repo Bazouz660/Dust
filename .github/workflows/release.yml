@@ -101,9 +101,23 @@ jobs:
           cp mod/_Dust.info release/Dust/
           cp mod/_Dust.img release/Dust/ 2>/dev/null || true
           TAG="${{ steps.version.outputs.label }}"
-          DESCRIPTION_PATH="$PWD/mod/workshop_description.txt"
-          sed "s|content/Dust|$PWD/release/Dust|;s|DESCRIPTION_FILE_PLACEHOLDER|$DESCRIPTION_PATH|;s|CHANGENOTE_PLACEHOLDER|$TAG|" \
+
+          # Build VDF with resolved content path and changenote
+          sed "s|content/Dust|$PWD/release/Dust|;s|CHANGENOTE_PLACEHOLDER|$TAG|" \
             .github/workshop.vdf > workshop_upload.vdf
+
+          # Inline the description file contents into the VDF
+          python3 - <<'PYEOF'
+with open('mod/workshop_description.txt') as f:
+    desc = f.read().strip()
+desc = desc.replace('\\', '\\\\').replace('"', '\\"')
+with open('workshop_upload.vdf') as f:
+    vdf = f.read()
+vdf = vdf.replace('DESCRIPTION_FILE_PLACEHOLDER', desc)
+with open('workshop_upload.vdf', 'w') as f:
+    f.write(vdf)
+PYEOF
+          echo "=== Generated VDF ==="
           cat workshop_upload.vdf
 
       - name: Install SteamCMD
