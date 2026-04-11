@@ -1,0 +1,75 @@
+[h1]Dust - Graphics Enhancement for Kenshi[/h1]
+
+Dust modernizes Kenshi's visuals with ambient occlusion, color grading, auto-exposure, depth of field, bloom, and more. The goal is to make the game look better while staying true to its original art style.
+
+Everything is tweakable in-game with an F11 settings menu, so you can adjust things to your taste or turn off what you don't like.
+
+Under the hood, Dust works differently from ReShade or other injectors. It hooks directly into the game's rendering pipeline, which means effects like SSAO can work with the actual lighting system instead of being applied on top after the fact. This avoids common issues like fog bleed and UI getting affected.
+
+The mod is also built as a plugin framework. Effects are separate DLLs, so anyone can make and share their own.
+
+[i]This is still an early project, expect bugs. Feedback and suggestions are welcome.[/i]
+
+[h1]Requirements[/h1]
+[list]
+[*] [url=https://www.nexusmods.com/kenshi/mods/847]RE_Kenshi[/url]
+[/list]
+
+[h1]What it does[/h1]
+
+[h2]Ambient Occlusion (SSAO)[/h2]
+Adds realistic contact shadows in corners, crevices, and where objects meet the ground. Works directly with the game's lighting, so it looks natural even under different weather and time of day. Automatically adjusts for night scenes.
+
+[h2]Color Grading[/h2]
+Better tonemapping and color control. Includes auto-exposure that adapts to scene brightness (no more pitch black nights or blown out deserts), along with contrast, saturation, temperature, and shadow/highlight toning.
+
+[h2]Depth of Field[/h2]
+Camera-style focus blur with auto-focus. Objects in front of and behind your focus point get blurred separately, with full control over near and far blur curves and intensity.
+
+[h2]Bloom[/h2]
+Soft glow on bright light sources. Extracted from the HDR scene before tonemapping for physically accurate results. Adjustable threshold, radius, and intensity.
+
+[h2]Clarity[/h2]
+Local contrast enhancement that brings out fine detail in textures without affecting the overall image brightness.
+
+[i]More effects in development.[/i]
+
+[h1]Features[/h1]
+[list]
+[*] [b]In-game settings (F11)[/b]: Tweak every effect in real-time with sliders, save your settings, reset anytime
+[*] [b]Performance overlay[/b]: See exactly how much GPU time each effect costs
+[*] [b]Hot-reloadable configs[/b]: Edit .ini files while the game is running
+[*] [b]Plugin system[/b]: Effects are separate DLLs, anyone can create and share new ones
+[/list]
+
+[h1]In-Game Settings[/h1]
+
+Press [b]F11[/b] to open the settings overlay. From there you can adjust every effect, see performance stats, save your configuration, or reset to defaults. Double-click any slider to type in an exact value.
+
+[h1]Compatibility[/h1]
+
+The mod should be compatible with any other mod, except mods that change the deferred.hlsl shader of the base
+game, or mods that modify the render pipeline directly.
+The mod currently does not support Proton/Wine, it is being worked on.
+
+A startup notification appears for 30 seconds indicating the mod is active and which key toggles the GUI. This can
+be disabled in the framework settings.
+
+[h1]How it works[/h1]
+
+Dust is not a ReShade preset or a post-process overlay. It hooks into Kenshi's D3D11 deferred rendering pipeline and injects effects at specific points in the render pass (after GBuffer, after lighting, after tonemapping, etc). This means effects have access to the actual depth buffer, HDR scene data, and lighting state before the game flattens everything to the final image.
+
+For example, SSAO is injected into the deferred lighting pass so it affects both ambient and direct light. Color grading captures the HDR render target before the game's tonemapper runs, applies its own ACES tonemapping, and writes the result back. This would not be possible with a generic post-process injector.
+
+Effects are loaded as plugin DLLs via a stable C API. The framework handles shader compilation, state management, constant buffers, GPU timing, config I/O, and the settings GUI. A new effect only needs to fill out a descriptor struct and provide a pixel shader.
+
+[h1]Credits[/h1]
+[list]
+[*] [b]BFrizzleFoShizzle[/b] - RE_Kenshi (plugin loader) and KenshiLib (game structure library)
+[*] [b]disi30[/b] - ShaderSSAO, the original Kenshi SSAO mod that inspired this project
+[*] [b]Bob[/b] - Native Stylise, also an inspiration
+[*] [b]Dear ImGui[/b] - In-game GUI library
+[/list]
+
+[h1]Source Code[/h1]
+[url=https://github.com/Bazouz660/Dust]github.com/Bazouz660/Dust[/url]

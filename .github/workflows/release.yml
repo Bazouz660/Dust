@@ -41,16 +41,9 @@ jobs:
           ~/steamcmd/steamcmd.sh +login ${{ secrets.STEAM_USERNAME }} +quit
           echo "Steam login successful"
 
-      - name: Query Workshop item
+      - name: Verify mod metadata
         run: |
-          echo "=== Querying Workshop item 3703458265 ==="
-          ~/steamcmd/steamcmd.sh +login ${{ secrets.STEAM_USERNAME }} \
-            +workshop_item_info 233860 3703458265 \
-            +quit 2>&1 | tee /tmp/workshop_info.txt
-
-          echo ""
           echo "=== Verifying mod metadata ==="
-          # Check that _Dust.info has the right workshop ID
           WORKSHOP_ID=$(grep -oP '<id>\K[^<]+' mod/_Dust.info)
           echo "Workshop ID in _Dust.info: $WORKSHOP_ID"
           if [ "$WORKSHOP_ID" != "3703458265" ]; then
@@ -103,22 +96,20 @@ jobs:
           files: Dust-${{ steps.version.outputs.label }}.zip
           generate_release_notes: true
 
-      # Workshop upload is disabled until verify-workshop is confirmed working.
-      # Uncomment below to enable.
+      - name: Prepare Workshop content
+        run: |
+          cp mod/_Dust.info release/Dust/
+          cp mod/_Dust.img release/Dust/ 2>/dev/null || true
+          TAG="${{ steps.version.outputs.label }}"
+          DESCRIPTION_PATH="$PWD/mod/workshop_description.txt"
+          sed "s|content/Dust|$PWD/release/Dust|;s|DESCRIPTION_FILE_PLACEHOLDER|$DESCRIPTION_PATH|;s|CHANGENOTE_PLACEHOLDER|$TAG|" \
+            .github/workshop.vdf > workshop_upload.vdf
+          cat workshop_upload.vdf
 
-      # - name: Prepare Workshop content
-      #   run: |
-      #     cp mod/_Dust.info release/Dust/
-      #     cp mod/_Dust.img release/Dust/ 2>/dev/null || true
-      #     TAG="${{ steps.version.outputs.label }}"
-      #     sed "s|content/Dust|$PWD/release/Dust|;s|CHANGENOTE_PLACEHOLDER|$TAG|" \
-      #       .github/workshop.vdf > workshop_upload.vdf
-      #     cat workshop_upload.vdf
-
-      # - name: Upload to Steam Workshop
-      #   uses: game-ci/steam-deploy@v3
-      #   with:
-      #     appId: 233860
-      #     username: ${{ secrets.STEAM_USERNAME }}
-      #     configVdf: ${{ secrets.STEAM_CONFIG_VDF }}
-      #     workshopVdf: workshop_upload.vdf
+      - name: Upload to Steam Workshop
+        uses: game-ci/steam-deploy@v3
+        with:
+          appId: 233860
+          username: ${{ secrets.STEAM_USERNAME }}
+          configVdf: ${{ secrets.STEAM_CONFIG_VDF }}
+          workshopVdf: workshop_upload.vdf
