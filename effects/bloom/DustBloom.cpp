@@ -27,11 +27,11 @@ static std::string GetPluginDir()
 
 struct BloomConfig {
     bool  enabled   = true;
-    float intensity = 0.155f;
-    float threshold = 1.576f;
-    float softKnee  = 0.537f;
-    float scatter   = 0.7f;
-    float radius    = 1.0f;
+    float intensity = 0.5f;
+    float threshold = 2.584f;
+    float softKnee  = 0.603f;
+    float scatter   = 0.411f;
+    float radius    = 2.814f;
     bool  debugView = false;
 };
 

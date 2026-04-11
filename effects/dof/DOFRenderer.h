@@ -22,3 +22,6 @@ namespace DOFRenderer
     void OnResolutionChanged(ID3D11Device* device, UINT newWidth, UINT newHeight);
     bool IsInitialized();
 }
+
+// Returns the resolved focus distance (auto-focus or manual)
+float DOFGetResolvedFocusDistance();

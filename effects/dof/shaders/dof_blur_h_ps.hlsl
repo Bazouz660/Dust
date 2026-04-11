@@ -7,8 +7,12 @@ cbuffer DOFParams : register(b0)
 {
     float2 texelSize;
     float  focusDistance;
-    float  focusRange;
-    float  blurStrength;
+    float  nearStart;
+    float  nearEnd;
+    float  nearStrength;
+    float  farStart;
+    float  farEnd;
+    float  farStrength;
     float  blurRadius;
     float  maxDepth;
     float  _pad;

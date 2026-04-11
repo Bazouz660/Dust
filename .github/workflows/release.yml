@@ -9,13 +9,69 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  # Verify Steam credentials and workshop item before doing anything
+  verify-workshop:
     runs-on: ubuntu-latest
     if: >
       github.event.workflow_run.conclusion == 'success' &&
       startsWith(github.event.workflow_run.head_branch, 'v')
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install SteamCMD
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y lib32gcc-s1 steamcmd
+
+      - name: Restore Steam config
+        run: |
+          mkdir -p ~/.steam/steam/config
+          echo "${{ secrets.STEAM_CONFIG_VDF }}" | base64 -d > ~/.steam/steam/config/config.vdf
+
+      - name: Verify Steam login
+        run: |
+          echo "=== Testing Steam authentication ==="
+          steamcmd +login ${{ secrets.STEAM_USERNAME }} +quit
+          echo "Steam login successful"
+
+      - name: Query Workshop item
+        run: |
+          echo "=== Querying Workshop item 3703458265 ==="
+          steamcmd +login ${{ secrets.STEAM_USERNAME }} \
+            +workshop_item_info 233860 3703458265 \
+            +quit 2>&1 | tee /tmp/workshop_info.txt
+
+          echo ""
+          echo "=== Verifying mod metadata ==="
+          # Check that _Dust.info has the right workshop ID
+          WORKSHOP_ID=$(grep -oP '<id>\K[^<]+' mod/_Dust.info)
+          echo "Workshop ID in _Dust.info: $WORKSHOP_ID"
+          if [ "$WORKSHOP_ID" != "3703458265" ]; then
+            echo "ERROR: Workshop ID mismatch! Expected 3703458265, got $WORKSHOP_ID"
+            exit 1
+          fi
+          echo "Workshop ID verified"
+
+      - name: Verify VDF configuration
+        run: |
+          echo "=== Checking workshop.vdf ==="
+          cat .github/workshop.vdf
+
+          # Verify appid and publishedfileid match
+          grep -q '"233860"' .github/workshop.vdf || { echo "ERROR: appid mismatch"; exit 1; }
+          grep -q '"3703458265"' .github/workshop.vdf || { echo "ERROR: publishedfileid mismatch"; exit 1; }
+          echo "VDF configuration verified"
+
+  release:
+    runs-on: ubuntu-latest
+    needs: verify-workshop
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
       - name: Resolve version
         id: version
         shell: bash
@@ -42,3 +98,23 @@ jobs:
           tag_name: ${{ steps.version.outputs.label }}
           files: Dust-${{ steps.version.outputs.label }}.zip
           generate_release_notes: true
+
+      # Workshop upload is disabled until verify-workshop is confirmed working.
+      # Uncomment below to enable.
+
+      # - name: Prepare Workshop content
+      #   run: |
+      #     cp mod/_Dust.info release/Dust/
+      #     cp mod/_Dust.img release/Dust/ 2>/dev/null || true
+      #     TAG="${{ steps.version.outputs.label }}"
+      #     sed "s|content/Dust|$PWD/release/Dust|;s|CHANGENOTE_PLACEHOLDER|$TAG|" \
+      #       .github/workshop.vdf > workshop_upload.vdf
+      #     cat workshop_upload.vdf
+
+      # - name: Upload to Steam Workshop
+      #   uses: game-ci/steam-deploy@v3
+      #   with:
+      #     appId: 233860
+      #     username: ${{ secrets.STEAM_USERNAME }}
+      #     configVdf: ${{ secrets.STEAM_CONFIG_VDF }}
+      #     workshopVdf: workshop_upload.vdf

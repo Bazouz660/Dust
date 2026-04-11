@@ -43,13 +43,17 @@ static ID3D11RasterizerState*   gNoCullRS = nullptr;
 static ID3D11SamplerState*      gPointClampSampler = nullptr;
 static ID3D11SamplerState*      gLinearClampSampler = nullptr;
 
-// Constant buffer
+// Constant buffer — must match cbuffer DOFParams in shaders
 struct DOFCBData
 {
     float texelSize[2];
-    float focusDistance;
-    float focusRange;
-    float blurStrength;
+    float focusDistance;   // Resolved (auto or manual)
+    float nearStart;
+    float nearEnd;
+    float nearStrength;
+    float farStart;
+    float farEnd;
+    float farStrength;
     float blurRadius;
     float maxDepth;
     float _pad;
@@ -285,9 +289,13 @@ void Render(ID3D11DeviceContext* ctx,
         DOFCBData cb = {};
         cb.texelSize[0] = 1.0f / (float)gWidth;
         cb.texelSize[1] = 1.0f / (float)gHeight;
-        cb.focusDistance = gDOFConfig.focusDistance;
-        cb.focusRange = gDOFConfig.focusRange;
-        cb.blurStrength = gDOFConfig.blurStrength;
+        cb.focusDistance = DOFGetResolvedFocusDistance();
+        cb.nearStart = gDOFConfig.nearStart;
+        cb.nearEnd = gDOFConfig.nearEnd;
+        cb.nearStrength = gDOFConfig.nearStrength;
+        cb.farStart = gDOFConfig.farStart;
+        cb.farEnd = gDOFConfig.farEnd;
+        cb.farStrength = gDOFConfig.farStrength;
         cb.blurRadius = gDOFConfig.blurRadius;
         cb.maxDepth = gDOFConfig.maxDepth;
         gHost->UpdateConstantBuffer(ctx, gDOFCB, &cb, sizeof(cb));
@@ -381,9 +389,14 @@ void RenderDebugOverlay(ID3D11DeviceContext* ctx,
         DOFCBData cb = {};
         cb.texelSize[0] = 1.0f / (float)gWidth;
         cb.texelSize[1] = 1.0f / (float)gHeight;
-        cb.focusDistance = gDOFConfig.focusDistance;
-        cb.focusRange = gDOFConfig.focusRange;
-        cb.blurStrength = gDOFConfig.blurStrength;
+        cb.focusDistance = DOFGetResolvedFocusDistance();
+        cb.nearStart = gDOFConfig.nearStart;
+        cb.nearEnd = gDOFConfig.nearEnd;
+        cb.nearStrength = gDOFConfig.nearStrength;
+        cb.farStart = gDOFConfig.farStart;
+        cb.farEnd = gDOFConfig.farEnd;
+        cb.farStrength = gDOFConfig.farStrength;
+        cb.blurRadius = gDOFConfig.blurRadius;
         cb.maxDepth = gDOFConfig.maxDepth;
         gHost->UpdateConstantBuffer(ctx, gDOFCB, &cb, sizeof(cb));
 

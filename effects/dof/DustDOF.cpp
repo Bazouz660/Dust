@@ -1,5 +1,6 @@
 // DustDOF.cpp - Depth of Field effect plugin for Dust (API v3)
-// Blurs the scene based on distance from a configurable focus plane.
+// Blurs the scene based on distance from a focus plane, with auto-focus
+// and separate near/far blur curves.
 // Exports DustEffectCreate per the Dust plugin API.
 
 #include "../../src/DustAPI.h"
@@ -9,6 +10,7 @@
 
 #include <d3d11.h>
 #include <cstring>
+#include <cmath>
 #include <string>
 
 DustLogFn gLogFn = nullptr;
@@ -16,6 +18,13 @@ DustLogFn gLogFn = nullptr;
 DOFConfig gDOFConfig;
 
 static HMODULE gPluginModule = nullptr;
+static const DustHostAPI* gHost = nullptr;
+
+// Auto-focus resources
+static ID3D11Texture2D* gFocusStagingTex = nullptr;
+static float gCurrentFocusDepth = 0.02f;
+static LARGE_INTEGER gLastFrameTime = {};
+static LARGE_INTEGER gPerfFreq = {};
 
 static std::string GetPluginDir()
 {
@@ -24,6 +33,99 @@ static std::string GetPluginDir()
     std::string s(path);
     auto pos = s.find_last_of("\\/");
     return (pos != std::string::npos) ? s.substr(0, pos) : s;
+}
+
+static bool CreateFocusResources(ID3D11Device* device)
+{
+    if (gFocusStagingTex) { gFocusStagingTex->Release(); gFocusStagingTex = nullptr; }
+
+    // 1x1 staging texture to read center depth
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = 1;
+    desc.Height = 1;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R32_FLOAT;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+    HRESULT hr = device->CreateTexture2D(&desc, nullptr, &gFocusStagingTex);
+    if (FAILED(hr))
+    {
+        Log("DOF: Failed to create focus staging texture: 0x%08X", hr);
+        return false;
+    }
+    return true;
+}
+
+// Read the depth at screen center for auto-focus
+static void UpdateAutoFocus(const DustFrameContext* ctx, const DustHostAPI* host)
+{
+    if (!gDOFConfig.autoFocus || !gFocusStagingTex)
+        return;
+
+    ID3D11ShaderResourceView* depthSRV = host->GetSRV(DUST_RESOURCE_DEPTH);
+    if (!depthSRV)
+        return;
+
+    // Get the underlying depth texture from the SRV
+    ID3D11Resource* depthResource = nullptr;
+    depthSRV->GetResource(&depthResource);
+    if (!depthResource)
+        return;
+
+    ID3D11Texture2D* depthTex = nullptr;
+    HRESULT hr = depthResource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&depthTex);
+    depthResource->Release();
+    if (FAILED(hr) || !depthTex)
+        return;
+
+    // Copy a 1x1 region from screen center
+    UINT cx = ctx->width / 2;
+    UINT cy = ctx->height / 2;
+    D3D11_BOX srcBox = { cx, cy, 0, cx + 1, cy + 1, 1 };
+    ctx->context->CopySubresourceRegion(gFocusStagingTex, 0, 0, 0, 0,
+                                         depthTex, 0, &srcBox);
+    depthTex->Release();
+
+    // Read back
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    hr = ctx->context->Map(gFocusStagingTex, 0, D3D11_MAP_READ, 0, &mapped);
+    if (SUCCEEDED(hr))
+    {
+        float centerDepth = *(float*)mapped.pData;
+        ctx->context->Unmap(gFocusStagingTex, 0);
+
+        // Skip invalid depth (sky, zero)
+        if (centerDepth > 0.0001f && centerDepth <= gDOFConfig.maxDepth)
+        {
+            // Temporal smoothing
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            float dt = (float)(now.QuadPart - gLastFrameTime.QuadPart) / (float)gPerfFreq.QuadPart;
+            gLastFrameTime = now;
+            dt = dt < 0.001f ? 0.001f : (dt > 0.5f ? 0.5f : dt);
+
+            float alpha = 1.0f - expf(-dt * gDOFConfig.autoFocusSpeed);
+            gCurrentFocusDepth += (centerDepth - gCurrentFocusDepth) * alpha;
+        }
+    }
+}
+
+// Get the resolved focus distance (auto or manual)
+float DOFGetResolvedFocusDistance()
+{
+    return gDOFConfig.autoFocus ? gCurrentFocusDepth : gDOFConfig.focusDistance;
+}
+
+// Called BEFORE the game's tonemap draw (for auto-focus sampling)
+static void DOFPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
+{
+    if (!gDOFConfig.enabled)
+        return;
+
+    UpdateAutoFocus(ctx, host);
 }
 
 // Called AFTER the game's tonemap draw
@@ -58,10 +160,18 @@ static int DOFInit(ID3D11Device* device, uint32_t width, uint32_t height, const 
 #undef Log
     gLogFn = host->Log;
 #define Log DustLog
+    gHost = host;
 
     std::string pluginDir = GetPluginDir();
     if (!DOFRenderer::Init(device, width, height, host, pluginDir.c_str()))
         return -1;
+
+    if (!CreateFocusResources(device))
+        return -2;
+
+    QueryPerformanceFrequency(&gPerfFreq);
+    QueryPerformanceCounter(&gLastFrameTime);
+    gCurrentFocusDepth = gDOFConfig.focusDistance;
 
     Log("DOF: Initialized (%ux%u)", width, height);
     return 0;
@@ -70,6 +180,7 @@ static int DOFInit(ID3D11Device* device, uint32_t width, uint32_t height, const 
 static void DOFShutdown()
 {
     DOFRenderer::Shutdown();
+    if (gFocusStagingTex) { gFocusStagingTex->Release(); gFocusStagingTex = nullptr; }
     Log("DOF: Shut down");
 }
 
@@ -87,13 +198,19 @@ static int DOFIsEnabled()
 // ==================== GUI Settings ====================
 
 static DustSettingDesc gSettingsArray[] = {
-    { "Enabled",        DUST_SETTING_BOOL,  &gDOFConfig.enabled,        0.0f, 1.0f,   "Enabled" },
-    { "Focus Distance", DUST_SETTING_FLOAT, &gDOFConfig.focusDistance,  0.001f, 0.1f,  "FocusDistance" },
-    { "Focus Range",    DUST_SETTING_FLOAT, &gDOFConfig.focusRange,     0.001f, 0.05f, "FocusRange" },
-    { "Blur Strength",  DUST_SETTING_FLOAT, &gDOFConfig.blurStrength,   0.0f, 2.0f,   "BlurStrength" },
-    { "Blur Radius",    DUST_SETTING_FLOAT, &gDOFConfig.blurRadius,     1.0f, 32.0f,  "BlurRadius" },
-    { "Max Depth",      DUST_SETTING_FLOAT, &gDOFConfig.maxDepth,       0.01f, 1.0f,  "MaxDepth" },
-    { "Debug View",     DUST_SETTING_BOOL,  &gDOFConfig.debugView,      0.0f, 1.0f,   "DebugView" },
+    { "Enabled",          DUST_SETTING_BOOL,  &gDOFConfig.enabled,          0.0f,   1.0f,   "Enabled" },
+    { "Auto Focus",       DUST_SETTING_BOOL,  &gDOFConfig.autoFocus,        0.0f,   1.0f,   "AutoFocus" },
+    { "Focus Speed",      DUST_SETTING_FLOAT, &gDOFConfig.autoFocusSpeed,   0.5f,   20.0f,  "AutoFocusSpeed" },
+    { "Focus Distance",   DUST_SETTING_FLOAT, &gDOFConfig.focusDistance,    0.001f, 0.1f,   "FocusDistance" },
+    { "Near Start",       DUST_SETTING_FLOAT, &gDOFConfig.nearStart,       0.0001f, 0.05f,  "NearStart" },
+    { "Near End",         DUST_SETTING_FLOAT, &gDOFConfig.nearEnd,         0.001f,  0.1f,   "NearEnd" },
+    { "Near Strength",    DUST_SETTING_FLOAT, &gDOFConfig.nearStrength,    0.0f,    1.0f,   "NearStrength" },
+    { "Far Start",        DUST_SETTING_FLOAT, &gDOFConfig.farStart,        0.0001f, 0.05f,  "FarStart" },
+    { "Far End",          DUST_SETTING_FLOAT, &gDOFConfig.farEnd,          0.001f,  0.1f,   "FarEnd" },
+    { "Far Strength",     DUST_SETTING_FLOAT, &gDOFConfig.farStrength,     0.0f,    1.0f,   "FarStrength" },
+    { "Blur Radius",      DUST_SETTING_FLOAT, &gDOFConfig.blurRadius,      1.0f,    32.0f,  "BlurRadius" },
+    { "Max Depth",        DUST_SETTING_FLOAT, &gDOFConfig.maxDepth,        0.01f,   1.0f,   "MaxDepth" },
+    { "Debug View",       DUST_SETTING_BOOL,  &gDOFConfig.debugView,       0.0f,    1.0f,   "DebugView" },
 };
 
 // Plugin entry point
@@ -108,7 +225,7 @@ extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
     desc->Init              = DOFInit;
     desc->Shutdown          = DOFShutdown;
     desc->OnResolutionChanged = DOFOnResolutionChanged;
-    desc->preExecute        = nullptr;
+    desc->preExecute        = DOFPreExecute;
     desc->postExecute       = DOFPostExecute;
     desc->IsEnabled         = DOFIsEnabled;
     desc->settings          = gSettingsArray;
