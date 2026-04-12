@@ -26,9 +26,11 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 {
     float depth = depthTex.Sample(pointClamp, uv);
 
-    // Sky and distant pixels: no blur
+    // Sky and distant pixels: treat as very far geometry so they go
+    // through the same far-field CoC ramp. If focus is far away,
+    // the sky will naturally stay sharp.
     if (depth <= 0.0001 || depth > maxDepth)
-        return float4(0, 0, 0, 1);
+        depth = maxDepth;
 
     float diff = depth - focusDistance;
     float coc = 0.0;

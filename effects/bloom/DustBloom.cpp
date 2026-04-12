@@ -27,11 +27,10 @@ static std::string GetPluginDir()
 
 struct BloomConfig {
     bool  enabled   = true;
-    float intensity = 0.5f;
-    float threshold = 2.584f;
-    float softKnee  = 0.603f;
-    float scatter   = 0.411f;
-    float radius    = 2.814f;
+    float intensity = 0.65f;
+    float threshold = 0.0f;
+    float radius    = 1.0f;
+    float spread    = 0.5f;   // 0 = tight sharp halo, 1 = wide soft glow
     bool  debugView = false;
 };
 
@@ -39,8 +38,9 @@ static BloomConfig gConfig;
 
 // ==================== GPU Resources ====================
 
-static ID3D11PixelShader* gExtractPS    = nullptr;
-static ID3D11PixelShader* gDownsamplePS = nullptr;
+static ID3D11PixelShader* gExtractPS         = nullptr;
+static ID3D11PixelShader* gDownsampleKarisPS = nullptr;
+static ID3D11PixelShader* gDownsamplePS      = nullptr;
 static ID3D11PixelShader* gUpsamplePS   = nullptr;
 static ID3D11PixelShader* gCompositePS  = nullptr;
 
@@ -55,16 +55,15 @@ static ID3D11RasterizerState*    gRasterState    = nullptr;
 struct BloomCB {
     float texelSizeX, texelSizeY;
     float threshold;
-    float softKnee;
     float intensity;
-    float scatter;
     float radius;
-    float pad;
+    float mipWeight;
+    float pad0, pad1;
 };
 
 // ==================== Mip Chain ====================
 
-#define BLOOM_MIP_COUNT 5
+#define BLOOM_MIP_COUNT 8
 
 struct BloomMip {
     ID3D11Texture2D*          tex = nullptr;
@@ -158,11 +157,12 @@ static int BloomInit(ID3D11Device* device, uint32_t width, uint32_t height, cons
     gShaderDir = GetPluginDir() + "\\shaders\\";
 
     // Compile shaders from .hlsl files
-    gExtractPS    = CompilePS("bloom_extract_ps.hlsl",    "extract");
-    gDownsamplePS = CompilePS("bloom_downsample_ps.hlsl", "downsample");
-    gUpsamplePS   = CompilePS("bloom_upsample_ps.hlsl",   "upsample");
-    gCompositePS  = CompilePS("bloom_composite_ps.hlsl",   "composite");
-    if (!gExtractPS || !gDownsamplePS || !gUpsamplePS || !gCompositePS)
+    gExtractPS         = CompilePS("bloom_extract_ps.hlsl",          "extract");
+    gDownsampleKarisPS = CompilePS("bloom_downsample_karis_ps.hlsl", "downsample_karis");
+    gDownsamplePS      = CompilePS("bloom_downsample_ps.hlsl",       "downsample");
+    gUpsamplePS        = CompilePS("bloom_upsample_ps.hlsl",         "upsample");
+    gCompositePS       = CompilePS("bloom_composite_ps.hlsl",        "composite");
+    if (!gExtractPS || !gDownsampleKarisPS || !gDownsamplePS || !gUpsamplePS || !gCompositePS)
         return -1;
 
     // Constant buffer
@@ -218,10 +218,11 @@ static void BloomShutdown()
     if (gNoBlend)       { gNoBlend->Release();       gNoBlend = nullptr; }
     if (gLinearSampler) { gLinearSampler->Release();  gLinearSampler = nullptr; }
     if (gCB)            { gCB->Release();             gCB = nullptr; }
-    if (gCompositePS)   { gCompositePS->Release();   gCompositePS = nullptr; }
-    if (gUpsamplePS)    { gUpsamplePS->Release();    gUpsamplePS = nullptr; }
-    if (gDownsamplePS)  { gDownsamplePS->Release();  gDownsamplePS = nullptr; }
-    if (gExtractPS)     { gExtractPS->Release();     gExtractPS = nullptr; }
+    if (gCompositePS)       { gCompositePS->Release();       gCompositePS = nullptr; }
+    if (gUpsamplePS)        { gUpsamplePS->Release();        gUpsamplePS = nullptr; }
+    if (gDownsamplePS)      { gDownsamplePS->Release();      gDownsamplePS = nullptr; }
+    if (gDownsampleKarisPS) { gDownsampleKarisPS->Release(); gDownsampleKarisPS = nullptr; }
+    if (gExtractPS)         { gExtractPS->Release();         gExtractPS = nullptr; }
     gDevice = nullptr;
     Log("Bloom: Shut down");
 }
@@ -234,26 +235,18 @@ static void BloomOnResolutionChanged(ID3D11Device* device, uint32_t w, uint32_t 
 
 // ==================== Per-frame ====================
 
-// preExecute: capture HDR before game tonemaps
-static void BloomPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
+// postExecute: full bloom pipeline (runs at POST_LIGHTING, composites onto HDR)
+static void BloomPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
 {
     if (!gConfig.enabled)
         return;
 
+    // Capture HDR scene and get HDR render target
     gHdrCopySRV = host->GetSceneCopy(ctx->context, DUST_RESOURCE_HDR_RT);
-}
+    if (!gHdrCopySRV) return;
 
-// postExecute: full bloom pipeline
-static void BloomPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
-{
-    if (!gConfig.enabled || !gHdrCopySRV)
-    {
-        gHdrCopySRV = nullptr;
-        return;
-    }
-
-    ID3D11RenderTargetView* ldrRTV = host->GetRTV(DUST_RESOURCE_LDR_RT);
-    if (!ldrRTV) { gHdrCopySRV = nullptr; return; }
+    ID3D11RenderTargetView* hdrRTV = host->GetRTV(DUST_RESOURCE_HDR_RT);
+    if (!hdrRTV) { gHdrCopySRV = nullptr; return; }
 
     ID3D11DeviceContext* dc = ctx->context;
     host->SaveState(dc);
@@ -264,15 +257,12 @@ static void BloomPostExecute(const DustFrameContext* ctx, const DustHostAPI* hos
     dc->PSSetSamplers(0, 1, &gLinearSampler);
     dc->PSSetConstantBuffers(0, 1, &gCB);
 
-    // --- Pass 1: Extract bright areas (HDR -> mip[0]) ---
+    // --- Pass 1: Karis downsample + prefilter (HDR -> mip[0]) ---
     {
         BloomCB cb = {};
         cb.texelSizeX = 1.0f / (float)ctx->width;
         cb.texelSizeY = 1.0f / (float)ctx->height;
         cb.threshold  = gConfig.threshold;
-        cb.softKnee   = gConfig.softKnee;
-        cb.intensity  = gConfig.intensity;
-        cb.scatter    = gConfig.scatter;
         host->UpdateConstantBuffer(dc, gCB, &cb, sizeof(cb));
 
         dc->OMSetBlendState(gNoBlend, nullptr, 0xFFFFFFFF);
@@ -282,7 +272,7 @@ static void BloomPostExecute(const DustFrameContext* ctx, const DustHostAPI* hos
         dc->RSSetViewports(1, &vp);
 
         dc->PSSetShaderResources(0, 1, &gHdrCopySRV);
-        host->DrawFullscreenTriangle(dc, gExtractPS);
+        host->DrawFullscreenTriangle(dc, gDownsampleKarisPS);
     }
 
     // --- Passes 2..N: Downsample chain ---
@@ -291,10 +281,8 @@ static void BloomPostExecute(const DustFrameContext* ctx, const DustHostAPI* hos
         BloomCB cb = {};
         cb.texelSizeX = 1.0f / (float)gMips[i].width;
         cb.texelSizeY = 1.0f / (float)gMips[i].height;
-        cb.scatter    = gConfig.scatter;
         host->UpdateConstantBuffer(dc, gCB, &cb, sizeof(cb));
 
-        // Unbind source from SRV before it was an RTV, set new RTV first
         dc->OMSetRenderTargets(1, &gMips[i + 1].rtv, nullptr);
 
         D3D11_VIEWPORT vp = { 0, 0, (float)gMips[i + 1].width, (float)gMips[i + 1].height, 0, 1 };
@@ -307,16 +295,27 @@ static void BloomPostExecute(const DustFrameContext* ctx, const DustHostAPI* hos
     // --- Passes N+1..2N: Upsample chain (additive onto each larger mip) ---
     dc->OMSetBlendState(gAdditiveBlend, nullptr, 0xFFFFFFFF);
 
+    // Generate mip weights from spread: gaussian curve centered based on spread value
+    float mipWeights[BLOOM_MIP_COUNT];
+    {
+        float center = gConfig.spread * (BLOOM_MIP_COUNT - 1);
+        float sigma  = BLOOM_MIP_COUNT * 0.35f;
+        for (int m = 0; m < BLOOM_MIP_COUNT; m++)
+        {
+            float d = (float)m - center;
+            mipWeights[m] = expf(-0.5f * (d * d) / (sigma * sigma));
+        }
+    }
+
     for (int i = BLOOM_MIP_COUNT - 1; i > 0; i--)
     {
         BloomCB cb = {};
         cb.texelSizeX = 1.0f / (float)gMips[i].width;
         cb.texelSizeY = 1.0f / (float)gMips[i].height;
-        cb.scatter    = gConfig.scatter;
         cb.radius     = gConfig.radius;
+        cb.mipWeight  = mipWeights[i];
         host->UpdateConstantBuffer(dc, gCB, &cb, sizeof(cb));
 
-        // Set target first to unbind any previous RTV binding
         dc->OMSetRenderTargets(1, &gMips[i - 1].rtv, nullptr);
 
         D3D11_VIEWPORT vp = { 0, 0, (float)gMips[i - 1].width, (float)gMips[i - 1].height, 0, 1 };
@@ -326,7 +325,8 @@ static void BloomPostExecute(const DustFrameContext* ctx, const DustHostAPI* hos
         host->DrawFullscreenTriangle(dc, gUpsamplePS);
     }
 
-    // --- Final: Composite bloom onto ldr_rt ---
+    // --- Final: Composite bloom additively onto HDR RT ---
+    // Tonemapper will naturally compress the bloom, no screen blend needed.
     {
         BloomCB cb = {};
         cb.texelSizeX = 1.0f / (float)gMips[0].width;
@@ -335,13 +335,10 @@ static void BloomPostExecute(const DustFrameContext* ctx, const DustHostAPI* hos
         host->UpdateConstantBuffer(dc, gCB, &cb, sizeof(cb));
 
         if (gConfig.debugView)
-        {
-            // Debug: replace scene with bloom texture
             dc->OMSetBlendState(gNoBlend, nullptr, 0xFFFFFFFF);
-        }
         // else: still additive from upsample loop
 
-        dc->OMSetRenderTargets(1, &ldrRTV, nullptr);
+        dc->OMSetRenderTargets(1, &hdrRTV, nullptr);
 
         D3D11_VIEWPORT vp = { 0, 0, (float)ctx->width, (float)ctx->height, 0, 1 };
         dc->RSSetViewports(1, &vp);
@@ -367,12 +364,11 @@ static int BloomIsEnabled()
 
 static DustSettingDesc gBloomSettingsArray[] = {
     { "Enabled",    DUST_SETTING_BOOL,  &gConfig.enabled,   0.0f, 1.0f, "Enabled" },
-    { "Intensity",  DUST_SETTING_FLOAT, &gConfig.intensity,  0.0f, 2.0f, "Intensity" },
-    { "Threshold",  DUST_SETTING_FLOAT, &gConfig.threshold,  0.0f, 5.0f, "Threshold" },
-    { "Soft Knee",  DUST_SETTING_FLOAT, &gConfig.softKnee,   0.0f, 1.0f, "SoftKnee" },
-    { "Scatter",    DUST_SETTING_FLOAT, &gConfig.scatter,    0.0f, 1.0f, "Scatter" },
-    { "Radius",     DUST_SETTING_FLOAT, &gConfig.radius,    0.5f, 3.0f, "Radius" },
-    { "Debug View", DUST_SETTING_BOOL,  &gConfig.debugView,  0.0f, 1.0f, "DebugView" },
+    { "Intensity",  DUST_SETTING_FLOAT, &gConfig.intensity, 0.0f, 2.0f, "Intensity" },
+    { "Threshold",  DUST_SETTING_FLOAT, &gConfig.threshold, 0.0f, 5.0f, "Threshold" },
+    { "Radius",     DUST_SETTING_FLOAT, &gConfig.radius,   0.5f, 3.0f, "Radius" },
+    { "Spread",     DUST_SETTING_FLOAT, &gConfig.spread,   0.0f, 1.0f, "Spread" },
+    { "Debug View", DUST_SETTING_BOOL,  &gConfig.debugView, 0.0f, 1.0f, "DebugView" },
 };
 
 // ==================== Plugin entry ====================
@@ -384,11 +380,10 @@ extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
     memset(desc, 0, sizeof(*desc));
     desc->apiVersion          = DUST_API_VERSION;
     desc->name                = "Bloom";
-    desc->injectionPoint      = DUST_INJECT_POST_TONEMAP;
+    desc->injectionPoint      = DUST_INJECT_POST_LIGHTING;
     desc->Init                = BloomInit;
     desc->Shutdown            = BloomShutdown;
     desc->OnResolutionChanged = BloomOnResolutionChanged;
-    desc->preExecute          = BloomPreExecute;
     desc->postExecute         = BloomPostExecute;
     desc->IsEnabled           = BloomIsEnabled;
     desc->settings            = gBloomSettingsArray;
@@ -396,7 +391,7 @@ extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
 
     desc->flags               = DUST_FLAG_FRAMEWORK_CONFIG | DUST_FLAG_FRAMEWORK_TIMING;
     desc->configSection       = "Bloom";
-    desc->priority            = 100;  // Run after LUT (priority 0) at the same injection point
+    desc->priority            = 60;  // Run after Outline (50) at POST_LIGHTING
 
     return 0;
 }

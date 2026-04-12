@@ -89,18 +89,21 @@ static void UpdateAutoFocus(const DustFrameContext* ctx, const DustHostAPI* host
             float centerDepth = *(float*)mapped.pData;
             ctx->context->Unmap(gFocusStagingTex[readIdx], 0);
 
-            // Skip invalid depth (sky, zero)
+            // Sky/invalid depth: focus toward maxDepth so sky comes into focus
+            float targetDepth;
             if (centerDepth > 0.0001f && centerDepth <= gDOFConfig.maxDepth)
-            {
-                LARGE_INTEGER now;
-                QueryPerformanceCounter(&now);
-                float dt = (float)(now.QuadPart - gLastFrameTime.QuadPart) / (float)gPerfFreq.QuadPart;
-                gLastFrameTime = now;
-                dt = dt < 0.001f ? 0.001f : (dt > 0.5f ? 0.5f : dt);
+                targetDepth = centerDepth;
+            else
+                targetDepth = gDOFConfig.maxDepth;
 
-                float alpha = 1.0f - expf(-dt * gDOFConfig.autoFocusSpeed);
-                gCurrentFocusDepth += (centerDepth - gCurrentFocusDepth) * alpha;
-            }
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            float dt = (float)(now.QuadPart - gLastFrameTime.QuadPart) / (float)gPerfFreq.QuadPart;
+            gLastFrameTime = now;
+            dt = dt < 0.001f ? 0.001f : (dt > 0.5f ? 0.5f : dt);
+
+            float alpha = 1.0f - expf(-dt * gDOFConfig.autoFocusSpeed);
+            gCurrentFocusDepth += (targetDepth - gCurrentFocusDepth) * alpha;
         }
     }
 

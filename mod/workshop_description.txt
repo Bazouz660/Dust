@@ -50,7 +50,7 @@ Press [b]F11[/b] to open the settings overlay. From there you can adjust every e
 
 The mod should be compatible with any other mod, except mods that change the deferred.hlsl shader of the base
 game, or mods that modify the render pipeline directly.
-The mod currently does not support Proton/Wine, it is being worked on.
+The mod currently does not support Proton/Wine, it is being worked on. It could work, but I can't guarantee it yet.
 
 A startup notification appears for 30 seconds indicating the mod is active and which key toggles the GUI. This can
 be disabled in the framework settings.

@@ -10,6 +10,15 @@
 #include <cstring>
 #include <cstdio>
 
+// Version string (DUST_VERSION is injected at build time by CI from git tags)
+#define DUST_STR2(x) #x
+#define DUST_STR(x) DUST_STR2(x)
+#ifdef DUST_VERSION
+static const char* DUST_VERSION_STR = "v" DUST_STR(DUST_VERSION);
+#else
+static const char* DUST_VERSION_STR = "dev";
+#endif
+
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 namespace DustGUI
@@ -31,7 +40,29 @@ struct EffectGUIState {
 struct FrameworkConfig {
     bool logging = false;
     bool showStartupMessage = true;
+    std::string lastPreset;    // name of last selected preset (empty = custom)
+    int toggleKey = VK_F11;    // virtual key code for overlay toggle
 };
+
+static const char* VKKeyName(int vk)
+{
+    static char buf[64];
+    UINT scanCode = MapVirtualKeyA(vk, MAPVK_VK_TO_VSC);
+    // Extended keys need the flag set
+    switch (vk) {
+        case VK_INSERT: case VK_DELETE: case VK_HOME: case VK_END:
+        case VK_PRIOR: case VK_NEXT: case VK_LEFT: case VK_RIGHT:
+        case VK_UP: case VK_DOWN:
+            scanCode |= 0x100;
+            break;
+    }
+    if (GetKeyNameTextA(scanCode << 16, buf, sizeof(buf)) > 0)
+        return buf;
+    snprintf(buf, sizeof(buf), "Key 0x%02X", vk);
+    return buf;
+}
+
+static bool gWaitingForKey = false;
 
 // ==================== State ====================
 
@@ -54,6 +85,7 @@ static std::string gDustIniPath;
 // Startup toast
 static float gToastTimer = 30.0f;
 static bool gToastActive = true;
+static bool gNewVersionInstalled = false;
 
 // Performance tracking
 static float gFrameTimes[120] = {};
@@ -192,7 +224,16 @@ static bool DustSliderFloat(const char* label, float* v, float minVal, float max
 
 static LRESULT CALLBACK DustWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-    if (msg == WM_KEYDOWN && wParam == VK_F11 && !(lParam & 0x40000000))
+    // Capture key binding when waiting for a new toggle key
+    if (gWaitingForKey && msg == WM_KEYDOWN)
+    {
+        if (wParam != VK_ESCAPE) // Escape cancels
+            gFwConfig.toggleKey = (int)wParam;
+        gWaitingForKey = false;
+        return 0;
+    }
+
+    if (msg == WM_KEYDOWN && (int)wParam == gFwConfig.toggleKey && !(lParam & 0x40000000))
     {
         gOverlayVisible = !gOverlayVisible;
         if (gOverlayVisible)
@@ -233,14 +274,52 @@ static void LoadFrameworkConfig()
     gDustIniPath = DustLogDir() + "Dust.ini";
     gFwConfig.logging = GetPrivateProfileIntA("Dust", "Logging", 0, gDustIniPath.c_str()) != 0;
     gFwConfig.showStartupMessage = GetPrivateProfileIntA("Dust", "ShowStartupMessage", 1, gDustIniPath.c_str()) != 0;
+
+    gFwConfig.toggleKey = GetPrivateProfileIntA("Dust", "ToggleKey", VK_F11, gDustIniPath.c_str());
+
+    char buf[256] = {};
+    GetPrivateProfileStringA("Dust", "LastPreset", "", buf, sizeof(buf), gDustIniPath.c_str());
+    gFwConfig.lastPreset = buf;
+
+    // Auto-load last preset
+    if (!gFwConfig.lastPreset.empty())
+    {
+        const auto& presets = gEffectLoader.GetPresets();
+        for (int i = 0; i < (int)presets.size(); i++)
+        {
+            if (presets[i].name == gFwConfig.lastPreset)
+            {
+                gEffectLoader.LoadPreset(i);
+                break;
+            }
+        }
+    }
+
+    // Detect version change (Steam Workshop overwrites DLL but not Dust.ini)
+    char lastVersion[128] = {};
+    GetPrivateProfileStringA("Dust", "LastSeenVersion", "", lastVersion, sizeof(lastVersion), gDustIniPath.c_str());
+    if (strcmp(lastVersion, DUST_VERSION_STR) != 0)
+    {
+        // First launch or version changed — update the stored version
+        gNewVersionInstalled = (lastVersion[0] != '\0'); // only show "new version" if there was a previous one
+        WritePrivateProfileStringA("Dust", "LastSeenVersion", DUST_VERSION_STR, gDustIniPath.c_str());
+        if (gNewVersionInstalled)
+            gToastActive = true; // always show toast on update, even if disabled
+    }
+
     gFwDiskConfig = gFwConfig;
-    gToastActive = gFwConfig.showStartupMessage;
+    if (!gNewVersionInstalled)
+        gToastActive = gFwConfig.showStartupMessage;
 }
 
 static void SaveFrameworkConfig()
 {
     WritePrivateProfileStringA("Dust", "Logging", gFwConfig.logging ? "1" : "0", gDustIniPath.c_str());
     WritePrivateProfileStringA("Dust", "ShowStartupMessage", gFwConfig.showStartupMessage ? "1" : "0", gDustIniPath.c_str());
+    char keyBuf[16];
+    snprintf(keyBuf, sizeof(keyBuf), "%d", gFwConfig.toggleKey);
+    WritePrivateProfileStringA("Dust", "ToggleKey", keyBuf, gDustIniPath.c_str());
+    WritePrivateProfileStringA("Dust", "LastPreset", gFwConfig.lastPreset.c_str(), gDustIniPath.c_str());
     gFwDiskConfig = gFwConfig;
     // Apply logging change immediately
     DustLogEnabled() = gFwConfig.logging;
@@ -256,15 +335,36 @@ static void ResetFrameworkConfig()
 static bool IsFrameworkDirty()
 {
     return gFwConfig.logging != gFwDiskConfig.logging ||
-           gFwConfig.showStartupMessage != gFwDiskConfig.showStartupMessage;
+           gFwConfig.showStartupMessage != gFwDiskConfig.showStartupMessage ||
+           gFwConfig.lastPreset != gFwDiskConfig.lastPreset ||
+           gFwConfig.toggleKey != gFwDiskConfig.toggleKey;
 }
 
 // ==================== Drawing: Framework pane ====================
 
 static void DrawFrameworkSection()
 {
-    ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Framework");
+    ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Dust");
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%s)", DUST_VERSION_STR);
     ImGui::Separator();
+    ImGui::Spacing();
+
+    // Toggle key binding
+    if (gWaitingForKey)
+    {
+        ImGui::Button("Press a key...", ImVec2(ImGui::GetContentRegionAvail().x, 0));
+    }
+    else
+    {
+        char label[128];
+        snprintf(label, sizeof(label), "Toggle: %s", VKKeyName(gFwConfig.toggleKey));
+        if (ImGui::Button(label, ImVec2(ImGui::GetContentRegionAvail().x, 0)))
+            gWaitingForKey = true;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Click to rebind the overlay toggle key");
+    }
+
     ImGui::Spacing();
 
     ImGui::Checkbox("Logging", &gFwConfig.logging);
@@ -324,7 +424,11 @@ static void DrawPresetSection()
     if (ImGui::BeginCombo("##Preset", previewName))
     {
         if (ImGui::Selectable("(Custom)", currentPreset < 0))
+        {
             gEffectLoader.SetCurrentPreset(-1);
+            gFwConfig.lastPreset.clear();
+            SaveFrameworkConfig();
+        }
 
         for (int p = 0; p < (int)presets.size(); p++)
         {
@@ -332,6 +436,8 @@ static void DrawPresetSection()
             if (ImGui::Selectable(presets[p].name.c_str(), selected))
             {
                 gEffectLoader.LoadPreset(p);
+                gFwConfig.lastPreset = presets[p].name;
+                SaveFrameworkConfig();
                 SnapshotAllEffects();
             }
         }
@@ -682,9 +788,12 @@ static void RenderToast()
 
     ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Dust");
     ImGui::SameLine();
-    ImGui::TextDisabled("Graphics Framework");
-    ImGui::Text("Press F11 to open settings");
-    ImGui::TextDisabled("(disable this message in settings)");
+    ImGui::TextDisabled("(%s)", DUST_VERSION_STR);
+    if (gNewVersionInstalled)
+        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "New version installed!");
+    ImGui::Text("Press %s to open settings", VKKeyName(gFwConfig.toggleKey));
+    if (!gNewVersionInstalled)
+        ImGui::TextDisabled("(disable this message in settings)");
 
     ImGui::End();
     ImGui::PopStyleVar(3);
@@ -773,7 +882,10 @@ void Render()
         ImGui::SetNextWindowSize(ImVec2(560, 420), ImGuiCond_FirstUseEver);
         ImGui::Begin("Dust Settings", &gOverlayVisible);
 
-        float leftW = 200.0f;
+        static float leftW = 220.0f;
+        const float minLeftW = 150.0f;
+        const float minRightW = 200.0f;
+        float availW = ImGui::GetContentRegionAvail().x;
 
         // ---- Left pane: Framework settings + Performance (always visible) ----
         ImGui::BeginChild("##left", ImVec2(leftW, 0), true);
@@ -788,6 +900,19 @@ void Render()
         DrawPerformanceSection();
 
         ImGui::EndChild();
+
+        // ---- Draggable splitter between panes ----
+        ImGui::SameLine();
+        ImGui::Button("##splitter", ImVec2(4.0f, ImGui::GetContentRegionAvail().y));
+        if (ImGui::IsItemActive())
+        {
+            float delta = ImGui::GetIO().MouseDelta.x;
+            leftW += delta;
+            if (leftW < minLeftW) leftW = minLeftW;
+            if (leftW > availW - minRightW) leftW = availW - minRightW;
+        }
+        if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
 
         ImGui::SameLine();
 

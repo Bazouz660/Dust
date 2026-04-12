@@ -6,11 +6,10 @@ SamplerState linearSamp : register(s0);
 cbuffer BloomParams : register(b0) {
     float2 texelSize;
     float threshold;
-    float softKnee;
     float intensity;
-    float scatter;
     float radius;
-    float padding;
+    float mipWeight;
+    float2 _pad;
 };
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
@@ -29,5 +28,5 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
     s += srcTex.SampleLevel(linearSamp, uv + float2( d.x,  d.y), 0).rgb;
     s /= 16.0;
 
-    return float4(s * scatter, 1.0);
+    return float4(s * mipWeight, 1.0);
 }

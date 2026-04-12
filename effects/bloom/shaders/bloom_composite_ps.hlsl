@@ -1,4 +1,4 @@
-// Composite: output bloom scaled by intensity (use with additive blend onto scene)
+// Composite: output bloom scaled by intensity (used with additive blend onto HDR)
 
 Texture2D bloomTex : register(t0);
 SamplerState linearSamp : register(s0);
@@ -6,11 +6,10 @@ SamplerState linearSamp : register(s0);
 cbuffer BloomParams : register(b0) {
     float2 texelSize;
     float threshold;
-    float softKnee;
     float intensity;
-    float scatter;
     float radius;
-    float padding;
+    float mipWeight;
+    float2 _pad;
 };
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
