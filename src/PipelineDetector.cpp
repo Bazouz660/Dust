@@ -24,7 +24,19 @@ PipelineDetector::DetectionResult PipelineDetector::OnFullscreenDraw(ID3D11Devic
         }
     }
 
-    // Detect tonemap pass (after lighting, writes B8G8R8A8_UNORM with HDR input)
+    // Detect fog pass (after lighting, alpha-blended fullscreen onto HDR RT with depth at SRV[0])
+    if (lightingDetected_ && !fogDetected_)
+    {
+        if (IsFogPass(ctx))
+        {
+            fogDetected_ = true;
+            result.detected = true;
+            result.point = InjectionPoint::POST_FOG;
+            return result;
+        }
+    }
+
+    // Detect tonemap pass (after lighting+fog, writes B8G8R8A8_UNORM with HDR input)
     if (lightingDetected_ && !tonemapDetected_)
     {
         if (IsTonemapPass(ctx))
@@ -136,6 +148,66 @@ void PipelineDetector::CaptureLightingResources(ID3D11DeviceContext* ctx)
             gResourceRegistry.GetRTV(ResourceName::HDR_RTV));
         sFirstDetectLogged = true;
     }
+}
+
+// Detect fog pass: fullscreen draw where:
+//   1. RT format = R11G11B10_FLOAT (same HDR target as lighting)
+//   2. Alpha blending is enabled (SrcAlpha/InvSrcAlpha — fog fades with distance)
+//   3. SRV[0] = R32_FLOAT (depth — not albedo like in the lighting pass)
+// This runs after lighting + water/forward objects.
+bool PipelineDetector::IsFogPass(ID3D11DeviceContext* ctx)
+{
+    // Check RT format is R11G11B10_FLOAT (HDR)
+    ID3D11RenderTargetView* rt = nullptr;
+    ctx->OMGetRenderTargets(1, &rt, nullptr);
+    if (!rt)
+        return false;
+
+    D3D11_RENDER_TARGET_VIEW_DESC rtDesc;
+    rt->GetDesc(&rtDesc);
+    rt->Release();
+
+    if (rtDesc.Format != DXGI_FORMAT_R11G11B10_FLOAT)
+        return false;
+
+    // Check alpha blending is enabled (fog uses SrcAlpha/InvSrcAlpha)
+    ID3D11BlendState* blendState = nullptr;
+    float blendFactor[4];
+    UINT sampleMask;
+    ctx->OMGetBlendState(&blendState, blendFactor, &sampleMask);
+    if (!blendState)
+        return false;
+
+    D3D11_BLEND_DESC blendDesc;
+    blendState->GetDesc(&blendDesc);
+    blendState->Release();
+
+    if (!blendDesc.RenderTarget[0].BlendEnable ||
+        blendDesc.RenderTarget[0].SrcBlend != D3D11_BLEND_SRC_ALPHA ||
+        blendDesc.RenderTarget[0].DestBlend != D3D11_BLEND_INV_SRC_ALPHA)
+        return false;
+
+    // Check SRV[0] is R32_FLOAT (depth buffer — not albedo like lighting pass)
+    ID3D11ShaderResourceView* srv0 = nullptr;
+    ctx->PSGetShaderResources(0, 1, &srv0);
+    if (!srv0)
+        return false;
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc;
+    srv0->GetDesc(&srvDesc);
+    srv0->Release();
+
+    if (srvDesc.Format != DXGI_FORMAT_R32_FLOAT)
+        return false;
+
+    static bool sLogged = false;
+    if (!sLogged)
+    {
+        Log("Pipeline: Fog pass detected");
+        sLogged = true;
+    }
+
+    return true;
 }
 
 // Detect tonemap pass: fullscreen draw where:

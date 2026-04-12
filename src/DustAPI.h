@@ -150,6 +150,11 @@ typedef struct DustHostAPI {
     ID3D11Buffer* (*CreateConstantBuffer)(ID3D11Device* device, uint32_t sizeBytes);
     void (*UpdateConstantBuffer)(ID3D11DeviceContext* ctx, ID3D11Buffer* cb,
                                  const void* data, uint32_t sizeBytes);
+
+    // Pre-fog HDR snapshot — returns the HDR scene as it was at POST_LIGHTING,
+    // before fog/atmosphere was drawn. Available from POST_FOG and POST_TONEMAP.
+    // Returns NULL if POST_LIGHTING hasn't fired yet this frame.
+    ID3D11ShaderResourceView* (*GetPreFogHDR)(void);
 } DustHostAPI;
 
 // Setting types for the GUI settings descriptor (API v2+)

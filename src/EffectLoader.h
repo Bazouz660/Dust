@@ -49,6 +49,7 @@ public:
     void DispatchPre(DustInjectionPoint point, const DustFrameContext* ctx);
     void DispatchPost(DustInjectionPoint point, const DustFrameContext* ctx);
 
+    void CapturePreFogHDR(ID3D11DeviceContext* ctx);
     void OnResolutionChanged(ID3D11Device* device, uint32_t w, uint32_t h);
     void ShutdownAll();
 

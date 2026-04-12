@@ -467,6 +467,10 @@ static void STDMETHODCALLTYPE HookedDraw(
         // Execute the game's original draw call
         oDraw(pThis, VertexCount, StartVertexLocation);
 
+        // Snapshot pre-fog HDR right after the lighting draw completes
+        if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
+            gEffectLoader.CapturePreFogHDR(pThis);
+
         // POST: effects that operate after the draw
         fctx.timing = DUST_TIMING_POST;
         gEffectLoader.DispatchPost(dip, &fctx);

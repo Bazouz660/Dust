@@ -87,6 +87,10 @@ static float gToastTimer = 30.0f;
 static bool gToastActive = true;
 static bool gNewVersionInstalled = false;
 
+// Cursor state when overlay opens
+static RECT gSavedClipRect = {};
+static bool gHadClipRect = false;
+
 // Performance tracking
 static float gFrameTimes[120] = {};
 static int gFrameTimeIdx = 0;
@@ -222,6 +226,28 @@ static bool DustSliderFloat(const char* label, float* v, float minVal, float max
 
 // ==================== WndProc ====================
 
+static void OnOverlayOpen(HWND hWnd)
+{
+    gToastActive = false;
+
+    // Save cursor clip rect and release it so the cursor can move freely
+    gHadClipRect = (GetClipCursor(&gSavedClipRect) != 0);
+    ClipCursor(nullptr);
+
+    // Show system cursor
+    while (ShowCursor(TRUE) < 0) {}
+}
+
+static void OnOverlayClose()
+{
+    // Restore cursor clipping (game usually clips cursor to window)
+    if (gHadClipRect)
+        ClipCursor(&gSavedClipRect);
+
+    // Hide system cursor (game manages its own)
+    while (ShowCursor(FALSE) >= 0) {}
+}
+
 static LRESULT CALLBACK DustWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     // Capture key binding when waiting for a new toggle key
@@ -237,17 +263,32 @@ static LRESULT CALLBACK DustWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     {
         gOverlayVisible = !gOverlayVisible;
         if (gOverlayVisible)
-            gToastActive = false; // dismiss toast when opening overlay
+            OnOverlayOpen(hWnd);
+        else
+            OnOverlayClose();
         return 0;
     }
 
     if (gOverlayVisible)
     {
+        // Keep cursor visible — game tries to hide it via WM_SETCURSOR
+        if (msg == WM_SETCURSOR)
+        {
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            return TRUE;
+        }
+
+        // Keep cursor unclipped (game may re-clip it each frame)
+        if (msg == WM_MOUSEMOVE)
+            ClipCursor(nullptr);
+
         if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
             return 0;
 
+        // Block all mouse, keyboard, and raw input from reaching the game
         if ((msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) ||
-            (msg >= WM_KEYFIRST && msg <= WM_KEYLAST))
+            (msg >= WM_KEYFIRST && msg <= WM_KEYLAST) ||
+            msg == WM_INPUT)
             return 0;
     }
 
@@ -847,6 +888,9 @@ void Shutdown()
 {
     if (!gInitialized) return;
 
+    if (gOverlayVisible)
+        OnOverlayClose();
+
     if (oWndProc && gHWnd)
         SetWindowLongPtrW(gHWnd, GWLP_WNDPROC, (LONG_PTR)oWndProc);
     oWndProc = nullptr;
@@ -880,7 +924,10 @@ void Render()
     if (gOverlayVisible)
     {
         ImGui::SetNextWindowSize(ImVec2(560, 420), ImGuiCond_FirstUseEver);
+        bool wasVisible = gOverlayVisible;
         ImGui::Begin("Dust Settings", &gOverlayVisible);
+        if (wasVisible && !gOverlayVisible)
+            OnOverlayClose(); // user clicked the X button
 
         static float leftW = 220.0f;
         const float minLeftW = 150.0f;

@@ -1,4 +1,4 @@
-// Progressive downsample (13-tap filter for quality anti-aliased mip chain)
+// Progressive downsample (4-tap bilinear box filter)
 
 Texture2D srcTex : register(t0);
 SamplerState linearSamp : register(s0);
@@ -6,35 +6,19 @@ SamplerState linearSamp : register(s0);
 cbuffer BloomParams : register(b0) {
     float2 texelSize;
     float threshold;
+    float softKnee;
     float intensity;
+    float scatter;
     float radius;
-    float mipWeight;
-    float2 _pad;
+    float padding;
 };
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
-    float2 d = texelSize;
-
-    // 13-tap downsample (Jimenez 2014)
-    float3 a = srcTex.SampleLevel(linearSamp, uv + float2(-2, -2) * d, 0).rgb;
-    float3 b = srcTex.SampleLevel(linearSamp, uv + float2( 0, -2) * d, 0).rgb;
-    float3 c = srcTex.SampleLevel(linearSamp, uv + float2( 2, -2) * d, 0).rgb;
-    float3 dd = srcTex.SampleLevel(linearSamp, uv + float2(-2,  0) * d, 0).rgb;
-    float3 e = srcTex.SampleLevel(linearSamp, uv,                       0).rgb;
-    float3 f = srcTex.SampleLevel(linearSamp, uv + float2( 2,  0) * d, 0).rgb;
-    float3 g = srcTex.SampleLevel(linearSamp, uv + float2(-2,  2) * d, 0).rgb;
-    float3 h = srcTex.SampleLevel(linearSamp, uv + float2( 0,  2) * d, 0).rgb;
-    float3 i = srcTex.SampleLevel(linearSamp, uv + float2( 2,  2) * d, 0).rgb;
-    float3 j = srcTex.SampleLevel(linearSamp, uv + float2(-1, -1) * d, 0).rgb;
-    float3 k = srcTex.SampleLevel(linearSamp, uv + float2( 1, -1) * d, 0).rgb;
-    float3 l = srcTex.SampleLevel(linearSamp, uv + float2(-1,  1) * d, 0).rgb;
-    float3 m = srcTex.SampleLevel(linearSamp, uv + float2( 1,  1) * d, 0).rgb;
-
-    // Weighted combination: center cross (0.5) + 4 corner quads (0.125 each)
-    float3 result = e * 0.125;
-    result += (j + k + l + m) * 0.125;
-    result += (b + dd + f + h) * 0.0625;
-    result += (a + c + g + i) * 0.03125;
-
-    return float4(result, 1.0);
+    float2 d = texelSize * 0.5;
+    float3 s;
+    s  = srcTex.SampleLevel(linearSamp, uv + float2(-d.x, -d.y), 0).rgb;
+    s += srcTex.SampleLevel(linearSamp, uv + float2( d.x, -d.y), 0).rgb;
+    s += srcTex.SampleLevel(linearSamp, uv + float2(-d.x,  d.y), 0).rgb;
+    s += srcTex.SampleLevel(linearSamp, uv + float2( d.x,  d.y), 0).rgb;
+    return float4(s * 0.25, 1.0);
 }

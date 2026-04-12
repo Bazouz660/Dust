@@ -42,6 +42,81 @@ static void ReleaseSceneCopies()
     gSceneCopies.clear();
 }
 
+// ==================== Pre-fog HDR snapshot ====================
+// Captured at POST_LIGHTING (before fog), available to effects at any later point.
+
+static SceneCopyEntry gPreFogHDR;
+
+static void ReleasePreFogHDR()
+{
+    if (gPreFogHDR.srv) { gPreFogHDR.srv->Release(); gPreFogHDR.srv = nullptr; }
+    if (gPreFogHDR.tex) { gPreFogHDR.tex->Release(); gPreFogHDR.tex = nullptr; }
+    gPreFogHDR.width = gPreFogHDR.height = 0;
+    gPreFogHDR.format = DXGI_FORMAT_UNKNOWN;
+}
+
+void EffectLoader::CapturePreFogHDR(ID3D11DeviceContext* ctx)
+{
+    ID3D11RenderTargetView* rtv = gResourceRegistry.GetRTV(DUST_RESOURCE_HDR_RT);
+    if (!rtv) return;
+
+    ID3D11Resource* resource = nullptr;
+    rtv->GetResource(&resource);
+    if (!resource) return;
+
+    ID3D11Texture2D* srcTex = nullptr;
+    resource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&srcTex);
+    resource->Release();
+    if (!srcTex) return;
+
+    D3D11_TEXTURE2D_DESC srcDesc;
+    srcTex->GetDesc(&srcDesc);
+
+    // Recreate if dimensions or format changed
+    if (gPreFogHDR.width != srcDesc.Width || gPreFogHDR.height != srcDesc.Height || gPreFogHDR.format != srcDesc.Format)
+    {
+        ReleasePreFogHDR();
+
+        D3D11_TEXTURE2D_DESC copyDesc = {};
+        copyDesc.Width = srcDesc.Width;
+        copyDesc.Height = srcDesc.Height;
+        copyDesc.MipLevels = 1;
+        copyDesc.ArraySize = 1;
+        copyDesc.Format = srcDesc.Format;
+        copyDesc.SampleDesc.Count = 1;
+        copyDesc.Usage = D3D11_USAGE_DEFAULT;
+        copyDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        ID3D11Device* device = nullptr;
+        ctx->GetDevice(&device);
+        if (!device) { srcTex->Release(); return; }
+
+        HRESULT hr = device->CreateTexture2D(&copyDesc, nullptr, &gPreFogHDR.tex);
+        if (FAILED(hr)) { device->Release(); srcTex->Release(); return; }
+
+        hr = device->CreateShaderResourceView(gPreFogHDR.tex, nullptr, &gPreFogHDR.srv);
+        device->Release();
+        if (FAILED(hr))
+        {
+            gPreFogHDR.tex->Release(); gPreFogHDR.tex = nullptr;
+            srcTex->Release();
+            return;
+        }
+
+        gPreFogHDR.width = srcDesc.Width;
+        gPreFogHDR.height = srcDesc.Height;
+        gPreFogHDR.format = srcDesc.Format;
+    }
+
+    ctx->CopyResource(gPreFogHDR.tex, srcTex);
+    srcTex->Release();
+}
+
+static ID3D11ShaderResourceView* HostGetPreFogHDR()
+{
+    return gPreFogHDR.srv;
+}
+
 // ==================== Host API wrappers (v2) ====================
 
 static ID3D11ShaderResourceView* HostGetSRV(const char* name)
@@ -321,6 +396,7 @@ void EffectLoader::BuildHostAPI()
     hostAPI_.GetSceneCopy           = HostGetSceneCopy;
     hostAPI_.CreateConstantBuffer   = HostCreateConstantBuffer;
     hostAPI_.UpdateConstantBuffer   = HostUpdateConstantBuffer;
+    hostAPI_.GetPreFogHDR           = HostGetPreFogHDR;
 }
 
 // ==================== v3: Config I/O ====================
@@ -969,6 +1045,7 @@ bool EffectLoader::ReinitAll(ID3D11Device* device, uint32_t w, uint32_t h)
 
     // Release scene copies (they belong to the old device)
     ReleaseSceneCopies();
+    ReleasePreFogHDR();
 
     // Recompile fullscreen VS on the new device
     if (gFullscreenVS) { gFullscreenVS->Release(); gFullscreenVS = nullptr; }
@@ -1064,6 +1141,7 @@ void EffectLoader::OnResolutionChanged(ID3D11Device* device, uint32_t w, uint32_
 
     // Release scene copies — they'll be recreated on demand
     ReleaseSceneCopies();
+    ReleasePreFogHDR();
 
     for (auto& le : effects_)
     {
@@ -1098,6 +1176,7 @@ void EffectLoader::ShutdownAll()
 
     // Release cached resources
     ReleaseSceneCopies();
+    ReleasePreFogHDR();
     if (gFullscreenVS) { gFullscreenVS->Release(); gFullscreenVS = nullptr; }
 }
 
