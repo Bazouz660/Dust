@@ -31,6 +31,7 @@ struct LoadedEffect {
 struct PresetInfo {
     std::string name;   // display name (folder name)
     std::string path;   // full path to the preset folder
+    std::string warnings; // non-empty if preset has outdated INI files (missing/unknown fields)
 };
 
 class EffectLoader {
@@ -62,6 +63,7 @@ public:
 
     // Global preset system
     void ScanPresets();
+    void ValidatePreset(int presetIdx);             // check for missing/unknown fields in preset INIs
     void LoadPreset(int presetIdx);                // load all effect configs from preset folder
     void SavePreset(int presetIdx);                // save all effect configs to preset folder
     int  SavePresetAs(const char* name);           // create new preset from current settings, returns index

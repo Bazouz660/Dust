@@ -1,6 +1,6 @@
 # Dust
 
-Dust is a modular rendering framework for Kenshi that hooks into the game's D3D11 pipeline, providing injection points where shader effects can be applied natively. Unlike post-processing injectors (ReShade, ENB), Dust intercepts specific render passes and integrates effects directly into the deferred lighting pipeline, enabling physically correct results that are immune to auto-exposure, fog bleed, and UI interference.
+Dust is a modular rendering framework for Kenshi that hooks into the game's D3D11 pipeline, providing injection points where shader effects can be applied natively. Unlike post-processing injectors (ReShade, ENB), Dust intercepts specific render passes and integrates effects directly into the deferred lighting pipeline, enabling physically correct results that integrate naturally with the game's auto-exposure, fog, and UI.
 
 Effects are loaded as separate DLL plugins from an `effects/` folder using a stable C API (`DustAPI.h`). Anyone can develop and distribute custom effects independently of the framework.
 
@@ -21,9 +21,10 @@ Dust works by hooking D3D11 at the vtable level and inspecting GPU state on ever
 ```
 Game Render Pipeline:
   GBuffer Fill -> Deferred Lighting -> Fog -> Post-Processing -> Tonemapping -> Present
-                        |                                              |
-                  POST_LIGHTING                                  POST_TONEMAP
-                  (SSAO, SSIL, SSS)                              (LUT, Clarity, Bloom)
+                        |               |                              |
+                  POST_LIGHTING      POST_FOG                    POST_TONEMAP
+              (SSAO, SSIL, SSS,                              (LUT, Clarity, Bloom,
+                    Outline)                                        DOF)
 ```
 
 Effects register at specific injection points. When Dust detects a matching render pass, it dispatches registered effects (in priority order) with full access to the relevant GPU resources.
@@ -64,7 +65,7 @@ typedef struct DustEffectDesc {
 
 With `DUST_FLAG_FRAMEWORK_CONFIG`, the framework automatically handles INI load/save/hot-reload from the `DustSettingDesc` array — no boilerplate needed. With `DUST_FLAG_FRAMEWORK_TIMING`, GPU timestamp queries are managed by the framework.
 
-The host provides a `DustHostAPI` struct with functions for logging, resource access (`GetSRV`, `GetRTV`), GPU state management (`SaveState`, `RestoreState`), shader compilation (`CompileShader`, `CompileShaderFromFile`), scene copying (`GetSceneCopy`), fullscreen drawing (`DrawFullscreenTriangle`), and constant buffer helpers (`CreateConstantBuffer`, `UpdateConstantBuffer`).
+The host provides a `DustHostAPI` struct with functions for logging, resource access (`GetSRV`, `GetRTV`), GPU state management (`SaveState`, `RestoreState`), shader compilation (`CompileShader`, `CompileShaderFromFile`), scene copying (`GetSceneCopy`), pre-fog HDR snapshot (`GetPreFogHDR`), fullscreen drawing (`DrawFullscreenTriangle`), and constant buffer helpers (`CreateConstantBuffer`, `UpdateConstantBuffer`).
 
 ## Current Effects
 
@@ -113,17 +114,39 @@ The host provides a `DustHostAPI` struct with functions for logging, resource ac
 
 ### Bloom — `POST_TONEMAP`, priority 100
 
-- **Physically-motivated bloom**: Runs after LUT so bloom is applied to graded colors
-- **Multi-pass pipeline**: Threshold extract → progressive downsample chain → upsample chain → composite
-- **Dual-threshold extraction**: Separate hard/soft thresholds to control bloom onset and spread
-- **Configurable scatter and strength**: Controls how broadly light halos spread
+- **HDR bloom pipeline**: Captures HDR scene before tonemapping, extracts bright areas, builds gaussian bloom via progressive downsample/upsample chain, composites additively onto LDR
+- **Post-fog extraction**: Blooms from the post-fog HDR scene so distant fogged objects don't bleed through
+- **Soft threshold**: Smooth knee curve controls bloom onset — only genuinely bright features contribute
+- **Simplified controls**: Intensity, Threshold, and Radius — no redundant settings
+
+### Outline — `POST_LIGHTING`, priority 50
+
+- **Edge detection**: Detects edges from both depth discontinuities (Laplacian) and normal angle differences
+- **Configurable appearance**: Adjustable thickness, strength/opacity, and outline color (RGB)
+- **Depth-limited**: Max depth parameter prevents outlines on distant objects and sky
+- **Debug visualization**: Overlay mode to inspect edge detection output
+
+### Kuwahara Filter — `POST_TONEMAP`, priority 150
+
+- **Painterly effect**: Anisotropic Kuwahara filter that smooths flat regions while preserving edges, giving a hand-painted look
+- **Configurable radius**: Controls the size of the filter kernel
+- **Blend strength**: Smoothly blend between original and filtered result
+- **Sharpness**: Controls how aggressively the lowest-variance sector wins
+
+### Depth of Field — `POST_TONEMAP`, priority 200
+
+- **Auto-focus**: Samples depth at screen center and smoothly tracks focus distance
+- **Near and far field blur**: Independent control over near-field and far-field blur strength and range
+- **Sky handling**: Sky pixels are clamped to max depth so they follow the natural far-field ramp — sharp when looking at the sky, soft at the horizon
+- **Configurable blur**: Adjustable blur radius and downscale factor for performance
 
 ## In-Game GUI
 
-Press **F11** to toggle the ImGui overlay. The GUI has two panes:
+Press **F11** (remappable) to toggle the ImGui overlay. When the overlay is open, game input is blocked (both Windows messages and DirectInput8) and an ImGui cursor is shown.
 
-**Left pane** (always visible):
-- **Framework settings**: Logging toggle, startup notification toggle
+**Left pane** (resizable):
+- **Framework settings**: Mod version display, remappable toggle key, logging toggle, startup notification toggle
+- **Preset system**: Quick-switch between presets (Low, Medium, High, Ultra, or custom). Selected preset is remembered across game restarts
 - **Performance**: FPS, frame time graph, per-effect GPU cost (color-coded), total GPU budget percentage
 
 **Right pane** (collapsible per-effect):
@@ -133,7 +156,7 @@ Press **F11** to toggle the ImGui overlay. The GUI has two panes:
 - **Save** button to write changes to disk
 - **Reset All** button to reload values from disk
 
-A startup toast notification appears for 30 seconds indicating the mod is active and which key toggles the GUI. This can be disabled in the framework settings.
+A startup toast notification appears for 30 seconds indicating the mod version and which key toggles the GUI. When the mod is updated, a "New version installed!" message is shown. The toast can be disabled in the framework settings.
 
 ## Installation
 
@@ -162,6 +185,14 @@ A startup toast notification appears for 30 seconds indicating the mod is active
                ├── DustClarity.dll
                ├── DustLUT.dll
                ├── DustBloom.dll
+               ├── DustDOF.dll
+               ├── DustOutline.dll
+               ├── DustKuwahara.dll
+               ├── presets/
+               │   ├── dust_low/
+               │   ├── dust_medium/
+               │   ├── dust_high/
+               │   └── dust_ultra/
                └── shaders/
                    ├── ssao_*.hlsl
                    ├── ssil_*.hlsl
@@ -169,6 +200,9 @@ A startup toast notification appears for 30 seconds indicating the mod is active
                    ├── clarity_*.hlsl
                    ├── lut_ps.hlsl
                    ├── bloom_*.hlsl
+                   ├── dof_*.hlsl
+                   ├── outline_*.hlsl
+                   ├── kuwahara_*.hlsl
                    └── fullscreen_vs.hlsl
    ```
 3. Launch the game. Dust patches the deferred lighting shader in memory at startup (no files are modified on disk), generates default `.ini` configs in the `effects/` folder, and begins rendering.
@@ -277,10 +311,57 @@ DebugView=0
 ```ini
 [Bloom]
 Enabled=1
-Threshold=0.8
-SoftKnee=0.5
-Strength=0.3
-Scatter=0.7
+Intensity=0.5
+Threshold=1.0
+Radius=2.814
+DebugView=0
+```
+
+### DOF.ini
+
+```ini
+[DOF]
+Enabled=1
+AutoFocus=1
+AutoFocusSpeed=3
+FocusDistance=0.02
+NearStart=0.003
+NearEnd=0.034
+NearStrength=0.5
+FarStart=0.01
+FarEnd=0.05
+FarStrength=1
+BlurRadius=2.565
+MaxDepth=1
+BlurDownscale=2
+DebugView=0
+```
+
+### Outline.ini
+
+```ini
+[Outline]
+Enabled=1
+DepthThreshold=0.003
+NormalThreshold=0.8
+Thickness=1
+Strength=0.8
+ColorR=0
+ColorG=0
+ColorB=0
+MaxDepth=0.5
+DebugView=0
+```
+
+### Kuwahara.ini
+
+```ini
+[Kuwahara]
+Enabled=1
+Radius=3
+Strength=1.0
+Sharpness=8.0
+DebugView=0
 ```
 
 ## Building from Source
@@ -319,6 +400,9 @@ msbuild effects\lut\DustLUT.vcxproj   /p:Configuration=Release /p:Platform=x64
 msbuild effects\bloom\DustBloom.vcxproj /p:Configuration=Release /p:Platform=x64
 msbuild effects\sss\DustSSS.vcxproj   /p:Configuration=Release /p:Platform=x64
 msbuild effects\clarity\DustClarity.vcxproj /p:Configuration=Release /p:Platform=x64
+msbuild effects\dof\DustDOF.vcxproj   /p:Configuration=Release /p:Platform=x64
+msbuild effects\outline\DustOutline.vcxproj /p:Configuration=Release /p:Platform=x64
+msbuild effects\kuwahara\DustKuwahara.vcxproj /p:Configuration=Release /p:Platform=x64
 ```
 
 ### Deployment
@@ -338,6 +422,10 @@ Copy the following into `<Kenshi>/mods/Dust/`:
 | `effects/bloom/build/Release/DustBloom.dll` | `effects/DustBloom.dll` |
 | `effects/sss/build/Release/DustSSS.dll` | `effects/DustSSS.dll` |
 | `effects/clarity/build/Release/DustClarity.dll` | `effects/DustClarity.dll` |
+| `effects/dof/build/Release/DustDOF.dll` | `effects/DustDOF.dll` |
+| `effects/outline/build/Release/DustOutline.dll` | `effects/DustOutline.dll` |
+| `effects/kuwahara/build/Release/DustKuwahara.dll` | `effects/DustKuwahara.dll` |
+| `effects/presets/` | `effects/presets/` |
 | `effects/*/shaders/*.hlsl` | `effects/shaders/` |
 
 ### Creating a New Effect Plugin
@@ -370,14 +458,17 @@ With no effects enabled, the framework's cost is unmeasurable.
 
 GPU costs are measured via D3D11 timestamp queries and displayed in the in-game GUI (F11). Typical costs at 2560×1440:
 
-| Effect | Passes | GPU Cost |
-|--------|--------|----------|
-| SSAO   | 3 (generate + blur H + blur V) | ~1–3 ms |
-| SSIL   | 3 (generate + blur H + blur V) | ~2–5 ms |
-| SSS    | 3 (generate + blur H + blur V) + 1 composite | ~1–3 ms |
-| Clarity| 3 (blur H + blur V + composite) | ~0.3–1 ms |
-| LUT    | 1 (HDR → ACES → LUT → dither) | ~0.1–0.3 ms |
-| Bloom  | ~6 (extract + downsample × 2 + upsample × 2 + composite) | ~0.5–1.5 ms |
+| Effect   | Passes | GPU Cost |
+|----------|--------|----------|
+| SSAO     | 3 (generate + blur H + blur V) | ~1–3 ms |
+| SSIL     | 3 (generate + blur H + blur V) | ~2–5 ms |
+| SSS      | 3 (generate + blur H + blur V) + 1 composite | ~1–3 ms |
+| Outline  | 1 (edge detect + composite) | ~0.2–0.5 ms |
+| Clarity  | 3 (blur H + blur V + composite) | ~0.3–1 ms |
+| LUT      | 1 (HDR → ACES → LUT → dither) | ~0.1–0.3 ms |
+| Bloom    | ~8 (extract + downsample × 3 + upsample × 3 + composite) | ~0.5–1.5 ms |
+| DOF      | 4 (CoC + downsample + blur H + blur V) | ~0.5–2 ms |
+| Kuwahara | 1 (anisotropic filter) | ~1–3 ms |
 
 ## Credits
 

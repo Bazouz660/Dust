@@ -83,26 +83,40 @@ jobs:
           /p:Configuration=Release
           /p:Platform=x64
 
+      - name: Build Outline plugin (DustOutline.dll)
+        run: >
+          msbuild effects\outline\DustOutline.vcxproj
+          /p:Configuration=Release
+          /p:Platform=x64
+
+      - name: Build Kuwahara plugin (DustKuwahara.dll)
+        run: >
+          msbuild effects\kuwahara\DustKuwahara.vcxproj
+          /p:Configuration=Release
+          /p:Platform=x64
+
       - name: Package release
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          mkdir release\Dust\shaders
           mkdir release\Dust\effects
           mkdir release\Dust\effects\shaders
           copy src\build\Release\Dust.dll release\Dust\
-          copy src\shaders\fullscreen_vs.hlsl release\Dust\shaders\
           copy effects\ssao\build\Release\DustSSAO.dll release\Dust\effects\
           copy effects\lut\build\Release\DustLUT.dll release\Dust\effects\
           copy effects\bloom\build\Release\DustBloom.dll release\Dust\effects\
           copy effects\dof\build\Release\DustDOF.dll release\Dust\effects\
           copy effects\clarity\build\Release\DustClarity.dll release\Dust\effects\
+          copy effects\outline\build\Release\DustOutline.dll release\Dust\effects\
+          copy effects\kuwahara\build\Release\DustKuwahara.dll release\Dust\effects\
           xcopy /Y effects\ssao\shaders\* release\Dust\effects\shaders\
           xcopy /Y effects\lut\shaders\* release\Dust\effects\shaders\
           xcopy /Y effects\bloom\shaders\* release\Dust\effects\shaders\
           xcopy /Y effects\dof\shaders\* release\Dust\effects\shaders\
           xcopy /Y effects\clarity\shaders\* release\Dust\effects\shaders\
+          xcopy /Y effects\outline\shaders\* release\Dust\effects\shaders\
+          xcopy /Y effects\kuwahara\shaders\* release\Dust\effects\shaders\
+          xcopy /S /Y /I effects\presets release\Dust\presets
           copy mod\Dust.mod release\Dust\
-          copy mod\Dust.ini release\Dust\
           copy mod\RE_Kenshi.json release\Dust\
 
       - name: Upload artifact

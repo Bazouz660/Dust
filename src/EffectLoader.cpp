@@ -536,9 +536,23 @@ void EffectLoader::EffectConfigLoadFrom(LoadedEffect& le, const std::string& pre
 
     std::string iniPath = presetDir + "\\" + std::string(section) + ".ini";
 
-    // Check if this effect has a file in the preset
+    // If this effect has no INI in the preset, disable it
     DWORD attr = GetFileAttributesA(iniPath.c_str());
-    if (attr == INVALID_FILE_ATTRIBUTES) return;
+    if (attr == INVALID_FILE_ATTRIBUTES)
+    {
+        for (uint32_t i = 0; i < le.desc.settingCount; i++)
+        {
+            const DustSettingDesc& s = le.desc.settings[i];
+            const char* key = s.iniKey ? s.iniKey : s.name;
+            if (s.type == DUST_SETTING_BOOL && s.valuePtr &&
+                key && _stricmp(key, "Enabled") == 0)
+            {
+                *(bool*)s.valuePtr = false;
+                break;
+            }
+        }
+        return;
+    }
 
     const char* sentinel = "\x01\x02MISSING";
 
@@ -644,6 +658,86 @@ void EffectLoader::ScanPresets()
     Log("Found %zu global presets in %s", presets_.size(), presetsDir_.c_str());
 }
 
+void EffectLoader::ValidatePreset(int presetIdx)
+{
+    if (presetIdx < 0 || presetIdx >= (int)presets_.size()) return;
+
+    PresetInfo& preset = presets_[presetIdx];
+    preset.warnings.clear();
+
+    for (const auto& le : effects_)
+    {
+        if (!le.initialized) continue;
+        if (le.desc.apiVersion < 3 || !(le.desc.flags & DUST_FLAG_FRAMEWORK_CONFIG)) continue;
+
+        const char* section = le.desc.configSection ? le.desc.configSection : le.desc.name;
+        if (!section) continue;
+
+        std::string iniPath = preset.path + "\\" + std::string(section) + ".ini";
+        DWORD attr = GetFileAttributesA(iniPath.c_str());
+        if (attr == INVALID_FILE_ATTRIBUTES) continue; // missing INI = disabled, not outdated
+
+        const char* sentinel = "\x01\x02MISSING";
+
+        // Check for missing keys (effect expects them, INI doesn't have them)
+        std::string missing;
+        std::vector<std::string> expectedKeys;
+        for (uint32_t i = 0; i < le.desc.settingCount; i++)
+        {
+            const DustSettingDesc& s = le.desc.settings[i];
+            const char* key = s.iniKey ? s.iniKey : s.name;
+            if (!key) continue;
+            expectedKeys.push_back(key);
+
+            char probe[64];
+            GetPrivateProfileStringA(section, key, sentinel, probe, sizeof(probe), iniPath.c_str());
+            if (strcmp(probe, sentinel) == 0)
+            {
+                if (!missing.empty()) missing += ", ";
+                missing += key;
+            }
+        }
+
+        // Check for unknown keys (INI has them, effect doesn't expect them)
+        // Read all keys from the INI section
+        std::string unknown;
+        char keysBuf[4096] = {};
+        DWORD keysLen = GetPrivateProfileStringA(section, nullptr, "", keysBuf, sizeof(keysBuf), iniPath.c_str());
+        if (keysLen > 0)
+        {
+            const char* p = keysBuf;
+            while (*p)
+            {
+                std::string iniKey(p);
+                bool found = false;
+                for (const auto& ek : expectedKeys)
+                {
+                    if (_stricmp(ek.c_str(), iniKey.c_str()) == 0)
+                    { found = true; break; }
+                }
+                if (!found)
+                {
+                    if (!unknown.empty()) unknown += ", ";
+                    unknown += iniKey;
+                }
+                p += iniKey.size() + 1;
+            }
+        }
+
+        if (!missing.empty() || !unknown.empty())
+        {
+            if (!preset.warnings.empty()) preset.warnings += "\n";
+            preset.warnings += std::string(le.desc.name) + ": ";
+            if (!missing.empty()) preset.warnings += "missing [" + missing + "]";
+            if (!missing.empty() && !unknown.empty()) preset.warnings += ", ";
+            if (!unknown.empty()) preset.warnings += "unknown [" + unknown + "]";
+        }
+    }
+
+    if (!preset.warnings.empty())
+        Log("Preset '%s' is outdated:\n%s", preset.name.c_str(), preset.warnings.c_str());
+}
+
 void EffectLoader::LoadPreset(int presetIdx)
 {
     if (presetIdx < 0 || presetIdx >= (int)presets_.size()) return;
@@ -679,6 +773,7 @@ void EffectLoader::SavePreset(int presetIdx)
         EffectConfigSaveTo(le, presetDir);
     }
 
+    presets_[presetIdx].warnings.clear(); // INI is now current
     Log("Saved global preset '%s'", presets_[presetIdx].name.c_str());
 }
 
@@ -839,18 +934,18 @@ int EffectLoader::LoadAll(const char* effectsDir)
     BuildHostAPI();
 
     // Derive framework shader directory: effectsDir is <modDir>/effects,
-    // framework shaders are at <modDir>/shaders/
+    // shared shaders (fullscreen_vs.hlsl etc.) live in <effectsDir>/shaders/
+    gFrameworkShaderDir = std::string(effectsDir) + "\\shaders\\";
+
+    // Set up global presets directory: <modRoot>/presets/
     {
         std::string eDir(effectsDir);
         size_t pos = eDir.find_last_of("\\/");
         if (pos != std::string::npos)
-            gFrameworkShaderDir = eDir.substr(0, pos) + "\\shaders\\";
+            presetsDir_ = eDir.substr(0, pos) + "\\presets";
         else
-            gFrameworkShaderDir = "shaders\\";
+            presetsDir_ = "presets";
     }
-
-    // Set up global presets directory: <effectsDir>/presets/
-    presetsDir_ = std::string(effectsDir) + "\\presets";
 
     char searchPath[MAX_PATH];
     snprintf(searchPath, sizeof(searchPath), "%s\\*.dll", effectsDir);
@@ -1013,6 +1108,8 @@ bool EffectLoader::InitAll(ID3D11Device* device, uint32_t w, uint32_t h)
 
     // Scan global presets after all effects are ready
     ScanPresets();
+    for (int i = 0; i < (int)presets_.size(); i++)
+        ValidatePreset(i);
 
     return allOk;
 }

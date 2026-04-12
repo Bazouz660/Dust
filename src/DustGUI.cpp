@@ -401,8 +401,11 @@ static void LoadFrameworkConfig()
     GetPrivateProfileStringA("Dust", "LastPreset", "", buf, sizeof(buf), gDustIniPath.c_str());
     gFwConfig.lastPreset = buf;
 
+    // Default to dust_high if no preset has been saved yet
+    if (gFwConfig.lastPreset.empty())
+        gFwConfig.lastPreset = "dust_high";
+
     // Auto-load last preset
-    if (!gFwConfig.lastPreset.empty())
     {
         const auto& presets = gEffectLoader.GetPresets();
         for (int i = 0; i < (int)presets.size(); i++)
@@ -562,6 +565,14 @@ static void DrawPresetSection()
             }
         }
         ImGui::EndCombo();
+    }
+
+    // Show warnings for outdated presets
+    if (currentPreset >= 0 && !presets[currentPreset].warnings.empty())
+    {
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "[!] Preset is outdated");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", presets[currentPreset].warnings.c_str());
     }
 
     // Save As
