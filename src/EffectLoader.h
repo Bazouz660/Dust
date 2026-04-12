@@ -27,6 +27,12 @@ struct LoadedEffect {
     FILETIME        configMtime;    // for hot-reload
 };
 
+// Global preset system — each preset is a folder with per-effect INI files
+struct PresetInfo {
+    std::string name;   // display name (folder name)
+    std::string path;   // full path to the preset folder
+};
+
 class EffectLoader {
 public:
     // Scan effects/ folder and load all plugin DLLs
@@ -53,12 +59,27 @@ public:
     void SaveEffectConfig(size_t index);
     void LoadEffectConfig(size_t index);
 
+    // Global preset system
+    void ScanPresets();
+    void LoadPreset(int presetIdx);                // load all effect configs from preset folder
+    void SavePreset(int presetIdx);                // save all effect configs to preset folder
+    int  SavePresetAs(const char* name);           // create new preset from current settings, returns index
+    void DeletePreset(int presetIdx);
+    const std::vector<PresetInfo>& GetPresets() const { return presets_; }
+    int  GetCurrentPreset() const { return currentPreset_; }
+    void SetCurrentPreset(int idx) { currentPreset_ = idx; }
+
     // v3: GPU timing access (for DustGUI)
     float GetEffectGpuTime(size_t index) const;
 
 private:
     std::vector<LoadedEffect> effects_;
     DustHostAPI hostAPI_ = {};
+
+    // Preset state
+    std::string presetsDir_;            // <effectsDir>/presets/
+    std::vector<PresetInfo> presets_;
+    int currentPreset_ = -1;            // -1 = custom
 
     void BuildHostAPI();
 
@@ -67,6 +88,10 @@ private:
     static void EffectConfigSave(LoadedEffect& le);
     static void EffectConfigWriteDefaults(LoadedEffect& le);
     static void EffectConfigCheckHotReload(LoadedEffect& le);
+
+    // Preset I/O helpers
+    static void EffectConfigLoadFrom(LoadedEffect& le, const std::string& presetDir);
+    static void EffectConfigSaveTo(LoadedEffect& le, const std::string& presetDir);
 
     // v3: GPU timing helpers (phase: 0=pre, 1=post)
     void CollectTiming(LoadedEffect& le, ID3D11DeviceContext* ctx, int phase);

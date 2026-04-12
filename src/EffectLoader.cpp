@@ -449,6 +449,257 @@ void EffectLoader::EffectConfigCheckHotReload(LoadedEffect& le)
     }
 }
 
+// ==================== Global Preset System ====================
+// Each preset is a folder under <effectsDir>/presets/ containing per-effect INI files.
+// e.g. effects/presets/dust_high/DOF.ini, effects/presets/dust_high/SSAO.ini, etc.
+
+void EffectLoader::EffectConfigLoadFrom(LoadedEffect& le, const std::string& presetDir)
+{
+    const char* section = le.desc.configSection ? le.desc.configSection : le.desc.name;
+    if (!section) return;
+
+    std::string iniPath = presetDir + "\\" + std::string(section) + ".ini";
+
+    // Check if this effect has a file in the preset
+    DWORD attr = GetFileAttributesA(iniPath.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES) return;
+
+    const char* sentinel = "\x01\x02MISSING";
+
+    for (uint32_t i = 0; i < le.desc.settingCount; i++)
+    {
+        const DustSettingDesc& s = le.desc.settings[i];
+        if (!s.valuePtr) continue;
+
+        const char* key = s.iniKey ? s.iniKey : s.name;
+        if (!key) continue;
+
+        char probe[64];
+        GetPrivateProfileStringA(section, key, sentinel, probe, sizeof(probe), iniPath.c_str());
+        if (strcmp(probe, sentinel) == 0) continue;
+
+        switch (s.type)
+        {
+        case DUST_SETTING_BOOL:
+        case DUST_SETTING_HIDDEN_BOOL:
+            *(bool*)s.valuePtr = (atoi(probe) != 0);
+            break;
+        case DUST_SETTING_FLOAT:
+        case DUST_SETTING_HIDDEN_FLOAT:
+            *(float*)s.valuePtr = (float)atof(probe);
+            break;
+        case DUST_SETTING_INT:
+        case DUST_SETTING_HIDDEN_INT:
+            *(int*)s.valuePtr = atoi(probe);
+            break;
+        }
+    }
+}
+
+void EffectLoader::EffectConfigSaveTo(LoadedEffect& le, const std::string& presetDir)
+{
+    const char* section = le.desc.configSection ? le.desc.configSection : le.desc.name;
+    if (!section) return;
+
+    std::string iniPath = presetDir + "\\" + std::string(section) + ".ini";
+    char buf[64];
+
+    for (uint32_t i = 0; i < le.desc.settingCount; i++)
+    {
+        const DustSettingDesc& s = le.desc.settings[i];
+        if (!s.valuePtr) continue;
+
+        const char* key = s.iniKey ? s.iniKey : s.name;
+        if (!key) continue;
+
+        switch (s.type)
+        {
+        case DUST_SETTING_BOOL:
+        case DUST_SETTING_HIDDEN_BOOL:
+            WritePrivateProfileStringA(section, key, *(bool*)s.valuePtr ? "1" : "0", iniPath.c_str());
+            break;
+        case DUST_SETTING_FLOAT:
+        case DUST_SETTING_HIDDEN_FLOAT:
+            snprintf(buf, sizeof(buf), "%g", *(float*)s.valuePtr);
+            WritePrivateProfileStringA(section, key, buf, iniPath.c_str());
+            break;
+        case DUST_SETTING_INT:
+        case DUST_SETTING_HIDDEN_INT:
+            snprintf(buf, sizeof(buf), "%d", *(int*)s.valuePtr);
+            WritePrivateProfileStringA(section, key, buf, iniPath.c_str());
+            break;
+        }
+    }
+}
+
+void EffectLoader::ScanPresets()
+{
+    presets_.clear();
+    currentPreset_ = -1;
+
+    if (presetsDir_.empty()) return;
+
+    // Ensure presets root directory exists
+    CreateDirectoryA(presetsDir_.c_str(), nullptr);
+
+    // Enumerate subdirectories
+    char searchPath[MAX_PATH];
+    snprintf(searchPath, sizeof(searchPath), "%s\\*", presetsDir_.c_str());
+
+    WIN32_FIND_DATAA fd;
+    HANDLE hFind = FindFirstFileA(searchPath, &fd);
+    if (hFind == INVALID_HANDLE_VALUE) return;
+
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (fd.cFileName[0] == '.') continue; // skip . and ..
+
+        PresetInfo info;
+        info.name = fd.cFileName;
+        info.path = presetsDir_ + "\\" + fd.cFileName;
+        presets_.push_back(std::move(info));
+    } while (FindNextFileA(hFind, &fd));
+
+    FindClose(hFind);
+
+    std::sort(presets_.begin(), presets_.end(),
+        [](const PresetInfo& a, const PresetInfo& b) { return a.name < b.name; });
+
+    Log("Found %zu global presets in %s", presets_.size(), presetsDir_.c_str());
+}
+
+void EffectLoader::LoadPreset(int presetIdx)
+{
+    if (presetIdx < 0 || presetIdx >= (int)presets_.size()) return;
+
+    const std::string& presetDir = presets_[presetIdx].path;
+
+    for (auto& le : effects_)
+    {
+        if (!le.initialized) continue;
+        if (le.desc.apiVersion < 3 || !(le.desc.flags & DUST_FLAG_FRAMEWORK_CONFIG)) continue;
+
+        EffectConfigLoadFrom(le, presetDir);
+
+        if (le.desc.OnSettingChanged)
+            le.desc.OnSettingChanged();
+    }
+
+    currentPreset_ = presetIdx;
+    Log("Loaded global preset '%s'", presets_[presetIdx].name.c_str());
+}
+
+void EffectLoader::SavePreset(int presetIdx)
+{
+    if (presetIdx < 0 || presetIdx >= (int)presets_.size()) return;
+
+    const std::string& presetDir = presets_[presetIdx].path;
+
+    for (auto& le : effects_)
+    {
+        if (!le.initialized) continue;
+        if (le.desc.apiVersion < 3 || !(le.desc.flags & DUST_FLAG_FRAMEWORK_CONFIG)) continue;
+
+        EffectConfigSaveTo(le, presetDir);
+    }
+
+    Log("Saved global preset '%s'", presets_[presetIdx].name.c_str());
+}
+
+int EffectLoader::SavePresetAs(const char* name)
+{
+    if (!name || !name[0] || presetsDir_.empty()) return -1;
+
+    // Sanitize folder name
+    std::string safeName(name);
+    for (char& c : safeName)
+    {
+        if (c == '\\' || c == '/' || c == ':' || c == '*' ||
+            c == '?' || c == '"' || c == '<' || c == '>' || c == '|')
+            c = '_';
+    }
+
+    std::string presetDir = presetsDir_ + "\\" + safeName;
+
+    // Create the preset folder
+    CreateDirectoryA(presetDir.c_str(), nullptr);
+
+    // Check if already in list
+    int existingIdx = -1;
+    for (int i = 0; i < (int)presets_.size(); i++)
+    {
+        if (_stricmp(presets_[i].name.c_str(), safeName.c_str()) == 0)
+        {
+            existingIdx = i;
+            break;
+        }
+    }
+
+    if (existingIdx >= 0)
+    {
+        SavePreset(existingIdx);
+        currentPreset_ = existingIdx;
+        return existingIdx;
+    }
+
+    // Add and sort
+    PresetInfo info;
+    info.name = safeName;
+    info.path = presetDir;
+    presets_.push_back(info);
+
+    std::sort(presets_.begin(), presets_.end(),
+        [](const PresetInfo& a, const PresetInfo& b) { return a.name < b.name; });
+
+    int newIdx = -1;
+    for (int i = 0; i < (int)presets_.size(); i++)
+    {
+        if (presets_[i].name == safeName) { newIdx = i; break; }
+    }
+
+    if (newIdx >= 0)
+    {
+        SavePreset(newIdx);
+        currentPreset_ = newIdx;
+    }
+
+    return newIdx;
+}
+
+void EffectLoader::DeletePreset(int presetIdx)
+{
+    if (presetIdx < 0 || presetIdx >= (int)presets_.size()) return;
+
+    const std::string& presetDir = presets_[presetIdx].path;
+
+    // Delete all INI files in the preset folder
+    char searchPath[MAX_PATH];
+    snprintf(searchPath, sizeof(searchPath), "%s\\*.ini", presetDir.c_str());
+
+    WIN32_FIND_DATAA fd;
+    HANDLE hFind = FindFirstFileA(searchPath, &fd);
+    if (hFind != INVALID_HANDLE_VALUE)
+    {
+        do {
+            std::string filePath = presetDir + "\\" + fd.cFileName;
+            DeleteFileA(filePath.c_str());
+        } while (FindNextFileA(hFind, &fd));
+        FindClose(hFind);
+    }
+
+    // Remove the directory
+    RemoveDirectoryA(presetDir.c_str());
+
+    Log("Deleted global preset '%s'", presets_[presetIdx].name.c_str());
+
+    presets_.erase(presets_.begin() + presetIdx);
+
+    if (currentPreset_ == presetIdx)
+        currentPreset_ = -1;
+    else if (currentPreset_ > presetIdx)
+        currentPreset_--;
+}
+
 // ==================== v3: GPU Timing ====================
 
 void EffectLoader::CollectTiming(LoadedEffect& le, ID3D11DeviceContext* ctx, int phase)
@@ -521,6 +772,9 @@ int EffectLoader::LoadAll(const char* effectsDir)
         else
             gFrameworkShaderDir = "shaders\\";
     }
+
+    // Set up global presets directory: <effectsDir>/presets/
+    presetsDir_ = std::string(effectsDir) + "\\presets";
 
     char searchPath[MAX_PATH];
     snprintf(searchPath, sizeof(searchPath), "%s\\*.dll", effectsDir);
@@ -680,6 +934,10 @@ bool EffectLoader::InitAll(ID3D11Device* device, uint32_t w, uint32_t h)
 
         Log("Initialized effect: %s", le.desc.name ? le.desc.name : "unnamed");
     }
+
+    // Scan global presets after all effects are ready
+    ScanPresets();
+
     return allOk;
 }
 

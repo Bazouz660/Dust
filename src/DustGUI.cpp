@@ -66,6 +66,9 @@ static float gDisplayFps = 0.0f;
 static bool gAllEffectsOn = true;
 static std::vector<bool> gEffectWasEnabled; // remembers which effects were on before global disable
 
+// Preset system GUI state
+static char gNewPresetName[64] = {};
+
 // Double-click to input mode
 static ImGuiID gInputModeID = 0;
 static int gInputModeFrames = 0;
@@ -290,6 +293,111 @@ static void DrawFrameworkSection()
     ImGui::SameLine();
     if (ImGui::Button("Reset##fw", ImVec2(80, 0)) && dirty)
         ResetFrameworkConfig();
+}
+
+// ==================== Drawing: Global preset selector ====================
+
+static void SnapshotAllEffects()
+{
+    size_t count = gEffectLoader.Count();
+    for (size_t i = 0; i < count; i++)
+    {
+        const LoadedEffect& le = gEffectLoader.GetEffect(i);
+        if (le.initialized)
+            SnapshotEffect(i);
+    }
+}
+
+static void DrawPresetSection()
+{
+    const auto& presets = gEffectLoader.GetPresets();
+    int currentPreset = gEffectLoader.GetCurrentPreset();
+
+    ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Preset");
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    const char* previewName = (currentPreset >= 0 && currentPreset < (int)presets.size())
+        ? presets[currentPreset].name.c_str() : "(Custom)";
+
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+    if (ImGui::BeginCombo("##Preset", previewName))
+    {
+        if (ImGui::Selectable("(Custom)", currentPreset < 0))
+            gEffectLoader.SetCurrentPreset(-1);
+
+        for (int p = 0; p < (int)presets.size(); p++)
+        {
+            bool selected = (p == currentPreset);
+            if (ImGui::Selectable(presets[p].name.c_str(), selected))
+            {
+                gEffectLoader.LoadPreset(p);
+                SnapshotAllEffects();
+            }
+        }
+        ImGui::EndCombo();
+    }
+
+    // Save As
+    if (ImGui::Button("Save As...", ImVec2(0, 0)))
+        ImGui::OpenPopup("##GlobalSavePresetAs");
+
+    if (ImGui::BeginPopup("##GlobalSavePresetAs"))
+    {
+        ImGui::Text("Save all settings as preset:");
+        ImGui::SetNextItemWidth(200);
+        ImGui::InputText("##presetname", gNewPresetName, sizeof(gNewPresetName));
+
+        bool nameValid = gNewPresetName[0] != '\0';
+        if (ImGui::Button("Save", ImVec2(80, 0)) && nameValid)
+        {
+            gEffectLoader.SavePresetAs(gNewPresetName);
+            gNewPresetName[0] = '\0';
+            SnapshotAllEffects();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(80, 0)))
+            ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    // Overwrite / Delete for active preset
+    if (currentPreset >= 0)
+    {
+        ImGui::SameLine();
+        if (ImGui::Button("Overwrite", ImVec2(0, 0)))
+        {
+            gEffectLoader.SavePreset(currentPreset);
+            SnapshotAllEffects();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Overwrite '%s' with current settings", presets[currentPreset].name.c_str());
+
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.15f, 0.15f, 1.0f));
+        if (ImGui::Button("Delete"))
+            ImGui::OpenPopup("##ConfirmDeletePreset");
+        ImGui::PopStyleColor();
+
+        if (ImGui::BeginPopup("##ConfirmDeletePreset"))
+        {
+            ImGui::Text("Delete preset '%s'?", presets[currentPreset].name.c_str());
+            if (ImGui::Button("Yes", ImVec2(60, 0)))
+            {
+                gEffectLoader.DeletePreset(currentPreset);
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("No", ImVec2(60, 0)))
+                ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
 }
 
 // ==================== Drawing: Effect settings ====================
@@ -694,6 +802,9 @@ void Render()
         }
         else
         {
+            // Global preset selector
+            DrawPresetSection();
+
             // Global effects toggle
             {
                 bool prev = gAllEffectsOn;
