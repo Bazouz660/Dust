@@ -10,6 +10,10 @@
 #include <cstring>
 #include <cstdio>
 
+#define DIRECTINPUT_VERSION 0x0800
+#include <dinput.h>
+#include <core/Functions.h>
+
 // Version string (DUST_VERSION is injected at build time by CI from git tags)
 #define DUST_STR2(x) #x
 #define DUST_STR(x) DUST_STR2(x)
@@ -224,6 +228,75 @@ static bool DustSliderFloat(const char* label, float* v, float minVal, float max
     return changed;
 }
 
+// ==================== DirectInput8 Hook ====================
+// Kenshi uses OIS which uses DirectInput8 — WM_ message blocking alone is not enough.
+
+typedef HRESULT(WINAPI* PFN_GetDeviceState)(IDirectInputDevice8W* self, DWORD cbData, LPVOID lpvData);
+typedef HRESULT(WINAPI* PFN_GetDeviceData)(IDirectInputDevice8W* self, DWORD cbObjectData,
+    LPDIDEVICEOBJECTDATA rgdod, LPDWORD pdwInOut, DWORD dwFlags);
+
+static PFN_GetDeviceState oGetDeviceState = nullptr;
+static PFN_GetDeviceData  oGetDeviceData  = nullptr;
+
+static HRESULT WINAPI HookedGetDeviceState(IDirectInputDevice8W* self, DWORD cbData, LPVOID lpvData)
+{
+    HRESULT hr = oGetDeviceState(self, cbData, lpvData);
+    if (SUCCEEDED(hr) && gOverlayVisible && lpvData)
+        memset(lpvData, 0, cbData);  // Zero out all input
+    return hr;
+}
+
+static HRESULT WINAPI HookedGetDeviceData(IDirectInputDevice8W* self, DWORD cbObjectData,
+    LPDIDEVICEOBJECTDATA rgdod, LPDWORD pdwInOut, DWORD dwFlags)
+{
+    HRESULT hr = oGetDeviceData(self, cbObjectData, rgdod, pdwInOut, dwFlags);
+    if (SUCCEEDED(hr) && gOverlayVisible && pdwInOut)
+        *pdwInOut = 0;  // Report zero events
+    return hr;
+}
+
+static bool InstallDInputHooks()
+{
+    HMODULE hDInput = GetModuleHandleA("dinput8.dll");
+    if (!hDInput)
+        hDInput = LoadLibraryA("dinput8.dll");
+    if (!hDInput) { Log("GUI: dinput8.dll not found"); return false; }
+
+    typedef HRESULT(WINAPI* PFN_DirectInput8Create)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
+    auto pDirectInput8Create = (PFN_DirectInput8Create)GetProcAddress(hDInput, "DirectInput8Create");
+    if (!pDirectInput8Create) { Log("GUI: DirectInput8Create not found"); return false; }
+
+    IDirectInput8W* di = nullptr;
+    HRESULT hr = pDirectInput8Create(GetModuleHandleA(nullptr), DIRECTINPUT_VERSION,
+                                      IID_IDirectInput8W, (void**)&di, nullptr);
+    if (FAILED(hr) || !di) { Log("GUI: DirectInput8Create failed: 0x%08X", hr); return false; }
+
+    IDirectInputDevice8W* dev = nullptr;
+    hr = di->CreateDevice(GUID_SysKeyboard, &dev, nullptr);
+    if (FAILED(hr) || !dev) { di->Release(); Log("GUI: CreateDevice failed: 0x%08X", hr); return false; }
+
+    // IDirectInputDevice8 vtable: GetDeviceState=9, GetDeviceData=10
+    void** vtable = *reinterpret_cast<void***>(dev);
+    void* addrGetDeviceState = vtable[9];
+    void* addrGetDeviceData  = vtable[10];
+
+    dev->Release();
+    di->Release();
+
+    bool ok = true;
+    if (KenshiLib::AddHook(addrGetDeviceState, (void*)HookedGetDeviceState,
+                           (void**)&oGetDeviceState) != KenshiLib::SUCCESS)
+    { Log("GUI: Failed to hook GetDeviceState"); ok = false; }
+
+    if (KenshiLib::AddHook(addrGetDeviceData, (void*)HookedGetDeviceData,
+                           (void**)&oGetDeviceData) != KenshiLib::SUCCESS)
+    { Log("GUI: Failed to hook GetDeviceData"); ok = false; }
+
+    if (ok)
+        Log("GUI: DirectInput8 hooks installed (input blocking enabled)");
+    return ok;
+}
+
 // ==================== WndProc ====================
 
 static void OnOverlayOpen(HWND hWnd)
@@ -236,10 +309,16 @@ static void OnOverlayOpen(HWND hWnd)
 
     // Show system cursor
     while (ShowCursor(TRUE) < 0) {}
+
+    // Enable ImGui software cursor (renders on top of everything)
+    ImGui::GetIO().MouseDrawCursor = true;
 }
 
 static void OnOverlayClose()
 {
+    // Disable ImGui software cursor
+    ImGui::GetIO().MouseDrawCursor = false;
+
     // Restore cursor clipping (game usually clips cursor to window)
     if (gHadClipRect)
         ClipCursor(&gSavedClipRect);
@@ -876,6 +955,8 @@ bool Init(IDXGISwapChain* swapChain, ID3D11Device* device, ID3D11DeviceContext* 
     ImGui_ImplDX11_Init(gDevice, gContext);
 
     oWndProc = (WNDPROC)SetWindowLongPtrW(gHWnd, GWLP_WNDPROC, (LONG_PTR)DustWndProc);
+
+    InstallDInputHooks();
 
     LoadFrameworkConfig();
 
