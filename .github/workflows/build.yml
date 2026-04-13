@@ -75,7 +75,13 @@ jobs:
           /p:Configuration=Release
           /p:Platform=x64
 
-      # SSIL and SSS are disabled for now (not ready for release)
+      - name: Build SSIL plugin (DustSSIL.dll)
+        run: >
+          msbuild effects\ssil\DustSSIL.vcxproj
+          /p:Configuration=Release
+          /p:Platform=x64
+
+      # SSS is disabled for now (not ready for release)
 
       - name: Build Clarity plugin (DustClarity.dll)
         run: >
@@ -105,9 +111,11 @@ jobs:
           copy effects\lut\build\Release\DustLUT.dll release\Dust\effects\
           copy effects\bloom\build\Release\DustBloom.dll release\Dust\effects\
           copy effects\dof\build\Release\DustDOF.dll release\Dust\effects\
+          copy effects\ssil\build\Release\DustSSIL.dll release\Dust\effects\
           copy effects\clarity\build\Release\DustClarity.dll release\Dust\effects\
           copy effects\outline\build\Release\DustOutline.dll release\Dust\effects\
           copy effects\kuwahara\build\Release\DustKuwahara.dll release\Dust\effects\
+          xcopy /Y effects\ssil\shaders\* release\Dust\effects\shaders\
           xcopy /Y effects\ssao\shaders\* release\Dust\effects\shaders\
           xcopy /Y effects\lut\shaders\* release\Dust\effects\shaders\
           xcopy /Y effects\bloom\shaders\* release\Dust\effects\shaders\

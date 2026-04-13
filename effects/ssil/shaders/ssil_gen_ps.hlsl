@@ -1,9 +1,9 @@
 // Screen-Space Indirect Lighting (SSIL) — computes indirect color bounce from nearby surfaces.
-// Uses the same hemisphere sampling approach as GTAO but accumulates albedo-weighted radiance
-// instead of occlusion.
+// Samples the lit HDR scene (not raw albedo) so bounced light carries actual surface radiance
+// including direct lighting, shadows, and specular.
 
-Texture2D<float> depthTex   : register(t0);
-Texture2D        albedoTex  : register(t1);
+Texture2D<float> depthTex  : register(t0);
+Texture2D        sceneTex  : register(t1);
 Texture2D        normalsTex : register(t2);
 SamplerState     pointClamp : register(s0);
 
@@ -104,31 +104,36 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 float sDepth = depthTex.Sample(pointClamp, sUV);
                 if (sDepth > 0.0001)
                 {
-                    float3 sPos = ReconstructViewPos(sUV, sDepth);
-                    float3 diff = sPos - viewPos;
-                    float dist = length(diff);
-                    if (dist > 0.00001)
+                    // Reject samples across depth discontinuities (silhouette edges)
+                    float depthDiff = abs(sDepth - depth);
+                    if (depthDiff < viewSpaceRadius * 4.0)
                     {
-                        float3 sDir = diff / dist;
-                        float cosAngle = dot(sDir, normal);
-
-                        // Only accept contributions from the hemisphere facing the normal
-                        if (cosAngle > ilBias)
+                        float3 sPos = ReconstructViewPos(sUV, sDepth);
+                        float3 diff = sPos - viewPos;
+                        float dist = length(diff);
+                        if (dist > 0.00001)
                         {
-                            float falloff = saturate(1.0 - dist / viewSpaceRadius);
-                            falloff = pow(falloff, falloffPower);
+                            float3 sDir = diff / dist;
+                            float cosAngle = dot(sDir, normal);
 
-                            // Foreground rejection
-                            float relFG = max(depth - sDepth, 0.0) / (depth + 0.00001);
-                            float fgAtten = exp(-relFG * foregroundFade);
+                            // Only accept contributions from the hemisphere facing the normal
+                            if (cosAngle > ilBias)
+                            {
+                                float falloff = saturate(1.0 - dist / viewSpaceRadius);
+                                falloff = pow(falloff, falloffPower);
 
-                            // Decode sample albedo from GBuffer
-                            float3 sAlbedo = albedoTex.Sample(pointClamp, sUV).rgb;
+                                // Foreground rejection
+                                float relFG = max(depth - sDepth, 0.0) / (depth + 0.00001);
+                                float fgAtten = exp(-relFG * foregroundFade);
 
-                            // Weight by visibility angle and distance falloff
-                            float weight = cosAngle * falloff * fgAtten;
-                            indirectLight += sAlbedo * weight;
-                            totalWeight += weight;
+                                // Sample lit scene radiance at this point
+                                float3 sAlbedo = sceneTex.Sample(pointClamp, sUV).rgb;
+
+                                // Weight by visibility angle and distance falloff
+                                float weight = cosAngle * falloff * fgAtten;
+                                indirectLight += sAlbedo * weight;
+                                totalWeight += weight;
+                            }
                         }
                     }
                 }
@@ -140,27 +145,31 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 float sDepth = depthTex.Sample(pointClamp, sUV);
                 if (sDepth > 0.0001)
                 {
-                    float3 sPos = ReconstructViewPos(sUV, sDepth);
-                    float3 diff = sPos - viewPos;
-                    float dist = length(diff);
-                    if (dist > 0.00001)
+                    float depthDiff = abs(sDepth - depth);
+                    if (depthDiff < viewSpaceRadius * 4.0)
                     {
-                        float3 sDir = diff / dist;
-                        float cosAngle = dot(sDir, normal);
-
-                        if (cosAngle > ilBias)
+                        float3 sPos = ReconstructViewPos(sUV, sDepth);
+                        float3 diff = sPos - viewPos;
+                        float dist = length(diff);
+                        if (dist > 0.00001)
                         {
-                            float falloff = saturate(1.0 - dist / viewSpaceRadius);
-                            falloff = pow(falloff, falloffPower);
+                            float3 sDir = diff / dist;
+                            float cosAngle = dot(sDir, normal);
 
-                            float relFG = max(depth - sDepth, 0.0) / (depth + 0.00001);
-                            float fgAtten = exp(-relFG * foregroundFade);
+                            if (cosAngle > ilBias)
+                            {
+                                float falloff = saturate(1.0 - dist / viewSpaceRadius);
+                                falloff = pow(falloff, falloffPower);
 
-                            float3 sAlbedo = albedoTex.Sample(pointClamp, sUV).rgb;
+                                float relFG = max(depth - sDepth, 0.0) / (depth + 0.00001);
+                                float fgAtten = exp(-relFG * foregroundFade);
 
-                            float weight = cosAngle * falloff * fgAtten;
-                            indirectLight += sAlbedo * weight;
-                            totalWeight += weight;
+                                float3 sAlbedo = sceneTex.Sample(pointClamp, sUV).rgb;
+
+                                float weight = cosAngle * falloff * fgAtten;
+                                indirectLight += sAlbedo * weight;
+                                totalWeight += weight;
+                            }
                         }
                     }
                 }
@@ -168,11 +177,10 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         }
     }
 
-    // Normalize and apply strength
-    if (totalWeight > 0.0001)
-        indirectLight = (indirectLight / totalWeight) * ilStrength * colorBleeding;
-    else
-        indirectLight = float3(0, 0, 0);
+    // Scale by total sample count — keeps IL proportional to how much nearby
+    // geometry occludes the hemisphere, rather than normalizing to average color.
+    float totalSamples = numDirections * numSteps * 2.0;
+    indirectLight = (indirectLight / totalSamples) * ilStrength * colorBleeding;
 
     // Depth fade
     float fadeRange = max(ilMaxDepth - depthFadeStart, 0.0001);

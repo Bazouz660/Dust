@@ -35,34 +35,33 @@ static std::string GetPluginDir()
     return (pos != std::string::npos) ? s.substr(0, pos) : s;
 }
 
-// Called BEFORE the game's lighting draw
+// preExecute — nothing to do; IL generation happens in postExecute after lighting
 static void SSILPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
 {
-    ID3D11ShaderResourceView* depthSRV = host->GetSRV(DUST_RESOURCE_DEPTH);
-    ID3D11ShaderResourceView* albedoSRV = host->GetSRV(DUST_RESOURCE_ALBEDO);
-    if (!depthSRV || !albedoSRV)
-        return;
-
-    if (!SSILRenderer::IsInitialized())
-        return;
-
-    if (!gSSILConfig.enabled)
-        return;
-
-    // Normals are optional (we reconstruct from depth if not available)
-    ID3D11ShaderResourceView* normalsSRV = host->GetSRV(DUST_RESOURCE_NORMALS);
-
-    // Generate IL texture (saves/restores GPU state internally)
-    SSILRenderer::RenderIL(ctx->context, depthSRV, albedoSRV, normalsSRV);
+    (void)ctx; (void)host;
 }
 
-// Called AFTER the game's lighting draw
+// Called AFTER the game's lighting draw — generate IL from the lit scene, then composite
 static void SSILPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
 {
     if (!gSSILConfig.enabled || !SSILRenderer::IsInitialized())
         return;
 
-    ID3D11ShaderResourceView* ilSRV = SSILRenderer::GetILSRV();
+    ID3D11ShaderResourceView* depthSRV = host->GetSRV(DUST_RESOURCE_DEPTH);
+    if (!depthSRV)
+        return;
+
+    // Snapshot the lit HDR scene — this contains actual surface radiance
+    // (direct lighting, shadows, AO, specular) not just flat albedo.
+    ID3D11ShaderResourceView* sceneSRV = host->GetSceneCopy(ctx->context, DUST_RESOURCE_HDR_RT);
+    if (!sceneSRV)
+        return;
+
+    // Normals are optional (we reconstruct from depth if not available)
+    ID3D11ShaderResourceView* normalsSRV = host->GetSRV(DUST_RESOURCE_NORMALS);
+
+    // Generate IL texture from the lit scene
+    ID3D11ShaderResourceView* ilSRV = SSILRenderer::RenderIL(ctx->context, depthSRV, sceneSRV, normalsSRV);
     if (!ilSRV)
         return;
 
@@ -178,7 +177,7 @@ static int SSILIsEnabled()
 static DustSettingDesc gSettingsArray[] = {
     { "Enabled",            DUST_SETTING_BOOL,  &gSSILConfig.enabled,          0.0f,    1.0f,   "Enabled" },
     { "Radius",             DUST_SETTING_FLOAT, &gSSILConfig.ilRadius,         0.0005f, 0.02f,  "Radius" },
-    { "Strength",           DUST_SETTING_FLOAT, &gSSILConfig.ilStrength,       0.1f,    5.0f,   "Strength" },
+    { "Strength",           DUST_SETTING_FLOAT, &gSSILConfig.ilStrength,       0.1f,    10.0f,  "Strength" },
     { "Bias",               DUST_SETTING_FLOAT, &gSSILConfig.ilBias,           0.0f,    0.3f,   "Bias" },
     { "Max Depth",          DUST_SETTING_FLOAT, &gSSILConfig.ilMaxDepth,       0.01f,   1.0f,   "MaxDepth" },
     { "Foreground Fade",    DUST_SETTING_FLOAT, &gSSILConfig.foregroundFade,   1.0f,    200.0f, "ForegroundFade" },
@@ -186,7 +185,8 @@ static DustSettingDesc gSettingsArray[] = {
     { "Max Screen Radius",  DUST_SETTING_FLOAT, &gSSILConfig.maxScreenRadius,  0.005f,  0.2f,   "MaxScreenRadius" },
     { "Min Screen Radius",  DUST_SETTING_FLOAT, &gSSILConfig.minScreenRadius,  0.0001f, 0.01f,  "MinScreenRadius" },
     { "Color Bleeding",     DUST_SETTING_FLOAT, &gSSILConfig.colorBleeding,    0.0f,    2.0f,   "ColorBleeding" },
-    { "Samples",            DUST_SETTING_INT,   &gSSILConfig.sampleCount,      4.0f,    12.0f,  "Samples" },
+    { "Directions",         DUST_SETTING_INT,   &gSSILConfig.sampleCount,      2.0f,    12.0f,  "Directions" },
+    { "Steps",              DUST_SETTING_INT,   &gSSILConfig.stepCount,        1.0f,    6.0f,   "Steps" },
     { "Blur Sharpness",     DUST_SETTING_FLOAT, &gSSILConfig.blurSharpness,    0.0f,    0.1f,   "BlurSharpness" },
     { "Debug View",         DUST_SETTING_BOOL,  &gSSILConfig.debugView,        0.0f,    1.0f,   "DebugView" },
     // Hidden settings

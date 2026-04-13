@@ -213,6 +213,8 @@ void OnResolutionChanged(ID3D11Device* device, UINT newWidth, UINT newHeight)
 {
     if (newWidth == gWidth && newHeight == gHeight)
         return;
+    if (newWidth == 0 || newHeight == 0)
+        return;
 
     Log("SSIL: Resolution changed: %ux%u -> %ux%u", gWidth, gHeight, newWidth, newHeight);
 
@@ -275,6 +277,9 @@ ID3D11ShaderResourceView* RenderIL(ID3D11DeviceContext* ctx,
             }
             res->Release();
         }
+        // OnResolutionChanged may have failed and set gInitialized = false
+        if (!gInitialized)
+            return nullptr;
     }
 
     gHost->SaveState(ctx);
@@ -301,9 +306,12 @@ ID3D11ShaderResourceView* RenderIL(ID3D11DeviceContext* ctx,
         cb.debugMode = gSSILConfig.debugView ? 1.0f : 0.0f;
         cb.blurSharpness = gSSILConfig.blurSharpness;
         int numDirs = gSSILConfig.sampleCount;
-        if (numDirs < 4) numDirs = 4;
+        if (numDirs < 2) numDirs = 2;
+        int numSteps = gSSILConfig.stepCount;
+        if (numSteps < 1) numSteps = 1;
+        if (numSteps > 6) numSteps = 6;
         cb.numDirections = (float)numDirs;
-        cb.numSteps = 4.0f;
+        cb.numSteps = (float)numSteps;
         gHost->UpdateConstantBuffer(ctx, gSSILCB, &cb, sizeof(cb));
     }
 
