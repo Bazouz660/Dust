@@ -27,6 +27,7 @@ static ID3D11PixelShader*  gAOCompositePS = nullptr;
 static ID3D11BlendState*   gAdditiveBlend = nullptr;
 static ID3D11BlendState*   gMultiplyBlend = nullptr;
 static ID3D11SamplerState* gLinearSampler = nullptr;
+static ID3D11SamplerState* gPointSampler = nullptr;
 static ID3D11Buffer*       gCompositeCB = nullptr;
 
 struct CompositeCBData
@@ -35,8 +36,7 @@ struct CompositeCBData
     float invViewportSize[2];
     float giIntensity;
     float saturation;
-    float _pad0;
-    float _pad1;
+    float giTexSize[2];
 };
 
 // Track the last GI SRV for compositing
@@ -95,27 +95,36 @@ static void RTGIPostExecute(const DustFrameContext* ctx, const DustHostAPI* host
     D3D11_VIEWPORT vp = { 0, 0, (float)ctx->width, (float)ctx->height, 0, 1 };
     dc->RSSetViewports(1, &vp);
 
+    // Composite cbuffer (shared by both passes)
+    UINT giW, giH;
+    RTGIRenderer::GetRenderSize(&giW, &giH);
+
+    CompositeCBData ccb = {};
+    ccb.viewportSize[0] = (float)ctx->width;
+    ccb.viewportSize[1] = (float)ctx->height;
+    ccb.invViewportSize[0] = 1.0f / (float)ctx->width;
+    ccb.invViewportSize[1] = 1.0f / (float)ctx->height;
+    ccb.giIntensity = gRTGIConfig.giIntensity;
+    ccb.saturation = gRTGIConfig.saturation;
+    ccb.giTexSize[0] = (float)giW;
+    ccb.giTexSize[1] = (float)giH;
+    host->UpdateConstantBuffer(dc, gCompositeCB, &ccb, sizeof(ccb));
+
+    ID3D11SamplerState* samplers[2] = { gLinearSampler, gPointSampler };
+
     // Step 1: Add indirect light (additive blend) with intensity + saturation applied in shader
     if (gRTGIConfig.giIntensity > 0.0f)
     {
-        CompositeCBData ccb = {};
-        ccb.viewportSize[0] = (float)ctx->width;
-        ccb.viewportSize[1] = (float)ctx->height;
-        ccb.invViewportSize[0] = 1.0f / (float)ctx->width;
-        ccb.invViewportSize[1] = 1.0f / (float)ctx->height;
-        ccb.giIntensity = gRTGIConfig.giIntensity;
-        ccb.saturation = gRTGIConfig.saturation;
-        host->UpdateConstantBuffer(dc, gCompositeCB, &ccb, sizeof(ccb));
-
         dc->OMSetRenderTargets(1, &hdrRTV, nullptr);
         float bf[4] = { 0, 0, 0, 0 };
         dc->OMSetBlendState(gAdditiveBlend, bf, 0xFFFFFFFF);
-        dc->PSSetShaderResources(0, 1, &giSRV);
-        dc->PSSetSamplers(0, 1, &gLinearSampler);
+        ID3D11ShaderResourceView* srvs[2] = { giSRV, depthSRV };
+        dc->PSSetShaderResources(0, 2, srvs);
+        dc->PSSetSamplers(0, 2, samplers);
         dc->PSSetConstantBuffers(0, 1, &gCompositeCB);
         host->DrawFullscreenTriangle(dc, gCompositePS);
-        ID3D11ShaderResourceView* null = nullptr;
-        dc->PSSetShaderResources(0, 1, &null);
+        ID3D11ShaderResourceView* nullSRVs[2] = {};
+        dc->PSSetShaderResources(0, 2, nullSRVs);
     }
 
     // Step 2: Apply AO (multiply blend)
@@ -124,11 +133,13 @@ static void RTGIPostExecute(const DustFrameContext* ctx, const DustHostAPI* host
         dc->OMSetRenderTargets(1, &hdrRTV, nullptr);
         float bf[4] = { 0, 0, 0, 0 };
         dc->OMSetBlendState(gMultiplyBlend, bf, 0xFFFFFFFF);
-        dc->PSSetShaderResources(0, 1, &giSRV);
-        dc->PSSetSamplers(0, 1, &gLinearSampler);
+        ID3D11ShaderResourceView* srvs[2] = { giSRV, depthSRV };
+        dc->PSSetShaderResources(0, 2, srvs);
+        dc->PSSetSamplers(0, 2, samplers);
+        dc->PSSetConstantBuffers(0, 1, &gCompositeCB);
         host->DrawFullscreenTriangle(dc, gAOCompositePS);
-        ID3D11ShaderResourceView* null = nullptr;
-        dc->PSSetShaderResources(0, 1, &null);
+        ID3D11ShaderResourceView* nullSRVs[2] = {};
+        dc->PSSetShaderResources(0, 2, nullSRVs);
     }
 
     host->RestoreState(dc);
@@ -207,6 +218,16 @@ static int RTGIInit(ID3D11Device* device, uint32_t width, uint32_t height, const
         if (FAILED(hr)) return -8;
     }
 
+    // Point clamp sampler (for bilateral upscale)
+    {
+        D3D11_SAMPLER_DESC sd = {};
+        sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        hr = device->CreateSamplerState(&sd, &gPointSampler);
+        if (FAILED(hr)) return -8;
+    }
+
     // Composite constant buffer
     gCompositeCB = host->CreateConstantBuffer(device, sizeof(CompositeCBData));
     if (!gCompositeCB) return -9;
@@ -221,7 +242,7 @@ static void RTGIShutdown()
 
 #define SR(p) if (p) { (p)->Release(); (p) = nullptr; }
     SR(gCompositePS); SR(gAOCompositePS);
-    SR(gAdditiveBlend); SR(gMultiplyBlend); SR(gLinearSampler);
+    SR(gAdditiveBlend); SR(gMultiplyBlend); SR(gLinearSampler); SR(gPointSampler);
     SR(gCompositeCB);
 #undef SR
 

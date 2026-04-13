@@ -31,6 +31,7 @@ static ID3D11Buffer* gStagingCB = nullptr;
 // Internal render resolution (supports half-res)
 static UINT gRenderWidth = 0;
 static UINT gRenderHeight = 0;
+static bool gLastHalfRes = false; // Track half-res toggle for runtime recreation
 
 // Raw ray trace output (RGBA16F)
 static ID3D11Texture2D*          gRawTex = nullptr;
@@ -155,8 +156,7 @@ struct CompositeCBData
     float invViewportSize[2];
     float giIntensity;
     float saturation;
-    float _pad0;
-    float _pad1;
+    float giTexSize[2];     // Half-res or full-res GI texture dimensions
 };
 
 struct DebugCBData
@@ -451,6 +451,7 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
     if (!gRayTraceCB || !gTemporalCB || !gDenoiseCB || !gCompositeCB || !gDebugCB)
         return false;
 
+    gLastHalfRes = gRTGIConfig.halfResolution;
     gInitialized = true;
     Log("RTGI: Initialized successfully (%ux%u, render %ux%u)", width, height, gRenderWidth, gRenderHeight);
     return true;
@@ -504,6 +505,7 @@ void OnResolutionChanged(ID3D11Device* device, UINT newWidth, UINT newHeight)
 
 bool IsInitialized() { return gInitialized; }
 bool HasValidCameraData() { return gHasValidCameraData; }
+void GetRenderSize(UINT* w, UINT* h) { *w = gRenderWidth; *h = gRenderHeight; }
 
 void ExtractCameraData(ID3D11DeviceContext* ctx)
 {
@@ -630,6 +632,29 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
             res->Release();
         }
         if (!gInitialized) return nullptr;
+    }
+
+    // Detect half-res toggle at runtime and recreate textures
+    if (gRTGIConfig.halfResolution != gLastHalfRes)
+    {
+        Log("RTGI: Half-res toggled: %d -> %d, recreating textures", gLastHalfRes, gRTGIConfig.halfResolution);
+        gLastHalfRes = gRTGIConfig.halfResolution;
+        ReleaseTextures();
+        ID3D11Device* device = nullptr;
+        ctx->GetDevice(&device);
+        if (device)
+        {
+            if (!CreateTextures(device, gWidth, gHeight))
+            {
+                Log("RTGI: WARNING: Failed to recreate textures after half-res toggle");
+                gInitialized = false;
+                device->Release();
+                return nullptr;
+            }
+            device->Release();
+        }
+        gHasPrevFrame = false;
+        gAccumWriteIndex = 0;
     }
 
     gHost->SaveState(ctx);

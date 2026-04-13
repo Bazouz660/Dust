@@ -23,4 +23,5 @@ namespace RTGIRenderer
     void OnResolutionChanged(ID3D11Device* device, UINT newWidth, UINT newHeight);
     bool IsInitialized();
     bool HasValidCameraData();
+    void GetRenderSize(UINT* w, UINT* h); // Internal render resolution (may be half-res)
 }
