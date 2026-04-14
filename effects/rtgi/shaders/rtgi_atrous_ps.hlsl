@@ -27,7 +27,24 @@ cbuffer DenoiseParams : register(b0)
     float  _pad2;
 };
 
-static const float kernel[3] = { 1.0, 2.0/3.0, 1.0/6.0 };
+// Precomputed 5x5 kernel weights: kernel[abs(dx)] * kernel[abs(dy)]
+// kernel = { 1.0, 2/3, 1/6 }
+static const float kernelWeights[5][5] = {
+    { 0.02778, 0.11111, 0.16667, 0.11111, 0.02778 },
+    { 0.11111, 0.44444, 0.66667, 0.44444, 0.11111 },
+    { 0.16667, 0.66667, 1.00000, 0.66667, 0.16667 },
+    { 0.11111, 0.44444, 0.66667, 0.44444, 0.11111 },
+    { 0.02778, 0.11111, 0.16667, 0.11111, 0.02778 }
+};
+
+// Precomputed distances: length(float2(dx, dy)) for dx,dy in [-2..2]
+static const float pixelDists[5][5] = {
+    { 2.82843, 2.23607, 2.00000, 2.23607, 2.82843 },
+    { 2.23607, 1.41421, 1.00000, 1.41421, 2.23607 },
+    { 2.00000, 1.00000, 0.00000, 1.00000, 2.00000 },
+    { 2.23607, 1.41421, 1.00000, 1.41421, 2.23607 },
+    { 2.82843, 2.23607, 2.00000, 2.23607, 2.82843 }
+};
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 {
@@ -46,11 +63,14 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     float depthDown  = depthTex.SampleLevel(pointClamp, uv + float2(0, invViewportSize.y), 0);
     float fwidthZ = max(abs(depthRight - centerDepth), abs(depthDown - centerDepth));
 
-    float  kw0 = kernel[0] * kernel[0];
-    float3 sumColor = centerGI.rgb * kw0;
-    float  wSumColor = kw0;
-    float  sumAO = centerAO * kw0;
-    float  wSumAO = kw0;
+    // Precompute reciprocals used in inner loop
+    float invPhiColor = 1.0 / max(phiColor * 0.1, 1e-6);
+
+    float  kw0 = 1.0; // kernelWeights[2][2]
+    float3 sumColor = centerGI.rgb;
+    float  wSumColor = 1.0;
+    float  sumAO = centerAO;
+    float  wSumAO = 1.0;
 
     // AO spatial falloff
     static const float AO_SIGMA_SQ2 = 2.0 * 4.0 * 4.0;
@@ -77,8 +97,8 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             float4 sampleGI = giTex.SampleLevel(pointClamp, sampleUV, 0);
             float3 sampleNormal = normalize(normalsTex.SampleLevel(pointClamp, sampleUV, 0).rgb * 2.0 - 1.0);
 
-            float pixelDist = length(float2(dx, dy));
-            float kw = kernel[abs(dx)] * kernel[abs(dy)];
+            float pixelDist = pixelDists[dy + 2][dx + 2];
+            float kw = kernelWeights[dy + 2][dx + 2];
 
             // ---- Depth weight ----
             float expectedChange = max(fwidthZ * pixelDist * stepSize, 1e-6);
@@ -89,18 +109,22 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             float normalDot = max(0.0, dot(centerNormal, sampleNormal));
 
             // ---- Color: depth + normal(pow16) + luminance ----
-            float wN_color = pow(normalDot, 16.0);
+            // pow(x, 16) = ((x^2)^2)^2)^2 — 4 multiplies instead of pow()
+            float n2 = normalDot * normalDot;
+            float n4 = n2 * n2;
+            float n8 = n4 * n4;
+            float wN_color = n8 * n8; // = normalDot^16
+
             float lumDiff = abs(centerLum - Luminance(sampleGI.rgb));
-            float wL = lumDiff / max(phiColor * 0.1, 1e-6);
+            float wL = lumDiff * invPhiColor;
             float wColor = depthW * wN_color * exp(-max(wL, 0.0)) * kw;
             sumColor += sampleGI.rgb * wColor;
             wSumColor += wColor;
 
             // ---- AO: depth + normal(pow8) + Gaussian spatial falloff ----
-            float wN_ao = pow(normalDot, 8.0);
             float actualPixelDist = pixelDist * stepSize;
             float aoSpatialW = exp(-actualPixelDist * actualPixelDist / AO_SIGMA_SQ2);
-            float wAO = depthW * wN_ao * kw * aoSpatialW;
+            float wAO = depthW * n8 * kw * aoSpatialW; // n8 = normalDot^8
             sumAO += sampleGI.a * wAO;
             wSumAO += wAO;
         }

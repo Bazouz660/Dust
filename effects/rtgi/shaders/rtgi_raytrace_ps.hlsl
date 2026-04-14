@@ -120,9 +120,8 @@ cbuffer RTGIParams : register(b0)
     float4x4 inverseView;
 };
 
-float4 TraceRay(float2 startUV, float startDepth, float3 rayDirView, int numSteps)
+float4 TraceRay(float2 startUV, float startDepth, float3 startView, float3 rayDirView, int numSteps)
 {
-    float3 startView = ReconstructViewPos(startUV, startDepth, tanHalfFov, aspectRatio);
     float3 endView = startView + rayDirView * rayLength * startDepth;
 
     if (endView.z <= 0.0001)
@@ -201,6 +200,11 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     float3 normal = ReconstructNormal(depthTex, pointClamp, uv, depth, invViewportSize,
                                        tanHalfFov, aspectRatio);
 
+    // Cache view-space position and tangent frame (used by all rays)
+    float3 startView = ReconstructViewPos(uv, depth, tanHalfFov, aspectRatio);
+    float3 tangent, bitangent;
+    BuildOrthonormalBasis(normal, tangent, bitangent);
+
     // Temporal noise — golden ratio sequence for good frame-to-frame coverage
     float temporalNoise = frac(frameIndex * 0.618033988 + Hash13(float3(pos.xy, 0)));
     int iRaysPerPixel = max(1, (int)raysPerPixel);
@@ -218,12 +222,12 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         xi = frac(xi + rayPhase);
 
         float3 localDir = CosineHemisphereSample(xi);
-        float3 rayDir = HemisphereToNormal(localDir, normal);
+        float3 rayDir = normalize(tangent * localDir.x + bitangent * localDir.y + normal * localDir.z);
 
         if (dot(rayDir, normal) < 0.0)
             rayDir = -rayDir;
 
-        float4 hitResult = TraceRay(uv, depth, rayDir, iRaySteps);
+        float4 hitResult = TraceRay(uv, depth, startView, rayDir, iRaySteps);
 
         totalIndirect += hitResult.rgb;
         totalOcclusion += hitResult.w;

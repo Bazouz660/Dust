@@ -72,6 +72,7 @@ static bool gWaitingForKey = false;
 
 static bool gInitialized = false;
 static bool gOverlayVisible = false;
+static volatile bool gResizeInProgress = false;
 static HWND gHWnd = nullptr;
 static WNDPROC oWndProc = nullptr;
 static ID3D11Device* gDevice = nullptr;
@@ -361,14 +362,25 @@ static LRESULT CALLBACK DustWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         if (msg == WM_MOUSEMOVE)
             ClipCursor(nullptr);
 
-        if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
-            return 0;
+        // Let ImGui process the message for its own UI state
+        ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
 
-        // Block all mouse, keyboard, and raw input from reaching the game
-        if ((msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) ||
-            (msg >= WM_KEYFIRST && msg <= WM_KEYLAST) ||
-            msg == WM_INPUT)
+        // Block mouse/keyboard/raw input from reaching the game while overlay is open
+        bool isMouse = (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST);
+        bool isKeyboard = (msg >= WM_KEYFIRST && msg <= WM_KEYLAST);
+        if (isMouse || isKeyboard || msg == WM_INPUT)
             return 0;
+    }
+    else
+    {
+        // Overlay is closed — let ImGui handle only non-input messages
+        // (e.g. WM_DISPLAYCHANGE, WM_DEVICECHANGE) without consuming game input
+        if (msg != WM_INPUT &&
+            !(msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) &&
+            !(msg >= WM_KEYFIRST && msg <= WM_KEYLAST))
+        {
+            ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
+        }
     }
 
     return CallWindowProcW(oWndProc, hWnd, msg, wParam, lParam);
@@ -1002,9 +1014,37 @@ bool IsVisible()
     return gOverlayVisible;
 }
 
-void Render()
+void SetResizeInProgress(bool inProgress)
+{
+    gResizeInProgress = inProgress;
+}
+
+void ReleaseBackBuffer()
 {
     if (!gInitialized) return;
+    if (gBackBufferRTV) { gBackBufferRTV->Release(); gBackBufferRTV = nullptr; }
+    ImGui_ImplDX11_InvalidateDeviceObjects();
+}
+
+bool RecreateBackBuffer(IDXGISwapChain* swapChain)
+{
+    if (!gInitialized) return false;
+    if (!CreateBackBufferRTV(swapChain))
+    {
+        Log("GUI: Failed to recreate back buffer RTV after resize");
+        return false;
+    }
+    return true;
+}
+
+void Render()
+{
+    if (!gInitialized || gResizeInProgress) return;
+    if (!gDevice || !gContext || !gBackBufferRTV) return;
+
+    // Skip rendering if device has been removed (alt-tab, resolution change, etc.)
+    HRESULT removeReason = gDevice->GetDeviceRemovedReason();
+    if (removeReason != S_OK) return;
 
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();

@@ -358,6 +358,19 @@ static void STDMETHODCALLTYPE HookedDraw(
     SurveyFullscreenDraw(pThis, VertexCount);
 #endif
 
+    // Check device health FIRST — before touching any D3D11 resources.
+    // During fullscreen alt-tab, the device can be removed and any
+    // OMGetRenderTargets / GetDesc / PSGetShaderResources call may crash.
+    {
+        HRESULT removeReason = gDevice->GetDeviceRemovedReason();
+        if (removeReason != S_OK)
+        {
+            Log("Device removed (0x%08X), skipping draw hook entirely", removeReason);
+            oDraw(pThis, VertexCount, StartVertexLocation);
+            return;
+        }
+    }
+
     // Detect render pass from GPU state
     auto result = gPipelineDetector.OnFullscreenDraw(pThis);
 
@@ -382,17 +395,6 @@ static void STDMETHODCALLTYPE HookedDraw(
             }
         }
 
-        // Check device health
-        bool deviceHealthy = true;
-        {
-            HRESULT removeReason = gDevice->GetDeviceRemovedReason();
-            if (removeReason != S_OK)
-            {
-                deviceHealthy = false;
-                Log("Device removed (0x%08X), current resolution=%ux%u", removeReason, gWidth, gHeight);
-            }
-        }
-
         // Detect real resolution from the HDR render target
         ID3D11RenderTargetView* rtv = nullptr;
         pThis->OMGetRenderTargets(1, &rtv, nullptr);
@@ -410,18 +412,10 @@ static void STDMETHODCALLTYPE HookedDraw(
                     tex->GetDesc(&desc);
                     if (desc.Width != gWidth || desc.Height != gHeight)
                     {
-                        if (!deviceHealthy)
-                        {
-                            Log("Deferring resolution change %ux%u -> %ux%u (device unhealthy)",
-                                gWidth, gHeight, desc.Width, desc.Height);
-                        }
-                        else
-                        {
-                            Log("Resolution changed: %ux%u -> %ux%u", gWidth, gHeight, desc.Width, desc.Height);
-                            gWidth = desc.Width;
-                            gHeight = desc.Height;
-                            gEffectLoader.OnResolutionChanged(gDevice, gWidth, gHeight);
-                        }
+                        Log("Resolution changed: %ux%u -> %ux%u", gWidth, gHeight, desc.Width, desc.Height);
+                        gWidth = desc.Width;
+                        gHeight = desc.Height;
+                        gEffectLoader.OnResolutionChanged(gDevice, gWidth, gHeight);
                     }
                     tex->Release();
                 }
@@ -430,11 +424,11 @@ static void STDMETHODCALLTYPE HookedDraw(
             rtv->Release();
         }
 
-        // Skip effect dispatch when device is unhealthy or resolution not yet detected.
+        // Skip effect dispatch when resolution not yet detected.
         // Effects initialized at 1x1 must not render into full-resolution targets.
-        if (!deviceHealthy || gWidth <= 1 || gHeight <= 1)
+        if (gWidth <= 1 || gHeight <= 1)
         {
-            Log("Skipping effect dispatch (healthy=%d, res=%ux%u)", deviceHealthy, gWidth, gHeight);
+            Log("Skipping effect dispatch (res=%ux%u)", gWidth, gHeight);
             oDraw(pThis, VertexCount, StartVertexLocation);
             return;
         }
@@ -525,15 +519,19 @@ static HRESULT STDMETHODCALLTYPE HookedResizeBuffers(
     IDXGISwapChain* pThis, UINT BufferCount, UINT Width, UINT Height,
     DXGI_FORMAT NewFormat, UINT SwapChainFlags)
 {
-    // ImGui holds a reference to the back buffer RTV — must shut down before resize
-    DustGUI::Shutdown();
+    // Block Render() while we tear down and recreate the back buffer
+    DustGUI::SetResizeInProgress(true);
+
+    // Release only the back buffer RTV — keep ImGui context, WndProc, DInput hooks intact
+    DustGUI::ReleaseBackBuffer();
 
     HRESULT hr = oResizeBuffers(pThis, BufferCount, Width, Height, NewFormat, SwapChainFlags);
 
-    // Re-init ImGui with the new back buffer
+    // Recreate back buffer RTV with the new swapchain dimensions
     if (SUCCEEDED(hr) && gDeviceCaptured)
-        DustGUI::Init(pThis, gDevice, gContext);
+        DustGUI::RecreateBackBuffer(pThis);
 
+    DustGUI::SetResizeInProgress(false);
     return hr;
 }
 

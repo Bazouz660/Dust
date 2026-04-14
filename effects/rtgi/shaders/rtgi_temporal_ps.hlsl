@@ -73,8 +73,8 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     if (prevViewPos.z > 0.0001)
     {
         float2 prevUV = ViewPosToUV(prevViewPos, tanHalfFov, aspectRatio);
-        float2 motionVec = (prevUV - uv) * viewportSize; // in pixels
-        pixelMotion = length(motionVec);
+        float2 motionVec = abs((prevUV - uv) * viewportSize); // in pixels
+        pixelMotion = max(motionVec.x, motionVec.y); // Chebyshev distance — no sqrt
     }
     else
     {
@@ -84,7 +84,8 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     // ---- Depth-change detection (catches disocclusion) ----
     float prevDepth = prevDepthTex.SampleLevel(pointClamp, uv, 0);
     float depthChange = abs(depth - prevDepth) / max(depth, 0.001);
-    float depthStability = exp(-depthChange * depthChange / (2.0 * 0.008 * 0.008));
+    static const float DEPTH_SIGMA_SQ2 = 2.0 * 0.008 * 0.008;
+    float depthStability = exp(-depthChange * depthChange / DEPTH_SIGMA_SQ2);
 
     // ---- Adaptive alpha ----
     float baseAlpha = max(1.0 - temporalBlend, 0.08);

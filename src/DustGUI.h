@@ -14,6 +14,13 @@ namespace DustGUI
     // Cleanup.
     void Shutdown();
 
+    // Signal that a swapchain resize is in progress (blocks Render).
+    void SetResizeInProgress(bool inProgress);
+
+    // Lightweight back buffer release/recreate for ResizeBuffers (no full teardown).
+    void ReleaseBackBuffer();
+    bool RecreateBackBuffer(IDXGISwapChain* swapChain);
+
     // Whether the overlay is currently visible.
     bool IsVisible();
 }
