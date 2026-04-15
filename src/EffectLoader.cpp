@@ -437,7 +437,12 @@ void EffectLoader::EffectConfigLoad(LoadedEffect& le)
         case DUST_SETTING_HIDDEN_FLOAT:
         {
             if (!missing)
-                *(float*)s.valuePtr = (float)atof(probe);
+            {
+                float val = (float)atof(probe);
+                if (s.minVal < s.maxVal)
+                    val = (val < s.minVal) ? s.minVal : (val > s.maxVal) ? s.maxVal : val;
+                *(float*)s.valuePtr = val;
+            }
             // else: keep default
             break;
         }
@@ -445,7 +450,12 @@ void EffectLoader::EffectConfigLoad(LoadedEffect& le)
         case DUST_SETTING_HIDDEN_INT:
         {
             if (!missing)
-                *(int*)s.valuePtr = GetPrivateProfileIntA(section, key, 0, le.configPath.c_str());
+            {
+                int val = GetPrivateProfileIntA(section, key, 0, le.configPath.c_str());
+                if (s.minVal < s.maxVal)
+                    val = (val < (int)s.minVal) ? (int)s.minVal : (val > (int)s.maxVal) ? (int)s.maxVal : val;
+                *(int*)s.valuePtr = val;
+            }
             // else: keep default
             break;
         }
@@ -576,12 +586,22 @@ void EffectLoader::EffectConfigLoadFrom(LoadedEffect& le, const std::string& pre
             break;
         case DUST_SETTING_FLOAT:
         case DUST_SETTING_HIDDEN_FLOAT:
-            *(float*)s.valuePtr = (float)atof(probe);
+        {
+            float val = (float)atof(probe);
+            if (s.minVal < s.maxVal)
+                val = (val < s.minVal) ? s.minVal : (val > s.maxVal) ? s.maxVal : val;
+            *(float*)s.valuePtr = val;
             break;
+        }
         case DUST_SETTING_INT:
         case DUST_SETTING_HIDDEN_INT:
-            *(int*)s.valuePtr = atoi(probe);
+        {
+            int val = atoi(probe);
+            if (s.minVal < s.maxVal)
+                val = (val < (int)s.minVal) ? (int)s.minVal : (val > (int)s.maxVal) ? (int)s.maxVal : val;
+            *(int*)s.valuePtr = val;
             break;
+        }
         }
     }
 }
