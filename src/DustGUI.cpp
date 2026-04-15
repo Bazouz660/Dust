@@ -5,6 +5,11 @@
 #include "imgui/backends/imgui_impl_win32.h"
 #include "imgui/backends/imgui_impl_dx11.h"
 
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+#include "discord_logo.h"
+#include "github_logo.h"
+
 #include <vector>
 #include <string>
 #include <cstring>
@@ -12,6 +17,7 @@
 
 #define DIRECTINPUT_VERSION 0x0800
 #include <dinput.h>
+#include <shellapi.h>
 #include <core/Functions.h>
 
 // Version string (DUST_VERSION is injected at build time by CI from git tags)
@@ -78,6 +84,8 @@ static WNDPROC oWndProc = nullptr;
 static ID3D11Device* gDevice = nullptr;
 static ID3D11DeviceContext* gContext = nullptr;
 static ID3D11RenderTargetView* gBackBufferRTV = nullptr;
+static ID3D11ShaderResourceView* gDiscordLogoSRV = nullptr;
+static ID3D11ShaderResourceView* gGithubLogoSRV  = nullptr;
 
 // Per-effect GUI state (saved values for reset)
 static std::vector<EffectGUIState> gEffectStates;
@@ -877,6 +885,49 @@ static void RenderToast()
     ImGui::PopStyleVar(3);
 }
 
+// ==================== Discord logo texture ====================
+
+static ID3D11ShaderResourceView* LoadTextureFromMemory(const unsigned char* data, int dataSize)
+{
+    int w, h, n;
+    unsigned char* pixels = stbi_load_from_memory(data, dataSize, &w, &h, &n, 4);
+    if (!pixels) return nullptr;
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width            = (UINT)w;
+    desc.Height           = (UINT)h;
+    desc.MipLevels        = 1;
+    desc.ArraySize        = 1;
+    desc.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage            = D3D11_USAGE_DEFAULT;
+    desc.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
+
+    D3D11_SUBRESOURCE_DATA init = {};
+    init.pSysMem     = pixels;
+    init.SysMemPitch = (UINT)(w * 4);
+
+    ID3D11ShaderResourceView* srv = nullptr;
+    ID3D11Texture2D* tex = nullptr;
+    if (SUCCEEDED(gDevice->CreateTexture2D(&desc, &init, &tex)))
+    {
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Format              = desc.Format;
+        srvDesc.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = 1;
+        gDevice->CreateShaderResourceView(tex, &srvDesc, &srv);
+        tex->Release();
+    }
+    stbi_image_free(pixels);
+    return srv;
+}
+
+static void LoadLogoTextures()
+{
+    gDiscordLogoSRV = LoadTextureFromMemory(kDiscordLogoPng, (int)kDiscordLogoPngSize);
+    gGithubLogoSRV  = LoadTextureFromMemory(kGithubLogoPng,  (int)kGithubLogoPngSize);
+}
+
 // ==================== Init / Shutdown / Render ====================
 
 bool Init(IDXGISwapChain* swapChain, ID3D11Device* device, ID3D11DeviceContext* context)
@@ -911,6 +962,7 @@ bool Init(IDXGISwapChain* swapChain, ID3D11Device* device, ID3D11DeviceContext* 
 
     ImGui_ImplWin32_Init(gHWnd);
     ImGui_ImplDX11_Init(gDevice, gContext);
+    LoadLogoTextures();
 
     oWndProc = (WNDPROC)SetWindowLongPtrW(gHWnd, GWLP_WNDPROC, (LONG_PTR)DustWndProc);
 
@@ -938,7 +990,9 @@ void Shutdown()
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
 
-    if (gBackBufferRTV) { gBackBufferRTV->Release(); gBackBufferRTV = nullptr; }
+    if (gBackBufferRTV)  { gBackBufferRTV->Release();  gBackBufferRTV = nullptr; }
+    if (gDiscordLogoSRV) { gDiscordLogoSRV->Release(); gDiscordLogoSRV = nullptr; }
+    if (gGithubLogoSRV)  { gGithubLogoSRV->Release();  gGithubLogoSRV = nullptr; }
 
     gEffectStates.clear();
     gInitialized = false;
@@ -1012,6 +1066,41 @@ void Render()
 
         // Performance (always visible)
         DrawPerformanceSection();
+
+        // Social logo buttons pinned to bottom of left pane
+        {
+            const float logoSize = 36.0f;
+            const float framePad = ImGui::GetStyle().FramePadding.y;
+            const float winPad   = ImGui::GetStyle().WindowPadding.y;
+            ImGui::SetCursorPosY(ImGui::GetWindowHeight() - logoSize - framePad * 2.0f - winPad);
+
+            ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 1.0f, 1.0f, 0.1f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(1.0f, 1.0f, 1.0f, 0.2f));
+
+            if (gDiscordLogoSRV)
+            {
+                ImGui::PushID("discord");
+                if (ImGui::ImageButton((ImTextureID)gDiscordLogoSRV, ImVec2(logoSize, logoSize)))
+                    ShellExecuteA(nullptr, "open", "https://discord.gg/QKhUG9bDCY", nullptr, nullptr, SW_SHOWNORMAL);
+                ImGui::PopID();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Join the Discord server");
+            }
+
+            if (gGithubLogoSRV)
+            {
+                ImGui::SameLine();
+                ImGui::PushID("github");
+                if (ImGui::ImageButton((ImTextureID)gGithubLogoSRV, ImVec2(logoSize, logoSize)))
+                    ShellExecuteA(nullptr, "open", "https://github.com/Bazouz660/Dust", nullptr, nullptr, SW_SHOWNORMAL);
+                ImGui::PopID();
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("View on GitHub");
+            }
+
+            ImGui::PopStyleColor(3);
+        }
 
         ImGui::EndChild();
 

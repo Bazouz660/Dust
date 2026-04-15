@@ -115,6 +115,9 @@
     <ClInclude Include="imgui\imgui.h" />
     <ClInclude Include="imgui\backends\imgui_impl_win32.h" />
     <ClInclude Include="imgui\backends\imgui_impl_dx11.h" />
+    <ClInclude Include="stb_image.h" />
+    <ClInclude Include="discord_logo.h" />
+    <ClInclude Include="github_logo.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="shaders\fullscreen_vs.hlsl" />
