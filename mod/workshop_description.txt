@@ -73,3 +73,6 @@ Effects are loaded as plugin DLLs via a stable C API. The framework handles shad
 
 [h1]Source Code[/h1]
 [url=https://github.com/Bazouz660/Dust]github.com/Bazouz660/Dust[/url]
+
+[h1]Discord Server[/h1]
+https://discord.gg/QKhUG9bDCY
