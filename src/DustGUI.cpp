@@ -159,17 +159,6 @@ static void SnapshotEffect(size_t idx)
     state.snapshotted = true;
 }
 
-static bool IsEffectDirty(size_t idx)
-{
-    const LoadedEffect& le = gEffectLoader.GetEffect(idx);
-    if (idx >= gEffectStates.size() || !gEffectStates[idx].snapshotted)
-        return false;
-    for (uint32_t i = 0; i < le.desc.settingCount; i++)
-        if (IsDirty(le.desc.settings[i], gEffectStates[idx].diskValues[i]))
-            return true;
-    return false;
-}
-
 // ==================== Effect enabled helpers ====================
 
 // Find the "Enabled" bool pointer in an effect's settings array (first DUST_SETTING_BOOL)
@@ -615,13 +604,13 @@ static void DrawPresetSection()
     if (currentPreset >= 0)
     {
         ImGui::SameLine();
-        if (ImGui::Button("Overwrite", ImVec2(0, 0)))
+        if (ImGui::Button("Save", ImVec2(0, 0)))
         {
             gEffectLoader.SavePreset(currentPreset);
             SnapshotAllEffects();
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Overwrite '%s' with current settings", presets[currentPreset].name.c_str());
+            ImGui::SetTooltip("Save current settings into '%s'", presets[currentPreset].name.c_str());
 
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.15f, 0.15f, 1.0f));
@@ -693,12 +682,11 @@ static void DrawEffectSection(size_t idx)
 
     const char* name = le.desc.name ? le.desc.name : "Unnamed";
 
-    // Build header label with enabled status and dirty indicator
-    bool dirty = IsEffectDirty(idx);
+    // Build header label with enabled status
     bool enabled = IsEffectEnabled(le);
     char headerLabel[256];
-    snprintf(headerLabel, sizeof(headerLabel), "%s  %s%s",
-             name, enabled ? "[ON]" : "[OFF]", dirty ? "  *" : "");
+    snprintf(headerLabel, sizeof(headerLabel), "%s  %s",
+             name, enabled ? "[ON]" : "[OFF]");
 
     // Color the header text
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f, 0.85f, 1.0f, 1.0f));
@@ -755,59 +743,6 @@ static void DrawEffectSection(size_t idx)
 
     if (anyChanged && le.desc.OnSettingChanged)
         le.desc.OnSettingChanged();
-
-    // Save / Reset All buttons
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
-
-    bool canSave = (le.desc.apiVersion >= 3 && (le.desc.flags & DUST_FLAG_FRAMEWORK_CONFIG))
-                || le.desc.SaveSettings;
-    bool canLoad = (le.desc.apiVersion >= 3 && (le.desc.flags & DUST_FLAG_FRAMEWORK_CONFIG))
-                || le.desc.LoadSettings;
-
-    if (dirty)
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.2f, 1.0f));
-    if (ImGui::Button("Save", ImVec2(80, 0)) && dirty && canSave)
-    {
-        gEffectLoader.SaveEffectConfig(idx);
-        SnapshotEffect(idx); // update disk values
-    }
-    if (dirty)
-        ImGui::PopStyleColor();
-    if (ImGui::IsItemHovered())
-    {
-        if (!canSave)
-            ImGui::SetTooltip("This effect does not support saving");
-        else if (!dirty)
-            ImGui::SetTooltip("No changes to save");
-    }
-
-    ImGui::SameLine();
-    if (ImGui::Button("Reset All", ImVec2(80, 0)) && dirty)
-    {
-        if (canLoad)
-        {
-            gEffectLoader.LoadEffectConfig(idx);
-            SnapshotEffect(idx);
-        }
-        else
-        {
-            // Fallback: restore from snapshot
-            for (uint32_t i = 0; i < le.desc.settingCount; i++)
-                SetValue(le.desc.settings[i], gEffectStates[idx].diskValues[i]);
-            if (le.desc.OnSettingChanged)
-                le.desc.OnSettingChanged();
-        }
-    }
-
-    if (dirty)
-    {
-        ImGui::SameLine();
-        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "*");
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Unsaved changes");
-    }
 }
 
 // ==================== Drawing: Performance ====================
