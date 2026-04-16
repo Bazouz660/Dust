@@ -272,6 +272,7 @@ static DustSettingDesc gSettingsArray[] = {
     { "Ray Steps",          DUST_SETTING_INT,   &gRTGIConfig.raySteps,        8.0f,   64.0f,  "RaySteps" },
     { "Rays Per Pixel",     DUST_SETTING_INT,   &gRTGIConfig.raysPerPixel,    1.0f,   16.0f,  "RaysPerPixel" },
     { "Thickness",          DUST_SETTING_FLOAT, &gRTGIConfig.thickness,       0.005f, 0.5f,   "Thickness" },
+    { "Thickness Curve",    DUST_SETTING_FLOAT, &gRTGIConfig.thicknessCurve,  0.3f,   1.5f,   "ThicknessCurve" },
     { "Fade Distance",      DUST_SETTING_FLOAT, &gRTGIConfig.fadeDistance,     0.01f,  1.0f,   "FadeDistance" },
     { "Bounce Intensity",   DUST_SETTING_FLOAT, &gRTGIConfig.bounceIntensity, 0.0f,   2.0f,   "BounceIntensity" },
     { "Saturation",         DUST_SETTING_FLOAT, &gRTGIConfig.saturation,      0.0f,   2.0f,   "Saturation" },

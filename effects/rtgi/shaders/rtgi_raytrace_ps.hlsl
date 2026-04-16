@@ -110,6 +110,8 @@ cbuffer RTGIParams : register(b0)
     float  aoIntensity;
     float  frameIndex;
     float  raysPerPixel;
+    float  thicknessCurve;
+    float  _pad0;
     float4x4 inverseView;
 };
 
@@ -143,7 +145,10 @@ float4 TraceRay(float2 startUV, float startDepth, float3 startView, float3 rayDi
 
         float depthDiff = rayDepth - sceneDepth;
 
-        if (depthDiff > 0.0 && depthDiff < thickness * startDepth)
+        // Thickness curve: exponent < 1 tightens the "back wall" for distant
+        // geometry, avoiding bleed/halos where foreground objects would occlude
+        // more than a linear-depth window would allow.
+        if (depthDiff > 0.0 && depthDiff < thickness * pow(startDepth, thicknessCurve))
         {
             // Binary search refinement — locate the exact ray/geometry crossing
             // between the last-miss step and this hit step. 4 iterations = 1/16th

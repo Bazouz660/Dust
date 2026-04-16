@@ -118,6 +118,8 @@ struct RayTraceCBData
     float aoIntensity;
     float frameIndex;
     float raysPerPixel;
+    float thicknessCurve;
+    float _pad0;           // pad so inverseView starts on a 16-byte boundary
     float inverseView[16]; // 4x4 matrix
 };
 
@@ -714,6 +716,7 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
         cb.aoIntensity = gRTGIConfig.aoIntensity;
         cb.frameIndex = (float)gFrameIndex;
         cb.raysPerPixel = (float)gRTGIConfig.raysPerPixel;
+        cb.thicknessCurve = gRTGIConfig.thicknessCurve;
         memcpy(cb.inverseView, gInverseView, 64);
         gHost->UpdateConstantBuffer(ctx, gRayTraceCB, &cb, sizeof(cb));
         ctx->PSSetConstantBuffers(0, 1, &gRayTraceCB);

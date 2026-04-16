@@ -10,6 +10,7 @@ struct RTGIConfig
     int   raySteps      = 16;      // march steps per ray
     int   raysPerPixel  = 1;       // rays per pixel per frame (temporal handles convergence)
     float thickness     = 0.1f;    // depth thickness for hit detection
+    float thicknessCurve = 0.8f;   // depth exponent (1 = linear, <1 = thinner far away)
     float fadeDistance   = 0.15f;   // depth at which GI fades out
 
     // Lighting
