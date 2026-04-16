@@ -77,6 +77,11 @@ static PFN_OMSetRenderTargets       oOMSetRenderTargets = nullptr;
 static PFN_Present                  oPresent = nullptr;
 static PFN_ResizeBuffers            oResizeBuffers = nullptr;
 
+// Hook-race diagnostics: if Present is bypassed by an overlay or a Present1 path,
+// Draw fires but Present never does. These let us confirm that from the log.
+static uint64_t gDrawHookCallCount = 0;
+static uint64_t gPresentHookCallCount = 0;
+
 // ==================== D3DCompile hook (runtime shader patching) ====================
 
 typedef HRESULT(WINAPI* PFN_D3DCompileHook)(
@@ -479,6 +484,12 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     ID3D11DeviceContext* pThis, UINT IndexCount, UINT StartIndexLocation,
     INT BaseVertexLocation)
 {
+    ++gDrawHookCallCount;
+    if ((gDrawHookCallCount % 3000) == 0)
+        Log("Hook diag: draws=%llu presents=%llu",
+            (unsigned long long)gDrawHookCallCount,
+            (unsigned long long)gPresentHookCallCount);
+
     oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 }
 
@@ -503,6 +514,8 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
 static HRESULT STDMETHODCALLTYPE HookedPresent(
     IDXGISwapChain* pThis, UINT SyncInterval, UINT Flags)
 {
+    ++gPresentHookCallCount;
+
     static bool guiInitDone = false;
     if (!guiInitDone && gDeviceCaptured)
     {

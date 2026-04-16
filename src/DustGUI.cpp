@@ -1074,19 +1074,44 @@ bool Init(IDXGISwapChain* swapChain, ID3D11Device* device, ID3D11DeviceContext* 
 {
     if (gInitialized) return true;  // Already initialized (e.g. ResizeBuffers ran before first Present)
 
+    Log("GUI: Init starting (swap=%p, dev=%p, ctx=%p)", swapChain, device, context);
+
+    if (!swapChain || !device || !context)
+    { Log("GUI: Init aborted — null swap/device/context"); return false; }
+
     gDevice = device;
     gContext = context;
 
-    DXGI_SWAP_CHAIN_DESC desc;
-    swapChain->GetDesc(&desc);
+    // Sanity: the swap chain must belong to the same device we'll render with,
+    // otherwise CreateRenderTargetView on its back buffer fails with E_INVALIDARG.
+    // This happens when Kenshi creates extra swap chains on a different device.
+    {
+        ID3D11Device* scDevice = nullptr;
+        HRESULT hr = swapChain->GetDevice(__uuidof(ID3D11Device), (void**)&scDevice);
+        if (FAILED(hr) || !scDevice)
+        { Log("GUI: swapChain->GetDevice failed hr=0x%08X", (unsigned)hr); if (scDevice) scDevice->Release(); return false; }
+        bool match = (scDevice == gDevice);
+        scDevice->Release();
+        if (!match)
+        { Log("GUI: swapChain device (%p) != captured device (%p) — skipping this swap chain", scDevice, gDevice); return false; }
+    }
+
+    DXGI_SWAP_CHAIN_DESC desc = {};
+    HRESULT hr = swapChain->GetDesc(&desc);
+    if (FAILED(hr))
+    { Log("GUI: swapChain->GetDesc failed hr=0x%08X", (unsigned)hr); return false; }
     gHWnd = desc.OutputWindow;
+    Log("GUI: hwnd=%p, size=%ux%u, format=%d", gHWnd, desc.BufferDesc.Width, desc.BufferDesc.Height, (int)desc.BufferDesc.Format);
     if (!gHWnd) { Log("GUI: No HWND"); return false; }
+    if (!IsWindow(gHWnd)) { Log("GUI: hwnd %p is not a valid window", gHWnd); return false; }
 
     if (!CreateBackBufferRTV(swapChain))
     { Log("GUI: Failed to create back buffer RTV"); return false; }
+    Log("GUI: back buffer RTV ok");
 
     IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
+    if (!ImGui::CreateContext())
+    { Log("GUI: ImGui::CreateContext failed"); return false; }
     ImGuiIO& io = ImGui::GetIO();
     // NOTE: NavEnableKeyboard intentionally NOT set — it maps Space to
     // "Activate" which can leave io.KeysDown[VK_SPACE] stuck when the
@@ -1102,13 +1127,26 @@ bool Init(IDXGISwapChain* swapChain, ID3D11Device* device, ID3D11DeviceContext* 
     style.WindowPadding = ImVec2(10, 10);
     style.ItemSpacing = ImVec2(8, 5);
 
-    ImGui_ImplWin32_Init(gHWnd);
-    ImGui_ImplDX11_Init(gDevice, gContext);
+    if (!ImGui_ImplWin32_Init(gHWnd))
+    { Log("GUI: ImGui_ImplWin32_Init failed"); ImGui::DestroyContext(); return false; }
+    Log("GUI: Win32 backend ok");
+    if (!ImGui_ImplDX11_Init(gDevice, gContext))
+    { Log("GUI: ImGui_ImplDX11_Init failed"); ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext(); return false; }
+    Log("GUI: DX11 backend ok");
     LoadLogoTextures();
 
+    SetLastError(0);
     oWndProc = (WNDPROC)SetWindowLongPtrW(gHWnd, GWLP_WNDPROC, (LONG_PTR)DustWndProc);
+    if (!oWndProc)
+    {
+        DWORD err = GetLastError();
+        if (err != 0)
+        { Log("GUI: SetWindowLongPtrW failed err=%lu", err); ImGui_ImplDX11_Shutdown(); ImGui_ImplWin32_Shutdown(); ImGui::DestroyContext(); return false; }
+    }
+    Log("GUI: WndProc subclassed");
 
     InstallDInputHooks();
+    Log("GUI: DInput hooks installed");
 
     LoadFrameworkConfig();
 
