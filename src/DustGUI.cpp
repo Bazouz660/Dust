@@ -447,8 +447,15 @@ static void OnOverlayOpen(HWND hWnd)
 
 static void OnOverlayClose()
 {
+    ImGuiIO& io = ImGui::GetIO();
+
     // Disable ImGui software cursor
-    ImGui::GetIO().MouseDrawCursor = false;
+    io.MouseDrawCursor = false;
+
+    // Clear all key/mouse state so nothing stays stuck in ImGui
+    memset(io.KeysDown, 0, sizeof(io.KeysDown));
+    memset(io.MouseDown, 0, sizeof(io.MouseDown));
+    io.KeyCtrl = io.KeyShift = io.KeyAlt = io.KeySuper = false;
 
     // Restore cursor clipping (game usually clips cursor to window)
     if (gHadClipRect)
@@ -1081,7 +1088,9 @@ bool Init(IDXGISwapChain* swapChain, ID3D11Device* device, ID3D11DeviceContext* 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    // NOTE: NavEnableKeyboard intentionally NOT set — it maps Space to
+    // "Activate" which can leave io.KeysDown[VK_SPACE] stuck when the
+    // overlay closes, breaking the game's pause key.
 
     // Style
     ImGui::StyleColorsDark();
