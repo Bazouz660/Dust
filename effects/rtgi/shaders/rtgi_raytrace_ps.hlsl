@@ -9,18 +9,11 @@ static const float TWO_PI = 6.28318530717959;
 
 // ---- Noise ----
 
-float Hash13(float3 p)
+// Interleaved Gradient Noise (Jimenez). Blue-noise-like spatial distribution,
+// so per-frame error averages cleanly under temporal accumulation + denoise.
+float IGN(float2 p)
 {
-    p = frac(p * 0.1031);
-    p += dot(p, p.zyx + 31.32);
-    return frac((p.x + p.y) * p.z);
-}
-
-float2 Hash22(float2 p)
-{
-    float3 p3 = frac(float3(p.xyx) * float3(0.1031, 0.1030, 0.0973));
-    p3 += dot(p3, p3.yzx + 33.33);
-    return frac((p3.xx + p3.yz) * p3.zy);
+    return frac(52.9829189 * frac(dot(p, float2(0.06711056, 0.00583715))));
 }
 
 // ---- View-space reconstruction ----
@@ -205,10 +198,14 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     float3 tangent, bitangent;
     BuildOrthonormalBasis(normal, tangent, bitangent);
 
-    // Temporal noise — golden ratio sequence for good frame-to-frame coverage
-    float temporalNoise = frac(frameIndex * 0.618033988 + Hash13(float3(pos.xy, 0)));
     int iRaysPerPixel = max(1, (int)raysPerPixel);
     int iRaySteps = max(8, (int)raySteps);
+
+    // Per-frame jitter of the IGN input breaks its directional banding — stripes
+    // shift each frame so temporal accumulation averages them out.
+    float2 jitter = float2(frac(frameIndex * 0.7548776662), frac(frameIndex * 0.5698402910)) * 127.0;
+    float2 blueNoise = float2(IGN(pos.xy + jitter), IGN(pos.xy + jitter + float2(23.97, 47.31)));
+    float temporalPhase = frac(frameIndex * 0.618033988);
 
     float3 totalIndirect = float3(0, 0, 0);
     float  totalOcclusion = 0.0;
@@ -216,10 +213,9 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     [loop]
     for (int ray = 0; ray < iRaysPerPixel; ray++)
     {
-        // Stratified: golden ratio + per-ray offset + spatial hash
-        float rayPhase = frac(temporalNoise + float(ray) * 0.618033988);
-        float2 xi = Hash22(pos.xy + float2(rayPhase * 1e3, ray * 127.1));
-        xi = frac(xi + rayPhase);
+        // Cranley-Patterson rotation: blue-noise offset + per-ray + temporal phase
+        float rayPhase = frac(temporalPhase + float(ray) * 0.618033988);
+        float2 xi = frac(blueNoise + rayPhase);
 
         float3 localDir = CosineHemisphereSample(xi);
         float3 rayDir = normalize(tangent * localDir.x + bitangent * localDir.y + normal * localDir.z);

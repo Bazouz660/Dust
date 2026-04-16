@@ -58,13 +58,34 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     float centerAO = centerGI.a;
     float3 centerNormal = normalize(normalsTex.SampleLevel(pointClamp, uv, 0).rgb * 2.0 - 1.0);
 
+    // Local 3x3 luminance variance — phiColor is scaled by stddev so weights
+    // relax in noisy regions and tighten at real edges (variance-guided SVGF).
+    float lumSum = centerLum;
+    float lumSumSq = centerLum * centerLum;
+    [unroll]
+    for (int vy = -1; vy <= 1; vy++)
+    {
+        [unroll]
+        for (int vx = -1; vx <= 1; vx++)
+        {
+            if (vx == 0 && vy == 0) continue;
+            float3 vc = giTex.SampleLevel(pointClamp, uv + float2(vx, vy) * invViewportSize, 0).rgb;
+            float vl = Luminance(vc);
+            lumSum += vl;
+            lumSumSq += vl * vl;
+        }
+    }
+    float lumMean = lumSum * (1.0 / 9.0);
+    float lumStdDev = sqrt(max(lumSumSq * (1.0 / 9.0) - lumMean * lumMean, 0.0));
+
     // Depth gradient
     float depthRight = depthTex.SampleLevel(pointClamp, uv + float2(invViewportSize.x, 0), 0);
     float depthDown  = depthTex.SampleLevel(pointClamp, uv + float2(0, invViewportSize.y), 0);
     float fwidthZ = max(abs(depthRight - centerDepth), abs(depthDown - centerDepth));
 
-    // Precompute reciprocals used in inner loop
-    float invPhiColor = 1.0 / max(phiColor * 0.1, 1e-6);
+    // phiColor now behaves like "how many sigmas of tolerance" — multiplied by local stddev.
+    // Epsilon prevents collapse in perfectly flat regions (lumStdDev == 0).
+    float invPhiColor = 1.0 / max(phiColor * lumStdDev + 1e-4, 1e-6);
 
     float  kw0 = 1.0; // kernelWeights[2][2]
     float3 sumColor = centerGI.rgb;
