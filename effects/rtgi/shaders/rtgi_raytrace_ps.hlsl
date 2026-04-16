@@ -145,9 +145,24 @@ float4 TraceRay(float2 startUV, float startDepth, float3 startView, float3 rayDi
 
         if (depthDiff > 0.0 && depthDiff < thickness * startDepth)
         {
-            // Refine hit position
-            float prevT = (float)(i - 1) * stepSize;
-            float hitT = lerp(prevT, t, 0.5);
+            // Binary search refinement — locate the exact ray/geometry crossing
+            // between the last-miss step and this hit step. 4 iterations = 1/16th
+            // of a coarse step of precision. Lets us use fewer coarse steps
+            // without losing contact accuracy.
+            float tLo = (float)(i - 1) * stepSize; // last miss (or ray origin)
+            float tHi = t;                         // current hit
+            [unroll]
+            for (int j = 0; j < 4; j++)
+            {
+                float tMid = (tLo + tHi) * 0.5;
+                float midRayD = startDepth + deltaDepth * tMid;
+                float midSceneD = depthTex.SampleLevel(pointClamp, startUV + deltaUV * tMid, 0);
+                if (midSceneD > 0.0001 && midRayD > midSceneD)
+                    tHi = tMid;
+                else
+                    tLo = tMid;
+            }
+            float hitT = tHi;
             float2 hitUV = saturate(startUV + deltaUV * hitT);
 
             // Sample the lit scene color at the hit point
