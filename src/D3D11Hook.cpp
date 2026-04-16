@@ -503,11 +503,19 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
 static HRESULT STDMETHODCALLTYPE HookedPresent(
     IDXGISwapChain* pThis, UINT SyncInterval, UINT Flags)
 {
-    static bool guiInitAttempted = false;
-    if (!guiInitAttempted && gDeviceCaptured)
+    static bool guiInitDone = false;
+    if (!guiInitDone && gDeviceCaptured)
     {
-        guiInitAttempted = true;
-        DustGUI::Init(pThis, gDevice, gContext);
+        if (DustGUI::Init(pThis, gDevice, gContext))
+        {
+            guiInitDone = true;
+        }
+        else
+        {
+            static int sRetryCount = 0;
+            if (sRetryCount < 3)
+                Log("GUI init failed, will retry (attempt %d)", ++sRetryCount);
+        }
     }
 
     DustGUI::Render();
