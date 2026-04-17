@@ -40,6 +40,7 @@ union SavedValue {
     bool bVal;
     float fVal;
     int iVal;
+    float f3Val[3];   // DUST_SETTING_COLOR3
 };
 
 struct EffectGUIState {
@@ -127,29 +128,52 @@ static int gInputModeFrames = 0;
 static SavedValue GetValue(const DustSettingDesc& s)
 {
     SavedValue v = {};
+    if (!s.valuePtr) return v;
     switch (s.type) {
-    case DUST_SETTING_BOOL:  v.bVal = *(bool*)s.valuePtr; break;
-    case DUST_SETTING_FLOAT: v.fVal = *(float*)s.valuePtr; break;
-    case DUST_SETTING_INT:   v.iVal = *(int*)s.valuePtr; break;
+    case DUST_SETTING_BOOL:   v.bVal = *(bool*)s.valuePtr; break;
+    case DUST_SETTING_FLOAT:  v.fVal = *(float*)s.valuePtr; break;
+    case DUST_SETTING_INT:
+    case DUST_SETTING_ENUM:   v.iVal = *(int*)s.valuePtr; break;
+    case DUST_SETTING_COLOR3: {
+        const float* src = (const float*)s.valuePtr;
+        v.f3Val[0] = src[0]; v.f3Val[1] = src[1]; v.f3Val[2] = src[2];
+        break;
+    }
+    default: break;
     }
     return v;
 }
 
 static void SetValue(const DustSettingDesc& s, const SavedValue& v)
 {
+    if (!s.valuePtr) return;
     switch (s.type) {
-    case DUST_SETTING_BOOL:  *(bool*)s.valuePtr = v.bVal; break;
-    case DUST_SETTING_FLOAT: *(float*)s.valuePtr = v.fVal; break;
-    case DUST_SETTING_INT:   *(int*)s.valuePtr = v.iVal; break;
+    case DUST_SETTING_BOOL:   *(bool*)s.valuePtr = v.bVal; break;
+    case DUST_SETTING_FLOAT:  *(float*)s.valuePtr = v.fVal; break;
+    case DUST_SETTING_INT:
+    case DUST_SETTING_ENUM:   *(int*)s.valuePtr = v.iVal; break;
+    case DUST_SETTING_COLOR3: {
+        float* dst = (float*)s.valuePtr;
+        dst[0] = v.f3Val[0]; dst[1] = v.f3Val[1]; dst[2] = v.f3Val[2];
+        break;
+    }
+    default: break;
     }
 }
 
 static bool IsDirty(const DustSettingDesc& s, const SavedValue& saved)
 {
+    if (!s.valuePtr) return false;
     switch (s.type) {
-    case DUST_SETTING_BOOL:  return *(bool*)s.valuePtr != saved.bVal;
-    case DUST_SETTING_FLOAT: return *(float*)s.valuePtr != saved.fVal;
-    case DUST_SETTING_INT:   return *(int*)s.valuePtr != saved.iVal;
+    case DUST_SETTING_BOOL:   return *(bool*)s.valuePtr != saved.bVal;
+    case DUST_SETTING_FLOAT:  return *(float*)s.valuePtr != saved.fVal;
+    case DUST_SETTING_INT:
+    case DUST_SETTING_ENUM:   return *(int*)s.valuePtr != saved.iVal;
+    case DUST_SETTING_COLOR3: {
+        const float* cur = (const float*)s.valuePtr;
+        return cur[0] != saved.f3Val[0] || cur[1] != saved.f3Val[1] || cur[2] != saved.f3Val[2];
+    }
+    default: break;
     }
     return false;
 }
@@ -857,12 +881,26 @@ static void DrawEffectSection(size_t idx)
     for (uint32_t i = 0; i < le.desc.settingCount; i++)
     {
         const DustSettingDesc& s = le.desc.settings[i];
-        if (!s.name || !s.valuePtr) continue;
+        if (!s.name) continue;
 
         // Skip hidden settings (persisted in INI but not shown in GUI)
         if (s.type == DUST_SETTING_HIDDEN_FLOAT || s.type == DUST_SETTING_HIDDEN_INT
             || s.type == DUST_SETTING_HIDDEN_BOOL)
             continue;
+
+        // Section: visual-only group header, no value, no reset button
+        if (s.type == DUST_SETTING_SECTION)
+        {
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.75f, 0.45f, 1.0f));
+            ImGui::TextUnformatted(s.name);
+            ImGui::PopStyleColor();
+            ImGui::Separator();
+            continue;
+        }
+
+        if (!s.valuePtr) continue;
 
         ImGui::PushID((int)i);
 
@@ -878,6 +916,47 @@ static void DrawEffectSection(size_t idx)
         case DUST_SETTING_INT:
             changed = ImGui::SliderInt(s.name, (int*)s.valuePtr, (int)s.minVal, (int)s.maxVal);
             break;
+        case DUST_SETTING_ENUM:
+        {
+            int count = 0;
+            if (s.enumLabels)
+                while (s.enumLabels[count]) count++;
+            int* v = (int*)s.valuePtr;
+            if (count > 0)
+            {
+                if (*v < 0) *v = 0;
+                if (*v >= count) *v = count - 1;
+                const char* preview = s.enumLabels[*v];
+                if (ImGui::BeginCombo(s.name, preview))
+                {
+                    for (int n = 0; n < count; n++)
+                    {
+                        bool selected = (*v == n);
+                        if (ImGui::Selectable(s.enumLabels[n], selected))
+                        {
+                            if (*v != n) { *v = n; changed = true; }
+                        }
+                        if (selected) ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+            }
+            break;
+        }
+        case DUST_SETTING_COLOR3:
+        {
+            float* col = (float*)s.valuePtr;
+            // HDR allows out-of-[0,1] values so we can reuse this widget for ASC-CDL-style
+            // triplets (lift/gamma/gain/offset/slope) that go negative or above 1.
+            changed = ImGui::ColorEdit3(s.name, col,
+                ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
+            if (changed && s.minVal < s.maxVal)
+            {
+                for (int c = 0; c < 3; c++)
+                    col[c] = (col[c] < s.minVal) ? s.minVal : (col[c] > s.maxVal ? s.maxVal : col[c]);
+            }
+            break;
+        }
         default:
             break;
         }

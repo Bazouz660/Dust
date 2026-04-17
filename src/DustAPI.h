@@ -165,17 +165,23 @@ typedef enum DustSettingType {
     // Hidden types (API v3+): persisted in INI but not shown in GUI
     DUST_SETTING_HIDDEN_FLOAT = 3,
     DUST_SETTING_HIDDEN_INT   = 4,
-    DUST_SETTING_HIDDEN_BOOL  = 5
+    DUST_SETTING_HIDDEN_BOOL  = 5,
+    // v3.1: rich GUI types
+    DUST_SETTING_ENUM    = 6,   // int-backed dropdown; uses enumLabels (NULL-terminated)
+    DUST_SETTING_COLOR3  = 7,   // float[3]-backed RGB color picker; minVal/maxVal clamp channels
+    DUST_SETTING_SECTION = 8    // visual-only collapsing header; name is the title, valuePtr unused
 } DustSettingType;
 
 // Describes a single configurable setting exposed to the host GUI
 typedef struct DustSettingDesc {
-    const char*     name;       // Display name
-    DustSettingType type;       // DUST_SETTING_BOOL, FLOAT, or INT (or HIDDEN_ variants)
-    void*           valuePtr;   // Pointer to the setting's storage (bool*, float*, or int*)
-    float           minVal;     // Min value (for FLOAT/INT sliders)
-    float           maxVal;     // Max value (for FLOAT/INT sliders)
-    const char*     iniKey;     // INI key name (API v3+, NULL = use display name)
+    const char*     name;       // Display name (also the header text for DUST_SETTING_SECTION)
+    DustSettingType type;       // DUST_SETTING_BOOL, FLOAT, or INT (or HIDDEN_/ENUM/COLOR3/SECTION)
+    void*           valuePtr;   // Pointer to the setting's storage (bool*/float*/int*/float[3]*); NULL for SECTION
+    float           minVal;     // Min value (for FLOAT/INT/COLOR3 clamp; ignored otherwise)
+    float           maxVal;     // Max value (for FLOAT/INT/COLOR3 clamp; ignored otherwise)
+    const char*     iniKey;     // INI key name (API v3+, NULL = use display name; ignored for SECTION)
+    // v3.1 additions — zero-initialized for older settings
+    const char* const* enumLabels;  // NULL-terminated array of labels (DUST_SETTING_ENUM only)
 } DustSettingDesc;
 
 // Effect descriptor flags (API v3+)

@@ -411,6 +411,7 @@ void EffectLoader::EffectConfigLoad(LoadedEffect& le)
     for (uint32_t i = 0; i < le.desc.settingCount; i++)
     {
         const DustSettingDesc& s = le.desc.settings[i];
+        if (s.type == DUST_SETTING_SECTION) continue;
         if (!s.valuePtr) continue;
 
         const char* key = s.iniKey ? s.iniKey : s.name;
@@ -459,6 +460,38 @@ void EffectLoader::EffectConfigLoad(LoadedEffect& le)
             // else: keep default
             break;
         }
+        case DUST_SETTING_ENUM:
+        {
+            if (!missing)
+            {
+                int count = 0;
+                if (s.enumLabels) while (s.enumLabels[count]) count++;
+                int val = atoi(probe);
+                if (count > 0)
+                    val = (val < 0) ? 0 : (val >= count ? count - 1 : val);
+                *(int*)s.valuePtr = val;
+            }
+            break;
+        }
+        case DUST_SETTING_COLOR3:
+        {
+            if (!missing)
+            {
+                float r = 0.0f, g = 0.0f, b = 0.0f;
+                if (sscanf(probe, "%f,%f,%f", &r, &g, &b) == 3)
+                {
+                    if (s.minVal < s.maxVal)
+                    {
+                        r = (r < s.minVal) ? s.minVal : (r > s.maxVal ? s.maxVal : r);
+                        g = (g < s.minVal) ? s.minVal : (g > s.maxVal ? s.maxVal : g);
+                        b = (b < s.minVal) ? s.minVal : (b > s.maxVal ? s.maxVal : b);
+                    }
+                    float* dst = (float*)s.valuePtr;
+                    dst[0] = r; dst[1] = g; dst[2] = b;
+                }
+            }
+            break;
+        }
         }
     }
 
@@ -481,6 +514,7 @@ void EffectLoader::EffectConfigSave(LoadedEffect& le)
     for (uint32_t i = 0; i < le.desc.settingCount; i++)
     {
         const DustSettingDesc& s = le.desc.settings[i];
+        if (s.type == DUST_SETTING_SECTION) continue;
         if (!s.valuePtr) continue;
 
         const char* key = s.iniKey ? s.iniKey : s.name;
@@ -499,9 +533,17 @@ void EffectLoader::EffectConfigSave(LoadedEffect& le)
             break;
         case DUST_SETTING_INT:
         case DUST_SETTING_HIDDEN_INT:
+        case DUST_SETTING_ENUM:
             snprintf(buf, sizeof(buf), "%d", *(int*)s.valuePtr);
             WritePrivateProfileStringA(section, key, buf, le.configPath.c_str());
             break;
+        case DUST_SETTING_COLOR3:
+        {
+            const float* c = (const float*)s.valuePtr;
+            snprintf(buf, sizeof(buf), "%g,%g,%g", c[0], c[1], c[2]);
+            WritePrivateProfileStringA(section, key, buf, le.configPath.c_str());
+            break;
+        }
         }
     }
 
@@ -569,6 +611,7 @@ void EffectLoader::EffectConfigLoadFrom(LoadedEffect& le, const std::string& pre
     for (uint32_t i = 0; i < le.desc.settingCount; i++)
     {
         const DustSettingDesc& s = le.desc.settings[i];
+        if (s.type == DUST_SETTING_SECTION) continue;
         if (!s.valuePtr) continue;
 
         const char* key = s.iniKey ? s.iniKey : s.name;
@@ -602,6 +645,32 @@ void EffectLoader::EffectConfigLoadFrom(LoadedEffect& le, const std::string& pre
             *(int*)s.valuePtr = val;
             break;
         }
+        case DUST_SETTING_ENUM:
+        {
+            int count = 0;
+            if (s.enumLabels) while (s.enumLabels[count]) count++;
+            int val = atoi(probe);
+            if (count > 0)
+                val = (val < 0) ? 0 : (val >= count ? count - 1 : val);
+            *(int*)s.valuePtr = val;
+            break;
+        }
+        case DUST_SETTING_COLOR3:
+        {
+            float r = 0.0f, g = 0.0f, b = 0.0f;
+            if (sscanf(probe, "%f,%f,%f", &r, &g, &b) == 3)
+            {
+                if (s.minVal < s.maxVal)
+                {
+                    r = (r < s.minVal) ? s.minVal : (r > s.maxVal ? s.maxVal : r);
+                    g = (g < s.minVal) ? s.minVal : (g > s.maxVal ? s.maxVal : g);
+                    b = (b < s.minVal) ? s.minVal : (b > s.maxVal ? s.maxVal : b);
+                }
+                float* dst = (float*)s.valuePtr;
+                dst[0] = r; dst[1] = g; dst[2] = b;
+            }
+            break;
+        }
         }
     }
 }
@@ -617,6 +686,7 @@ void EffectLoader::EffectConfigSaveTo(LoadedEffect& le, const std::string& prese
     for (uint32_t i = 0; i < le.desc.settingCount; i++)
     {
         const DustSettingDesc& s = le.desc.settings[i];
+        if (s.type == DUST_SETTING_SECTION) continue;
         if (!s.valuePtr) continue;
 
         const char* key = s.iniKey ? s.iniKey : s.name;
@@ -635,9 +705,17 @@ void EffectLoader::EffectConfigSaveTo(LoadedEffect& le, const std::string& prese
             break;
         case DUST_SETTING_INT:
         case DUST_SETTING_HIDDEN_INT:
+        case DUST_SETTING_ENUM:
             snprintf(buf, sizeof(buf), "%d", *(int*)s.valuePtr);
             WritePrivateProfileStringA(section, key, buf, iniPath.c_str());
             break;
+        case DUST_SETTING_COLOR3:
+        {
+            const float* c = (const float*)s.valuePtr;
+            snprintf(buf, sizeof(buf), "%g,%g,%g", c[0], c[1], c[2]);
+            WritePrivateProfileStringA(section, key, buf, iniPath.c_str());
+            break;
+        }
         }
     }
 }
@@ -705,6 +783,7 @@ void EffectLoader::ValidatePreset(int presetIdx)
         for (uint32_t i = 0; i < le.desc.settingCount; i++)
         {
             const DustSettingDesc& s = le.desc.settings[i];
+            if (s.type == DUST_SETTING_SECTION) continue;
             const char* key = s.iniKey ? s.iniKey : s.name;
             if (!key) continue;
             expectedKeys.push_back(key);

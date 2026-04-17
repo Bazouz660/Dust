@@ -33,6 +33,7 @@ struct LUTConfig {
     bool enabled       = true;
     float intensity    = 1.0f;
     float exposure     = 0.692f;  // EV stops (-3 to 3), acts as compensation when auto-exposure is on
+    int tonemapper     = 3;       // index into gTonemapperLabels — default ACES Narkowicz (previous behaviour)
 
     // Auto-exposure
     bool autoExposure       = true;
@@ -210,7 +211,7 @@ struct LUTParams {
     float intensity;
     float lutSize;
     float exposure;
-    float pad;
+    int   tonemapper;
 };
 
 // HDR scene captured in preExecute, used in postExecute
@@ -524,7 +525,7 @@ static void LUTPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     host->SaveState(dc);
 
     float finalExposure = gConfig.autoExposure ? gAdaptedExposure : gConfig.exposure;
-    LUTParams params = { gConfig.intensity, (float)LUT_SIZE, finalExposure, 0.0f };
+    LUTParams params = { gConfig.intensity, (float)LUT_SIZE, finalExposure, gConfig.tonemapper };
     host->UpdateConstantBuffer(dc, gCB, &params, sizeof(params));
 
     dc->PSSetConstantBuffers(0, 1, &gCB);
@@ -562,13 +563,29 @@ static int LUTIsEnabled()
 
 // ==================== GUI Settings ====================
 
+// Order MUST match the Tonemap() switch in lut_ps.hlsl.
+static const char* const gTonemapperLabels[] = {
+    "Linear (none)",
+    "Reinhard",
+    "Reinhard Extended",
+    "ACES (Narkowicz)",
+    "ACES (Hill)",
+    "Uncharted 2 (Hable)",
+    "AgX",
+    "Khronos PBR Neutral",
+    nullptr
+};
+
 static DustSettingDesc gLUTSettingsArray[] = {
     { "Enabled",          DUST_SETTING_BOOL,  &gConfig.enabled,     0.0f,  1.0f, "Enabled" },
+    { "-- Tonemap --",    DUST_SETTING_SECTION, nullptr,            0.0f,  0.0f, nullptr },
+    { "Tonemapper",       DUST_SETTING_ENUM,  &gConfig.tonemapper,  0.0f,  0.0f, "Tonemapper", gTonemapperLabels },
     { "Exposure",         DUST_SETTING_FLOAT, &gConfig.exposure,   -3.0f,  3.0f, "Exposure" },
     { "Auto Exposure",    DUST_SETTING_BOOL,  &gConfig.autoExposure, 0.0f, 1.0f, "AutoExposure" },
     { "Adaptation Speed", DUST_SETTING_FLOAT, &gConfig.adaptationSpeed, 0.1f, 10.0f, "AdaptationSpeed" },
     { "Min Auto EV",      DUST_SETTING_FLOAT, &gConfig.minAutoExposure, -5.0f, 0.0f, "MinAutoExposure" },
     { "Max Auto EV",      DUST_SETTING_FLOAT, &gConfig.maxAutoExposure,  0.0f, 5.0f, "MaxAutoExposure" },
+    { "-- Grading --",    DUST_SETTING_SECTION, nullptr,            0.0f,  0.0f, nullptr },
     { "Intensity",        DUST_SETTING_FLOAT, &gConfig.intensity,   0.0f,  1.0f, "Intensity" },
     { "Lift (Shadows)",   DUST_SETTING_FLOAT, &gConfig.lift,       -0.1f,  0.1f, "Lift" },
     { "Gamma (Midtones)", DUST_SETTING_FLOAT, &gConfig.gamma,       0.8f,  1.2f, "Gamma" },
@@ -577,6 +594,7 @@ static DustSettingDesc gLUTSettingsArray[] = {
     { "Saturation",       DUST_SETTING_FLOAT, &gConfig.saturation,  0.0f,  2.0f, "Saturation" },
     { "Temperature",      DUST_SETTING_FLOAT, &gConfig.temperature,-1.0f,  1.0f, "Temperature" },
     { "Tint",             DUST_SETTING_FLOAT, &gConfig.tint,       -1.0f,  1.0f, "Tint" },
+    { "-- Split Toning --", DUST_SETTING_SECTION, nullptr,          0.0f,  0.0f, nullptr },
     { "Shadow Red",       DUST_SETTING_FLOAT, &gConfig.shadowR,    -0.1f,  0.1f, "ShadowR" },
     { "Shadow Green",     DUST_SETTING_FLOAT, &gConfig.shadowG,    -0.1f,  0.1f, "ShadowG" },
     { "Shadow Blue",      DUST_SETTING_FLOAT, &gConfig.shadowB,    -0.1f,  0.1f, "ShadowB" },
