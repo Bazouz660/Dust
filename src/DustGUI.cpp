@@ -1345,7 +1345,7 @@ void Render()
             {
                 ImGui::PushID("discord");
                 if (ImGui::ImageButton((ImTextureID)gDiscordLogoSRV, ImVec2(logoSize, logoSize)))
-                    ShellExecuteA(nullptr, "open", "https://discord.gg/QKhUG9bDCY", nullptr, nullptr, SW_SHOWNORMAL);
+                    ShellExecuteA(nullptr, "open", "https://discord.gg/3fd3c7EFvT", nullptr, nullptr, SW_SHOWNORMAL);
                 ImGui::PopID();
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("Join the Discord server");
