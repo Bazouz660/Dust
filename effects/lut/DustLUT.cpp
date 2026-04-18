@@ -34,6 +34,7 @@ struct LUTConfig {
     float intensity    = 1.0f;
     float exposure     = 0.692f;  // EV stops (-3 to 3), acts as compensation when auto-exposure is on
     int tonemapper     = 3;       // index into gTonemapperLabels — default ACES Narkowicz (previous behaviour)
+    float whitePoint   = 4.0f;    // Reinhard Extended only — luminance that maps to pure white
 
     // Auto-exposure
     bool autoExposure       = true;
@@ -212,6 +213,10 @@ struct LUTParams {
     float lutSize;
     float exposure;
     int   tonemapper;
+    float whitePoint;
+    float _pad0;
+    float _pad1;
+    float _pad2;
 };
 
 // HDR scene captured in preExecute, used in postExecute
@@ -309,6 +314,8 @@ static bool CreateLuminanceResources(ID3D11Device* device, uint32_t /*width*/, u
 
 // ==================== Init / Shutdown ====================
 
+static void UpdateConditionalSettings();
+
 static int LUTInit(ID3D11Device* device, uint32_t width, uint32_t height, const DustHostAPI* host)
 {
     gHost = host;
@@ -381,6 +388,9 @@ static int LUTInit(ID3D11Device* device, uint32_t width, uint32_t height, const 
     QueryPerformanceFrequency(&gPerfFreq);
     QueryPerformanceCounter(&gLastFrameTime);
     gAdaptedExposure = gConfig.exposure;
+
+    // Apply initial conditional visibility (whitepoint only for Reinhard Extended)
+    UpdateConditionalSettings();
 
     // Generate LUT from config settings
     if (!GenerateLUT(device))
@@ -525,7 +535,8 @@ static void LUTPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     host->SaveState(dc);
 
     float finalExposure = gConfig.autoExposure ? gAdaptedExposure : gConfig.exposure;
-    LUTParams params = { gConfig.intensity, (float)LUT_SIZE, finalExposure, gConfig.tonemapper };
+    LUTParams params = { gConfig.intensity, (float)LUT_SIZE, finalExposure, gConfig.tonemapper,
+                         gConfig.whitePoint, 0.0f, 0.0f, 0.0f };
     host->UpdateConstantBuffer(dc, gCB, &params, sizeof(params));
 
     dc->PSSetConstantBuffers(0, 1, &gCB);
@@ -576,16 +587,18 @@ static const char* const gTonemapperLabels[] = {
     nullptr
 };
 
+// Tonemapper index for Reinhard Extended in gTonemapperLabels
+static const int TONEMAPPER_REINHARD_EXT = 2;
+
 static DustSettingDesc gLUTSettingsArray[] = {
     { "Enabled",          DUST_SETTING_BOOL,  &gConfig.enabled,     0.0f,  1.0f, "Enabled" },
-    { "-- Tonemap --",    DUST_SETTING_SECTION, nullptr,            0.0f,  0.0f, nullptr },
     { "Tonemapper",       DUST_SETTING_ENUM,  &gConfig.tonemapper,  0.0f,  0.0f, "Tonemapper", gTonemapperLabels },
+    { "White Point",      DUST_SETTING_HIDDEN_FLOAT, &gConfig.whitePoint, 1.0f, 16.0f, "WhitePoint" },
     { "Exposure",         DUST_SETTING_FLOAT, &gConfig.exposure,   -3.0f,  3.0f, "Exposure" },
     { "Auto Exposure",    DUST_SETTING_BOOL,  &gConfig.autoExposure, 0.0f, 1.0f, "AutoExposure" },
     { "Adaptation Speed", DUST_SETTING_FLOAT, &gConfig.adaptationSpeed, 0.1f, 10.0f, "AdaptationSpeed" },
     { "Min Auto EV",      DUST_SETTING_FLOAT, &gConfig.minAutoExposure, -5.0f, 0.0f, "MinAutoExposure" },
     { "Max Auto EV",      DUST_SETTING_FLOAT, &gConfig.maxAutoExposure,  0.0f, 5.0f, "MaxAutoExposure" },
-    { "-- Grading --",    DUST_SETTING_SECTION, nullptr,            0.0f,  0.0f, nullptr },
     { "Intensity",        DUST_SETTING_FLOAT, &gConfig.intensity,   0.0f,  1.0f, "Intensity" },
     { "Lift (Shadows)",   DUST_SETTING_FLOAT, &gConfig.lift,       -0.1f,  0.1f, "Lift" },
     { "Gamma (Midtones)", DUST_SETTING_FLOAT, &gConfig.gamma,       0.8f,  1.2f, "Gamma" },
@@ -594,7 +607,6 @@ static DustSettingDesc gLUTSettingsArray[] = {
     { "Saturation",       DUST_SETTING_FLOAT, &gConfig.saturation,  0.0f,  2.0f, "Saturation" },
     { "Temperature",      DUST_SETTING_FLOAT, &gConfig.temperature,-1.0f,  1.0f, "Temperature" },
     { "Tint",             DUST_SETTING_FLOAT, &gConfig.tint,       -1.0f,  1.0f, "Tint" },
-    { "-- Split Toning --", DUST_SETTING_SECTION, nullptr,          0.0f,  0.0f, nullptr },
     { "Shadow Red",       DUST_SETTING_FLOAT, &gConfig.shadowR,    -0.1f,  0.1f, "ShadowR" },
     { "Shadow Green",     DUST_SETTING_FLOAT, &gConfig.shadowG,    -0.1f,  0.1f, "ShadowG" },
     { "Shadow Blue",      DUST_SETTING_FLOAT, &gConfig.shadowB,    -0.1f,  0.1f, "ShadowB" },
@@ -603,8 +615,24 @@ static DustSettingDesc gLUTSettingsArray[] = {
     { "Highlight Blue",   DUST_SETTING_FLOAT, &gConfig.highlightB, -0.1f,  0.1f, "HighlightB" },
 };
 
+// Whitepoint slider is only relevant to Reinhard Extended — hide it for every other operator.
+static void UpdateConditionalSettings()
+{
+    for (auto& s : gLUTSettingsArray)
+    {
+        if (s.valuePtr == &gConfig.whitePoint)
+        {
+            s.type = (gConfig.tonemapper == TONEMAPPER_REINHARD_EXT)
+                ? DUST_SETTING_FLOAT
+                : DUST_SETTING_HIDDEN_FLOAT;
+            break;
+        }
+    }
+}
+
 static void LUTOnSettingChanged()
 {
+    UpdateConditionalSettings();
     // Regenerate LUT from the updated parameters
     if (gDevice)
         GenerateLUT(gDevice);

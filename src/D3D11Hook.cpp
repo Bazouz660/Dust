@@ -8,6 +8,7 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <dxgi.h>
+#include <dxgi1_2.h>
 #include <string>
 #include <cstring>
 
@@ -76,6 +77,11 @@ static PFN_DrawIndexedInstanced     oDrawIndexedInstanced = nullptr;
 static PFN_OMSetRenderTargets       oOMSetRenderTargets = nullptr;
 static PFN_Present                  oPresent = nullptr;
 static PFN_ResizeBuffers            oResizeBuffers = nullptr;
+
+typedef HRESULT(STDMETHODCALLTYPE* PFN_Present1)(
+    IDXGISwapChain1* pThis, UINT SyncInterval, UINT PresentFlags,
+    const DXGI_PRESENT_PARAMETERS* pPresentParameters);
+static PFN_Present1                 oPresent1 = nullptr;
 
 // Hook-race diagnostics: if Present is bypassed by an overlay or a Present1 path,
 // Draw fires but Present never does. These let us confirm that from the log.
@@ -512,8 +518,7 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
 
 // ==================== Swap chain hooks (ImGui) ====================
 
-static HRESULT STDMETHODCALLTYPE HookedPresent(
-    IDXGISwapChain* pThis, UINT SyncInterval, UINT Flags)
+static void TickGuiOnPresent(IDXGISwapChain* swapChain, const char* via)
 {
     ++gPresentHookCallCount;
 
@@ -521,8 +526,8 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(
     if (gPresentHookCallCount <= 5 ||
         (gPresentHookCallCount <= 600 && (gPresentHookCallCount % 60) == 0))
     {
-        Log("Present #%llu: captured=%d guiDone=%d draws=%llu",
-            (unsigned long long)gPresentHookCallCount,
+        Log("Present #%llu via %s: captured=%d guiDone=%d draws=%llu",
+            (unsigned long long)gPresentHookCallCount, via,
             (int)gDeviceCaptured,
             (int)gGuiInitDone,
             (unsigned long long)gDrawHookCallCount);
@@ -530,7 +535,7 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(
 
     if (!gGuiInitDone && gDeviceCaptured)
     {
-        if (DustGUI::Init(pThis, gDevice, gContext))
+        if (DustGUI::Init(swapChain, gDevice, gContext))
         {
             gGuiInitDone = true;
         }
@@ -543,8 +548,21 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(
     }
 
     DustGUI::Render();
+}
 
+static HRESULT STDMETHODCALLTYPE HookedPresent(
+    IDXGISwapChain* pThis, UINT SyncInterval, UINT Flags)
+{
+    TickGuiOnPresent(pThis, "Present");
     return oPresent(pThis, SyncInterval, Flags);
+}
+
+static HRESULT STDMETHODCALLTYPE HookedPresent1(
+    IDXGISwapChain1* pThis, UINT SyncInterval, UINT PresentFlags,
+    const DXGI_PRESENT_PARAMETERS* pPresentParameters)
+{
+    TickGuiOnPresent(pThis, "Present1");
+    return oPresent1(pThis, SyncInterval, PresentFlags, pPresentParameters);
 }
 
 static HRESULT STDMETHODCALLTYPE HookedResizeBuffers(
@@ -576,6 +594,7 @@ static const int VTIDX_CTX_DrawIndexedInstanced     = 20;
 static const int VTIDX_CTX_OMSetRenderTargets       = 33;
 static const int VTIDX_SC_Present                   = 8;
 static const int VTIDX_SC_ResizeBuffers             = 13;
+static const int VTIDX_SC1_Present1                  = 22;
 
 bool Install()
 {
@@ -630,6 +649,19 @@ bool Install()
     void* addrPresent      = scVtable[VTIDX_SC_Present];
     void* addrResizeBuf    = scVtable[VTIDX_SC_ResizeBuffers];
 
+    // Try to find Present1 (IDXGISwapChain1, DXGI 1.2). Many flip-model
+    // swap chains route through this and bypass Present entirely.
+    void* addrPresent1 = nullptr;
+    {
+        IDXGISwapChain1* sc1 = nullptr;
+        if (SUCCEEDED(tmpSwapChain->QueryInterface(__uuidof(IDXGISwapChain1), (void**)&sc1)) && sc1)
+        {
+            void** sc1Vtable = *reinterpret_cast<void***>(sc1);
+            addrPresent1 = sc1Vtable[VTIDX_SC1_Present1];
+            sc1->Release();
+        }
+    }
+
     Log("Function addresses discovered:");
     Log("  CreatePixelShader     = %p", addrCreatePS);
     Log("  Draw                  = %p", addrDraw);
@@ -637,6 +669,7 @@ bool Install()
     Log("  DrawIndexedInstanced  = %p", addrDrawIdxInst);
     Log("  OMSetRenderTargets    = %p", addrOMSetRT);
     Log("  Present               = %p", addrPresent);
+    Log("  Present1              = %p", addrPresent1);
     Log("  ResizeBuffers         = %p", addrResizeBuf);
 
     tmpSwapChain->Release();
@@ -704,12 +737,22 @@ bool Install()
                            (void**)&oPresent) != KenshiLib::SUCCESS)
     { Log("ERROR: Failed to hook Present"); ok = false; }
 
+    if (addrPresent1)
+    {
+        if (KenshiLib::AddHook(addrPresent1, (void*)HookedPresent1,
+                               (void**)&oPresent1) != KenshiLib::SUCCESS)
+        { Log("WARNING: Failed to hook Present1 (flip-model swap chains may not show GUI)"); }
+        else
+        { Log("  Present1 hook installed"); }
+    }
+
     if (KenshiLib::AddHook(addrResizeBuf, (void*)HookedResizeBuffers,
                            (void**)&oResizeBuffers) != KenshiLib::SUCCESS)
     { Log("ERROR: Failed to hook ResizeBuffers"); ok = false; }
 
     if (ok)
-        Log("All D3D11 hooks installed successfully (including Present + ResizeBuffers)");
+        Log("All D3D11 hooks installed successfully (Present%s + ResizeBuffers)",
+            addrPresent1 ? " + Present1" : "");
 
     return ok;
 }

@@ -14,6 +14,7 @@ cbuffer LUTParams : register(b0) {
     float lutSize;     // number of slices (e.g. 32)
     float exposure;    // EV stops
     int   tonemapper;  // see Tonemap() below — matches gLUTSettingsArray enum order
+    float whitePoint;  // Reinhard Extended only — luminance that maps to pure white
 };
 
 // ======================== Tonemapping operators ========================
@@ -27,8 +28,7 @@ float3 TM_Linear(float3 x) { return saturate(x); }
 float3 TM_Reinhard(float3 x) { return x / (1.0 + x); }
 
 // 2 — Reinhard Extended with whitepoint (preserves bright highlights)
-float3 TM_ReinhardExt(float3 x) {
-    const float W = 4.0;
+float3 TM_ReinhardExt(float3 x, float W) {
     return (x * (1.0 + x / (W * W))) / (1.0 + x);
 }
 
@@ -120,7 +120,7 @@ float3 TM_PBRNeutral(float3 x) {
 float3 Tonemap(float3 x, int mode) {
     if (mode == 0) return TM_Linear(x);
     if (mode == 1) return saturate(TM_Reinhard(x));
-    if (mode == 2) return saturate(TM_ReinhardExt(x));
+    if (mode == 2) return saturate(TM_ReinhardExt(x, whitePoint));
     if (mode == 3) return saturate(TM_ACESNarkowicz(x));
     if (mode == 4) return saturate(TM_ACESHill(x));
     if (mode == 5) return saturate(TM_Uncharted2(x));
