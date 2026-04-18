@@ -492,7 +492,8 @@ static void OnOverlayClose()
 static LRESULT CALLBACK DustWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     // Capture key binding when waiting for a new toggle key
-    if (gWaitingForKey && msg == WM_KEYDOWN)
+    // WM_SYSKEYDOWN is required for F10 (Windows treats it as a menu-activation key)
+    if (gWaitingForKey && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN))
     {
         if (wParam != VK_ESCAPE) // Escape cancels
             gFwConfig.toggleKey = (int)wParam;
@@ -500,7 +501,9 @@ static LRESULT CALLBACK DustWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         return 0;
     }
 
-    if (msg == WM_KEYDOWN && (int)wParam == gFwConfig.toggleKey && !(lParam & 0x40000000))
+    bool isToggleMsg = (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) &&
+                       (int)wParam == gFwConfig.toggleKey && !(lParam & 0x40000000);
+    if (isToggleMsg)
     {
         gOverlayVisible = !gOverlayVisible;
         if (gOverlayVisible)
@@ -1230,7 +1233,7 @@ bool Init(IDXGISwapChain* swapChain, ID3D11Device* device, ID3D11DeviceContext* 
     LoadFrameworkConfig();
 
     gInitialized = true;
-    Log("GUI: Initialized (F11 to toggle)");
+    Log("GUI: Initialized (%s to toggle)", VKKeyName(gFwConfig.toggleKey));
     return true;
 }
 

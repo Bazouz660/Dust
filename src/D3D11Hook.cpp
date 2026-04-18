@@ -81,6 +81,7 @@ static PFN_ResizeBuffers            oResizeBuffers = nullptr;
 // Draw fires but Present never does. These let us confirm that from the log.
 static uint64_t gDrawHookCallCount = 0;
 static uint64_t gPresentHookCallCount = 0;
+static bool gGuiInitDone = false;
 
 // ==================== D3DCompile hook (runtime shader patching) ====================
 
@@ -516,12 +517,22 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(
 {
     ++gPresentHookCallCount;
 
-    static bool guiInitDone = false;
-    if (!guiInitDone && gDeviceCaptured)
+    // Periodic diagnostic: confirm Present is firing and show init state
+    if (gPresentHookCallCount <= 5 ||
+        (gPresentHookCallCount <= 600 && (gPresentHookCallCount % 60) == 0))
+    {
+        Log("Present #%llu: captured=%d guiDone=%d draws=%llu",
+            (unsigned long long)gPresentHookCallCount,
+            (int)gDeviceCaptured,
+            (int)gGuiInitDone,
+            (unsigned long long)gDrawHookCallCount);
+    }
+
+    if (!gGuiInitDone && gDeviceCaptured)
     {
         if (DustGUI::Init(pThis, gDevice, gContext))
         {
-            guiInitDone = true;
+            gGuiInitDone = true;
         }
         else
         {
