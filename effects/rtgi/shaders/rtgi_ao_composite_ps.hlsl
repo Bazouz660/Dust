@@ -36,7 +36,12 @@ float4 BilateralUpsample(float2 uv, float refDepth)
     };
 
     float4 result = float4(0, 0, 0, 0);
-    float totalW = 0.0;
+    float  totalW = 0.0;
+
+    // Fallback: nearest-depth sample. Critical for AO — multiply-blend turns
+    // a degenerate ratio into black pixels at depth edges.
+    float4 bestGI = float4(0, 0, 0, 1);
+    float  bestDepthDiff = 1e20;
 
     [unroll]
     for (int i = 0; i < 4; i++)
@@ -51,9 +56,18 @@ float4 BilateralUpsample(float2 uv, float refDepth)
         float w = bilinWeights[i] * depthW;
         result += gi * w;
         totalW += w;
+
+        if (depthDiff < bestDepthDiff)
+        {
+            bestDepthDiff = depthDiff;
+            bestGI = gi;
+        }
     }
 
-    return result / max(totalW, 1e-6);
+    if (totalW < 0.01)
+        return bestGI;
+
+    return result / totalW;
 }
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target

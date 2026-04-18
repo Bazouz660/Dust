@@ -30,6 +30,7 @@ struct BloomConfig {
     float intensity = 0.5f;
     float threshold = 1.0f;
     float radius    = 2.814f;
+    float curve     = 1.0f;
     bool  debugView = false;
 };
 
@@ -57,7 +58,7 @@ struct BloomCB {
     float intensity;
     float scatter;
     float radius;
-    float pad;
+    float curve;
 };
 
 // ==================== Mip Chain ====================
@@ -330,6 +331,7 @@ static void BloomPostExecute(const DustFrameContext* ctx, const DustHostAPI* hos
         cb.texelSizeX = 1.0f / (float)gMips[0].width;
         cb.texelSizeY = 1.0f / (float)gMips[0].height;
         cb.intensity  = gConfig.intensity;
+        cb.curve      = gConfig.curve;
         host->UpdateConstantBuffer(dc, gCB, &cb, sizeof(cb));
 
         if (gConfig.debugView)
@@ -368,6 +370,7 @@ static DustSettingDesc gBloomSettingsArray[] = {
     { "Intensity",  DUST_SETTING_FLOAT, &gConfig.intensity,  0.0f, 2.0f, "Intensity" },
     { "Threshold",  DUST_SETTING_FLOAT, &gConfig.threshold,  0.0f, 5.0f, "Threshold" },
     { "Radius",     DUST_SETTING_FLOAT, &gConfig.radius,    0.5f, 3.0f, "Radius" },
+    { "Curve",      DUST_SETTING_FLOAT, &gConfig.curve,     0.5f, 3.0f, "Curve" },
     { "Debug View", DUST_SETTING_BOOL,  &gConfig.debugView,  0.0f, 1.0f, "DebugView" },
 };
 

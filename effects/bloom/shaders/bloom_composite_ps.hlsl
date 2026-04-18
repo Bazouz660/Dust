@@ -10,10 +10,11 @@ cbuffer BloomParams : register(b0) {
     float intensity;
     float scatter;
     float radius;
-    float padding;
+    float curve;
 };
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
     float3 bloom = bloomTex.SampleLevel(linearSamp, uv, 0).rgb;
+    bloom = pow(max(bloom, 0.0), curve);
     return float4(bloom * intensity, 1.0);
 }

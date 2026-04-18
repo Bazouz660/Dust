@@ -112,10 +112,12 @@ cbuffer RTGIParams : register(b0)
     float  raysPerPixel;
     float  thicknessCurve;
     float  _pad0;
+    float2 sampleJitter; // render-viewport UV pixels, in [-0.5, 0.5]
+    float2 _padJitter;
     float4x4 inverseView;
 };
 
-float4 TraceRay(float2 startUV, float startDepth, float3 startView, float3 rayDirView, int numSteps)
+float4 TraceRay(float2 startUV, float startDepth, float3 startView, float3 rayDirView, int numSteps, float thicknessLimit)
 {
     float3 endView = startView + rayDirView * rayLength * startDepth;
 
@@ -145,10 +147,7 @@ float4 TraceRay(float2 startUV, float startDepth, float3 startView, float3 rayDi
 
         float depthDiff = rayDepth - sceneDepth;
 
-        // Thickness curve: exponent < 1 tightens the "back wall" for distant
-        // geometry, avoiding bleed/halos where foreground objects would occlude
-        // more than a linear-depth window would allow.
-        if (depthDiff > 0.0 && depthDiff < thickness * pow(startDepth, thicknessCurve))
+        if (depthDiff > 0.0 && depthDiff < thicknessLimit)
         {
             // Binary search refinement — locate the exact ray/geometry crossing
             // between the last-miss step and this hit step. 4 iterations = 1/16th
@@ -205,6 +204,13 @@ float4 TraceRay(float2 startUV, float startDepth, float3 startView, float3 rayDi
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 {
+    // Sub-pixel temporal jitter: each frame, the render-res pixel samples
+    // a different sub-pixel position in the full-res depth buffer. Over the
+    // 16-frame Halton cycle, quarter-res covers its full 4×4 footprint and
+    // half-res covers its 2×2 footprint. Temporal accumulation averages the
+    // samples, recovering detail that would otherwise be lost at reduced res.
+    uv += sampleJitter * invViewportSize;
+
     float depth = depthTex.SampleLevel(pointClamp, uv, 0);
 
     if (depth <= 0.0001 || depth > fadeDistance)
@@ -220,6 +226,10 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
     int iRaysPerPixel = max(1, (int)raysPerPixel);
     int iRaySteps = max(8, (int)raySteps);
+
+    // Thickness curve: exponent < 1 tightens the "back wall" for distant
+    // geometry. Hoisted out of the ray loop — constant per pixel.
+    float thicknessLimit = thickness * pow(depth, thicknessCurve);
 
     // Per-frame jitter of the IGN input breaks its directional banding — stripes
     // shift each frame so temporal accumulation averages them out.
@@ -243,7 +253,7 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         if (dot(rayDir, normal) < 0.0)
             rayDir = -rayDir;
 
-        float4 hitResult = TraceRay(uv, depth, startView, rayDir, iRaySteps);
+        float4 hitResult = TraceRay(uv, depth, startView, rayDir, iRaySteps, thicknessLimit);
 
         totalIndirect += hitResult.rgb;
         totalOcclusion += hitResult.w;

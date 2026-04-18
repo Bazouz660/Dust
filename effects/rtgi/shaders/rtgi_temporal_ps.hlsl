@@ -60,6 +60,23 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     if (frameIndex < 1.0 || depth <= 0.0001)
         return current;
 
+    // ---- Firefly clamp ----
+    // Clamp current to the min/max of its 4 cardinal neighbors. A stray hit
+    // (specular, sun, long distance) would otherwise pollute history for
+    // ~30 frames at temporalBlend=0.97 and show as a stationary bright speckle.
+    // Cost: 4 extra texel fetches. AABB clip on the RAW input only — history
+    // is left alone so legitimate highlights that survive over many frames
+    // still show through.
+    {
+        float4 cN = currentGI.SampleLevel(pointClamp, uv + float2(0, -invViewportSize.y), 0);
+        float4 cS = currentGI.SampleLevel(pointClamp, uv + float2(0,  invViewportSize.y), 0);
+        float4 cE = currentGI.SampleLevel(pointClamp, uv + float2( invViewportSize.x, 0), 0);
+        float4 cW = currentGI.SampleLevel(pointClamp, uv + float2(-invViewportSize.x, 0), 0);
+        float3 cMin = min(min(cN.rgb, cS.rgb), min(cE.rgb, cW.rgb));
+        float3 cMax = max(max(cN.rgb, cS.rgb), max(cE.rgb, cW.rgb));
+        current.rgb = clamp(current.rgb, cMin, cMax);
+    }
+
     // ---- Always read history at current UV (no reprojection contamination) ----
     float4 history = historyGI.SampleLevel(pointClamp, uv, 0);
 

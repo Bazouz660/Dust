@@ -55,6 +55,13 @@ void (*GameWorld__mainLoop_GPUSensitiveStuff_orig)(GameWorld* thisptr, float tim
 
 void GameWorld__mainLoop_GPUSensitiveStuff_hook(GameWorld* thisptr, float time)
 {
+    // Diagnostic: confirm game loop is actually firing. Pairs with Present diagnostic
+    // in D3D11Hook so we can tell apart "game frozen" vs "Present hook bypassed".
+    static uint64_t sLoopCount = 0;
+    ++sLoopCount;
+    if (sLoopCount <= 5 || (sLoopCount <= 600 && (sLoopCount % 60) == 0))
+        Log("GameLoop #%llu", (unsigned long long)sLoopCount);
+
     // Reset per-frame state before the game renders
     D3D11Hook::ResetFrameState();
 

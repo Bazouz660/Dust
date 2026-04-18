@@ -264,6 +264,13 @@ static int RTGIIsEnabled()
 
 // ==================== Settings ====================
 
+static const char* const gResolutionLabels[] = {
+    "Full",
+    "Half",
+    "Quarter",
+    nullptr
+};
+
 static DustSettingDesc gSettingsArray[] = {
     { "Enabled",            DUST_SETTING_BOOL,  &gRTGIConfig.enabled,         0.0f,   1.0f,   "Enabled" },
     { "GI Intensity",       DUST_SETTING_FLOAT, &gRTGIConfig.giIntensity,     0.0f,   5.0f,   "GIIntensity" },
@@ -280,7 +287,7 @@ static DustSettingDesc gSettingsArray[] = {
     { "Denoise Steps",      DUST_SETTING_INT,   &gRTGIConfig.denoiseSteps,    0.0f,   5.0f,   "DenoiseSteps" },
     { "Depth Sigma",        DUST_SETTING_FLOAT, &gRTGIConfig.depthSigma,      0.1f,   5.0f,   "DepthSigma" },
     { "Color Phi",          DUST_SETTING_FLOAT, &gRTGIConfig.phiColor,        1.0f,   10.0f,  "PhiColor" },
-    { "Half Resolution",    DUST_SETTING_BOOL,  &gRTGIConfig.halfResolution,  0.0f,   1.0f,   "HalfResolution" },
+    { "Resolution",         DUST_SETTING_ENUM,  &gRTGIConfig.resolutionMode,  0.0f,   2.0f,   "ResolutionMode", gResolutionLabels },
     { "Debug View",         DUST_SETTING_INT,   &gRTGIConfig.debugView,       0.0f,   3.0f,   "DebugView" },
     // Hidden
     { "Tan Half FOV",       DUST_SETTING_HIDDEN_FLOAT, &gRTGIConfig.tanHalfFov, 0.1f, 2.0f,   "TanHalfFov" },

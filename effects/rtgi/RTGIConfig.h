@@ -27,8 +27,9 @@ struct RTGIConfig
     float depthSigma    = 2.0f;    // depth weight sensitivity (higher = more permissive on smooth surfaces)
     float phiColor      = 4.0f;    // luminance sensitivity (variance-guided, higher = smoother)
 
-    // Quality
-    bool  halfResolution = false;
+    // Quality — 0=full, 1=half, 2=quarter. Sub-pixel temporal jitter
+    // (Halton 2,3) reclaims most of the detail lost at reduced resolution.
+    int   resolutionMode = 0;
 
     // Camera (hidden)
     float tanHalfFov    = 0.5218f;

@@ -10,7 +10,7 @@ cbuffer BloomParams : register(b0) {
     float intensity;
     float scatter;
     float radius;
-    float padding;
+    float curve;
 };
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
