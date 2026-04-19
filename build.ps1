@@ -51,7 +51,6 @@ New-Item -ItemType Directory -Force -Path "$ModDir\presets"         | Out-Null
 Copy-Item "$Root\src\build\Release\Dust.dll"  "$ModDir\"
 Copy-Item "$Root\mod\RE_Kenshi.json"          "$ModDir\"
 Copy-Item "$Root\mod\Dust.mod"                "$ModDir\"
-Copy-Item "$Root\mod\shaders\deferred.hlsl"   "$ModDir\shaders\"
 
 foreach ($effect in $Effects) {
     $dll = Get-ChildItem "$Root\effects\$effect\build\Release\Dust*.dll" | Select-Object -First 1
