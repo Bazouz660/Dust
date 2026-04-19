@@ -44,8 +44,30 @@ The flickering comes from the warp tree recomputation on the CPU side, before an
 
 ---
 
-## Recommended Approach
+## Implemented: Improved RTWSM Shadow Filtering
 
-**Screen-space contact shadows + better filtering + shadow map resolution bump.** This combo would meaningfully improve the close-range experience without touching the engine's shadow architecture.
+The deferred lighting shader is patched at D3DCompile time (via `PatchDeferredShader` in `D3D11Hook.cpp`) to replace the vanilla `RTWShadow()` call with `DustRTWShadow()`:
 
-Screen-space contact shadows are now implemented — see `effects/sss/`. Better filtering and shadow map resolution override remain as future work.
+**Vanilla problems fixed:**
+- PCF texel size was `0.0001` — for a 2048 shadow map (texel ≈ 0.000488), the 3x3 grid covered less than one texel. Essentially a single sample.
+- Regular grid pattern visible as blocky shadow edges.
+- No per-pixel variation — identical artifact patterns across the screen.
+
+**DustRTWShadow improvements:**
+- **12-sample Poisson disk** — well-distributed samples vs. 3×3 grid (9 samples).
+- **Per-pixel rotation** via interleaved gradient noise — eliminates banding, looks smooth.
+- **Correct filter radius** — `0.0012` in pre-warp UV (covers ~2.5 texels) vs. `0.0001` (< 1 texel).
+- **PCSS blocker search** (12-sample) — estimates distance to occluder, produces variable penumbra. Contact shadows are sharp, distant shadows are soft. Toggled via `DUST_SHADOW_PCSS` define (default on).
+- **Compilation fallback** — if the patched shader fails, falls back to vanilla automatically.
+
+**Tunable constants** (in the injected shader source):
+- `fr` (filterRadius): base PCF filter size in pre-warp UV. Default `0.0012`.
+- `ls` (lightSize): virtual light size for PCSS search radius. Default `0.004`.
+- `DUST_SHADOW_PCSS`: set to `0` to disable PCSS and use fixed-radius PCF only.
+
+**Performance:** ~48 texture reads/pixel (PCSS on) vs. 18 (vanilla). ~2.7× shadow sampling cost, acceptable for a graphics mod.
+
+## Remaining Future Work
+
+- **Shadow map resolution override** — intercept `CreateTexture2D` to force higher-res shadow maps.
+- **Runtime parameter tuning** — add constant buffer for live adjustment of filter radius / light size via GUI.

@@ -33,7 +33,7 @@ function Build-Project($vcxproj) {
 Build-Project (Join-Path $Root "src\Dust.vcxproj")
 
 # Build effect plugins (SSS excluded — not release-ready)
-$Effects = @("ssao", "lut", "bloom", "dof", "ssil", "clarity", "outline", "kuwahara", "rtgi")
+$Effects = @("ssao", "lut", "bloom", "dof", "ssil", "clarity", "outline", "kuwahara", "rtgi", "shadows")
 foreach ($effect in $Effects) {
     $vcxproj = Get-ChildItem (Join-Path $Root "effects\$effect\*.vcxproj") | Select-Object -First 1
     Build-Project $vcxproj.FullName

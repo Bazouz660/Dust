@@ -23,6 +23,7 @@ bool gDeviceCaptured = false;
 
 static UINT gWidth = 0;
 static UINT gHeight = 0;
+static UINT gShadowResOverride = 0;
 static uint64_t gFrameIndex = 0;
 static bool gDispatchedThisFrame = false;
 
@@ -42,6 +43,10 @@ void ResetFrameState()
 }
 
 // ==================== Original function pointers ====================
+
+typedef HRESULT(STDMETHODCALLTYPE* PFN_CreateTexture2D)(
+    ID3D11Device* pThis, const D3D11_TEXTURE2D_DESC* pDesc,
+    const D3D11_SUBRESOURCE_DATA* pInitialData, ID3D11Texture2D** ppTexture2D);
 
 typedef HRESULT(STDMETHODCALLTYPE* PFN_CreatePixelShader)(
     ID3D11Device* pThis, const void* pShaderBytecode, SIZE_T BytecodeLength,
@@ -70,6 +75,7 @@ typedef HRESULT(STDMETHODCALLTYPE* PFN_ResizeBuffers)(
     IDXGISwapChain* pThis, UINT BufferCount, UINT Width, UINT Height,
     DXGI_FORMAT NewFormat, UINT SwapChainFlags);
 
+static PFN_CreateTexture2D          oCreateTexture2D = nullptr;
 static PFN_CreatePixelShader        oCreatePixelShader = nullptr;
 static PFN_Draw                     oDraw = nullptr;
 static PFN_DrawIndexed              oDrawIndexed = nullptr;
@@ -100,11 +106,13 @@ typedef HRESULT(WINAPI* PFN_D3DCompileHook)(
 
 static PFN_D3DCompileHook oD3DCompile = nullptr;
 
-// Patch vanilla deferred.hlsl source to add AO support.
+// Patch vanilla deferred.hlsl source to add AO support and improved shadow filtering.
 // Returns the modified source, or the original if patterns weren't found.
 static std::string PatchDeferredShader(const std::string& src)
 {
     std::string result = src;
+
+    // === AO Patches ===
 
     // Injection 1: Add aoMap + aoParams sampler declarations.
     // Anchor: "uniform float4 ambientParams," exists in all variants.
@@ -142,6 +150,136 @@ static std::string PatchDeferredShader(const std::string& src)
         "\tsunLight.specular *= directFade;\n\n\t";
     result.insert(pos2, inject2);
 
+    // === Shadow Patches ===
+    // Replace vanilla RTWShadow (3x3 PCF with 0.0001 texel size — essentially a single sample)
+    // with improved filtering: 12-sample Poisson disk, per-pixel rotation, PCSS penumbra.
+    // Parameters come from a constant buffer (b2) bound by the Shadows effect plugin.
+
+    // Injection 3: Add cbuffer declaration + DustRTWShadow function.
+    // Insert before main_vs so it's defined after includes (GetOffsetLocationS, ShadowMap)
+    // but before use in main_fs.
+    const char* anchor3 = "void main_vs (";
+    size_t pos3 = result.find(anchor3);
+    if (pos3 != std::string::npos)
+    {
+        std::string inject3 =
+            "// [Dust] Shadow filtering parameters (bound by Shadows plugin at b2)\n"
+            "cbuffer DustShadowParams : register(b2) {\n"
+            "\tfloat dustShadowEnabled;\n"
+            "\tfloat dustFilterRadius;\n"
+            "\tfloat dustLightSize;\n"
+            "\tfloat dustPCSSEnabled;\n"
+            "\tfloat dustBiasScale;\n"
+            "};\n\n"
+            "// [Dust] Improved RTWSM shadow filtering (post-warp offsets)\n"
+            "float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,\n"
+            "                     float3 worldPos, float b, float edgeBias, float2 screenPos) {\n"
+            "\tfloat4 sc = mul(shadowMatrix, float4(worldPos, 1));\n"
+            "\tfloat2 center = GetOffsetLocationS(wMap, sc.xy);\n"
+            "\tfloat2 edge = saturate(abs(center - 0.5) * 20 - 9);\n"
+            "\tb += edgeBias * (edge.x + edge.y);\n"
+            "\tfloat sd = saturate(sc.z);\n"
+            "\n"
+            "\tfloat noise = frac(52.9829189 * frac(dot(screenPos, float2(0.06711056, 0.00583715))));\n"
+            "\tfloat ang = noise * 6.28318530718;\n"
+            "\tfloat sa, ca;\n"
+            "\tsincos(ang, sa, ca);\n"
+            "\tfloat2x2 rot = float2x2(ca, sa, -sa, ca);\n"
+            "\n"
+            "\tstatic const float2 pd[12] = {\n"
+            "\t\tfloat2(-0.326212, -0.405810),\n"
+            "\t\tfloat2(-0.840144, -0.073580),\n"
+            "\t\tfloat2(-0.695914,  0.457137),\n"
+            "\t\tfloat2(-0.203345,  0.620716),\n"
+            "\t\tfloat2( 0.962340, -0.194983),\n"
+            "\t\tfloat2( 0.473434, -0.480026),\n"
+            "\t\tfloat2( 0.519456,  0.767022),\n"
+            "\t\tfloat2( 0.185461, -0.893124),\n"
+            "\t\tfloat2( 0.507431,  0.064425),\n"
+            "\t\tfloat2( 0.896420,  0.412458),\n"
+            "\t\tfloat2(-0.321940, -0.932615),\n"
+            "\t\tfloat2(-0.791559, -0.597705)\n"
+            "\t};\n"
+            "\n"
+            "\tfloat fr = dustFilterRadius;\n"
+            "\tfloat ls = dustLightSize;\n"
+            "\tb += fr * dustBiasScale;\n"
+            "\n"
+            "\tif (dustPCSSEnabled > 0.5) {\n"
+            "\t\tfloat bSum = 0;\n"
+            "\t\tfloat bCnt = 0;\n"
+            "\t\t[unroll]\n"
+            "\t\tfor (int j = 0; j < 12; j++) {\n"
+            "\t\t\tfloat2 off = mul(rot, pd[j]) * ls;\n"
+            "\t\t\tfloat2 suv = center + off;\n"
+            "\t\t\tfloat dd = tex2Dlod(sMap, float4(suv, 0, 0)).x;\n"
+            "\t\t\tif (dd < sd - b) {\n"
+            "\t\t\t\tbSum += dd;\n"
+            "\t\t\t\tbCnt += 1.0;\n"
+            "\t\t\t}\n"
+            "\t\t}\n"
+            "\t\tif (bCnt > 0) {\n"
+            "\t\t\tfloat avgB = bSum / bCnt;\n"
+            "\t\t\tfloat pen = (sd - avgB) * ls / max(avgB, 0.001);\n"
+            "\t\t\tfr = clamp(pen, fr * 0.5, fr * 3.0);\n"
+            "\t\t}\n"
+            "\t}\n"
+            "\n"
+            "\tfloat shadow = 0;\n"
+            "\t[unroll]\n"
+            "\tfor (int i = 0; i < 12; i++) {\n"
+            "\t\tfloat2 off = mul(rot, pd[i]) * fr;\n"
+            "\t\tfloat2 suv = center + off;\n"
+            "\t\tshadow += ShadowMap(sMap, suv, sd, b, 0);\n"
+            "\t}\n"
+            "\tshadow /= 12.0;\n"
+            "\treturn shadow;\n"
+            "}\n\n";
+        result.insert(pos3, inject3);
+        Log("ShaderPatch: injected DustShadowParams cbuffer + DustRTWShadow function");
+    }
+    else
+    {
+        Log("ShaderPatch: anchor 'main_vs' not found, shadow function injection skipped");
+    }
+
+    // Injection 4: Replace RTWShadow call with conditional.
+    // Search for "= RTWShadow(" to find the call site (skips DustRTWShadow definition).
+    // Extracts parameters dynamically so it works regardless of spacing or extra bias terms.
+    const char* callAnchor = "= RTWShadow(";
+    size_t anchorPos = result.find(callAnchor);
+    if (anchorPos != std::string::npos)
+    {
+        size_t funcStart = anchorPos + 2; // position of 'R' in RTWShadow
+        size_t openParen = result.find('(', funcStart);
+
+        int depth = 1;
+        size_t scan = openParen + 1;
+        while (scan < result.size() && depth > 0)
+        {
+            if (result[scan] == '(') depth++;
+            else if (result[scan] == ')') depth--;
+            scan++;
+        }
+        size_t closeParen = scan - 1;
+
+        std::string originalCall = result.substr(funcStart, closeParen - funcStart + 1);
+        std::string params = result.substr(openParen + 1, closeParen - openParen - 1);
+
+        std::string newExpr =
+            "(dustShadowEnabled > 0.5) "
+            "? DustRTWShadow(" + params + ", pixel.xy) "
+            ": " + originalCall;
+
+        result.replace(funcStart, closeParen - funcStart + 1, newExpr);
+        Log("ShaderPatch: redirected RTWShadow -> conditional DustRTWShadow");
+        Log("ShaderPatch: original call: %s", originalCall.c_str());
+    }
+    else
+    {
+        Log("ShaderPatch: '= RTWShadow(' not found, shadow redirect skipped");
+    }
+
     return result;
 }
 
@@ -166,7 +304,20 @@ static HRESULT WINAPI HookedD3DCompile(
             {
                 Log("ShaderPatch: patched deferred main_fs (%zu -> %zu bytes)",
                     src.size(), patched.size());
-                return oD3DCompile(patched.c_str(), patched.size(), pSourceName,
+                HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
+                                          pDefines, pInclude, pEntrypoint, pTarget,
+                                          Flags1, Flags2, ppCode, ppErrorMsgs);
+                if (SUCCEEDED(hr))
+                    return hr;
+
+                Log("ShaderPatch: patched shader failed to compile, falling back to original");
+                if (ppErrorMsgs && *ppErrorMsgs)
+                {
+                    Log("ShaderPatch: error: %s", (const char*)(*ppErrorMsgs)->GetBufferPointer());
+                    (*ppErrorMsgs)->Release();
+                    *ppErrorMsgs = nullptr;
+                }
+                return oD3DCompile(pSrcData, SrcDataSize, pSourceName,
                                     pDefines, pInclude, pEntrypoint, pTarget,
                                     Flags1, Flags2, ppCode, ppErrorMsgs);
             }
@@ -237,6 +388,61 @@ static void TryCaptureDevice(ID3D11Device* device)
 }
 
 // ==================== Hook implementations ====================
+
+static bool IsPowerOf2(UINT v) { return v && !(v & (v - 1)); }
+
+static const char* FormatName(DXGI_FORMAT f)
+{
+    switch (f) {
+        case DXGI_FORMAT_R32_FLOAT:     return "R32_FLOAT";
+        case DXGI_FORMAT_R32_TYPELESS:  return "R32_TYPELESS";
+        case DXGI_FORMAT_R16_FLOAT:     return "R16_FLOAT";
+        case DXGI_FORMAT_R16_UNORM:     return "R16_UNORM";
+        case DXGI_FORMAT_R16_TYPELESS:  return "R16_TYPELESS";
+        case DXGI_FORMAT_R24G8_TYPELESS:return "R24G8_TYPELESS";
+        case DXGI_FORMAT_D32_FLOAT:     return "D32_FLOAT";
+        case DXGI_FORMAT_D16_UNORM:     return "D16_UNORM";
+        case DXGI_FORMAT_D24_UNORM_S8_UINT: return "D24S8";
+        default: return nullptr;
+    }
+}
+
+static HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
+    ID3D11Device* pThis, const D3D11_TEXTURE2D_DESC* pDesc,
+    const D3D11_SUBRESOURCE_DATA* pInitialData, ID3D11Texture2D** ppTexture2D)
+{
+    if (pDesc && pDesc->Width == pDesc->Height &&
+        IsPowerOf2(pDesc->Width) && pDesc->Width >= 256 && pDesc->Width <= 8192)
+    {
+        const char* fn = FormatName(pDesc->Format);
+        if (fn)
+        {
+            bool hasSRV = (pDesc->BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0;
+            bool hasRTV = (pDesc->BindFlags & D3D11_BIND_RENDER_TARGET) != 0;
+            bool hasDSV = (pDesc->BindFlags & D3D11_BIND_DEPTH_STENCIL) != 0;
+            Log("CreateTex2D: %ux%u %s bind=%s%s%s",
+                pDesc->Width, pDesc->Height, fn,
+                hasSRV ? "SRV " : "", hasRTV ? "RTV " : "", hasDSV ? "DSV " : "");
+
+            if (gShadowResOverride > 0 && hasSRV && !pInitialData &&
+                pDesc->Width >= 1024 && pDesc->Width != gShadowResOverride &&
+                pDesc->MipLevels == 1 && pDesc->ArraySize == 1 &&
+                pDesc->SampleDesc.Count == 1 &&
+                (pDesc->Format == DXGI_FORMAT_R32_FLOAT ||
+                 pDesc->Format == DXGI_FORMAT_R32_TYPELESS))
+            {
+                D3D11_TEXTURE2D_DESC modified = *pDesc;
+                modified.Width  = gShadowResOverride;
+                modified.Height = gShadowResOverride;
+                Log("CreateTex2D: shadow map override %ux%u -> %ux%u",
+                    pDesc->Width, pDesc->Height, modified.Width, modified.Height);
+                return oCreateTexture2D(pThis, &modified, pInitialData, ppTexture2D);
+            }
+        }
+    }
+
+    return oCreateTexture2D(pThis, pDesc, pInitialData, ppTexture2D);
+}
 
 static HRESULT STDMETHODCALLTYPE HookedCreatePixelShader(
     ID3D11Device* pThis, const void* pShaderBytecode, SIZE_T BytecodeLength,
@@ -587,6 +793,7 @@ static HRESULT STDMETHODCALLTYPE HookedResizeBuffers(
 
 // ==================== Install ====================
 
+static const int VTIDX_DEVICE_CreateTexture2D       = 5;
 static const int VTIDX_DEVICE_CreatePixelShader     = 15;
 static const int VTIDX_CTX_DrawIndexed              = 12;
 static const int VTIDX_CTX_Draw                     = 13;
@@ -641,6 +848,7 @@ bool Install()
     void** ctxVtable = *reinterpret_cast<void***>(tmpContext);
     void** scVtable  = *reinterpret_cast<void***>(tmpSwapChain);
 
+    void* addrCreateTex2D  = devVtable[VTIDX_DEVICE_CreateTexture2D];
     void* addrCreatePS     = devVtable[VTIDX_DEVICE_CreatePixelShader];
     void* addrDraw         = ctxVtable[VTIDX_CTX_Draw];
     void* addrDrawIndexed  = ctxVtable[VTIDX_CTX_DrawIndexed];
@@ -712,6 +920,21 @@ bool Install()
         if (!hooked)
         { Log("WARNING: Could not hook D3DCompile, shader patching disabled"); }
     }
+
+    // Read shadow resolution multiplier from Dust.ini
+    {
+        std::string ini = DustLogDir() + "Dust.ini";
+        int val = GetPrivateProfileIntA("Shadows", "ShadowResolution", 0, ini.c_str());
+        if (val >= 1024 && val <= 8192)
+        {
+            gShadowResOverride = (UINT)val;
+            Log("  Shadow map resolution override: %u", gShadowResOverride);
+        }
+    }
+
+    if (KenshiLib::AddHook(addrCreateTex2D, (void*)HookedCreateTexture2D,
+                           (void**)&oCreateTexture2D) != KenshiLib::SUCCESS)
+    { Log("ERROR: Failed to hook CreateTexture2D"); ok = false; }
 
     if (KenshiLib::AddHook(addrCreatePS, (void*)HookedCreatePixelShader,
                            (void**)&oCreatePixelShader) != KenshiLib::SUCCESS)
