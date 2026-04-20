@@ -161,7 +161,7 @@ Additional effects that stay within the post-processing paradigm:
 | Effect | Description | Impact |
 |--------|-------------|--------|
 | **SSR** | Screen-space reflections via depth-buffer ray march | High — no reflections currently exist |
-| **TAA** | Temporal anti-aliasing using RTGI's reprojection infrastructure | High — replaces FXAA, massive quality jump |
+| **SMAA** | Subpixel morphological AA (spatial only, no temporal) | High — replaces FXAA, sharper edges without smearing |
 | **Volumetric Lighting** | Ray march depth buffer with scattering model for god rays / atmospheric dust | High — fits Kenshi's desert aesthetic |
 | **PBR Deferred Upgrade** | Patch deferred shader to use Cook-Torrance GGX BRDF | Medium — better material response |
 
@@ -469,8 +469,8 @@ New injection in `PatchDeferredShader`:
 | `HookedDrawIndexed` hook | Geometry capture entry point |
 | `PipelineDetector` pattern | GBuffer-pass detection (same state-inspection approach) |
 | `CaptureLightingResources` pattern | Capturing VB/IB/VS/CB references |
-| RTGI temporal accumulation | Shadow temporal filtering (if needed) |
-| RTGI A-trous denoise | Shadow denoising (if soft shadows need it) |
+| RTGI A-trous spatial denoiser | Shadow spatial filtering (if needed) |
+| RTGI A-trous denoise | Spatial shadow denoising (if soft shadows need it) |
 | RTGI camera data extraction | Light data extraction (same CB readback technique) |
 | `D3DCompile` shader patching | CSM integration into deferred shader |
 | `DrawFullscreenTriangle` | Shadow composite pass |
@@ -486,7 +486,7 @@ New injection in `PatchDeferredShader`:
 1. **DrawIndexed geometry survey** — understand what the game sends us
 2. **Geometry capture system** — build the per-frame draw call list
 3. **Custom CSM** — proper shadows, the #1 visual issue
-4. **TAA** — temporal anti-aliasing using existing reprojection infra
+4. **SMAA** — subpixel morphological anti-aliasing (spatial only, replaces FXAA)
 5. **Volumetric lighting** — atmospheric depth for Kenshi's desert setting
 6. **SSR** — screen-space reflections
 7. **PBR deferred upgrade** — better material response

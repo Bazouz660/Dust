@@ -670,7 +670,7 @@ static void DrawFrameworkSection()
 
     ImGui::Checkbox("Logging", &gFwConfig.logging);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Write logs to Dust.log next to the DLL");
+        ImGui::SetTooltip("Write timestamped logs to logs/ folder next to the DLL");
 
     ImGui::Checkbox("Startup Message", &gFwConfig.showStartupMessage);
     if (ImGui::IsItemHovered())
