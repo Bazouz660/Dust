@@ -1,6 +1,8 @@
 #include "DustGUI.h"
 #include "DustLog.h"
 #include "EffectLoader.h"
+#include "Survey.h"
+#include "SurveyRecorder.h"
 #include "imgui/imgui.h"
 #include "imgui/backends/imgui_impl_win32.h"
 #include "imgui/backends/imgui_impl_dx11.h"
@@ -692,6 +694,37 @@ static void DrawFrameworkSection()
     ImGui::SameLine();
     if (ImGui::Button("Reset##fw", ImVec2(80, 0)) && dirty)
         ResetFrameworkConfig();
+
+    // ---- Pipeline Survey ----
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Pipeline Survey");
+
+    if (Survey::IsActive())
+    {
+        ImGui::TextWrapped("Capturing frame %d / %d...",
+                           Survey::CurrentFrame() + 1, Survey::TotalFrames());
+        if (ImGui::Button("Stop Survey", ImVec2(ImGui::GetContentRegionAvail().x, 0)))
+            Survey::Stop();
+    }
+    else
+    {
+        static int surveyFrames = 3;
+        static int surveyDetail = 1;
+        ImGui::SliderInt("Frames##survey", &surveyFrames, 1, 30);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Number of frames to capture");
+        ImGui::SliderInt("Detail##survey", &surveyDetail, 0, 3);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("0=Minimal, 1=Standard, 2=Deep (CB data), 3=Full (VB/IB)");
+        if (ImGui::Button("Capture Survey", ImVec2(ImGui::GetContentRegionAvail().x, 0)))
+        {
+            SurveyRecorder::Reset();
+            Survey::Start(surveyFrames, surveyDetail);
+        }
+    }
 }
 
 // ==================== Drawing: Global preset selector ====================

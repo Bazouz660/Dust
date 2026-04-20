@@ -3,6 +3,9 @@
 #include "PipelineDetector.h"
 #include "EffectLoader.h"
 #include "ResourceRegistry.h"
+#include "Survey.h"
+#include "SurveyRecorder.h"
+#include "SurveyWriter.h"
 #include "DustLog.h"
 #include <core/Functions.h>
 #include <d3d11.h>
@@ -11,6 +14,7 @@
 #include <dxgi1_2.h>
 #include <string>
 #include <cstring>
+#include <vector>
 
 namespace D3D11Hook
 {
@@ -27,9 +31,8 @@ static UINT gShadowResOverride = 0;
 static uint64_t gFrameIndex = 0;
 static bool gDispatchedThisFrame = false;
 
-#ifdef DUST_SURVEY
-static bool gResetPending = false;
-#endif
+// Survey: collected frame data for writing after all frames captured
+static std::vector<SurveyFrameData> sSurveyFrames;
 
 void ResetFrameState()
 {
@@ -37,9 +40,6 @@ void ResetFrameState()
     gResourceRegistry.ResetFrame();
     gDispatchedThisFrame = false;
     gFrameIndex++;
-#ifdef DUST_SURVEY
-    gResetPending = true;
-#endif
 }
 
 // ==================== Original function pointers ====================
@@ -308,7 +308,14 @@ static HRESULT WINAPI HookedD3DCompile(
                                           pDefines, pInclude, pEntrypoint, pTarget,
                                           Flags1, Flags2, ppCode, ppErrorMsgs);
                 if (SUCCEEDED(hr))
+                {
+                    // Record shader source for survey (use patched source)
+                    if (ppCode && *ppCode)
+                        SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
+                            pEntrypoint, pTarget, pSourceName,
+                            (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
                     return hr;
+                }
 
                 Log("ShaderPatch: patched shader failed to compile, falling back to original");
                 if (ppErrorMsgs && *ppErrorMsgs)
@@ -317,16 +324,24 @@ static HRESULT WINAPI HookedD3DCompile(
                     (*ppErrorMsgs)->Release();
                     *ppErrorMsgs = nullptr;
                 }
-                return oD3DCompile(pSrcData, SrcDataSize, pSourceName,
-                                    pDefines, pInclude, pEntrypoint, pTarget,
-                                    Flags1, Flags2, ppCode, ppErrorMsgs);
+                // Fall through to compile original below
             }
         }
     }
 
-    return oD3DCompile(pSrcData, SrcDataSize, pSourceName,
-                        pDefines, pInclude, pEntrypoint, pTarget,
-                        Flags1, Flags2, ppCode, ppErrorMsgs);
+    HRESULT hr = oD3DCompile(pSrcData, SrcDataSize, pSourceName,
+                              pDefines, pInclude, pEntrypoint, pTarget,
+                              Flags1, Flags2, ppCode, ppErrorMsgs);
+
+    // Record shader source for survey (always, for all shaders)
+    if (SUCCEEDED(hr) && ppCode && *ppCode && pSrcData && SrcDataSize > 0)
+    {
+        SurveyRecorder::OnShaderCompiled(pSrcData, SrcDataSize,
+            pEntrypoint, pTarget, pSourceName,
+            (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+    }
+
+    return hr;
 }
 
 // ==================== Device capture ====================
@@ -452,101 +467,39 @@ static HRESULT STDMETHODCALLTYPE HookedCreatePixelShader(
     // temporary enumeration devices that are destroyed before rendering begins.
     // Device capture happens in HookedDraw from the actual rendering context.
 
-    return oCreatePixelShader(pThis, pShaderBytecode, BytecodeLength,
-                               pClassLinkage, ppPixelShader);
+    HRESULT hr = oCreatePixelShader(pThis, pShaderBytecode, BytecodeLength,
+                                     pClassLinkage, ppPixelShader);
+    if (SUCCEEDED(hr) && ppPixelShader && *ppPixelShader)
+        SurveyRecorder::OnPixelShaderCreated(pShaderBytecode, BytecodeLength, *ppPixelShader);
+    return hr;
 }
 
-#ifdef DUST_SURVEY
-// Pipeline survey: log all fullscreen draws for the first few frames
-static int gSurveyFrameCount = 0;
-static int gSurveyDrawIndex = 0;
-static const int SURVEY_FRAMES = 5;
+// ==================== CreateVertexShader hook (for shader source tracking) ====================
 
-static void SurveyFullscreenDraw(ID3D11DeviceContext* ctx, UINT vertexCount)
+typedef HRESULT(STDMETHODCALLTYPE* PFN_CreateVertexShader)(
+    ID3D11Device* pThis, const void* pShaderBytecode, SIZE_T BytecodeLength,
+    ID3D11ClassLinkage* pClassLinkage, ID3D11VertexShader** ppVertexShader);
+
+static PFN_CreateVertexShader oCreateVertexShader = nullptr;
+
+static HRESULT STDMETHODCALLTYPE HookedCreateVertexShader(
+    ID3D11Device* pThis, const void* pShaderBytecode, SIZE_T BytecodeLength,
+    ID3D11ClassLinkage* pClassLinkage, ID3D11VertexShader** ppVertexShader)
 {
-    if (gSurveyFrameCount >= SURVEY_FRAMES)
-        return;
-
-    if (gResetPending)
-    {
-        if (gSurveyDrawIndex > 0)
-        {
-            Log("SURVEY: Frame %d had %d fullscreen draws", gSurveyFrameCount, gSurveyDrawIndex);
-            gSurveyFrameCount++;
-        }
-        gSurveyDrawIndex = 0;
-        gResetPending = false;
-        if (gSurveyFrameCount >= SURVEY_FRAMES)
-            return;
-    }
-
-    ID3D11RenderTargetView* rtvs[4] = {};
-    ctx->OMGetRenderTargets(4, rtvs, nullptr);
-    int numRTs = 0;
-    DXGI_FORMAT rtFormats[4] = {};
-    UINT rtWidth = 0, rtHeight = 0;
-    for (int i = 0; i < 4; i++)
-    {
-        if (rtvs[i])
-        {
-            numRTs = i + 1;
-            D3D11_RENDER_TARGET_VIEW_DESC desc;
-            rtvs[i]->GetDesc(&desc);
-            rtFormats[i] = desc.Format;
-            if (i == 0)
-            {
-                ID3D11Resource* res = nullptr;
-                rtvs[i]->GetResource(&res);
-                if (res)
-                {
-                    ID3D11Texture2D* tex = nullptr;
-                    res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex);
-                    if (tex)
-                    {
-                        D3D11_TEXTURE2D_DESC td;
-                        tex->GetDesc(&td);
-                        rtWidth = td.Width;
-                        rtHeight = td.Height;
-                        tex->Release();
-                    }
-                    res->Release();
-                }
-            }
-            rtvs[i]->Release();
-        }
-    }
-
-    ID3D11ShaderResourceView* srvs[8] = {};
-    ctx->PSGetShaderResources(0, 8, srvs);
-    char srvInfo[256] = {};
-    int pos = 0;
-    for (int i = 0; i < 8; i++)
-    {
-        if (srvs[i])
-        {
-            D3D11_SHADER_RESOURCE_VIEW_DESC desc;
-            srvs[i]->GetDesc(&desc);
-            pos += snprintf(srvInfo + pos, sizeof(srvInfo) - pos, " t%d=%u", i, desc.Format);
-            srvs[i]->Release();
-        }
-    }
-
-    ID3D11PixelShader* ps = nullptr;
-    ctx->PSGetShader(&ps, nullptr, nullptr);
-    void* psAddr = ps;
-    if (ps) ps->Release();
-
-    Log("SURVEY F%d D%02d: verts=%u RTs=%d rt0fmt=%u %ux%u PS=%p SRVs:[%s]",
-        gSurveyFrameCount, gSurveyDrawIndex, vertexCount,
-        numRTs, rtFormats[0], rtWidth, rtHeight, psAddr, srvInfo);
-
-    gSurveyDrawIndex++;
+    HRESULT hr = oCreateVertexShader(pThis, pShaderBytecode, BytecodeLength,
+                                      pClassLinkage, ppVertexShader);
+    if (SUCCEEDED(hr) && ppVertexShader && *ppVertexShader)
+        SurveyRecorder::OnVertexShaderCreated(pShaderBytecode, BytecodeLength, *ppVertexShader);
+    return hr;
 }
-#endif
 
 static void STDMETHODCALLTYPE HookedDraw(
     ID3D11DeviceContext* pThis, UINT VertexCount, UINT StartVertexLocation)
 {
+    // Survey: record ALL draws (before fullscreen filter)
+    if (Survey::IsActive())
+        SurveyRecorder::OnDraw(pThis, VertexCount, StartVertexLocation);
+
     if (VertexCount != 3 && VertexCount != 4)
     {
         oDraw(pThis, VertexCount, StartVertexLocation);
@@ -571,10 +524,6 @@ static void STDMETHODCALLTYPE HookedDraw(
             return;
         }
     }
-
-#ifdef DUST_SURVEY
-    SurveyFullscreenDraw(pThis, VertexCount);
-#endif
 
     // Check device health FIRST — before touching any D3D11 resources.
     // During fullscreen alt-tab, the device can be removed and any
@@ -703,6 +652,9 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
             (unsigned long long)gDrawHookCallCount,
             (unsigned long long)gPresentHookCallCount);
 
+    if (Survey::IsActive())
+        SurveyRecorder::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
+
     oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 }
 
@@ -710,6 +662,11 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
     ID3D11DeviceContext* pThis, UINT IndexCountPerInstance, UINT InstanceCount,
     UINT StartIndexLocation, INT BaseVertexLocation, UINT StartInstanceLocation)
 {
+    if (Survey::IsActive())
+        SurveyRecorder::OnDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
+                                                StartIndexLocation, BaseVertexLocation,
+                                                StartInstanceLocation);
+
     oDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
                           StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
 }
@@ -737,6 +694,24 @@ static void TickGuiOnPresent(IDXGISwapChain* swapChain, const char* via)
             (int)gDeviceCaptured,
             (int)gGuiInitDone,
             (unsigned long long)gDrawHookCallCount);
+    }
+
+    // Survey: finalize frame at Present boundary
+    if (Survey::IsActive())
+    {
+        SurveyFrameData frameData = SurveyRecorder::OnEndFrame();
+        SurveyWriter::WriteFrame(frameData, Survey::GetOutputDir());
+        sSurveyFrames.push_back(std::move(frameData));
+
+        if (Survey::OnFrameEnd())
+        {
+            // Survey just finished — write shaders and summary
+            SurveyWriter::WriteShaders(Survey::GetOutputDir());
+            SurveyWriter::WriteSummary(sSurveyFrames.data(), (int)sSurveyFrames.size(),
+                                        Survey::GetOutputDir());
+            sSurveyFrames.clear();
+            SurveyRecorder::Shutdown();
+        }
     }
 
     if (!gGuiInitDone && gDeviceCaptured)
@@ -794,6 +769,7 @@ static HRESULT STDMETHODCALLTYPE HookedResizeBuffers(
 // ==================== Install ====================
 
 static const int VTIDX_DEVICE_CreateTexture2D       = 5;
+static const int VTIDX_DEVICE_CreateVertexShader    = 12;
 static const int VTIDX_DEVICE_CreatePixelShader     = 15;
 static const int VTIDX_CTX_DrawIndexed              = 12;
 static const int VTIDX_CTX_Draw                     = 13;
@@ -849,6 +825,7 @@ bool Install()
     void** scVtable  = *reinterpret_cast<void***>(tmpSwapChain);
 
     void* addrCreateTex2D  = devVtable[VTIDX_DEVICE_CreateTexture2D];
+    void* addrCreateVS     = devVtable[VTIDX_DEVICE_CreateVertexShader];
     void* addrCreatePS     = devVtable[VTIDX_DEVICE_CreatePixelShader];
     void* addrDraw         = ctxVtable[VTIDX_CTX_Draw];
     void* addrDrawIndexed  = ctxVtable[VTIDX_CTX_DrawIndexed];
@@ -871,6 +848,7 @@ bool Install()
     }
 
     Log("Function addresses discovered:");
+    Log("  CreateVertexShader    = %p", addrCreateVS);
     Log("  CreatePixelShader     = %p", addrCreatePS);
     Log("  Draw                  = %p", addrDraw);
     Log("  DrawIndexed           = %p", addrDrawIndexed);
@@ -930,11 +908,18 @@ bool Install()
             gShadowResOverride = (UINT)val;
             Log("  Shadow map resolution override: %u", gShadowResOverride);
         }
+
+        // Init survey defaults from INI
+        Survey::InitFromINI(ini.c_str());
     }
 
     if (KenshiLib::AddHook(addrCreateTex2D, (void*)HookedCreateTexture2D,
                            (void**)&oCreateTexture2D) != KenshiLib::SUCCESS)
     { Log("ERROR: Failed to hook CreateTexture2D"); ok = false; }
+
+    if (KenshiLib::AddHook(addrCreateVS, (void*)HookedCreateVertexShader,
+                           (void**)&oCreateVertexShader) != KenshiLib::SUCCESS)
+    { Log("WARNING: Failed to hook CreateVertexShader (shader source tracking for VS disabled)"); }
 
     if (KenshiLib::AddHook(addrCreatePS, (void*)HookedCreatePixelShader,
                            (void**)&oCreatePixelShader) != KenshiLib::SUCCESS)
