@@ -14,6 +14,7 @@ static int          sTotalFrames  = 3;
 static int          sDetailLevel  = DETAIL_STANDARD;
 static int          sMaxBudgetMs  = 500;
 static std::string  sOutputDir;
+static std::string  sLabel;
 static std::string  sIniPath;
 
 // Timing
@@ -84,7 +85,24 @@ void InitFromINI(const char* iniPath)
         sTotalFrames, sDetailLevel, sMaxBudgetMs);
 }
 
-void Start(int numFrames, int detailLevel)
+static std::string SanitizeLabel(const char* raw)
+{
+    if (!raw || !raw[0])
+        return "";
+    std::string out;
+    for (const char* p = raw; *p && out.size() < 48; ++p)
+    {
+        char c = *p;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '-' || c == '_')
+            out += c;
+        else if (c == ' ')
+            out += '_';
+    }
+    return out;
+}
+
+void Start(int numFrames, int detailLevel, const char* label)
 {
     if (sActive)
     {
@@ -92,8 +110,34 @@ void Start(int numFrames, int detailLevel)
         return;
     }
 
-    // Build output path next to the DLL
-    sOutputDir = DustLogDir() + "survey\\";
+    sLabel = label ? label : "";
+    std::string sanitized = SanitizeLabel(label);
+
+    // Build a timestamped output path so captures are never overwritten
+    // e.g. survey/2026-04-20_143052_desert_night/
+    std::string surveyRoot = DustLogDir() + "survey\\";
+    if (!CreateDirectoryA(surveyRoot.c_str(), nullptr))
+    {
+        DWORD err = GetLastError();
+        if (err != ERROR_ALREADY_EXISTS)
+        {
+            Log("SURVEY: Failed to create survey root (error %u)", err);
+            return;
+        }
+    }
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char stamp[64];
+    snprintf(stamp, sizeof(stamp), "%04d-%02d-%02d_%02d%02d%02d",
+             st.wYear, st.wMonth, st.wDay,
+             st.wHour, st.wMinute, st.wSecond);
+
+    std::string folderName = stamp;
+    if (!sanitized.empty())
+        folderName += "_" + sanitized;
+
+    sOutputDir = surveyRoot + folderName + "\\";
     if (!CreateOutputDir(sOutputDir))
     {
         Log("SURVEY: Cannot create output directory, aborting");
@@ -111,8 +155,8 @@ void Start(int numFrames, int detailLevel)
     if (f) fflush(f);
 
     sActive = true;
-    Log("SURVEY: Started capture (%d frames, detail level %d, output: %s)",
-        sTotalFrames, sDetailLevel, sOutputDir.c_str());
+    Log("SURVEY: Started capture (%d frames, detail level %d, label: '%s', output: %s)",
+        sTotalFrames, sDetailLevel, sLabel.c_str(), sOutputDir.c_str());
 }
 
 void Stop()
@@ -147,6 +191,11 @@ int GetDetailLevel()
 const char* GetOutputDir()
 {
     return sOutputDir.c_str();
+}
+
+const char* GetLabel()
+{
+    return sLabel.c_str();
 }
 
 bool OnFrameEnd()

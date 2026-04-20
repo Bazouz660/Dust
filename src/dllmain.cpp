@@ -39,14 +39,73 @@ static std::string GetGameDir(HMODULE hModule)
     return modDir;
 }
 
-// Invalidate RE_Kenshi's shader cache so D3DCompile is called for all shaders,
-// allowing our runtime hook to patch the deferred shader. Without this, cached
-// bytecode would bypass D3DCompile entirely.
-static void InvalidateShaderCache(const std::string& gameDir)
+// Build a stamp string that changes when any shader-affecting config changes.
+// If the stamp matches the stored one, the cached bytecode already has our
+// patches baked in and D3DCompile can be skipped for cached shaders.
+static std::string BuildCacheStamp(const std::string& modDir)
+{
+#ifdef DUST_VERSION
+    #define DUST_STAMP_STR2(x) #x
+    #define DUST_STAMP_STR(x) DUST_STAMP_STR2(x)
+    std::string stamp = "dust|" DUST_STAMP_STR(DUST_VERSION);
+#else
+    std::string stamp = "dust|dev";
+#endif
+
+    std::string ini = modDir + "Dust.ini";
+    int shadowRes = GetPrivateProfileIntA("Shadows", "ShadowResolution", 0, ini.c_str());
+    stamp += "|sr=" + std::to_string(shadowRes);
+
+    return stamp;
+}
+
+static void ManageShaderCache(const std::string& gameDir, const std::string& modDir)
 {
     std::string cachePath = gameDir + "RE_Kenshi\\shader_cache.sc";
+    std::string stampPath = gameDir + "RE_Kenshi\\dust_cache_stamp.txt";
+
+    std::string currentStamp = BuildCacheStamp(modDir);
+
+    // Read existing stamp
+    std::string storedStamp;
+    {
+        FILE* f = fopen(stampPath.c_str(), "r");
+        if (f)
+        {
+            char buf[256] = {};
+            if (fgets(buf, sizeof(buf), f))
+                storedStamp = buf;
+            fclose(f);
+            // Strip trailing newline
+            while (!storedStamp.empty() &&
+                   (storedStamp.back() == '\n' || storedStamp.back() == '\r'))
+                storedStamp.pop_back();
+        }
+    }
+
+    if (storedStamp == currentStamp)
+    {
+        Log("Shader cache stamp matches (%s), keeping cached bytecode", currentStamp.c_str());
+        return;
+    }
+
+    // Stamp mismatch — invalidate cache and write new stamp
     if (DeleteFileA(cachePath.c_str()))
-        Log("Invalidated RE_Kenshi shader cache (will recompile shaders this launch)");
+        Log("Invalidated RE_Kenshi shader cache (stamp changed: '%s' -> '%s')",
+            storedStamp.c_str(), currentStamp.c_str());
+    else
+        Log("Shader cache not present or already clean (new stamp: %s)", currentStamp.c_str());
+
+    // Ensure RE_Kenshi directory exists
+    std::string reDir = gameDir + "RE_Kenshi";
+    CreateDirectoryA(reDir.c_str(), nullptr);
+
+    FILE* f = fopen(stampPath.c_str(), "w");
+    if (f)
+    {
+        fprintf(f, "%s\n", currentStamp.c_str());
+        fclose(f);
+    }
 }
 
 // ==================== Game loop hook ====================
@@ -96,13 +155,14 @@ __declspec(dllexport) void startPlugin()
     Log("Dust (dev) loading...");
 #endif
 
-    // Invalidate shader cache so our D3DCompile hook can patch shaders at runtime
+    // Manage shader cache: only invalidate when Dust version or config changes
     std::string gameDir = GetGameDir(gDllModule);
-    InvalidateShaderCache(gameDir);
+    std::string modDir = GetModuleDir(gDllModule);
+    ManageShaderCache(gameDir, modDir);
 
     // Load effect plugins from effects/ directory next to the DLL
     {
-        std::string effectsDir = GetModuleDir(gDllModule) + "effects";
+        std::string effectsDir = modDir + "effects";
         int loaded = gEffectLoader.LoadAll(effectsDir.c_str());
         Log("Loaded %d effect plugin(s) from %s", loaded, effectsDir.c_str());
     }

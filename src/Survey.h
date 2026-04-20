@@ -19,8 +19,9 @@ namespace Survey
         int  maxFrameBudgetMs = 500; // auto-reduce detail if exceeded
     };
 
-    // Start a survey capture. Creates output directory, resets state.
-    void Start(int numFrames, int detailLevel);
+    // Start a survey capture. Creates timestamped output directory, resets state.
+    // Optional label (e.g. "desert_night") is included in the folder name and metadata.
+    void Start(int numFrames, int detailLevel, const char* label = nullptr);
 
     // Stop an in-progress survey early.
     void Stop();
@@ -35,8 +36,11 @@ namespace Survey
     // Detail level for the current (or last) survey.
     int  GetDetailLevel();
 
-    // Output directory path (e.g. "<DLL dir>/survey/").
+    // Output directory path (e.g. "<DLL dir>/survey/2026-04-20_143052_label/").
     const char* GetOutputDir();
+
+    // Label for the current (or last) survey capture.
+    const char* GetLabel();
 
     // Called once at startup to read defaults from Dust.ini [Survey] section.
     void InitFromINI(const char* iniPath);

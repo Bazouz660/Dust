@@ -711,8 +711,12 @@ static void DrawFrameworkSection()
     }
     else
     {
-        static int surveyFrames = 3;
-        static int surveyDetail = 1;
+        static int  surveyFrames = 3;
+        static int  surveyDetail = 1;
+        static char surveyLabel[64] = "";
+        ImGui::InputText("Label##survey", surveyLabel, sizeof(surveyLabel));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Optional label for this capture (e.g. desert_night, hub_city)");
         ImGui::SliderInt("Frames##survey", &surveyFrames, 1, 30);
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Number of frames to capture");
@@ -722,7 +726,8 @@ static void DrawFrameworkSection()
         if (ImGui::Button("Capture Survey", ImVec2(ImGui::GetContentRegionAvail().x, 0)))
         {
             SurveyRecorder::Reset();
-            Survey::Start(surveyFrames, surveyDetail);
+            Survey::Start(surveyFrames, surveyDetail,
+                          surveyLabel[0] ? surveyLabel : nullptr);
         }
     }
 }

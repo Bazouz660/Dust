@@ -206,34 +206,6 @@ static std::string Base64Encode(const uint8_t* data, size_t len)
     return out;
 }
 
-// ==================== JSON string escaping ====================
-
-static std::string JsonEscape(const char* s)
-{
-    std::string out;
-    for (; *s; s++)
-    {
-        switch (*s)
-        {
-        case '"':  out += "\\\""; break;
-        case '\\': out += "\\\\"; break;
-        case '\n': out += "\\n";  break;
-        case '\r': out += "\\r";  break;
-        case '\t': out += "\\t";  break;
-        default:
-            if ((unsigned char)*s < 0x20)
-            {
-                char buf[8];
-                snprintf(buf, sizeof(buf), "\\u%04x", (unsigned char)*s);
-                out += buf;
-            }
-            else
-                out.push_back(*s);
-        }
-    }
-    return out;
-}
-
 // ==================== JSON writer helpers ====================
 
 static void WritePtr(FILE* f, const char* key, uint64_t ptr)
@@ -568,7 +540,10 @@ void WriteSummary(const SurveyFrameData* frames, int numFrames, const char* outp
     }
 
     fprintf(f, "{\n");
-    fprintf(f, "  \"framesCapured\": %d,\n", numFrames);
+    const char* label = Survey::GetLabel();
+    if (label && label[0])
+        fprintf(f, "  \"label\": \"%s\",\n", label);
+    fprintf(f, "  \"framesCaptured\": %d,\n", numFrames);
     fprintf(f, "  \"totalDrawEvents\": %u,\n", totalDraws);
     fprintf(f, "  \"totalCaptureTimeMs\": %.2f,\n", totalCaptureMs);
     fprintf(f, "  \"uniquePixelShaders\": %zu,\n", uniquePS.size());
