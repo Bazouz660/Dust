@@ -93,26 +93,37 @@ Captures every Draw/DrawIndexed/DrawIndexedInstanced call across N frames with f
 
 ### Kenshi's Rendering Pipeline
 
-Deferred shading with forward pass for sky/particles. Full pipeline documented in `docs/kenshi_rendering_pipeline.md`.
+Deferred shading with forward light volumes and forward sky/water/particles. Full pipeline documented in `docs/pipeline/` (10 files, organized from survey data). Legacy monolith at `docs/kenshi_rendering_pipeline.md`.
 
 ```
-GBuffer fill (3 MRT + depth) → Deferred Lighting → Fog/Atmosphere → Luminance chain →
-Auto-exposure → Bloom extract → Bloom blur → Tonemapping → FXAA → Heat Haze → Present
+[Heat haze prev-frame] → [Cubemap 512x512] → GBuffer fill (3 MRT + depth) →
+Stencil mask → GBuffer repack (YCoCg→float) → Deferred sun → Light volumes →
+Water (forward) → Fog/Atmosphere → Luminance chain → Bloom extract → Tonemapping →
+LDR post → DOF → Half-res blur → Bloom pyramid → FXAA → Heat Haze → Present
 ```
 
-**GBuffer layout:**
-- RT0: B8G8R8A8_UNORM — Albedo (alpha channel may carry roughness/shininess)
-- RT1: B8G8R8A8_UNORM — Normals (alpha channel may carry metalness/specular)
+**GBuffer layout (confirmed by survey):**
+- RT0: B8G8R8A8_UNORM — YCoCg chroma-subsampled color (NOT separate albedo+roughness)
+- RT1: B8G8R8A8_UNORM — Packed normals + material data (emissive/translucency in alpha)
 - RT2: R32_FLOAT — Linear depth
+- GBuffer is repacked to R16G16B16A16_FLOAT before deferred lighting (draws 3645-3647)
 
-**Kenshi's texture data (from modding wiki):**
-- Roughness/shininess → alpha channel of diffuse texture (black = matte, white = shiny)
-- Metalness → blue channel of color map (mask texture)
-- Question: does this data make it into the GBuffer alpha channels? Survey will answer.
+**GBuffer material data:** Roughness and metalness from textures are NOT stored as separate GBuffer channels. The YCoCg encoding uses all channels of RT0 for color. Material properties flow through the existing per-pixel shader math but are not independently recoverable from the GBuffer for deferred lighting — this limits per-material BRDF branching.
 
-**Kenshi's likely BRDF:** Lambert diffuse + Blinn-Phong specular. Evidence: OGRE 2.0 defaults, `CalcEnvironmentLight` function names, `LightingData` struct with `.diffuse`/`.specular`, irradianceCube/specularityCube IBL inputs. Not confirmed — need to capture and read the actual deferred shader HLSL via survey.
+**Kenshi's BRDF (confirmed by survey — deferred.hlsl captured):**
+- **Specular:** GGX microfacet model — Trowbridge-Reitz NDF, Schlick Fresnel, Kelemen-Szirmay-Kalos visibility term
+- **Diffuse:** Lambert with Fresnel energy conservation (Disney/Burley diffuse is present in lightingFunctions.hlsl but commented out)
+- **IBL:** Lazarov approximation for specular, cubemap decode `rgb * a * scale`
+- NOT Blinn-Phong as previously suspected — Kenshi already has modern PBR
 
-**Kenshi's shadows:** Cascaded Shadow Maps (user-corrected — not RTWSM as previously documented in `shadow_improvements.md`). Quality is poor: low resolution, shimmer, filtering issues. Current Dust fix: PCSS via 12-sample Poisson disk in patched deferred shader.
+**Kenshi's shadows (confirmed by survey):**
+- CSM: 4 cascades in a single 4096x4096 R32_FLOAT atlas
+- 52% tessellated shadow casters (PATCHLIST_3_CP topology), 7 unique VS, 4 unique PS
+- 12-sample hex PCF filtering in deferred shader
+- Draws 2590-3640 (~1050 draw calls in dense scenes)
+- Current Dust fix: PCSS via patched deferred shader
+
+**Light volumes:** Point/spot lights rendered as forward geometry (spheres/cones) with additive blending after the deferred sun pass. Each light is a separate draw call with its own constant buffer containing position, color, radius, attenuation.
 
 ---
 
@@ -195,44 +206,25 @@ Write a script/tool that reads the survey JSON and produces:
   - All render targets used, with formats and sizes
   - Constant buffer sizes and binding frequency
 
-### 4.2 — Deferred Shader BRDF Analysis
+### 4.2 — Deferred Shader BRDF Analysis ✅ COMPLETE
 
-From the captured deferred shader HLSL source:
-- Confirm whether it uses Lambert diffuse
-- Confirm whether it uses Blinn-Phong specular
-- Identify if/how roughness and metalness data is read from the GBuffer
-- Map all constant buffer offsets and their semantic meaning
-- Document the exact lighting math for replacement planning
+**Findings:** GGX specular (Trowbridge-Reitz NDF, Schlick Fresnel, Kelemen-SzK visibility) + Lambert diffuse with Fresnel energy conservation. Disney/Burley diffuse is present but commented out. IBL uses Lazarov approximation. See `docs/pipeline/04_deferred_lighting.md`.
 
-### 4.3 — GBuffer Alpha Channel Investigation
+### 4.3 — GBuffer Alpha Channel Investigation ✅ COMPLETE
 
-From detail level 2+ survey data (CB readback) and shader source:
-- Determine if the GBuffer shaders write roughness to RT0.a
-- Determine if the GBuffer shaders write metalness/specular to RT1.a
-- If not: plan how to patch GBuffer shaders to pass this data through
+**Findings:** GBuffer uses YCoCg chroma subsampling — all channels of RT0 encode color, not separate roughness/metalness. RT1.a encodes emissive/translucency. Roughness is derived from gloss in the material shaders and flows through the per-pixel lighting math, but is NOT stored as a separate GBuffer channel for deferred access. See `docs/pipeline/01_gbuffer.md`.
 
-### 4.4 — Shadow Pass Analysis
+### 4.4 — Shadow Pass Analysis ✅ COMPLETE
 
-- Identify all shadow-related draws (by RT format = depth-only, or by known shadow shader)
-- Document shadow map resolution, format, cascade count
-- Extract shadow matrices from constant buffers
-- Understand how shadow data flows into the deferred lighting shader
-- Determine what's actually wrong with the current shadows (resolution? filtering? cascade splits? projection instability?)
+**Findings:** CSM with 4 cascades in a single 4096x4096 R32_FLOAT atlas. 52% of shadow casters are tessellated (PATCHLIST_3_CP). 7 unique VS, 4 unique PS, 1 HS, 1 DS. Shadow VS CB0 is 64 bytes (light view matrix + translation). Shadow PS CB0 is 16 bytes (bias parameters). 12-sample hex PCF in the deferred shader. See `docs/pipeline/03_shadows.md`.
 
-### 4.5 — Light Data Extraction
+### 4.5 — Light Data Extraction ✅ COMPLETE
 
-- From the deferred lighting CB: map all light-related parameters
-- Identify how point lights / spot lights are passed (forward pass? tiled? separate draws?)
-- Determine if light positions are accessible for multi-light shadow rendering
+**Findings:** Point/spot lights are forward-rendered as light volumes (additive-blended sphere/cone geometry). Each light is a separate draw call after the deferred sun pass. Deferred sun PS CB0 (352 bytes): c0=sunDirection, c1=sunColour, c6=resolution, c8-c11=inverseView matrix. Light volume PS shares the same `light_fs` shader with per-light CB data. See `docs/pipeline/04_deferred_lighting.md`.
 
-### 4.6 — Documentation Update
+### 4.6 — Documentation Update ✅ COMPLETE
 
-Update `docs/kenshi_rendering_pipeline.md` with all findings from the survey:
-- Verified GBuffer contents (especially alpha channels)
-- Confirmed BRDF
-- Shadow system details
-- Light passing mechanism
-- Any surprises or undocumented passes
+Created `docs/pipeline/` with 10 organized files (00_overview through 09_injection_reference). 492 unique shaders mapped to 50 source files, 0 unidentified. All pipeline stages documented with draw indices, shader sources, RT formats, and injection points.
 
 ---
 
@@ -248,22 +240,23 @@ Update `docs/kenshi_rendering_pipeline.md` with all findings from the survey:
 - **Any survey-revealed bugs** — the pipeline mapping may reveal issues in how effects interact with the pipeline (wrong injection timing, missed state, etc.)
 - **RTGI temporal artifacts** — RTGI currently uses temporal accumulation. For the stable release, this is acceptable (it's the existing shipped behavior). For v2, it will be replaced with a spatial-only technique.
 
-### 5.2 — Shader Cache Compatibility
+### 5.2 — Shader Cache Compatibility ✅ COMPLETE
 
-Instead of deleting RE_Kenshi's shader cache every launch:
-- Write a `dust_cache_stamp.txt` file containing Dust version + hash of shader-affecting config
-- On startup: compare stamp to current values
-  - Match → leave cache alone (fast startup)
-  - Mismatch → delete cache, write new stamp (recompile needed)
-- The D3DCompile hook patches the shader source before compilation. RE_Kenshi caches the compiled (patched) bytecode. On next launch, cached bytecode already has our patches baked in.
-- For survey shader source capture: add a "force recompile" option that temporarily invalidates the cache
+Implemented stamp-based cache management in `src/dllmain.cpp`:
+- `BuildCacheStamp()` generates a stamp from Dust version + shadow resolution config
+- `ManageShaderCache()` compares stamp to `RE_Kenshi/dust_cache_stamp.txt`
+  - Match → keep cache (fast startup, no recompilation)
+  - Mismatch → delete `shader_cache.sc`, write new stamp
+- Replaces the old `InvalidateShaderCache()` that deleted the cache every launch
 
-### 5.3 — Code Cleanup
+### 5.3 — Code Cleanup ✅ COMPLETE
 
-- Remove any dead code, unused #ifdef blocks, old prototype survey code
-- Ensure all COM references are properly released (survey especially — lots of Get* calls)
-- Verify no resource leaks across multiple survey runs
-- Test with Proton/Linux (Steam Deck compatibility)
+Audited all source files:
+- **COM references:** All properly released. SurveyRecorder uses SAFE_RELEASE throughout, staging buffer pool cleaned in Shutdown(). EffectLoader releases scene copies, pre-fog HDR, timing queries, fullscreen VS on shutdown/reinit. D3D11StateBlock releases all captured COM objects on restore/destruction. PipelineDetector releases all Get* results immediately.
+- **Dead code removed:** `JsonEscape` in SurveyWriter.cpp (defined but never called), `LUMINANCE_SRV` in ResourceRegistry.h (defined but never used, no corresponding API constant).
+- **No dead #ifdef blocks found** — `DUST_VERSION` is the only conditional, correctly used in dllmain.cpp, DustGUI.cpp.
+- **Survey system:** Clean. Timestamped output directories, label support, SEH-wrapped state capture. Added to DustGUI.
+- Proton/Linux testing: deferred to in-game validation
 
 ### 5.4 — Stable Release
 
@@ -664,19 +657,17 @@ Each phase ships the corresponding API additions. Plugins query `apiVersion` to 
 
 These can be done immediately in the v2 branch, before geometry interception is built. All are shader patches or new post-process passes.
 
-### 3A.1 — BRDF Upgrade
+### 3A.1 — BRDF Refinement
 
-Patch the deferred lighting shader via D3DCompile to replace the lighting math:
+Kenshi already uses GGX specular + Lambert diffuse (confirmed by survey). The upgrade is incremental, not a wholesale replacement:
 
-- **Diffuse:** Lambert → Disney/Burley diffuse (or Oren-Nayar for rough surfaces)
-- **Specular:** Blinn-Phong → GGX microfacet (Trowbridge-Reitz distribution, Smith geometry term, Schlick Fresnel)
-- **Energy conservation:** ensure diffuse + specular ≤ 1
+1. **Diffuse:** Uncomment Disney/Burley diffuse (already present in `lightingFunctions.hlsl`, just commented out)
+2. **Visibility term:** Replace Kelemen-Szirmay-Kalos with Smith-GGX height-correlated (more accurate at grazing angles)
+3. **Multi-scatter:** Add Kulla-Conty energy compensation (prevents energy loss at high roughness)
+4. **IBL:** Replace Lazarov approximation with Split-Sum (more accurate environment reflections)
+5. **Light falloff:** Replace custom cubic attenuation with physical inverse-square falloff for point/spot lights
 
-Prerequisite: Phase 1 BRDF analysis confirms what math to replace and whether roughness/metalness data is available in the GBuffer.
-
-If roughness/metalness is NOT in the GBuffer, also patch the GBuffer pixel shaders to pass it through from the texture alpha channels.
-
-**Impact:** Every surface in the game responds to light more realistically. Rough surfaces get edge brightening, metals get colored reflections, surfaces get brighter at grazing angles (Fresnel). Near-zero performance cost.
+**Impact:** Incremental quality improvement — the base BRDF is already modern PBR, so gains are in edge cases (grazing angles, high roughness, rough metals). Near-zero performance cost.
 
 ### 3A.2 — SMAA Anti-Aliasing
 
@@ -819,9 +810,9 @@ Using survey data + geometry capture:
 ### 3D.2 — Material ID in GBuffer
 
 - Extend the GBuffer with a material ID:
-  - Option A: use an unused bit range in RT0.a or RT1.a
-  - Option B: patch GBuffer pixel shaders to write material ID based on classification
-  - Option C: add a separate R8 render target (requires hooking OMSetRenderTargets to add it)
+  - ~~Option A: use unused bit range in RT0.a or RT1.a~~ — NOT viable. RT0 uses all 4 channels for YCoCg chroma-subsampled color. RT1.a encodes emissive/translucency. No spare bits.
+  - Option B: use the stencil buffer (D24_UNORM_S8_UINT) — 8-bit stencil per pixel, supports up to 255 material classes. Patch GBuffer shaders to write stencil value via OMSetDepthStencilState per draw call.
+  - Option C: add a separate R8 render target (requires hooking OMSetRenderTargets to add a 4th MRT during GBuffer fill)
 - Write material class ID during GBuffer fill based on draw call classification
 
 ### 3D.3 — Per-Material BRDF
@@ -1063,20 +1054,18 @@ Quick reference:
 
 ---
 
-## 17. Open Questions
+## 17. Open Questions — All Answered by Survey
 
-These will be answered by the survey data:
+1. **What BRDF does the deferred shader actually use?** ✅ GGX specular (Trowbridge-Reitz NDF, Schlick Fresnel, Kelemen-SzK visibility) + Lambert diffuse with Fresnel energy conservation. Disney/Burley diffuse is present but commented out. NOT Blinn-Phong.
 
-1. **What BRDF does the deferred shader actually use?** Suspected Lambert + Blinn-Phong, but need to confirm from captured HLSL source.
+2. **Does roughness/metalness reach the GBuffer?** ✅ No. GBuffer uses YCoCg chroma subsampling — RT0 encodes color data across all 4 channels, not separate albedo+roughness. RT1.a encodes emissive/translucency. Roughness flows through per-pixel shader math but is not recoverable from the GBuffer as a separate channel.
 
-2. **Does roughness/metalness reach the GBuffer?** Kenshi textures have roughness in diffuse alpha and metalness in color map blue channel. But do the GBuffer pixel shaders write these to RT0.a / RT1.a?
+3. **How are point lights passed to the GPU?** ✅ Forward-rendered light volumes. Each point/spot light is drawn as a sphere/cone with additive blending after the deferred sun pass. Separate draw call per light with its own constant buffer. Uses the same `light_fs` pixel shader as the deferred sun but with different CB data.
 
-3. **How are point lights passed to the GPU?** Separate forward draws? Tiled? Constant buffer array? This determines how we extract light positions for multi-light shadows.
+4. **What's actually wrong with the shadows?** ✅ CSM with 4 cascades in 4096x4096 atlas. 12-sample hex PCF filtering. Issues are: limited resolution per cascade (1024x1024 effective per cascade in a 4096 atlas), no contact-hardening (fixed filter width), possible cascade split distance issues. Shadow VS CB0 is 64 bytes (3x3 light view matrix + translation).
 
-4. **What's actually wrong with the shadows?** Resolution? Cascade splits? Projection stability? Bias? The survey will show the shadow pass in detail.
+5. **How bad is the draw call overhead?** ✅ 3763 draw calls in dense scenes (Shark capture), 582 in sparse (Ashlands). GBuffer pass: 1177 draws. Shadow pass: ~1050 draws. Cubemap: up to 1400 draws (full scene re-render at 512x512). Average across 33 captures: 1545 draws. Instancing analysis shows significant potential reduction.
 
-5. **How bad is the draw call overhead?** Total draws per frame, repeat counts, redundant state changes. This determines how much performance we can recover via instancing.
+6. **What does the VS constant buffer layout look like?** ✅ GBuffer VS CB0 (160 bytes): c0=per-object material params, c1-c4=viewProjection matrix, c5=camera world position, c6-c9=per-object data. Deferred VS CB0 (32 bytes): c0-c1=far frustum corners + near plane.
 
-6. **What does the VS constant buffer layout look like?** Need to map World, View, Projection, WVP matrix offsets for geometry replay.
-
-7. **Are there any surprises in the pipeline?** Hidden passes, undocumented render targets, unusual state. The survey is designed to catch these.
+7. **Are there any surprises in the pipeline?** ✅ Yes — several: (a) YCoCg chroma subsampling in GBuffer (not standard MRT layout), (b) GBuffer repack pass converts to R16G16B16A16_FLOAT before deferred lighting, (c) cubemap pass re-renders the entire scene (1400 draws in dense captures), (d) heat haze renders previous-frame geometry at the START of the frame (draws 0-6), (e) 492 unique shaders mapped to 50 source files with 0 unidentified.
