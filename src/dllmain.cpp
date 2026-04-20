@@ -62,6 +62,16 @@ void GameWorld__mainLoop_GPUSensitiveStuff_hook(GameWorld* thisptr, float time)
     if (sLoopCount <= 5 || (sLoopCount <= 600 && (sLoopCount % 60) == 0))
         Log("GameLoop #%llu", (unsigned long long)sLoopCount);
 
+    // Watchdog: if Present hasn't fired after enough game loops, try to recover.
+    // 120 loops ≈ 2 seconds of gameplay — enough for all overlays to finish init.
+    if (sLoopCount == 120 && D3D11Hook::gDeviceCaptured && !D3D11Hook::IsPresentHooked())
+    {
+        Log("WARNING: Present hook has not fired after %llu game loops!",
+            (unsigned long long)sLoopCount);
+        Log("WARNING: Attempting recovery — may be caused by overlay DLL (Steam/Discord/ReShade)");
+        D3D11Hook::TryRecoverPresent();
+    }
+
     // Reset per-frame state before the game renders
     D3D11Hook::ResetFrameState();
 

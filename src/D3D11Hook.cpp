@@ -31,6 +31,17 @@ static UINT gShadowResOverride = 0;
 static uint64_t gFrameIndex = 0;
 static bool gDispatchedThisFrame = false;
 
+// VTable indices for swap chain methods (used by both Install() and deferred hooking)
+static const int VTIDX_SC_Present        = 8;
+static const int VTIDX_SC_ResizeBuffers  = 13;
+static const int VTIDX_SC1_Present1      = 22;
+
+// Deferred Present hooking: addresses saved from temp device, installed later
+static void* sSavedAddrPresent   = nullptr;
+static void* sSavedAddrPresent1  = nullptr;
+static void* sSavedAddrResizeBuf = nullptr;
+static bool  sSwapChainHooked    = false;
+
 // Survey: collected frame data for writing after all frames captured
 static std::vector<SurveyFrameData> sSurveyFrames;
 
@@ -344,6 +355,174 @@ static HRESULT WINAPI HookedD3DCompile(
     return hr;
 }
 
+// ==================== Deferred swap chain hooking ====================
+
+// Forward declarations for hooks defined later (needed by TryInstallSwapChainHooks)
+static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pThis, UINT SyncInterval, UINT Flags);
+static HRESULT STDMETHODCALLTYPE HookedPresent1(IDXGISwapChain1* pThis, UINT SyncInterval,
+    UINT PresentFlags, const DXGI_PRESENT_PARAMETERS* pPresentParameters);
+static HRESULT STDMETHODCALLTYPE HookedResizeBuffers(IDXGISwapChain* pThis, UINT BufferCount,
+    UINT Width, UINT Height, DXGI_FORMAT NewFormat, UINT SwapChainFlags);
+
+// Try to find the game's real swap chain by walking DXGI from the current
+// render target. If the RT is the swap chain's back buffer, IDXGISurface::GetParent
+// returns the swap chain. Falls back gracefully if the RT is an intermediate buffer.
+static bool TryDiscoverSwapChain(IDXGISwapChain** ppSwapChain)
+{
+    *ppSwapChain = nullptr;
+
+    ID3D11RenderTargetView* rtv = nullptr;
+    gContext->OMGetRenderTargets(1, &rtv, nullptr);
+    if (!rtv)
+    {
+        Log("SwapChain discovery: no render target bound");
+        return false;
+    }
+
+    ID3D11Resource* res = nullptr;
+    rtv->GetResource(&res);
+    rtv->Release();
+    if (!res)
+    {
+        Log("SwapChain discovery: RT has no resource");
+        return false;
+    }
+
+    IDXGISurface* surface = nullptr;
+    HRESULT hr = res->QueryInterface(__uuidof(IDXGISurface), (void**)&surface);
+    res->Release();
+    if (FAILED(hr) || !surface)
+    {
+        Log("SwapChain discovery: RT resource is not a DXGI surface (hr=0x%08X)", (unsigned)hr);
+        return false;
+    }
+
+    hr = surface->GetParent(__uuidof(IDXGISwapChain), (void**)ppSwapChain);
+    surface->Release();
+
+    if (FAILED(hr) || !*ppSwapChain)
+    {
+        Log("SwapChain discovery: surface parent is not a swap chain (hr=0x%08X) — RT is likely an intermediate buffer",
+            (unsigned)hr);
+        return false;
+    }
+
+    Log("SwapChain discovery: found real swap chain at %p", *ppSwapChain);
+    return true;
+}
+
+static void TryInstallSwapChainHooks()
+{
+    if (sSwapChainHooked)
+        return;
+
+    // Try to discover the real swap chain and read its VTable
+    void* realAddrPresent  = sSavedAddrPresent;
+    void* realAddrPresent1 = sSavedAddrPresent1;
+    void* realAddrResize   = sSavedAddrResizeBuf;
+
+    IDXGISwapChain* realSwapChain = nullptr;
+    if (TryDiscoverSwapChain(&realSwapChain) && realSwapChain)
+    {
+        void** scVtable = *reinterpret_cast<void***>(realSwapChain);
+        void* scPresent = scVtable[VTIDX_SC_Present];
+        void* scResize  = scVtable[VTIDX_SC_ResizeBuffers];
+
+        if (scPresent != sSavedAddrPresent)
+            Log("Present address MISMATCH: temp=%p real=%p (using real)",
+                sSavedAddrPresent, scPresent);
+        else
+            Log("Present address matches temp device (%p)", scPresent);
+
+        realAddrPresent = scPresent;
+        realAddrResize  = scResize;
+
+        // Try Present1 on real swap chain
+        IDXGISwapChain1* sc1 = nullptr;
+        if (SUCCEEDED(realSwapChain->QueryInterface(__uuidof(IDXGISwapChain1), (void**)&sc1)) && sc1)
+        {
+            void** sc1Vtable = *reinterpret_cast<void***>(sc1);
+            realAddrPresent1 = sc1Vtable[VTIDX_SC1_Present1];
+            sc1->Release();
+        }
+
+        realSwapChain->Release();
+    }
+    else
+    {
+        Log("SwapChain discovery failed, using temp device addresses for Present hooks");
+    }
+
+    // Install hooks using the best available addresses
+    bool ok = true;
+
+    if (KenshiLib::AddHook(realAddrPresent, (void*)HookedPresent,
+                           (void**)&oPresent) != KenshiLib::SUCCESS)
+    { Log("ERROR: Failed to hook Present (addr=%p)", realAddrPresent); ok = false; }
+    else
+    { Log("  Present hook installed at %p (deferred)", realAddrPresent); }
+
+    if (realAddrPresent1)
+    {
+        if (KenshiLib::AddHook(realAddrPresent1, (void*)HookedPresent1,
+                               (void**)&oPresent1) != KenshiLib::SUCCESS)
+        { Log("WARNING: Failed to hook Present1 at %p", realAddrPresent1); }
+        else
+        { Log("  Present1 hook installed at %p (deferred)", realAddrPresent1); }
+    }
+
+    if (KenshiLib::AddHook(realAddrResize, (void*)HookedResizeBuffers,
+                           (void**)&oResizeBuffers) != KenshiLib::SUCCESS)
+    { Log("ERROR: Failed to hook ResizeBuffers (addr=%p)", realAddrResize); ok = false; }
+    else
+    { Log("  ResizeBuffers hook installed at %p (deferred)", realAddrResize); }
+
+    sSwapChainHooked = true;
+
+    if (ok)
+        Log("All swap chain hooks installed successfully (deferred)");
+    else
+        Log("WARNING: Some swap chain hooks failed — GUI may not work");
+}
+
+// ==================== Present hook diagnostics ====================
+
+bool IsPresentHooked()
+{
+    return sSwapChainHooked && gPresentHookCallCount > 0;
+}
+
+void TryRecoverPresent()
+{
+    if (gPresentHookCallCount > 0)
+        return; // Already working
+
+    if (!gDeviceCaptured || !gDevice || !gContext)
+    {
+        Log("RECOVER: Cannot recover — device not captured yet");
+        return;
+    }
+
+    Log("RECOVER: Attempting to re-discover swap chain and re-hook Present...");
+
+    // Reset the flag so TryInstallSwapChainHooks will retry
+    // NOTE: we can only hook an address once with KenshiLib::AddHook.
+    // If the address is the same as before, the re-hook will fail (already hooked).
+    // But if TryDiscoverSwapChain finds a DIFFERENT address, the new hook will succeed.
+    bool wasHooked = sSwapChainHooked;
+    sSwapChainHooked = false;
+
+    TryInstallSwapChainHooks();
+
+    if (!sSwapChainHooked)
+    {
+        // Re-hook failed completely, restore flag
+        sSwapChainHooked = wasHooked;
+        Log("RECOVER: Re-hook failed. Present may be hooked by an overlay that doesn't chain properly.");
+        Log("RECOVER: GUI will not be available this session. Effects still work.");
+    }
+}
+
 // ==================== Device capture ====================
 
 static void TryCaptureDevice(ID3D11Device* device)
@@ -398,6 +577,11 @@ static void TryCaptureDevice(ID3D11Device* device)
     // Initialize all loaded effect plugins
     if (!gEffectLoader.InitAll(gDevice, gWidth, gHeight))
         Log("WARNING: One or more effect plugins failed to initialize");
+
+    // Deferred: install Present/ResizeBuffers hooks now that the real device is captured.
+    // By waiting until the first Draw call, we avoid the race with overlay DLLs
+    // (Steam, Discord, ReShade) that also hook Present during their initialization.
+    TryInstallSwapChainHooks();
 
     Log("Dust fully initialized and active");
 }
@@ -775,9 +959,7 @@ static const int VTIDX_CTX_DrawIndexed              = 12;
 static const int VTIDX_CTX_Draw                     = 13;
 static const int VTIDX_CTX_DrawIndexedInstanced     = 20;
 static const int VTIDX_CTX_OMSetRenderTargets       = 33;
-static const int VTIDX_SC_Present                   = 8;
-static const int VTIDX_SC_ResizeBuffers             = 13;
-static const int VTIDX_SC1_Present1                  = 22;
+// VTIDX_SC_* constants moved to top of file (needed by deferred hook code)
 
 bool Install()
 {
@@ -941,26 +1123,18 @@ bool Install()
                            (void**)&oOMSetRenderTargets) != KenshiLib::SUCCESS)
     { Log("ERROR: Failed to hook OMSetRenderTargets"); ok = false; }
 
-    if (KenshiLib::AddHook(addrPresent, (void*)HookedPresent,
-                           (void**)&oPresent) != KenshiLib::SUCCESS)
-    { Log("ERROR: Failed to hook Present"); ok = false; }
-
-    if (addrPresent1)
-    {
-        if (KenshiLib::AddHook(addrPresent1, (void*)HookedPresent1,
-                               (void**)&oPresent1) != KenshiLib::SUCCESS)
-        { Log("WARNING: Failed to hook Present1 (flip-model swap chains may not show GUI)"); }
-        else
-        { Log("  Present1 hook installed"); }
-    }
-
-    if (KenshiLib::AddHook(addrResizeBuf, (void*)HookedResizeBuffers,
-                           (void**)&oResizeBuffers) != KenshiLib::SUCCESS)
-    { Log("ERROR: Failed to hook ResizeBuffers"); ok = false; }
+    // Present/Present1/ResizeBuffers hooks are DEFERRED until the first Draw call.
+    // This avoids a race with overlay DLLs (Steam, Discord, ReShade) that also hook
+    // Present during their initialization. By hooking later, we wrap their hooks
+    // and always fire. Addresses are saved and used in TryInstallSwapChainHooks().
+    sSavedAddrPresent  = addrPresent;
+    sSavedAddrPresent1 = addrPresent1;
+    sSavedAddrResizeBuf = addrResizeBuf;
+    Log("  Present hooks DEFERRED (Present=%p, Present1=%p, ResizeBuffers=%p)",
+        addrPresent, addrPresent1, addrResizeBuf);
 
     if (ok)
-        Log("All D3D11 hooks installed successfully (Present%s + ResizeBuffers)",
-            addrPresent1 ? " + Present1" : "");
+        Log("Device/Context hooks installed, swap chain hooks deferred to first Draw");
 
     return ok;
 }
