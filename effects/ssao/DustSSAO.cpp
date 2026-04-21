@@ -169,7 +169,8 @@ static void SSAOPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     }
 
     // Generate AO (saves/restores GPU state internally)
-    ID3D11ShaderResourceView* aoSRV = SSAORenderer::RenderAO(ctx->context, depthSRV);
+    ID3D11ShaderResourceView* normalsSRV = host->GetSRV(DUST_RESOURCE_NORMALS);
+    ID3D11ShaderResourceView* aoSRV = SSAORenderer::RenderAO(ctx->context, depthSRV, normalsSRV, &ctx->camera);
     if (!aoSRV)
     {
         Log("[SSAO] WARNING: RenderAO returned null, binding white fallback");

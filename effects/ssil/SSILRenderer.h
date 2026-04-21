@@ -13,7 +13,8 @@ namespace SSILRenderer
     ID3D11ShaderResourceView* RenderIL(ID3D11DeviceContext* ctx,
                                         ID3D11ShaderResourceView* depthSRV,
                                         ID3D11ShaderResourceView* albedoSRV,
-                                        ID3D11ShaderResourceView* normalsSRV);
+                                        ID3D11ShaderResourceView* normalsSRV,
+                                        const DustCameraData* camera);
 
     // Render debug overlay onto HDR target.
     void RenderDebugOverlay(ID3D11DeviceContext* ctx,

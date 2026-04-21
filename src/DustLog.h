@@ -13,7 +13,7 @@ inline bool& DustLogEnabled()
     return enabled;
 }
 
-// Directory where Dust.log is written (next to the DLL)
+// Directory where the DLL lives (logs go into logs/ subfolder)
 inline std::string& DustLogDir()
 {
     static std::string dir;
@@ -42,7 +42,20 @@ inline FILE* DustLogFile()
     static FILE* f = nullptr;
     if (!f && !DustLogDir().empty())
     {
-        std::string path = DustLogDir() + "Dust.log";
+        // Create logs/ subdirectory
+        std::string logsDir = DustLogDir() + "logs";
+        CreateDirectoryA(logsDir.c_str(), nullptr);
+
+        // Generate timestamped filename: Dust_YYYY-MM-DD_HH-MM-SS.log
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        char filename[128];
+        snprintf(filename, sizeof(filename),
+                 "Dust_%04d-%02d-%02d_%02d-%02d-%02d.log",
+                 st.wYear, st.wMonth, st.wDay,
+                 st.wHour, st.wMinute, st.wSecond);
+
+        std::string path = logsDir + "\\" + filename;
         f = fopen(path.c_str(), "w");
     }
     return f;

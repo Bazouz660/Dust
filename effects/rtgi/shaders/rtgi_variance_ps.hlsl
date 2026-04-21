@@ -17,7 +17,8 @@ float Luminance(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 {
-    float centerLum = Luminance(giTex.SampleLevel(pointClamp, uv, 0).rgb);
+    int2 pix = int2(pos.xy);
+    float centerLum = Luminance(giTex.Load(int3(pix, 0)).rgb);
     float lumSum = centerLum;
     float lumSumSq = centerLum * centerLum;
 
@@ -28,7 +29,7 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         for (int vx = -1; vx <= 1; vx++)
         {
             if (vx == 0 && vy == 0) continue;
-            float3 vc = giTex.SampleLevel(pointClamp, uv + float2(vx, vy) * invViewportSize, 0).rgb;
+            float3 vc = giTex.Load(int3(pix + int2(vx, vy), 0)).rgb;
             float vl = Luminance(vc);
             lumSum += vl;
             lumSumSq += vl * vl;

@@ -53,9 +53,10 @@ void main(uint3 tid : SV_DispatchThreadID)
     if (tid.x >= (uint)viewportSize.x || tid.y >= (uint)viewportSize.y)
         return;
 
-    float2 uv = (float2(tid.xy) + 0.5) * invViewportSize;
+    int2 pix = int2(tid.xy);
+    float2 uv = (float2(pix) + 0.5) * invViewportSize;
 
-    float4 centerGI = giTex.SampleLevel(pointClamp, uv, 0);
+    float4 centerGI = giTex.Load(int3(pix, 0));
     float  centerDepth = depthTex.SampleLevel(pointClamp, uv, 0);
 
     if (centerDepth <= 0.0001 || centerDepth > fadeDistance)
@@ -66,9 +67,9 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     float  centerLum = Luminance(centerGI.rgb);
     float  centerAO = centerGI.a;
-    float3 centerNormal = normalize(normalsTex.SampleLevel(pointClamp, uv, 0).rgb * 2.0 - 1.0);
+    float3 centerNormal = normalsTex.SampleLevel(pointClamp, uv, 0).rgb * 2.0 - 1.0;
 
-    float lumStdDev = varianceTex.SampleLevel(pointClamp, uv, 0);
+    float lumStdDev = varianceTex.Load(int3(pix, 0));
 
     // Depth gradient
     float depthRight = depthTex.SampleLevel(pointClamp, uv + float2(invViewportSize.x, 0), 0);
@@ -83,6 +84,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     float  wSumAO = 1.0;
 
     static const float AO_SIGMA_SQ2 = 2.0 * 4.0 * 4.0;
+    int iStep = (int)stepSize;
 
     [unroll]
     for (int dy = -1; dy <= 1; dy++)
@@ -93,18 +95,19 @@ void main(uint3 tid : SV_DispatchThreadID)
             if (dx == 0 && dy == 0)
                 continue;
 
-            float2 sampleUV = uv + float2(dx, dy) * invViewportSize * stepSize;
+            int2 samplePix = pix + int2(dx, dy) * iStep;
 
-            if (any(sampleUV < 0.0) || any(sampleUV > 1.0))
+            if (any(samplePix < 0) || samplePix.x >= (int)viewportSize.x || samplePix.y >= (int)viewportSize.y)
                 continue;
 
+            float2 sampleUV = (float2(samplePix) + 0.5) * invViewportSize;
             float sampleDepth = depthTex.SampleLevel(pointClamp, sampleUV, 0);
 
             if (sampleDepth <= 0.0001)
                 continue;
 
-            float4 sampleGI = giTex.SampleLevel(pointClamp, sampleUV, 0);
-            float3 sampleNormal = normalize(normalsTex.SampleLevel(pointClamp, sampleUV, 0).rgb * 2.0 - 1.0);
+            float4 sampleGI = giTex.Load(int3(samplePix, 0));
+            float3 sampleNormal = normalsTex.SampleLevel(pointClamp, sampleUV, 0).rgb * 2.0 - 1.0;
 
             float pixelDist = pixelDists[dy + 1][dx + 1];
             float kw = kernelWeights[dy + 1][dx + 1];

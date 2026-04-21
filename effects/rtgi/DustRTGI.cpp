@@ -51,13 +51,13 @@ static std::string GetPluginDir()
     return (pos != std::string::npos) ? s.substr(0, pos) : s;
 }
 
-// PRE callback: extract camera data from the game's bound constant buffer
+// PRE callback: feed camera data from the framework to the renderer
 static void RTGIPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
 {
     if (!gRTGIConfig.enabled || !RTGIRenderer::IsInitialized())
         return;
 
-    RTGIRenderer::ExtractCameraData(ctx->context);
+    RTGIRenderer::UpdateCameraData(&ctx->camera);
 }
 
 // POST callback: render GI and composite onto HDR scene
@@ -147,7 +147,7 @@ static void RTGIPostExecute(const DustFrameContext* ctx, const DustHostAPI* host
     // Debug overlay (replaces scene if active)
     if (gRTGIConfig.debugView != 0)
     {
-        RTGIRenderer::RenderDebugOverlay(dc, hdrRTV);
+        RTGIRenderer::RenderDebugOverlay(dc, hdrRTV, depthSRV, normalsSRV);
     }
 }
 
@@ -288,7 +288,7 @@ static DustSettingDesc gSettingsArray[] = {
     { "Depth Sigma",        DUST_SETTING_FLOAT, &gRTGIConfig.depthSigma,      0.1f,   5.0f,   "DepthSigma" },
     { "Color Phi",          DUST_SETTING_FLOAT, &gRTGIConfig.phiColor,        1.0f,   10.0f,  "PhiColor" },
     { "Resolution",         DUST_SETTING_ENUM,  &gRTGIConfig.resolutionMode,  0.0f,   2.0f,   "ResolutionMode", gResolutionLabels },
-    { "Debug View",         DUST_SETTING_INT,   &gRTGIConfig.debugView,       0.0f,   3.0f,   "DebugView" },
+    { "Debug View",         DUST_SETTING_INT,   &gRTGIConfig.debugView,       0.0f,   6.0f,   "DebugView" },
     // Hidden
     { "Tan Half FOV",       DUST_SETTING_HIDDEN_FLOAT, &gRTGIConfig.tanHalfFov, 0.1f, 2.0f,   "TanHalfFov" },
 };

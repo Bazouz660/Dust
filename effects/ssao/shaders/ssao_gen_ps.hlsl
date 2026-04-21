@@ -1,8 +1,9 @@
 // GTAO — Ground Truth Ambient Occlusion (Jimenez et al. 2016)
 // Marches in structured screen-space directions, tracks horizon angles.
 
-Texture2D<float> depthTex   : register(t0);
-SamplerState     pointClamp : register(s0);
+Texture2D<float>  depthTex   : register(t0);
+Texture2D<float4> normalsTex : register(t1);
+SamplerState      pointClamp : register(s0);
 
 cbuffer SSAOParams : register(b0)
 {
@@ -25,6 +26,10 @@ cbuffer SSAOParams : register(b0)
     float  noiseScale;
     float  numDirections;
     float  numSteps;
+    float3 _pad0;
+    float4 camRight;
+    float4 camUp;
+    float4 camForward;
 };
 
 static const float PI = 3.14159265;
@@ -51,45 +56,13 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     viewPos.y = (1.0 - uv.y * 2.0) * uvScale.y * depth;
     viewPos.z = depth;
 
-    // Normal from depth cross-derivatives (smallest-delta method)
-    float depthR = depthTex.Sample(pointClamp, uv + float2( invViewportSize.x, 0));
-    float depthL = depthTex.Sample(pointClamp, uv + float2(-invViewportSize.x, 0));
-    float depthU = depthTex.Sample(pointClamp, uv + float2(0, -invViewportSize.y));
-    float depthD = depthTex.Sample(pointClamp, uv + float2(0,  invViewportSize.y));
-
-    // Use precomputed UV offsets for neighbor reconstruction
-    float3 ddxPos, ddyPos;
-    if (abs(depthR - depth) < abs(depthL - depth))
-    {
-        float2 nUV = uv + float2(invViewportSize.x, 0);
-        ddxPos = float3((nUV.x * 2.0 - 1.0) * uvScale.x * depthR,
-                        (1.0 - nUV.y * 2.0) * uvScale.y * depthR,
-                        depthR) - viewPos;
-    }
-    else
-    {
-        float2 nUV = uv - float2(invViewportSize.x, 0);
-        ddxPos = viewPos - float3((nUV.x * 2.0 - 1.0) * uvScale.x * depthL,
-                                   (1.0 - nUV.y * 2.0) * uvScale.y * depthL,
-                                   depthL);
-    }
-
-    if (abs(depthD - depth) < abs(depthU - depth))
-    {
-        float2 nUV = uv + float2(0, invViewportSize.y);
-        ddyPos = float3((nUV.x * 2.0 - 1.0) * uvScale.x * depthD,
-                        (1.0 - nUV.y * 2.0) * uvScale.y * depthD,
-                        depthD) - viewPos;
-    }
-    else
-    {
-        float2 nUV = uv - float2(0, invViewportSize.y);
-        ddyPos = viewPos - float3((nUV.x * 2.0 - 1.0) * uvScale.x * depthU,
-                                   (1.0 - nUV.y * 2.0) * uvScale.y * depthU,
-                                   depthU);
-    }
-
-    float3 normal = normalize(cross(ddxPos, ddyPos));
+    // GBuffer world-space normals transformed to view-space
+    float3 worldN = normalize(normalsTex.Sample(pointClamp, uv).rgb * 2.0 - 1.0);
+    float3 normal;
+    normal.x =  dot(worldN, camRight.xyz);
+    normal.y =  dot(worldN, camUp.xyz);
+    normal.z = -dot(worldN, camForward.xyz);
+    normal = normalize(normal);
 
     // Per-pixel rotation using interleaved gradient noise
     float noiseAngle = InterleavedGradientNoise(pos.xy * noiseScale) * PI;
@@ -114,7 +87,9 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     for (int dir = 0; dir < iNumDirs; dir++)
     {
         float angle = (float(dir) * invDirCount) * PI + noiseAngle;
-        float2 direction = float2(cos(angle), sin(angle));
+        float s, c;
+        sincos(angle, s, c);
+        float2 direction = float2(c, s);
 
         float maxCosPos = biasVal;
         float maxCosNeg = biasVal;

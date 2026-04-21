@@ -35,7 +35,7 @@ struct RTGIConfig
     float tanHalfFov    = 0.5218f;
 
     // Debug
-    int   debugView     = 0;       // 0=off, 1=GI, 2=AO, 3=combined
+    int   debugView     = 0;       // 0=off, 1=GI, 2=AO, 3=combined, 4=world normals, 5=view normals, 6=depth
 };
 
 extern RTGIConfig gRTGIConfig;

@@ -12,7 +12,6 @@ namespace ResourceName
     constexpr const char* ALBEDO_SRV    = "albedo";
     constexpr const char* HDR_RTV       = "hdr_rt";
     constexpr const char* LDR_RTV       = "ldr_rt";
-    constexpr const char* LUMINANCE_SRV = "luminance";
 }
 
 class ResourceRegistry

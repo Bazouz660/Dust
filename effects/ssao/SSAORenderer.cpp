@@ -12,6 +12,7 @@ static UINT gWidth = 0;
 static UINT gHeight = 0;
 static const DustHostAPI* gHost = nullptr;
 static std::string gShaderDir;
+static uint64_t gFrameIndex = 0;
 
 // Full-res AO textures (ping-pong for gen + blur)
 static ID3D11Texture2D*          gAoTex = nullptr;
@@ -69,6 +70,10 @@ struct SSAOCBData
     float noiseScale;
     float numDirections;
     float numSteps;
+    float _pad0[3];
+    float camRight[4];
+    float camUp[4];
+    float camForward[4];
 };
 static ID3D11Buffer* gSSAOCB = nullptr;
 
@@ -247,6 +252,7 @@ void Shutdown()
     SAFE_RELEASE(gPointClampSampler); SAFE_RELEASE(gLinearClampSampler); SAFE_RELEASE(gSSAOCB);
 #undef SAFE_RELEASE
     gInitialized = false;
+    gFrameIndex = 0;
     gHost = nullptr;
     Log("SSAORenderer shut down");
 }
@@ -295,12 +301,16 @@ float GetLastGpuTimeMs()
 }
 
 ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
-                                    ID3D11ShaderResourceView* depthSRV)
+                                    ID3D11ShaderResourceView* depthSRV,
+                                    ID3D11ShaderResourceView* normalsSRV,
+                                    const DustCameraData* camera)
 {
     if (!gInitialized || !ctx || !depthSRV || !gHost)
         return nullptr;
 
-    // Detect resolution from depth texture
+    // Defensive resolution fallback — every 300 frames (~5s) to catch
+    // missed OnResolutionChanged calls without paying QI/GetDesc every frame.
+    if ((gFrameIndex % 300) == 0)
     {
         ID3D11Resource* res = nullptr;
         depthSRV->GetResource(&res);
@@ -327,6 +337,7 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
             res->Release();
         }
     }
+    gFrameIndex++;
 
     gHost->SaveState(ctx);
 
@@ -361,6 +372,13 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
         cb.noiseScale = 1.0f;
         cb.numDirections = (float)numDirs;
         cb.numSteps = (float)numSteps;
+        if (camera && camera->valid)
+        {
+            const float* iv = camera->inverseView;
+            cb.camRight[0]   = iv[0]; cb.camRight[1]   = iv[4]; cb.camRight[2]   = iv[8];  cb.camRight[3]   = 0;
+            cb.camUp[0]      = iv[1]; cb.camUp[1]      = iv[5]; cb.camUp[2]      = iv[9];  cb.camUp[3]      = 0;
+            cb.camForward[0] = iv[2]; cb.camForward[1] = iv[6]; cb.camForward[2] = iv[10]; cb.camForward[3] = 0;
+        }
         gHost->UpdateConstantBuffer(ctx, gSSAOCB, &cb, sizeof(cb));
     }
 
@@ -388,7 +406,7 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
     {
         ctx->OMSetRenderTargets(1, &gAoRTV, nullptr);
         ctx->PSSetShader(gSSAOGenPS, nullptr, 0);
-        ID3D11ShaderResourceView* srvs[2] = { depthSRV, nullptr };
+        ID3D11ShaderResourceView* srvs[2] = { depthSRV, normalsSRV };
         ctx->PSSetShaderResources(0, 2, srvs);
         ctx->Draw(3, 0);
         ctx->PSSetShaderResources(0, 2, nullSRVs);

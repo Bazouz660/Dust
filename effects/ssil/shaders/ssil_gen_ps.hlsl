@@ -27,6 +27,9 @@ cbuffer SSILParams : register(b0)
     float  blurSharpness;
     float  numDirections;
     float  numSteps;
+    float4 camRight;
+    float4 camUp;
+    float4 camForward;
 };
 
 static const float PI = 3.14159265;
@@ -54,24 +57,13 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
     float3 viewPos = ReconstructViewPos(uv, depth);
 
-    // Normal from depth cross-derivatives (smallest-delta method)
-    float depthR = depthTex.Sample(pointClamp, uv + float2( invViewportSize.x, 0));
-    float depthL = depthTex.Sample(pointClamp, uv + float2(-invViewportSize.x, 0));
-    float depthU = depthTex.Sample(pointClamp, uv + float2(0, -invViewportSize.y));
-    float depthD = depthTex.Sample(pointClamp, uv + float2(0,  invViewportSize.y));
-
-    float3 ddxPos, ddyPos;
-    if (abs(depthR - depth) < abs(depthL - depth))
-        ddxPos = ReconstructViewPos(uv + float2(invViewportSize.x, 0), depthR) - viewPos;
-    else
-        ddxPos = viewPos - ReconstructViewPos(uv - float2(invViewportSize.x, 0), depthL);
-
-    if (abs(depthD - depth) < abs(depthU - depth))
-        ddyPos = ReconstructViewPos(uv + float2(0, invViewportSize.y), depthD) - viewPos;
-    else
-        ddyPos = viewPos - ReconstructViewPos(uv - float2(0, invViewportSize.y), depthU);
-
-    float3 normal = normalize(cross(ddxPos, ddyPos));
+    // GBuffer world-space normals transformed to view-space
+    float3 worldN = normalize(normalsTex.Sample(pointClamp, uv).rgb * 2.0 - 1.0);
+    float3 normal;
+    normal.x =  dot(worldN, camRight.xyz);
+    normal.y =  dot(worldN, camUp.xyz);
+    normal.z = -dot(worldN, camForward.xyz);
+    normal = normalize(normal);
 
     // Per-pixel rotation
     float noiseAngle = InterleavedGradientNoise(pos.xy) * PI;
@@ -90,7 +82,9 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     for (int dir = 0; dir < iNumDirs; dir++)
     {
         float angle = (float(dir) / numDirections) * PI + noiseAngle;
-        float2 direction = float2(cos(angle), sin(angle));
+        float s, c;
+        sincos(angle, s, c);
+        float2 direction = float2(c, s);
 
         [loop]
         for (int step = 1; step <= iNumSteps; step++)

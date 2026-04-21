@@ -3,6 +3,9 @@
 #include "PipelineDetector.h"
 #include "EffectLoader.h"
 #include "ResourceRegistry.h"
+#include "Survey.h"
+#include "SurveyRecorder.h"
+#include "SurveyWriter.h"
 #include "DustLog.h"
 #include <core/Functions.h>
 #include <d3d11.h>
@@ -11,6 +14,7 @@
 #include <dxgi1_2.h>
 #include <string>
 #include <cstring>
+#include <vector>
 
 namespace D3D11Hook
 {
@@ -27,19 +31,107 @@ static UINT gShadowResOverride = 0;
 static uint64_t gFrameIndex = 0;
 static bool gDispatchedThisFrame = false;
 
-#ifdef DUST_SURVEY
-static bool gResetPending = false;
-#endif
+// Camera extraction from the game's deferred lighting CB
+// (staging CBs are in gCameraStagingCBs[], declared near ExtractCameraData)
+static DustCameraData gCameraData = {};
+static bool gCameraDataExtracted = false; // per-frame flag
+
+// VTable indices for swap chain methods (used by both Install() and deferred hooking)
+static const int VTIDX_SC_Present        = 8;
+static const int VTIDX_SC_ResizeBuffers  = 13;
+static const int VTIDX_SC1_Present1      = 22;
+
+// Deferred Present hooking: addresses saved from temp device, installed later
+static void* sSavedAddrPresent   = nullptr;
+static void* sSavedAddrPresent1  = nullptr;
+static void* sSavedAddrResizeBuf = nullptr;
+static bool  sSwapChainHooked    = false;
+
+// Survey: collected frame data for writing after all frames captured
+static std::vector<SurveyFrameData> sSurveyFrames;
+
+static bool gDeviceRemovedThisFrame = false;
 
 void ResetFrameState()
 {
     gPipelineDetector.ResetFrame();
     gResourceRegistry.ResetFrame();
     gDispatchedThisFrame = false;
+    gCameraDataExtracted = false;
+    gDeviceRemovedThisFrame = false;
     gFrameIndex++;
-#ifdef DUST_SURVEY
-    gResetPending = true;
-#endif
+}
+
+// Extract camera basis vectors from the game's deferred lighting PS constant buffer.
+// The inverse view matrix sits at register c8 (offset 128 bytes / 32 floats).
+// Camera axes are the COLUMNS of the inverse view matrix (= rows of the view matrix).
+// Double-buffered staging: CopyResource into slot N this frame, Map slot N-1
+// (which the GPU finished long ago). Eliminates the CPU-GPU sync stall that
+// was blocking the pipeline every frame.
+static ID3D11Buffer* gCameraStagingCBs[2] = {};
+static int gCameraStagingSlot = 0;
+static bool gCameraStagingReady = false; // false until first copy has been issued
+
+static void ExtractCameraData(ID3D11DeviceContext* ctx)
+{
+    if (gCameraDataExtracted) return;
+
+    ID3D11Buffer* psCB = nullptr;
+    ctx->PSGetConstantBuffers(0, 1, &psCB);
+    if (!psCB) return;
+
+    D3D11_BUFFER_DESC cbDesc;
+    psCB->GetDesc(&cbDesc);
+    if (cbDesc.ByteWidth < 192) { psCB->Release(); return; }
+
+    if (!gCameraStagingCBs[0])
+    {
+        D3D11_BUFFER_DESC sd = cbDesc;
+        sd.Usage = D3D11_USAGE_STAGING;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        sd.BindFlags = 0;
+        sd.MiscFlags = 0;
+        gDevice->CreateBuffer(&sd, nullptr, &gCameraStagingCBs[0]);
+        gDevice->CreateBuffer(&sd, nullptr, &gCameraStagingCBs[1]);
+    }
+    if (!gCameraStagingCBs[0] || !gCameraStagingCBs[1]) { psCB->Release(); return; }
+
+    int writeSlot = gCameraStagingSlot;
+    int readSlot = 1 - writeSlot;
+
+    // Copy this frame's CB into the write slot (async, no stall)
+    ctx->CopyResource(gCameraStagingCBs[writeSlot], psCB);
+    psCB->Release();
+
+    // Read LAST frame's data from the other slot (GPU finished it long ago)
+    if (gCameraStagingReady)
+    {
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        if (SUCCEEDED(ctx->Map(gCameraStagingCBs[readSlot], 0, D3D11_MAP_READ, 0, &mapped)))
+        {
+            float m[16];
+            memcpy(m, (float*)mapped.pData + 32, 64); // c8 offset
+            ctx->Unmap(gCameraStagingCBs[readSlot], 0);
+
+            bool valid = true;
+            for (int i = 0; i < 16; i++)
+                if (!isfinite(m[i])) { valid = false; break; }
+
+            if (valid)
+            {
+                memcpy(gCameraData.inverseView, m, 64);
+                gCameraData.camRight[0]   = m[0]; gCameraData.camRight[1]   = m[4]; gCameraData.camRight[2]   = m[8];
+                gCameraData.camUp[0]      = m[1]; gCameraData.camUp[1]      = m[5]; gCameraData.camUp[2]      = m[9];
+                gCameraData.camForward[0] = m[2]; gCameraData.camForward[1] = m[6]; gCameraData.camForward[2] = m[10];
+                gCameraData.camPosition[0] = m[12]; gCameraData.camPosition[1] = m[13]; gCameraData.camPosition[2] = m[14];
+                gCameraData.valid = 1;
+                gCameraDataExtracted = true;
+            }
+        }
+    }
+
+    gCameraStagingSlot = readSlot;
+    gCameraStagingReady = true;
 }
 
 // ==================== Original function pointers ====================
@@ -308,7 +400,14 @@ static HRESULT WINAPI HookedD3DCompile(
                                           pDefines, pInclude, pEntrypoint, pTarget,
                                           Flags1, Flags2, ppCode, ppErrorMsgs);
                 if (SUCCEEDED(hr))
+                {
+                    // Record shader source for survey (use patched source)
+                    if (ppCode && *ppCode)
+                        SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
+                            pEntrypoint, pTarget, pSourceName,
+                            (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
                     return hr;
+                }
 
                 Log("ShaderPatch: patched shader failed to compile, falling back to original");
                 if (ppErrorMsgs && *ppErrorMsgs)
@@ -317,16 +416,176 @@ static HRESULT WINAPI HookedD3DCompile(
                     (*ppErrorMsgs)->Release();
                     *ppErrorMsgs = nullptr;
                 }
-                return oD3DCompile(pSrcData, SrcDataSize, pSourceName,
-                                    pDefines, pInclude, pEntrypoint, pTarget,
-                                    Flags1, Flags2, ppCode, ppErrorMsgs);
+                // Fall through to compile original below
             }
         }
     }
 
-    return oD3DCompile(pSrcData, SrcDataSize, pSourceName,
-                        pDefines, pInclude, pEntrypoint, pTarget,
-                        Flags1, Flags2, ppCode, ppErrorMsgs);
+    HRESULT hr = oD3DCompile(pSrcData, SrcDataSize, pSourceName,
+                              pDefines, pInclude, pEntrypoint, pTarget,
+                              Flags1, Flags2, ppCode, ppErrorMsgs);
+
+    // Record shader source for survey (always, for all shaders)
+    if (SUCCEEDED(hr) && ppCode && *ppCode && pSrcData && SrcDataSize > 0)
+    {
+        SurveyRecorder::OnShaderCompiled(pSrcData, SrcDataSize,
+            pEntrypoint, pTarget, pSourceName,
+            (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+    }
+
+    return hr;
+}
+
+// ==================== Deferred swap chain hooking ====================
+
+// Forward declarations for hooks defined later (needed by TryInstallSwapChainHooks)
+static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* pThis, UINT SyncInterval, UINT Flags);
+static HRESULT STDMETHODCALLTYPE HookedPresent1(IDXGISwapChain1* pThis, UINT SyncInterval,
+    UINT PresentFlags, const DXGI_PRESENT_PARAMETERS* pPresentParameters);
+static HRESULT STDMETHODCALLTYPE HookedResizeBuffers(IDXGISwapChain* pThis, UINT BufferCount,
+    UINT Width, UINT Height, DXGI_FORMAT NewFormat, UINT SwapChainFlags);
+
+// Try to find the game's real swap chain by walking DXGI from the current
+// render target. If the RT is the swap chain's back buffer, IDXGISurface::GetParent
+// returns the swap chain. Falls back gracefully if the RT is an intermediate buffer.
+static bool TryDiscoverSwapChain(IDXGISwapChain** ppSwapChain)
+{
+    *ppSwapChain = nullptr;
+
+    ID3D11RenderTargetView* rtv = nullptr;
+    gContext->OMGetRenderTargets(1, &rtv, nullptr);
+    if (!rtv)
+    {
+        Log("SwapChain discovery: no render target bound");
+        return false;
+    }
+
+    ID3D11Resource* res = nullptr;
+    rtv->GetResource(&res);
+    rtv->Release();
+    if (!res)
+    {
+        Log("SwapChain discovery: RT has no resource");
+        return false;
+    }
+
+    IDXGISurface* surface = nullptr;
+    HRESULT hr = res->QueryInterface(__uuidof(IDXGISurface), (void**)&surface);
+    res->Release();
+    if (FAILED(hr) || !surface)
+    {
+        Log("SwapChain discovery: RT resource is not a DXGI surface (hr=0x%08X)", (unsigned)hr);
+        return false;
+    }
+
+    hr = surface->GetParent(__uuidof(IDXGISwapChain), (void**)ppSwapChain);
+    surface->Release();
+
+    if (FAILED(hr) || !*ppSwapChain)
+    {
+        Log("SwapChain discovery: surface parent is not a swap chain (hr=0x%08X) — RT is likely an intermediate buffer",
+            (unsigned)hr);
+        return false;
+    }
+
+    Log("SwapChain discovery: found real swap chain at %p", *ppSwapChain);
+    return true;
+}
+
+// VTable hook: directly replace function pointer in the COM object's vtable.
+// Immune to inline hook conflicts from overlays (Steam, Discord, ReShade).
+static bool VTableHook(void* pObject, int vtableIndex, void* detour, void** original)
+{
+    void** vtable = *reinterpret_cast<void***>(pObject);
+    *original = vtable[vtableIndex];
+
+    DWORD oldProtect;
+    if (!VirtualProtect(&vtable[vtableIndex], sizeof(void*), PAGE_READWRITE, &oldProtect))
+        return false;
+    vtable[vtableIndex] = detour;
+    VirtualProtect(&vtable[vtableIndex], sizeof(void*), oldProtect, &oldProtect);
+    return true;
+}
+
+// The swap chain pointer we vtable-hooked — needed for recovery verification
+static IDXGISwapChain* gHookedSwapChain = nullptr;
+
+static void TryInstallSwapChainHooks()
+{
+    if (sSwapChainHooked)
+        return;
+
+    IDXGISwapChain* realSwapChain = nullptr;
+    if (!TryDiscoverSwapChain(&realSwapChain) || !realSwapChain)
+    {
+        Log("SwapChain discovery failed — cannot install Present hooks");
+        return;
+    }
+
+    bool ok = true;
+
+    // VTable hook Present (index 8)
+    if (!VTableHook(realSwapChain, VTIDX_SC_Present, (void*)HookedPresent, (void**)&oPresent))
+    { Log("ERROR: Failed to vtable-hook Present"); ok = false; }
+    else
+    { Log("  Present vtable-hooked on swap chain %p", realSwapChain); }
+
+    // VTable hook ResizeBuffers (index 13)
+    if (!VTableHook(realSwapChain, VTIDX_SC_ResizeBuffers, (void*)HookedResizeBuffers, (void**)&oResizeBuffers))
+    { Log("ERROR: Failed to vtable-hook ResizeBuffers"); ok = false; }
+    else
+    { Log("  ResizeBuffers vtable-hooked on swap chain %p", realSwapChain); }
+
+    // VTable hook Present1 (index 22 on IDXGISwapChain1)
+    IDXGISwapChain1* sc1 = nullptr;
+    if (SUCCEEDED(realSwapChain->QueryInterface(__uuidof(IDXGISwapChain1), (void**)&sc1)) && sc1)
+    {
+        if (!VTableHook(sc1, VTIDX_SC1_Present1, (void*)HookedPresent1, (void**)&oPresent1))
+        { Log("WARNING: Failed to vtable-hook Present1"); }
+        else
+        { Log("  Present1 vtable-hooked"); }
+        sc1->Release();
+    }
+
+    gHookedSwapChain = realSwapChain;
+    realSwapChain->Release();
+    sSwapChainHooked = true;
+
+    if (ok)
+        Log("All swap chain hooks installed successfully (vtable, deferred)");
+    else
+        Log("WARNING: Some swap chain hooks failed — GUI may not work");
+}
+
+// ==================== Present hook diagnostics ====================
+
+bool IsPresentHooked()
+{
+    return sSwapChainHooked && gPresentHookCallCount > 0;
+}
+
+void TryRecoverPresent()
+{
+    if (gPresentHookCallCount > 0)
+        return; // Already working
+
+    if (!gDeviceCaptured || !gDevice || !gContext)
+    {
+        Log("RECOVER: Cannot recover — device not captured yet");
+        return;
+    }
+
+    Log("RECOVER: Attempting to re-discover swap chain and re-patch vtable...");
+
+    // With vtable hooks, recovery is simple: re-patch the vtable entry.
+    // Another overlay may have overwritten our pointer after initial install.
+    sSwapChainHooked = false;
+    TryInstallSwapChainHooks();
+
+    if (!sSwapChainHooked)
+    {
+        Log("RECOVER: Re-hook failed. GUI will not be available this session. Effects still work.");
+    }
 }
 
 // ==================== Device capture ====================
@@ -383,6 +642,11 @@ static void TryCaptureDevice(ID3D11Device* device)
     // Initialize all loaded effect plugins
     if (!gEffectLoader.InitAll(gDevice, gWidth, gHeight))
         Log("WARNING: One or more effect plugins failed to initialize");
+
+    // Deferred: install Present/ResizeBuffers hooks now that the real device is captured.
+    // By waiting until the first Draw call, we avoid the race with overlay DLLs
+    // (Steam, Discord, ReShade) that also hook Present during their initialization.
+    TryInstallSwapChainHooks();
 
     Log("Dust fully initialized and active");
 }
@@ -452,101 +716,39 @@ static HRESULT STDMETHODCALLTYPE HookedCreatePixelShader(
     // temporary enumeration devices that are destroyed before rendering begins.
     // Device capture happens in HookedDraw from the actual rendering context.
 
-    return oCreatePixelShader(pThis, pShaderBytecode, BytecodeLength,
-                               pClassLinkage, ppPixelShader);
+    HRESULT hr = oCreatePixelShader(pThis, pShaderBytecode, BytecodeLength,
+                                     pClassLinkage, ppPixelShader);
+    if (SUCCEEDED(hr) && ppPixelShader && *ppPixelShader)
+        SurveyRecorder::OnPixelShaderCreated(pShaderBytecode, BytecodeLength, *ppPixelShader);
+    return hr;
 }
 
-#ifdef DUST_SURVEY
-// Pipeline survey: log all fullscreen draws for the first few frames
-static int gSurveyFrameCount = 0;
-static int gSurveyDrawIndex = 0;
-static const int SURVEY_FRAMES = 5;
+// ==================== CreateVertexShader hook (for shader source tracking) ====================
 
-static void SurveyFullscreenDraw(ID3D11DeviceContext* ctx, UINT vertexCount)
+typedef HRESULT(STDMETHODCALLTYPE* PFN_CreateVertexShader)(
+    ID3D11Device* pThis, const void* pShaderBytecode, SIZE_T BytecodeLength,
+    ID3D11ClassLinkage* pClassLinkage, ID3D11VertexShader** ppVertexShader);
+
+static PFN_CreateVertexShader oCreateVertexShader = nullptr;
+
+static HRESULT STDMETHODCALLTYPE HookedCreateVertexShader(
+    ID3D11Device* pThis, const void* pShaderBytecode, SIZE_T BytecodeLength,
+    ID3D11ClassLinkage* pClassLinkage, ID3D11VertexShader** ppVertexShader)
 {
-    if (gSurveyFrameCount >= SURVEY_FRAMES)
-        return;
-
-    if (gResetPending)
-    {
-        if (gSurveyDrawIndex > 0)
-        {
-            Log("SURVEY: Frame %d had %d fullscreen draws", gSurveyFrameCount, gSurveyDrawIndex);
-            gSurveyFrameCount++;
-        }
-        gSurveyDrawIndex = 0;
-        gResetPending = false;
-        if (gSurveyFrameCount >= SURVEY_FRAMES)
-            return;
-    }
-
-    ID3D11RenderTargetView* rtvs[4] = {};
-    ctx->OMGetRenderTargets(4, rtvs, nullptr);
-    int numRTs = 0;
-    DXGI_FORMAT rtFormats[4] = {};
-    UINT rtWidth = 0, rtHeight = 0;
-    for (int i = 0; i < 4; i++)
-    {
-        if (rtvs[i])
-        {
-            numRTs = i + 1;
-            D3D11_RENDER_TARGET_VIEW_DESC desc;
-            rtvs[i]->GetDesc(&desc);
-            rtFormats[i] = desc.Format;
-            if (i == 0)
-            {
-                ID3D11Resource* res = nullptr;
-                rtvs[i]->GetResource(&res);
-                if (res)
-                {
-                    ID3D11Texture2D* tex = nullptr;
-                    res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex);
-                    if (tex)
-                    {
-                        D3D11_TEXTURE2D_DESC td;
-                        tex->GetDesc(&td);
-                        rtWidth = td.Width;
-                        rtHeight = td.Height;
-                        tex->Release();
-                    }
-                    res->Release();
-                }
-            }
-            rtvs[i]->Release();
-        }
-    }
-
-    ID3D11ShaderResourceView* srvs[8] = {};
-    ctx->PSGetShaderResources(0, 8, srvs);
-    char srvInfo[256] = {};
-    int pos = 0;
-    for (int i = 0; i < 8; i++)
-    {
-        if (srvs[i])
-        {
-            D3D11_SHADER_RESOURCE_VIEW_DESC desc;
-            srvs[i]->GetDesc(&desc);
-            pos += snprintf(srvInfo + pos, sizeof(srvInfo) - pos, " t%d=%u", i, desc.Format);
-            srvs[i]->Release();
-        }
-    }
-
-    ID3D11PixelShader* ps = nullptr;
-    ctx->PSGetShader(&ps, nullptr, nullptr);
-    void* psAddr = ps;
-    if (ps) ps->Release();
-
-    Log("SURVEY F%d D%02d: verts=%u RTs=%d rt0fmt=%u %ux%u PS=%p SRVs:[%s]",
-        gSurveyFrameCount, gSurveyDrawIndex, vertexCount,
-        numRTs, rtFormats[0], rtWidth, rtHeight, psAddr, srvInfo);
-
-    gSurveyDrawIndex++;
+    HRESULT hr = oCreateVertexShader(pThis, pShaderBytecode, BytecodeLength,
+                                      pClassLinkage, ppVertexShader);
+    if (SUCCEEDED(hr) && ppVertexShader && *ppVertexShader)
+        SurveyRecorder::OnVertexShaderCreated(pShaderBytecode, BytecodeLength, *ppVertexShader);
+    return hr;
 }
-#endif
 
 static void STDMETHODCALLTYPE HookedDraw(
     ID3D11DeviceContext* pThis, UINT VertexCount, UINT StartVertexLocation)
 {
+    // Survey: record ALL draws (before fullscreen filter)
+    if (Survey::IsActive())
+        SurveyRecorder::OnDraw(pThis, VertexCount, StartVertexLocation);
+
     if (VertexCount != 3 && VertexCount != 4)
     {
         oDraw(pThis, VertexCount, StartVertexLocation);
@@ -572,21 +774,21 @@ static void STDMETHODCALLTYPE HookedDraw(
         }
     }
 
-#ifdef DUST_SURVEY
-    SurveyFullscreenDraw(pThis, VertexCount);
-#endif
-
-    // Check device health FIRST — before touching any D3D11 resources.
-    // During fullscreen alt-tab, the device can be removed and any
-    // OMGetRenderTargets / GetDesc / PSGetShaderResources call may crash.
+    // Check device health once per frame, not per draw call.
+    // GetDeviceRemovedReason can cause driver synchronization on some hardware.
+    if (!gDeviceRemovedThisFrame)
     {
         HRESULT removeReason = gDevice->GetDeviceRemovedReason();
         if (removeReason != S_OK)
         {
             Log("Device removed (0x%08X), skipping draw hook entirely", removeReason);
-            oDraw(pThis, VertexCount, StartVertexLocation);
-            return;
+            gDeviceRemovedThisFrame = true;
         }
+    }
+    if (gDeviceRemovedThisFrame)
+    {
+        oDraw(pThis, VertexCount, StartVertexLocation);
+        return;
     }
 
     // Detect render pass from GPU state
@@ -613,37 +815,39 @@ static void STDMETHODCALLTYPE HookedDraw(
             }
         }
 
-        // Detect real resolution from the HDR render target
-        ID3D11RenderTargetView* rtv = nullptr;
-        pThis->OMGetRenderTargets(1, &rtv, nullptr);
-        if (rtv)
+        // Detect real resolution from the HDR render target — only on the
+        // lighting pass (first detection per frame) to avoid redundant COM calls.
+        if (result.point == InjectionPoint::POST_LIGHTING)
         {
-            ID3D11Resource* res = nullptr;
-            rtv->GetResource(&res);
-            if (res)
+            ID3D11RenderTargetView* rtv = nullptr;
+            pThis->OMGetRenderTargets(1, &rtv, nullptr);
+            if (rtv)
             {
-                ID3D11Texture2D* tex = nullptr;
-                res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex);
-                if (tex)
+                ID3D11Resource* res = nullptr;
+                rtv->GetResource(&res);
+                if (res)
                 {
-                    D3D11_TEXTURE2D_DESC desc;
-                    tex->GetDesc(&desc);
-                    if (desc.Width != gWidth || desc.Height != gHeight)
+                    ID3D11Texture2D* tex = nullptr;
+                    res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex);
+                    if (tex)
                     {
-                        Log("Resolution changed: %ux%u -> %ux%u", gWidth, gHeight, desc.Width, desc.Height);
-                        gWidth = desc.Width;
-                        gHeight = desc.Height;
-                        gEffectLoader.OnResolutionChanged(gDevice, gWidth, gHeight);
+                        D3D11_TEXTURE2D_DESC desc;
+                        tex->GetDesc(&desc);
+                        if (desc.Width != gWidth || desc.Height != gHeight)
+                        {
+                            Log("Resolution changed: %ux%u -> %ux%u", gWidth, gHeight, desc.Width, desc.Height);
+                            gWidth = desc.Width;
+                            gHeight = desc.Height;
+                            gEffectLoader.OnResolutionChanged(gDevice, gWidth, gHeight);
+                        }
+                        tex->Release();
                     }
-                    tex->Release();
+                    res->Release();
                 }
-                res->Release();
+                rtv->Release();
             }
-            rtv->Release();
         }
 
-        // Skip effect dispatch when resolution not yet detected.
-        // Effects initialized at 1x1 must not render into full-resolution targets.
         if (gWidth <= 1 || gHeight <= 1)
         {
             Log("Skipping effect dispatch (res=%ux%u)", gWidth, gHeight);
@@ -664,6 +868,10 @@ static void STDMETHODCALLTYPE HookedDraw(
             }
         }
 
+        // Extract camera data at POST_LIGHTING (deferred CB is bound)
+        if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
+            ExtractCameraData(pThis);
+
         DustFrameContext fctx = {};
         fctx.device = gDevice;
         fctx.context = pThis;
@@ -671,6 +879,7 @@ static void STDMETHODCALLTYPE HookedDraw(
         fctx.width = gWidth;
         fctx.height = gHeight;
         fctx.frameIndex = gFrameIndex;
+        fctx.camera = gCameraData;
 
         // PRE: effects bind resources before the game's draw
         fctx.timing = DUST_TIMING_PRE;
@@ -678,10 +887,6 @@ static void STDMETHODCALLTYPE HookedDraw(
 
         // Execute the game's original draw call
         oDraw(pThis, VertexCount, StartVertexLocation);
-
-        // Snapshot pre-fog HDR right after the lighting draw completes
-        if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
-            gEffectLoader.CapturePreFogHDR(pThis);
 
         // POST: effects that operate after the draw
         fctx.timing = DUST_TIMING_POST;
@@ -697,11 +902,8 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     ID3D11DeviceContext* pThis, UINT IndexCount, UINT StartIndexLocation,
     INT BaseVertexLocation)
 {
-    ++gDrawHookCallCount;
-    if ((gDrawHookCallCount % 3000) == 0)
-        Log("Hook diag: draws=%llu presents=%llu",
-            (unsigned long long)gDrawHookCallCount,
-            (unsigned long long)gPresentHookCallCount);
+    if (Survey::IsActive())
+        SurveyRecorder::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 
     oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 }
@@ -710,6 +912,11 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
     ID3D11DeviceContext* pThis, UINT IndexCountPerInstance, UINT InstanceCount,
     UINT StartIndexLocation, INT BaseVertexLocation, UINT StartInstanceLocation)
 {
+    if (Survey::IsActive())
+        SurveyRecorder::OnDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
+                                                StartIndexLocation, BaseVertexLocation,
+                                                StartInstanceLocation);
+
     oDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
                           StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
 }
@@ -737,6 +944,24 @@ static void TickGuiOnPresent(IDXGISwapChain* swapChain, const char* via)
             (int)gDeviceCaptured,
             (int)gGuiInitDone,
             (unsigned long long)gDrawHookCallCount);
+    }
+
+    // Survey: finalize frame at Present boundary
+    if (Survey::IsActive())
+    {
+        SurveyFrameData frameData = SurveyRecorder::OnEndFrame();
+        SurveyWriter::WriteFrame(frameData, Survey::GetOutputDir());
+        sSurveyFrames.push_back(std::move(frameData));
+
+        if (Survey::OnFrameEnd())
+        {
+            // Survey just finished — write shaders and summary
+            SurveyWriter::WriteShaders(Survey::GetOutputDir());
+            SurveyWriter::WriteSummary(sSurveyFrames.data(), (int)sSurveyFrames.size(),
+                                        Survey::GetOutputDir());
+            sSurveyFrames.clear();
+            SurveyRecorder::Shutdown();
+        }
     }
 
     if (!gGuiInitDone && gDeviceCaptured)
@@ -794,14 +1019,13 @@ static HRESULT STDMETHODCALLTYPE HookedResizeBuffers(
 // ==================== Install ====================
 
 static const int VTIDX_DEVICE_CreateTexture2D       = 5;
+static const int VTIDX_DEVICE_CreateVertexShader    = 12;
 static const int VTIDX_DEVICE_CreatePixelShader     = 15;
 static const int VTIDX_CTX_DrawIndexed              = 12;
 static const int VTIDX_CTX_Draw                     = 13;
 static const int VTIDX_CTX_DrawIndexedInstanced     = 20;
 static const int VTIDX_CTX_OMSetRenderTargets       = 33;
-static const int VTIDX_SC_Present                   = 8;
-static const int VTIDX_SC_ResizeBuffers             = 13;
-static const int VTIDX_SC1_Present1                  = 22;
+// VTIDX_SC_* constants moved to top of file (needed by deferred hook code)
 
 bool Install()
 {
@@ -849,6 +1073,7 @@ bool Install()
     void** scVtable  = *reinterpret_cast<void***>(tmpSwapChain);
 
     void* addrCreateTex2D  = devVtable[VTIDX_DEVICE_CreateTexture2D];
+    void* addrCreateVS     = devVtable[VTIDX_DEVICE_CreateVertexShader];
     void* addrCreatePS     = devVtable[VTIDX_DEVICE_CreatePixelShader];
     void* addrDraw         = ctxVtable[VTIDX_CTX_Draw];
     void* addrDrawIndexed  = ctxVtable[VTIDX_CTX_DrawIndexed];
@@ -871,6 +1096,7 @@ bool Install()
     }
 
     Log("Function addresses discovered:");
+    Log("  CreateVertexShader    = %p", addrCreateVS);
     Log("  CreatePixelShader     = %p", addrCreatePS);
     Log("  Draw                  = %p", addrDraw);
     Log("  DrawIndexed           = %p", addrDrawIndexed);
@@ -925,16 +1151,23 @@ bool Install()
     {
         std::string ini = DustLogDir() + "Dust.ini";
         int val = GetPrivateProfileIntA("Shadows", "ShadowResolution", 0, ini.c_str());
-        if (val >= 1024 && val <= 8192)
+        if (val >= 1024 && val <= 16384)
         {
             gShadowResOverride = (UINT)val;
             Log("  Shadow map resolution override: %u", gShadowResOverride);
         }
+
+        // Init survey defaults from INI
+        Survey::InitFromINI(ini.c_str());
     }
 
     if (KenshiLib::AddHook(addrCreateTex2D, (void*)HookedCreateTexture2D,
                            (void**)&oCreateTexture2D) != KenshiLib::SUCCESS)
     { Log("ERROR: Failed to hook CreateTexture2D"); ok = false; }
+
+    if (KenshiLib::AddHook(addrCreateVS, (void*)HookedCreateVertexShader,
+                           (void**)&oCreateVertexShader) != KenshiLib::SUCCESS)
+    { Log("WARNING: Failed to hook CreateVertexShader (shader source tracking for VS disabled)"); }
 
     if (KenshiLib::AddHook(addrCreatePS, (void*)HookedCreatePixelShader,
                            (void**)&oCreatePixelShader) != KenshiLib::SUCCESS)
@@ -956,26 +1189,18 @@ bool Install()
                            (void**)&oOMSetRenderTargets) != KenshiLib::SUCCESS)
     { Log("ERROR: Failed to hook OMSetRenderTargets"); ok = false; }
 
-    if (KenshiLib::AddHook(addrPresent, (void*)HookedPresent,
-                           (void**)&oPresent) != KenshiLib::SUCCESS)
-    { Log("ERROR: Failed to hook Present"); ok = false; }
-
-    if (addrPresent1)
-    {
-        if (KenshiLib::AddHook(addrPresent1, (void*)HookedPresent1,
-                               (void**)&oPresent1) != KenshiLib::SUCCESS)
-        { Log("WARNING: Failed to hook Present1 (flip-model swap chains may not show GUI)"); }
-        else
-        { Log("  Present1 hook installed"); }
-    }
-
-    if (KenshiLib::AddHook(addrResizeBuf, (void*)HookedResizeBuffers,
-                           (void**)&oResizeBuffers) != KenshiLib::SUCCESS)
-    { Log("ERROR: Failed to hook ResizeBuffers"); ok = false; }
+    // Present/Present1/ResizeBuffers hooks are DEFERRED until the first Draw call.
+    // This avoids a race with overlay DLLs (Steam, Discord, ReShade) that also hook
+    // Present during their initialization. By hooking later, we wrap their hooks
+    // and always fire. Addresses are saved and used in TryInstallSwapChainHooks().
+    sSavedAddrPresent  = addrPresent;
+    sSavedAddrPresent1 = addrPresent1;
+    sSavedAddrResizeBuf = addrResizeBuf;
+    Log("  Present hooks DEFERRED (Present=%p, Present1=%p, ResizeBuffers=%p)",
+        addrPresent, addrPresent1, addrResizeBuf);
 
     if (ok)
-        Log("All D3D11 hooks installed successfully (Present%s + ResizeBuffers)",
-            addrPresent1 ? " + Present1" : "");
+        Log("Device/Context hooks installed, swap chain hooks deferred to first Draw");
 
     return ok;
 }

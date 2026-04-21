@@ -52,33 +52,27 @@ cbuffer TemporalParams : register(b0)
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 {
+    int2 pix = int2(pos.xy);
     float depth = depthTex.SampleLevel(pointClamp, uv, 0);
 
-    float4 current = currentGI.SampleLevel(pointClamp, uv, 0);
+    float4 current = currentGI.Load(int3(pix, 0));
 
     // ---- First frame or sky ----
     if (frameIndex < 1.0 || depth <= 0.0001)
         return current;
 
     // ---- Firefly clamp ----
-    // Clamp current to the min/max of its 4 cardinal neighbors. A stray hit
-    // (specular, sun, long distance) would otherwise pollute history for
-    // ~30 frames at temporalBlend=0.97 and show as a stationary bright speckle.
-    // Cost: 4 extra texel fetches. AABB clip on the RAW input only — history
-    // is left alone so legitimate highlights that survive over many frames
-    // still show through.
     {
-        float4 cN = currentGI.SampleLevel(pointClamp, uv + float2(0, -invViewportSize.y), 0);
-        float4 cS = currentGI.SampleLevel(pointClamp, uv + float2(0,  invViewportSize.y), 0);
-        float4 cE = currentGI.SampleLevel(pointClamp, uv + float2( invViewportSize.x, 0), 0);
-        float4 cW = currentGI.SampleLevel(pointClamp, uv + float2(-invViewportSize.x, 0), 0);
+        float4 cN = currentGI.Load(int3(pix + int2(0, -1), 0));
+        float4 cS = currentGI.Load(int3(pix + int2(0,  1), 0));
+        float4 cE = currentGI.Load(int3(pix + int2( 1, 0), 0));
+        float4 cW = currentGI.Load(int3(pix + int2(-1, 0), 0));
         float3 cMin = min(min(cN.rgb, cS.rgb), min(cE.rgb, cW.rgb));
         float3 cMax = max(max(cN.rgb, cS.rgb), max(cE.rgb, cW.rgb));
         current.rgb = clamp(current.rgb, cMin, cMax);
     }
 
-    // ---- Always read history at current UV (no reprojection contamination) ----
-    float4 history = historyGI.SampleLevel(pointClamp, uv, 0);
+    float4 history = historyGI.Load(int3(pix, 0));
 
     // ---- Per-pixel motion vector from reprojection ----
     // Used ONLY to determine alpha, NOT to read history.
@@ -98,16 +92,22 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         pixelMotion = 100.0;
     }
 
+    // Dead zone: the game recomputes the view matrix each frame and floating-point
+    // non-determinism produces phantom sub-pixel motion even when the camera is still.
+    // At large world coordinates or certain orientations the jitter can reach 1-2 px,
+    // which otherwise prevents temporal convergence entirely.
+    pixelMotion = max(pixelMotion - 1.5, 0.0);
+
     // ---- Depth-change detection (catches disocclusion) ----
     float prevDepth = prevDepthTex.SampleLevel(pointClamp, uv, 0);
     float depthChange = abs(depth - prevDepth) / max(depth, 0.001);
-    static const float DEPTH_SIGMA_SQ2 = 2.0 * 0.008 * 0.008;
+    static const float DEPTH_SIGMA_SQ2 = 2.0 * 0.02 * 0.02;
     float depthStability = exp(-depthChange * depthChange / DEPTH_SIGMA_SQ2);
 
     // ---- Adaptive alpha ----
     float baseAlpha = max(1.0 - temporalBlend, 0.08);
 
-    // Motion-based alpha: gradual ramp
+    // Motion-based alpha: gradual ramp (after dead zone subtraction)
     float motionAlpha = saturate(pixelMotion * 0.2);
 
     // Depth-based alpha: large depth change → flush

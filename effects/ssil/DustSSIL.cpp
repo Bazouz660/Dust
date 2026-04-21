@@ -57,11 +57,10 @@ static void SSILPostExecute(const DustFrameContext* ctx, const DustHostAPI* host
     if (!sceneSRV)
         return;
 
-    // Normals are optional (we reconstruct from depth if not available)
     ID3D11ShaderResourceView* normalsSRV = host->GetSRV(DUST_RESOURCE_NORMALS);
 
     // Generate IL texture from the lit scene
-    ID3D11ShaderResourceView* ilSRV = SSILRenderer::RenderIL(ctx->context, depthSRV, sceneSRV, normalsSRV);
+    ID3D11ShaderResourceView* ilSRV = SSILRenderer::RenderIL(ctx->context, depthSRV, sceneSRV, normalsSRV, &ctx->camera);
     if (!ilSRV)
         return;
 

@@ -16,4 +16,8 @@ namespace D3D11Hook
 
     // Reset per-frame state (call at frame start)
     void ResetFrameState();
+
+    // Present hook diagnostics and recovery
+    bool IsPresentHooked();     // true if Present hook has actually fired
+    void TryRecoverPresent();   // re-attempt swap chain discovery + hook
 }

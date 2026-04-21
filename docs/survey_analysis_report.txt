@@ -1,0 +1,896 @@
+================================================================================
+DUST SURVEY ANALYSIS REPORT
+Captures analyzed: 33
+Total frames: 99
+================================================================================
+
+================================================================================
+1. PER-CAPTURE OVERVIEW
+================================================================================
+
+Capture                                             Draws  GBuf  Shadow  Cube   PS   VS
+--------------------------------------------------------------------------------
+2026-04-20_000000_initial_capture                    2129   583     829   615   72   33
+2026-04-20_185402_day_worlds_end                     2817  1248    1247   179   80   36
+2026-04-20_185441_day_hidden_forest                  2501   805     866   698   82   40
+2026-04-20_185520_day_flood_lands                    1365   303     602   313   74   36
+2026-04-20_185638_day_obedience                       866   176     599     0   62   30
+2026-04-20_190533_day_mongrel                        3490  1388    1378   549   81   38
+2026-04-20_191154_day_stack                          2413  1128    1046     0   81   39
+2026-04-20_191421_day_okran_pride                    1490   421     475   498   70   33
+2026-04-20_191447_day_skinner_roam                   1028   383     502     0   75   38
+2026-04-20_191509_night_skinner_roam                 1319   553     551     0   82   41
+2026-04-20_191513_night_skinner_roam                 1303   553     551     0   82   41
+2026-04-20_191535_night_deadlands                    1063   251     393   290   73   37
+2026-04-20_191609_night_bd_city                      1476   401     532   318   83   37
+2026-04-20_191638_night_scraphouse                   1003   355     460     0   74   35
+2026-04-20_191700_night_deadlands2                    948   208     244   306   75   39
+2026-04-20_191726_night_the_eye                       894   261     220   268   76   38
+2026-04-20_191744_night_gut                           840   227     253   231   69   33
+2026-04-20_191819_day_traders_edge                   2043   880    1040     0   80   39
+2026-04-20_191903_day_venge                           726   323     239     0   67   32
+2026-04-20_192027_day_stobes_gamble                  1084   345     282   333   72   33
+2026-04-20_192050_day_stobes_gamble2                  980   270     286   328   72   32
+2026-04-20_192124_day_flat_lagoon                    2316   733     818   657   84   38
+2026-04-20_192153_day_bonefields                      872   436     313     0   67   31
+2026-04-20_192302_day_southern_hive                  2114   954     997     0   77   37
+2026-04-20_192351_sonorous_dark                       840   315     342     0   70   33
+2026-04-20_192411_ashlands                            582   238     196     0   61   32
+2026-04-20_192509_ominous_place                       856   492     256     0   66   35
+2026-04-20_192736_catun                              1723   798     825     0   77   36
+2026-04-20_192852_fishman_island                     1855   543     710   417   72   39
+2026-04-20_193003_fishman_king                       1783   505     404   777   79   40
+2026-04-20_193246_arach                              1021   331     297   290   67   34
+2026-04-20_193559_swamp1                             1485   420     306   633   69   34
+2026-04-20_193729_shark                              3763  1177    1051  1400   85   41
+
+Draw counts — min: 582, max: 3763, avg: 1545
+GBuffer draws — min: 176, max: 1388, avg: 545
+Shadow draws — min: 196, max: 1378, avg: 579
+
+================================================================================
+2. PIPELINE STRUCTURE (from densest capture)
+================================================================================
+
+Source: 2026-04-20_193729_shark
+Total draws in frame: 3763
+Render passes identified: 37
+
+Pass  Draws           Range Classification       Tess  VS#  PS# RT Signature
+------------------------------------------------------------------------------------------------------------------------
+0        7             0-6 FINAL_OUTPUT                 1    1 R8G8B8A8_UNORM 2560x1440
+1     1400          7-1406 CUBEMAP_RENDER              20   37 B8G8R8A8_UNORM 512x512 | DS=D32_FLOAT 512x512
+2     1177       1407-2583 GBUFFER_FILL                16   34 B8G8R8A8_UNORM 2560x1440 + B8G8R8A8_UNORM 2560x1440 + R32_FLOAT 2560x1440 | DS=D24_UNORM_S8_UINT 2560x1440
+3        2       2584-2585 HDR_PASS                     2    2 R11G11B10_FLOAT 2560x1440 | DS=D24_UNORM_S8_UINT 2560x1440
+4        1       2586-2586 LUMINANCE_CHAIN              1    1 R32_FLOAT 512x512 | DS=D32_FLOAT 512x512
+5        2       2587-2588 LUMINANCE_CHAIN              1    2 R32_FLOAT 512x2 | DS=D32_FLOAT 512x2
+6        1       2589-2589 LUMINANCE_CHAIN              1    1 R32_FLOAT 513x2 | DS=D32_FLOAT 513x2
+7     1051       2590-3640 SHADOW_MAP            YES    7    4 R32_FLOAT 4096x4096 | DS=D32_FLOAT 4096x4096
+8        1       3641-3641 HDR_PASS                     1    1 R11G11B10_FLOAT 2560x1440 | DS=D24_UNORM_S8_UINT 2560x1440
+9        3       3642-3644 STENCIL_MASK                 1    3 R8_UNORM 2560x1440
+10       3       3645-3647 HDR_TEMP                     1    3 R16G16B16A16_FLOAT 2560x1440
+11       2       3648-3649 HDR_PASS                     1    2 R11G11B10_FLOAT 2560x1440
+12      59       3650-3708 HDR_PASS                     5    6 R11G11B10_FLOAT 2560x1440 | DS=D24_UNORM_S8_UINT 2560x1440
+13       1       3709-3709 LUMINANCE_CHAIN              1    1 R32_FLOAT 128x128 | DS=D32_FLOAT 128x128
+14       1       3710-3710 LUMINANCE_CHAIN              1    1 R32_FLOAT 64x64 | DS=D32_FLOAT 64x64
+15       1       3711-3711 LUMINANCE_CHAIN              1    1 R32_FLOAT 16x16 | DS=D32_FLOAT 16x16
+16       1       3712-3712 LUMINANCE_CHAIN              1    1 R32_FLOAT 4x4 | DS=D32_FLOAT 4x4
+17       3       3713-3715 LUMINANCE_CHAIN              1    3 R32_FLOAT 1x1 | DS=D32_FLOAT 1x1
+18       2       3716-3717 BLOOM_CHAIN                  1    2 R11G11B10_FLOAT 640x360 | DS=D32_FLOAT 640x360
+19       1       3718-3718 LDR_PASS                     1    1 B8G8R8A8_UNORM 2560x1440 | DS=D24_UNORM_S8_UINT 2560x1440
+20       1       3719-3719 LUMINANCE_CHAIN              1    1 R32_FLOAT 256x256
+21       4       3720-3723 LDR_PASS                     2    4 B8G8R8A8_UNORM 2560x1440
+22       1       3724-3724 DOF_PASS                     1    1 R16_FLOAT 2560x1440
+23       3       3725-3727 HALF_RES_POST                1    3 B8G8R8A8_UNORM 1280x720
+24       1       3728-3728 LDR_PASS                     1    1 B8G8R8A8_UNORM 2560x1440
+25       1       3729-3729 BLOOM_CHAIN                  1    1 R11G11B10_FLOAT 1280x720
+26       1       3730-3730 BLOOM_CHAIN                  1    1 R11G11B10_FLOAT 640x360
+27       1       3731-3731 BLOOM_CHAIN                  1    1 R11G11B10_FLOAT 320x180
+28       1       3732-3732 BLOOM_CHAIN                  1    1 R11G11B10_FLOAT 160x90
+29       1       3733-3733 BLOOM_CHAIN                  1    1 R11G11B10_FLOAT 80x45
+30       1       3734-3734 BLOOM_CHAIN                  1    1 R11G11B10_FLOAT 160x90
+31       1       3735-3735 BLOOM_CHAIN                  1    1 R11G11B10_FLOAT 320x180
+32       1       3736-3736 BLOOM_CHAIN                  1    1 R11G11B10_FLOAT 640x360
+33       1       3737-3737 BLOOM_CHAIN                  1    1 R11G11B10_FLOAT 1280x720
+34       1       3738-3738 LDR_PASS                     1    1 B8G8R8A8_UNORM 2560x1440
+35       1       3739-3739 LDR_PASS                     1    1 B8G8R8A8_UNORM 2560x1440 | DS=D24_UNORM_S8_UINT 2560x1440
+36      23       3740-3762 FINAL_OUTPUT                 2    2 R8G8B8A8_UNORM 2560x1440 | DS=D24_UNORM_S8_UINT 2560x1440
+
+================================================================================
+3. GBUFFER PASS ANALYSIS
+================================================================================
+
+GBuffer draws: 1177
+RT format: B8G8R8A8_UNORM + B8G8R8A8_UNORM + R32_FLOAT
+Resolution: 2560x1440
+Depth: D24_UNORM_S8_UINT 2560x1440
+
+Topology breakdown:
+  TRIANGLELIST: 1073 draws
+  TRIANGLESTRIP: 104 draws
+
+Draw type breakdown:
+  DrawIndexed: 1100 draws
+  DrawIndexedInstanced: 77 draws
+
+Unique pixel shaders in GBuffer: 34
+  0x1359EB6B8: 3 draws
+  0x1359EB9B8: 26 draws
+  0x1359EBB38: 15 draws
+  0x1359EBE78: 2 draws
+  0x1359ECC78: 20 draws
+  0x25CBFA4B8: 2 draws
+  0x25CBFA638: 8 draws
+  0x25CBFAC78: 1 draws
+  0x25CBFB438: 29 draws
+  0x25CBFC238: 3 draws
+  0x25CBFC3F8: 1 draws
+  0x25CBFC878: 1 draws
+  0x6162D3B8: 3 draws
+  0x6162D878: 137 draws
+  0x6162E9B8: 36 draws
+  0x6384F838: 20 draws
+  0x6384FCF8: 22 draws
+  0x63850338: 29 draws
+  0x63E05738: 46 draws
+  0x63E06078: 14 draws
+  0x63E063B8: 39 draws
+  0x63E06838: 10 draws
+  0x63E07978: 3 draws
+  0x63E07AF8: 63 draws
+  0x63E07FB8: 36 draws
+  0x63E08778: 3 draws
+  0x63E08938: 16 draws
+  0x63E090F8: 10 draws
+  0x63E093F8: 2 draws
+  0x63E70A78: 292 draws
+  0x63E71238: 5 draws
+  0x642886B8: 149 draws
+  0x66B36EF8: 53 draws
+  0x66B37538: 78 draws
+
+Unique vertex shaders in GBuffer: 16
+  0x1359EC178: 3 draws
+  0x25CBF9FF8: 8 draws
+  0x6162D578: 5 draws
+  0x6162D9F8: 36 draws
+  0x6162E378: 137 draws
+  0x6162F178: 3 draws
+  0x6384F1F8: 22 draws
+  0x63850038: 20 draws
+  0x63850978: 82 draws
+  0x63E066B8: 38 draws
+  0x63E07CB8: 10 draws
+  0x63E085F8: 128 draws
+  0x63E08C38: 29 draws
+  0x63E710B8: 345 draws
+  0x64287A38: 233 draws
+  0x66B360B8: 78 draws
+
+Tessellated GBuffer draws: 0
+
+Texture (SRV) formats bound during GBuffer:
+  BC1_UNORM: 4766 bindings
+  BC3_UNORM: 4720 bindings
+  BC2_UNORM: 1102 bindings
+  R16G16_FLOAT: 1055 bindings
+  B8G8R8A8_UNORM: 959 bindings
+  R8G8B8A8_UNORM: 24 bindings
+
+Vertex strides:
+  24 bytes: 475 draws
+  56 bytes: 270 draws
+  64 bytes: 152 draws
+  60 bytes: 110 draws
+  40 bytes: 104 draws
+  88 bytes: 13 draws
+  44 bytes: 12 draws
+  28 bytes: 12 draws
+  48 bytes: 7 draws
+  92 bytes: 7 draws
+  96 bytes: 6 draws
+  76 bytes: 4 draws
+  36 bytes: 3 draws
+  72 bytes: 1 draws
+  68 bytes: 1 draws
+
+--- Instancing Candidates ---
+Total unique mesh signatures: 147
+Total potential draw reduction: 624 / 1177 (53.0%)
+
+Top 20 most-repeated meshes:
+  VS=0x66B360B8 PS=0x66B37538 stride=24 idxCount=3852: 44x (save 43 draws)
+  VS=0x6162D9F8 PS=0x6162E9B8 stride=24 idxCount=9120: 36x (save 35 draws)
+  VS=0x63E710B8 PS=0x63E70A78 stride=24 idxCount=1026: 31x (save 30 draws)
+  VS=0x63850978 PS=0x63850338 stride=40 idxCount=8572: 29x (save 28 draws)
+  VS=0x63850978 PS=0x1359EB9B8 stride=40 idxCount=8572: 26x (save 25 draws)
+  VS=0x64287A38 PS=0x642886B8 stride=56 idxCount=1992: 26x (save 25 draws)
+  VS=0x6384F1F8 PS=0x6384FCF8 stride=40 idxCount=8572: 22x (save 21 draws)
+  VS=0x66B360B8 PS=0x66B37538 stride=24 idxCount=16614: 22x (save 21 draws)
+  VS=0x63E710B8 PS=0x63E70A78 stride=24 idxCount=4566: 20x (save 19 draws)
+  VS=0x63E710B8 PS=0x63E70A78 stride=56 idxCount=2790: 20x (save 19 draws)
+  VS=0x63850978 PS=0x1359EBB38 stride=40 idxCount=8572: 15x (save 14 draws)
+  VS=0x64287A38 PS=0x642886B8 stride=56 idxCount=942: 12x (save 11 draws)
+  VS=0x64287A38 PS=0x642886B8 stride=60 idxCount=120: 12x (save 11 draws)
+  VS=0x63E710B8 PS=0x63E70A78 stride=24 idxCount=2016: 12x (save 11 draws)
+  VS=0x64287A38 PS=0x642886B8 stride=60 idxCount=132: 11x (save 10 draws)
+  VS=0x63E710B8 PS=0x63E70A78 stride=24 idxCount=1740: 11x (save 10 draws)
+  VS=0x63E710B8 PS=0x63E70A78 stride=24 idxCount=1164: 11x (save 10 draws)
+  VS=0x64287A38 PS=0x642886B8 stride=60 idxCount=3774: 10x (save 9 draws)
+  VS=0x63E710B8 PS=0x63E70A78 stride=24 idxCount=1326: 10x (save 9 draws)
+  VS=0x63E710B8 PS=0x63E70A78 stride=24 idxCount=5877: 8x (save 7 draws)
+
+================================================================================
+4. SHADOW PASS ANALYSIS
+================================================================================
+
+Shadow draws: 1051
+Shadow map resolution: 4096x4096
+Shadow map format: R32_FLOAT
+Shadow depth: D32_FLOAT
+
+Topology breakdown:
+  PATCHLIST_3_CP: 548 draws
+  TRIANGLELIST: 438 draws
+  TRIANGLESTRIP: 65 draws
+Tessellated draws: 548 / 1051
+
+Unique shaders — VS: 7, PS: 4, HS: 1, DS: 1
+VS: ['0x6162D6F8', '0x638507F8', '0x63E06E78', '0x63E071B8', '0x63E08F78', '0x63E6F7B8', '0x64287878']
+PS: ['0x63E08138', '0x64286A78', '0x64286DB8', '0x642876F8']
+HS: ['0x66B35DB8']
+DS (domain): ['0x66B366F8']
+
+Draw types: {'DrawIndexedInstanced': 82, 'DrawIndexed': 969}
+
+Vertex shaders shared with GBuffer: 0 / 7
+
+Shadow pass draw range: [2590 - 3640]
+GBuffer last draw: 2583
+Deferred lighting draw: 3648
+
+================================================================================
+5. DEFERRED LIGHTING SHADER
+================================================================================
+
+Draw index: 3648
+Type: Draw
+VS: 0x6394F578
+PS: 0x63DB45B8
+Topology: TRIANGLELIST
+Index count: N/A
+
+SRVs bound to PS:
+  slot 0: R16G16B16A16_FLOAT 2560x1440 (TEXTURE2D)
+  slot 1: R32_FLOAT 2560x1440 (TEXTURE2D)
+  slot 2: R32_FLOAT 2560x1440 (TEXTURE2D)
+  slot 3: B8G8R8A8_UNORM 1024x1024 (TEXTURE2D)
+  slot 4: R32_FLOAT 513x2 (TEXTURE2D)
+  slot 5: R32_FLOAT 4096x4096 (TEXTURE2D)
+  slot 6: BC3_UNORM 16x16 (TEXTURECUBE)
+  slot 7: BC3_UNORM 256x256 (TEXTURECUBE)
+
+SRVs bound to VS:
+  slot 0: B8G8R8A8_UNORM 2560x1440
+  slot 1: B8G8R8A8_UNORM 2560x1440
+  slot 2: R32_FLOAT 2560x1440
+  slot 3: B8G8R8A8_UNORM 1024x1024
+
+PS CB slot 0 (32 bytes):
+  c0: ( 2560.000000,  1440.000000,     0.000391,     0.000694)
+  c1: (    1.543000,     1.000000,  2560.000000,  1440.000000)
+
+  Annotations:
+
+VS CB slot 0 (32 bytes):
+  c0: (36818.988281, 20710.677734, -50000.000000,  -451.470459)
+  c1: (-36818.988281, -20710.677734, -50000.000000,     0.000080)
+
+  Annotations:
+
+--- Deferred lighting PS consistency across captures ---
+Unique deferred PS across all captures: {'0x63862038', '0x63DB45B8'}
+Unique deferred VS across all captures: {'0x63862378', '0x6394F578'}
+WARNING: Multiple deferred lighting pixel shaders detected — may have permutations.
+
+================================================================================
+6. CUBEMAP / REFLECTION PROBE PASS
+================================================================================
+
+Cubemap draws: 1400
+Resolution: 512x512
+Unique PS: 37, VS: 20
+PS shared with GBuffer: 34 / 37
+Topology: {'TRIANGLELIST': 1106, 'TRIANGLESTRIP': 294}
+
+================================================================================
+7. POST-PROCESSING CHAIN
+================================================================================
+
+  [   0-   6] FINAL_OUTPUT         draws=  7  R8G8B8A8_UNORM 2560x1440
+  [2584-2585] HDR_PASS             draws=  2  R11G11B10_FLOAT 2560x1440 | DS=D24_UNORM_S8_UINT 2560x1440
+  [2586-2586] LUMINANCE_CHAIN      draws=  1  R32_FLOAT 512x512 | DS=D32_FLOAT 512x512
+  [2587-2588] LUMINANCE_CHAIN      draws=  2  R32_FLOAT 512x2 | DS=D32_FLOAT 512x2
+  [2589-2589] LUMINANCE_CHAIN      draws=  1  R32_FLOAT 513x2 | DS=D32_FLOAT 513x2
+  [3641-3641] HDR_PASS             draws=  1  R11G11B10_FLOAT 2560x1440 | DS=D24_UNORM_S8_UINT 2560x1440
+  [3642-3644] STENCIL_MASK         draws=  3  R8_UNORM 2560x1440
+  [3645-3647] HDR_TEMP             draws=  3  R16G16B16A16_FLOAT 2560x1440
+  [3648-3649] HDR_PASS             draws=  2  R11G11B10_FLOAT 2560x1440
+  [3650-3708] HDR_PASS             draws= 59  R11G11B10_FLOAT 2560x1440 | DS=D24_UNORM_S8_UINT 2560x1440
+  [3709-3709] LUMINANCE_CHAIN      draws=  1  R32_FLOAT 128x128 | DS=D32_FLOAT 128x128
+  [3710-3710] LUMINANCE_CHAIN      draws=  1  R32_FLOAT 64x64 | DS=D32_FLOAT 64x64
+  [3711-3711] LUMINANCE_CHAIN      draws=  1  R32_FLOAT 16x16 | DS=D32_FLOAT 16x16
+  [3712-3712] LUMINANCE_CHAIN      draws=  1  R32_FLOAT 4x4 | DS=D32_FLOAT 4x4
+  [3713-3715] LUMINANCE_CHAIN      draws=  3  R32_FLOAT 1x1 | DS=D32_FLOAT 1x1
+  [3716-3717] BLOOM_CHAIN          draws=  2  R11G11B10_FLOAT 640x360 | DS=D32_FLOAT 640x360
+  [3718-3718] LDR_PASS             draws=  1  B8G8R8A8_UNORM 2560x1440 | DS=D24_UNORM_S8_UINT 2560x1440
+  [3719-3719] LUMINANCE_CHAIN      draws=  1  R32_FLOAT 256x256
+  [3720-3723] LDR_PASS             draws=  4  B8G8R8A8_UNORM 2560x1440
+  [3724-3724] DOF_PASS             draws=  1  R16_FLOAT 2560x1440
+  [3725-3727] HALF_RES_POST        draws=  3  B8G8R8A8_UNORM 1280x720
+  [3728-3728] LDR_PASS             draws=  1  B8G8R8A8_UNORM 2560x1440
+  [3729-3729] BLOOM_CHAIN          draws=  1  R11G11B10_FLOAT 1280x720
+  [3730-3730] BLOOM_CHAIN          draws=  1  R11G11B10_FLOAT 640x360
+  [3731-3731] BLOOM_CHAIN          draws=  1  R11G11B10_FLOAT 320x180
+  [3732-3732] BLOOM_CHAIN          draws=  1  R11G11B10_FLOAT 160x90
+  [3733-3733] BLOOM_CHAIN          draws=  1  R11G11B10_FLOAT 80x45
+  [3734-3734] BLOOM_CHAIN          draws=  1  R11G11B10_FLOAT 160x90
+  [3735-3735] BLOOM_CHAIN          draws=  1  R11G11B10_FLOAT 320x180
+  [3736-3736] BLOOM_CHAIN          draws=  1  R11G11B10_FLOAT 640x360
+  [3737-3737] BLOOM_CHAIN          draws=  1  R11G11B10_FLOAT 1280x720
+  [3738-3738] LDR_PASS             draws=  1  B8G8R8A8_UNORM 2560x1440
+  [3739-3739] LDR_PASS             draws=  1  B8G8R8A8_UNORM 2560x1440 | DS=D24_UNORM_S8_UINT 2560x1440
+  [3740-3762] FINAL_OUTPUT         draws= 23  R8G8B8A8_UNORM 2560x1440 | DS=D24_UNORM_S8_UINT 2560x1440
+
+================================================================================
+8. SHADER INVENTORY (across all captures)
+================================================================================
+
+Total unique pixel shaders: 202
+Total unique vertex shaders: 86
+
+--- Pixel Shaders by Pass Classification ---
+
+  BLOOM_CHAIN (10 PS):
+    0x63A4D0B8: 96 draws across 32 captures
+    0x63A4D3B8: 96 draws across 32 captures
+    0x63A4DE78: 3 draws across 1 captures
+    0x63A4F2B8: 3 draws across 1 captures
+    0x63CE5378: 3 draws across 1 captures
+    0x63CE5E78: 12 draws across 1 captures
+    0x63CE6DF8: 12 draws across 1 captures
+    0x63DB3478: 384 draws across 32 captures
+    0x63DB5578: 96 draws across 32 captures
+    0x63DB59F8: 384 draws across 32 captures
+
+  CUBEMAP_RENDER (87 PS):
+    0x11A05F7B8: 282 draws across 1 captures
+    0x11A05F938: 195 draws across 1 captures
+    0x11A060A78: 12 draws across 1 captures
+    0x11A060BF8: 393 draws across 1 captures
+    0x1359EAEB8: 603 draws across 17 captures
+    0x1359EB6B8: 327 draws across 12 captures
+    0x1359EB9B8: 237 draws across 5 captures
+    0x1359EBB38: 1380 draws across 25 captures
+    0x1359EBE78: 63 draws across 7 captures
+    0x1359EBFF8: 6 draws across 1 captures
+    0x1359EC638: 1023 draws across 26 captures
+    0x1359ECAF8: 12 draws across 2 captures
+    0x1359ECC78: 1839 draws across 29 captures
+    0x1E7AACFB8: 72 draws across 1 captures
+    0x1E7AAEEF8: 6 draws across 1 captures
+    0x25CBF94F8: 540 draws across 1 captures
+    0x25CBF9838: 99 draws across 2 captures
+    0x25CBF9CB8: 144 draws across 5 captures
+    0x25CBF9E78: 39 draws across 3 captures
+    0x25CBF9FF8: 222 draws across 9 captures
+    0x25CBFA2F8: 42 draws across 2 captures
+    0x25CBFA4B8: 63 draws across 6 captures
+    0x25CBFA638: 66 draws across 2 captures
+    0x25CBFA7B8: 18 draws across 1 captures
+    0x25CBFAC78: 174 draws across 6 captures
+    0x25CBFAF78: 1029 draws across 5 captures
+    0x25CBFB2B8: 99 draws across 7 captures
+    0x25CBFB438: 174 draws across 1 captures
+    0x25CBFBF38: 1200 draws across 4 captures
+    0x25CBFC238: 54 draws across 8 captures
+    0x25CBFC3F8: 93 draws across 2 captures
+    0x25CBFC6F8: 327 draws across 2 captures
+    0x25CBFC878: 15 draws across 4 captures
+    0x25CBFCA38: 117 draws across 2 captures
+    0x25CBFCEB8: 561 draws across 12 captures
+    0x25CBFD078: 816 draws across 10 captures
+    0x25CBFD1F8: 273 draws across 3 captures
+    0x61386B78: 6 draws across 1 captures
+    0x61387378: 12 draws across 1 captures
+    0x6162D3B8: 282 draws across 20 captures
+    0x6162D878: 9402 draws across 30 captures
+    0x6162E9B8: 945 draws across 21 captures
+    0x61AB25F8: 48 draws across 1 captures
+    0x6384F838: 5307 draws across 32 captures
+    0x6384FCF8: 4368 draws across 30 captures
+    0x638501B8: 66 draws across 8 captures
+    0x63850338: 8010 draws across 32 captures
+    0x63926938: 150 draws across 32 captures
+    0x63926C78: 150 draws across 32 captures
+    0x63B64AF8: 36 draws across 1 captures
+    0x63CE5678: 24 draws across 1 captures
+    0x63CE64B8: 78 draws across 1 captures
+    0x63CE67B8: 93 draws across 1 captures
+    0x63CE6C78: 42 draws across 1 captures
+    0x63CE7DB8: 204 draws across 1 captures
+    0x63E05738: 1548 draws across 18 captures
+    0x63E06078: 276 draws across 10 captures
+    0x63E063B8: 1197 draws across 19 captures
+    0x63E06838: 456 draws across 13 captures
+    0x63E07338: 852 draws across 18 captures
+    0x63E077F8: 18 draws across 2 captures
+    0x63E07978: 135 draws across 9 captures
+    0x63E07AF8: 2184 draws across 27 captures
+    0x63E07E38: 177 draws across 18 captures
+    0x63E07FB8: 4956 draws across 32 captures
+    0x63E08478: 1479 draws across 19 captures
+    0x63E08778: 138 draws across 11 captures
+    0x63E08938: 1761 draws across 18 captures
+    0x63E08AB8: 108 draws across 9 captures
+    0x63E08DB8: 60 draws across 2 captures
+    0x63E090F8: 1680 draws across 17 captures
+    0x63E09278: 69 draws across 2 captures
+    0x63E093F8: 90 draws across 8 captures
+    0x63E70A78: 9849 draws across 31 captures
+    0x63E71238: 66 draws across 2 captures
+    0x641AB5F8: 6 draws across 1 captures
+    0x642886B8: 5328 draws across 30 captures
+    0x6435C278: 6 draws across 1 captures
+    0x66B36BB8: 60 draws across 7 captures
+    0x66B36EF8: 1338 draws across 13 captures
+    0x66B37538: 3604 draws across 31 captures
+    0xAA169F8: 24 draws across 1 captures
+    0xAA174F8: 6 draws across 1 captures
+    0xAA17B38: 1215 draws across 1 captures
+    0xAC0C3F8: 459 draws across 1 captures
+    0xAC0D078: 255 draws across 1 captures
+    0xAC0D9B8: 117 draws across 1 captures
+
+  DOF_PASS (2 PS):
+    0x638632F8: 3 draws across 1 captures
+    0x63DB6CB8: 96 draws across 32 captures
+
+  FINAL_OUTPUT (6 PS):
+    0x617F6738: 2224 draws across 32 captures
+    0x618B8AB8: 57 draws across 1 captures
+    0x63CE51F8: 21 draws across 1 captures
+    0x63DB6038: 672 draws across 32 captures
+    0x641AADF8: 3 draws across 1 captures
+    0x64447B38: 96 draws across 32 captures
+
+  GBUFFER_FILL (91 PS):
+    0x11A05F7B8: 282 draws across 1 captures
+    0x11A05F938: 195 draws across 1 captures
+    0x11A060A78: 12 draws across 1 captures
+    0x11A060BF8: 393 draws across 1 captures
+    0x1359EAEB8: 603 draws across 17 captures
+    0x1359EB078: 48 draws across 1 captures
+    0x1359EB4F8: 60 draws across 3 captures
+    0x1359EB6B8: 327 draws across 12 captures
+    0x1359EB9B8: 237 draws across 5 captures
+    0x1359EBB38: 1380 draws across 25 captures
+    0x1359EBE78: 63 draws across 7 captures
+    0x1359EBFF8: 6 draws across 1 captures
+    0x1359EC638: 1023 draws across 26 captures
+    0x1359ECAF8: 12 draws across 2 captures
+    0x1359ECC78: 1839 draws across 29 captures
+    0x1E7AACFB8: 72 draws across 1 captures
+    0x1E7AAEEF8: 6 draws across 1 captures
+    0x25CBF94F8: 540 draws across 1 captures
+    0x25CBF9838: 99 draws across 2 captures
+    0x25CBF9CB8: 144 draws across 5 captures
+    0x25CBF9E78: 39 draws across 3 captures
+    0x25CBF9FF8: 222 draws across 9 captures
+    0x25CBFA178: 81 draws across 1 captures
+    0x25CBFA2F8: 42 draws across 2 captures
+    0x25CBFA4B8: 63 draws across 6 captures
+    0x25CBFA638: 66 draws across 2 captures
+    0x25CBFA7B8: 18 draws across 1 captures
+    0x25CBFAC78: 174 draws across 6 captures
+    0x25CBFAF78: 1029 draws across 5 captures
+    0x25CBFB2B8: 99 draws across 7 captures
+    0x25CBFB438: 174 draws across 1 captures
+    0x25CBFB8F8: 24 draws across 1 captures
+    0x25CBFBA78: 9 draws across 1 captures
+    0x25CBFBDB8: 6 draws across 1 captures
+    0x25CBFBF38: 1200 draws across 4 captures
+    0x25CBFC238: 54 draws across 8 captures
+    0x25CBFC3F8: 93 draws across 2 captures
+    0x25CBFC6F8: 327 draws across 2 captures
+    0x25CBFC878: 15 draws across 4 captures
+    0x25CBFCA38: 117 draws across 2 captures
+    0x25CBFCBB8: 3 draws across 1 captures
+    0x25CBFCEB8: 561 draws across 12 captures
+    0x25CBFD078: 816 draws across 10 captures
+    0x25CBFD1F8: 273 draws across 3 captures
+    0x61386B78: 6 draws across 1 captures
+    0x61387378: 12 draws across 1 captures
+    0x6162D3B8: 282 draws across 20 captures
+    0x6162D878: 9402 draws across 30 captures
+    0x6162E9B8: 945 draws across 21 captures
+    0x61AB25F8: 48 draws across 1 captures
+    0x6384F838: 5307 draws across 32 captures
+    0x6384FCF8: 4368 draws across 30 captures
+    0x63850338: 8010 draws across 32 captures
+    0x638504B8: 51 draws across 6 captures
+    0x63B64AF8: 36 draws across 1 captures
+    0x63CE5678: 24 draws across 1 captures
+    0x63CE64B8: 78 draws across 1 captures
+    0x63CE67B8: 93 draws across 1 captures
+    0x63CE6C78: 42 draws across 1 captures
+    0x63CE7DB8: 204 draws across 1 captures
+    0x63E05738: 1548 draws across 18 captures
+    0x63E06078: 276 draws across 10 captures
+    0x63E063B8: 1197 draws across 19 captures
+    0x63E06838: 456 draws across 13 captures
+    0x63E07338: 852 draws across 18 captures
+    0x63E077F8: 18 draws across 2 captures
+    0x63E07978: 135 draws across 9 captures
+    0x63E07AF8: 2184 draws across 27 captures
+    0x63E07E38: 177 draws across 18 captures
+    0x63E07FB8: 4956 draws across 32 captures
+    0x63E08478: 1479 draws across 19 captures
+    0x63E08778: 138 draws across 11 captures
+    0x63E08938: 1761 draws across 18 captures
+    0x63E08AB8: 108 draws across 9 captures
+    0x63E08DB8: 60 draws across 2 captures
+    0x63E090F8: 1680 draws across 17 captures
+    0x63E09278: 69 draws across 2 captures
+    0x63E093F8: 90 draws across 8 captures
+    0x63E70A78: 9849 draws across 31 captures
+    0x63E71238: 66 draws across 2 captures
+    0x642886B8: 5328 draws across 30 captures
+    0x66B36EF8: 1338 draws across 13 captures
+    0x66B371F8: 12 draws across 2 captures
+    0x66B37538: 3604 draws across 31 captures
+    0xAA169F8: 24 draws across 1 captures
+    0xAA174F8: 6 draws across 1 captures
+    0xAA17B38: 1215 draws across 1 captures
+    0xAC0C3F8: 459 draws across 1 captures
+    0xAC0D078: 255 draws across 1 captures
+    0xAC0D538: 9 draws across 1 captures
+    0xAC0D9B8: 117 draws across 1 captures
+
+  HALF_RES_POST (6 PS):
+    0x63864778: 3 draws across 1 captures
+    0x63864A78: 3 draws across 1 captures
+    0x63865578: 3 draws across 1 captures
+    0x63DB2FF8: 96 draws across 32 captures
+    0x63DB5238: 96 draws across 32 captures
+    0x63DB6378: 96 draws across 32 captures
+
+  HDR_PASS (32 PS):
+    0x1359EC338: 402 draws across 16 captures
+    0x25CBFC578: 42 draws across 3 captures
+    0x25CBFD078: 816 draws across 10 captures
+    0x6162ECB8: 36 draws across 3 captures
+    0x6162EE78: 189 draws across 11 captures
+    0x6162EFF8: 96 draws across 32 captures
+    0x61AB1B38: 6 draws across 1 captures
+    0x638501B8: 66 draws across 8 captures
+    0x63862038: 3 draws across 1 captures
+    0x638642B8: 3 draws across 1 captures
+    0x63926938: 150 draws across 32 captures
+    0x63926C78: 150 draws across 32 captures
+    0x63A4CD78: 60 draws across 3 captures
+    0x63A4D238: 96 draws across 32 captures
+    0x63A4D678: 3 draws across 1 captures
+    0x63A4D9F8: 6 draws across 2 captures
+    0x63A4DEB8: 186 draws across 19 captures
+    0x63A4E1F8: 96 draws across 32 captures
+    0x63A4E378: 423 draws across 30 captures
+    0x63A4E638: 33 draws across 1 captures
+    0x63A4E838: 12 draws across 4 captures
+    0x63A4F438: 3 draws across 1 captures
+    0x63DB45B8: 96 draws across 32 captures
+    0x63DB5878: 96 draws across 32 captures
+    0x63E6F938: 429 draws across 14 captures
+    0x63E70778: 888 draws across 29 captures
+    0x63E70F38: 3594 draws across 30 captures
+    0x641AB5F8: 6 draws across 1 captures
+    0x6435C278: 6 draws across 1 captures
+    0xAA16078: 3 draws across 1 captures
+    0xAC0C578: 39 draws across 1 captures
+    0xAC0CA38: 3 draws across 1 captures
+
+  HDR_TEMP (6 PS):
+    0x638637B8: 3 draws across 1 captures
+    0x63863F78: 3 draws across 1 captures
+    0x63864BF8: 3 draws across 1 captures
+    0x63DB3C78: 96 draws across 32 captures
+    0x63DB40F8: 96 draws across 32 captures
+    0x63DB42B8: 96 draws across 32 captures
+
+  LDR_PASS (16 PS):
+    0x63862E78: 3 draws across 1 captures
+    0x63863938: 3 draws across 1 captures
+    0x638645B8: 3 draws across 1 captures
+    0x638650B8: 3 draws across 1 captures
+    0x63A4DCB8: 3 draws across 1 captures
+    0x63A4E4F8: 96 draws across 32 captures
+    0x63CE46F8: 3 draws across 1 captures
+    0x63CE6938: 3 draws across 1 captures
+    0x63DB32F8: 96 draws across 32 captures
+    0x63DB3AB8: 96 draws across 32 captures
+    0x63DB4A78: 96 draws across 32 captures
+    0x63DB4BF8: 96 draws across 32 captures
+    0x63DB4D78: 96 draws across 32 captures
+    0x63DB64F8: 96 draws across 32 captures
+    0x641A9FF8: 3 draws across 1 captures
+    0x644474F8: 96 draws across 32 captures
+
+  LUMINANCE_CHAIN (18 PS):
+    0x63864438: 3 draws across 1 captures
+    0x63A4DBB8: 384 draws across 32 captures
+    0x63A4DFF8: 3 draws across 1 captures
+    0x63A4E4B8: 3 draws across 1 captures
+    0x63A4E9B8: 96 draws across 32 captures
+    0x63A4EAF8: 3 draws across 1 captures
+    0x63A4F138: 12 draws across 1 captures
+    0x63B639B8: 3 draws across 1 captures
+    0x63B63B38: 3 draws across 1 captures
+    0x63B63FF8: 3 draws across 1 captures
+    0x63B65438: 3 draws across 1 captures
+    0x63DB50B8: 96 draws across 32 captures
+    0x642870B8: 96 draws across 32 captures
+    0x642873F8: 96 draws across 32 captures
+    0x64288378: 96 draws across 32 captures
+    0x64288838: 96 draws across 32 captures
+    0x64446D38: 96 draws across 32 captures
+    0x64447038: 96 draws across 32 captures
+
+  SHADOW_MAP (8 PS):
+    0x63B63CF8: 1815 draws across 1 captures
+    0x63B644B8: 18 draws across 1 captures
+    0x63B647B8: 168 draws across 1 captures
+    0x63CE7438: 486 draws across 1 captures
+    0x63E08138: 4407 draws across 31 captures
+    0x64286A78: 12291 draws across 32 captures
+    0x64286DB8: 45 draws across 2 captures
+    0x642876F8: 38100 draws across 32 captures
+
+  STENCIL_MASK (6 PS):
+    0x63863178: 3 draws across 1 captures
+    0x63863AF8: 3 draws across 1 captures
+    0x638648F8: 3 draws across 1 captures
+    0x6394FA38: 96 draws across 32 captures
+    0x6394FBB8: 96 draws across 32 captures
+    0x63950378: 96 draws across 32 captures
+
+  UNKNOWN (2 PS):
+    0x63E06538: 12 draws across 2 captures
+    0x66B36BB8: 60 draws across 7 captures
+
+--- Vertex Shaders by Pass Classification ---
+
+  BLOOM_CHAIN (4 VS):
+    0x61AB14F8: 36 draws across 1 captures
+    0x63862378: 57 draws across 1 captures
+    0x6394F578: 1824 draws across 32 captures
+    0x63E71578: 1152 draws across 32 captures
+
+  CUBEMAP_RENDER (39 VS):
+    0x1359EBCF8: 1023 draws across 26 captures
+    0x1359EC178: 327 draws across 12 captures
+    0x25CBF9838: 1482 draws across 14 captures
+    0x25CBF9FF8: 66 draws across 2 captures
+    0x25CBFBDB8: 186 draws across 3 captures
+    0x61386538: 6 draws across 1 captures
+    0x613877F8: 12 draws across 1 captures
+    0x6162D578: 66 draws across 2 captures
+    0x6162D9F8: 945 draws across 21 captures
+    0x6162E378: 9402 draws across 30 captures
+    0x6162E4F8: 603 draws across 17 captures
+    0x6162F178: 282 draws across 20 captures
+    0x61AB2178: 54 draws across 1 captures
+    0x6384F1F8: 4419 draws across 30 captures
+    0x6384F3B8: 66 draws across 8 captures
+    0x63850038: 5307 draws across 32 captures
+    0x63850978: 12657 draws across 32 captures
+    0x63926638: 150 draws across 32 captures
+    0x63B64978: 411 draws across 1 captures
+    0x63CE4BB8: 78 draws across 1 captures
+    0x63CE6F78: 588 draws across 1 captures
+    0x63E066B8: 1743 draws across 20 captures
+    0x63E06B78: 60 draws across 2 captures
+    0x63E07CB8: 1680 draws across 17 captures
+    0x63E085F8: 10440 draws across 32 captures
+    0x63E08C38: 2118 draws across 18 captures
+    0x63E705B8: 60 draws across 7 captures
+    0x63E710B8: 11247 draws across 31 captures
+    0x641AB138: 6 draws across 1 captures
+    0x64287A38: 9594 draws across 32 captures
+    0x6435B778: 6 draws across 1 captures
+    0x64446238: 150 draws across 32 captures
+    0x66B35F38: 201 draws across 22 captures
+    0x66B360B8: 3604 draws across 31 captures
+    0xAA166B8: 1215 draws across 1 captures
+    0xAA16878: 24 draws across 1 captures
+    0xAC0C8B8: 615 draws across 1 captures
+    0xAC0D378: 459 draws across 1 captures
+    0xAC0D838: 126 draws across 1 captures
+
+  DOF_PASS (2 VS):
+    0x63862378: 57 draws across 1 captures
+    0x6394F578: 1824 draws across 32 captures
+
+  FINAL_OUTPUT (6 VS):
+    0x617F6438: 2224 draws across 32 captures
+    0x618B85F8: 57 draws across 1 captures
+    0x61AB14F8: 36 draws across 1 captures
+    0x63CE5CB8: 21 draws across 1 captures
+    0x63DB5EB8: 672 draws across 32 captures
+    0x63E71578: 1152 draws across 32 captures
+
+  GBUFFER_FILL (35 VS):
+    0x1359EBCF8: 1023 draws across 26 captures
+    0x1359EC178: 327 draws across 12 captures
+    0x25CBF94F8: 93 draws across 1 captures
+    0x25CBF9838: 1482 draws across 14 captures
+    0x25CBF9FF8: 66 draws across 2 captures
+    0x25CBFBDB8: 186 draws across 3 captures
+    0x61386538: 6 draws across 1 captures
+    0x613877F8: 12 draws across 1 captures
+    0x6162D578: 66 draws across 2 captures
+    0x6162D9F8: 945 draws across 21 captures
+    0x6162E378: 9402 draws across 30 captures
+    0x6162E4F8: 603 draws across 17 captures
+    0x6162F178: 282 draws across 20 captures
+    0x61AB2178: 54 draws across 1 captures
+    0x6384F1F8: 4419 draws across 30 captures
+    0x63850038: 5307 draws across 32 captures
+    0x63850978: 12657 draws across 32 captures
+    0x63B64978: 411 draws across 1 captures
+    0x63CE4BB8: 78 draws across 1 captures
+    0x63CE6F78: 588 draws across 1 captures
+    0x63E066B8: 1743 draws across 20 captures
+    0x63E06B78: 60 draws across 2 captures
+    0x63E07CB8: 1680 draws across 17 captures
+    0x63E085F8: 10440 draws across 32 captures
+    0x63E08C38: 2118 draws across 18 captures
+    0x63E710B8: 11247 draws across 31 captures
+    0x64287A38: 9594 draws across 32 captures
+    0x66B35F38: 201 draws across 22 captures
+    0x66B360B8: 3604 draws across 31 captures
+    0x66B37078: 12 draws across 2 captures
+    0xAA166B8: 1215 draws across 1 captures
+    0xAA16878: 24 draws across 1 captures
+    0xAC0C8B8: 615 draws across 1 captures
+    0xAC0D378: 459 draws across 1 captures
+    0xAC0D838: 126 draws across 1 captures
+
+  HALF_RES_POST (2 VS):
+    0x63862378: 57 draws across 1 captures
+    0x6394F578: 1824 draws across 32 captures
+
+  HDR_PASS (19 VS):
+    0x6162E038: 225 draws across 11 captures
+    0x6162EB38: 192 draws across 32 captures
+    0x61AB1E38: 6 draws across 1 captures
+    0x6384F3B8: 66 draws across 8 captures
+    0x63850FB8: 861 draws across 32 captures
+    0x63862378: 57 draws across 1 captures
+    0x63926638: 150 draws across 32 captures
+    0x6394F578: 1824 draws across 32 captures
+    0x63A4CF38: 12 draws across 4 captures
+    0x63A4D878: 6 draws across 2 captures
+    0x63A4E038: 423 draws across 30 captures
+    0x63A4E2F8: 33 draws across 1 captures
+    0x63E70138: 2420 draws across 32 captures
+    0x63E70BF8: 2491 draws across 23 captures
+    0x641AB138: 6 draws across 1 captures
+    0x6435B778: 6 draws across 1 captures
+    0x64446238: 150 draws across 32 captures
+    0xAA17E38: 6 draws across 1 captures
+    0xAC0DCF8: 45 draws across 1 captures
+
+  HDR_TEMP (2 VS):
+    0x63861D38: 9 draws across 1 captures
+    0x63DB3F78: 288 draws across 32 captures
+
+  LDR_PASS (6 VS):
+    0x61AB14F8: 36 draws across 1 captures
+    0x63862378: 57 draws across 1 captures
+    0x63864F38: 9 draws across 1 captures
+    0x6394F578: 1824 draws across 32 captures
+    0x63DB6678: 288 draws across 32 captures
+    0x63E71578: 1152 draws across 32 captures
+
+  LUMINANCE_CHAIN (8 VS):
+    0x61385EF8: 9 draws across 1 captures
+    0x618B93F8: 3 draws across 1 captures
+    0x61AB14F8: 36 draws across 1 captures
+    0x63862378: 57 draws across 1 captures
+    0x6394F578: 1824 draws across 32 captures
+    0x63E71578: 1152 draws across 32 captures
+    0x64287EB8: 96 draws across 32 captures
+    0x66B35C38: 288 draws across 32 captures
+
+  SHADOW_MAP (14 VS):
+    0x11A05F4B8: 438 draws across 1 captures
+    0x6162D6F8: 45 draws across 2 captures
+    0x61AB1338: 168 draws across 1 captures
+    0x638507F8: 11406 draws across 32 captures
+    0x63B64638: 840 draws across 1 captures
+    0x63CE49F8: 48 draws across 1 captures
+    0x63CE54F8: 129 draws across 1 captures
+    0x63E06E78: 870 draws across 18 captures
+    0x63E071B8: 3537 draws across 31 captures
+    0x63E08F78: 4479 draws across 26 captures
+    0x63E6F7B8: 12291 draws across 32 captures
+    0x64287878: 22215 draws across 32 captures
+    0xAA177F8: 18 draws across 1 captures
+    0xAC0CBB8: 846 draws across 1 captures
+
+  STENCIL_MASK (2 VS):
+    0x63862B38: 9 draws across 1 captures
+    0x6394F6F8: 288 draws across 32 captures
+
+  UNKNOWN (2 VS):
+    0x63E05BB8: 12 draws across 2 captures
+    0x63E705B8: 60 draws across 7 captures
+
+================================================================================
+9. VS CONSTANT BUFFER LAYOUT (GBuffer draws)
+================================================================================
+
+CB size distribution (slot, size) -> count:
+  slot 0, 160 bytes: 30 draws
+
+Slot usage: {0: 30}
+
+--- Sample VS CB data (first 3 GBuffer draws) ---
+
+Draw 1407 (VS=0x63E08C38, idxCount=2091):
+  CB slot 0 (160 bytes, 160 decoded):
+    c0: (    1.000000,     1.000000,     0.741961,     0.000000)
+    c1: (    0.931749,    -0.346785,    -0.109783,     0.000000)
+    c2: (    0.158966,     0.831435,     0.931842,     0.931749)
+    c3: (    0.000001,     2.264441,    -0.346820,    -0.346785)
+    c4: (    1.348976,    -0.098199,    -0.109794,    -0.109783)
+    c5: (  110.411766, -2103.309326,  -637.109863,  -632.046143)
+    c6: (    0.184314,     0.101961,     0.058824,     0.000000)
+    c7: (    0.000000,     0.000000,     1.000000,     0.000000)
+    c8: (    0.000000,     0.000000,     1.000000,     0.000000)
+    c9: (    0.000000,     0.000000,     0.000000,     1.000000)
+
+Draw 1408 (VS=0x63E066B8, idxCount=120):
+  CB slot 0 (160 bytes, 160 decoded):
+    c0: (    1.000000,     1.000000,     0.616078,     0.000000)
+    c1: (    0.931749,    -0.346785,    -0.109783,     0.000000)
+    c2: (    0.158966,     0.831435,     0.931842,     0.931749)
+    c3: (    0.000001,     2.264441,    -0.346820,    -0.346785)
+    c4: (    1.348976,    -0.098199,    -0.109794,    -0.109783)
+    c5: (  110.411766, -2103.309326,  -637.109863,  -632.046143)
+    c6: (    0.000000,     0.000000,     0.000000,     0.000000)
+    c7: (    0.000000,     0.000000,     0.000000,     0.000000)
+    c8: (    0.000000,     0.000000,     0.000000,     0.000000)
+    c9: (    0.000000,     0.000000,     0.000000,     0.000000)
+
+Draw 1409 (VS=0x63E066B8, idxCount=849):
+  CB slot 0 (160 bytes, 160 decoded):
+    c0: (    1.000000,     1.000000,     0.729412,     0.000000)
+    c1: (    0.931749,    -0.346785,    -0.109783,     0.000000)
+    c2: (    0.158966,     0.831435,     0.931842,     0.931749)
+    c3: (    0.000001,     2.264441,    -0.346820,    -0.346785)
+    c4: (    1.348976,    -0.098199,    -0.109794,    -0.109783)
+    c5: (  110.411766, -2103.309326,  -637.109863,  -632.046143)
+    c6: (    0.000000,     0.000000,     0.000000,     0.000000)
+    c7: (    0.000000,     0.000000,     0.000000,     0.000000)
+    c8: (    0.000000,     0.000000,     0.000000,     0.000000)
+    c9: (    0.000000,     0.000000,     0.000000,     0.000000)
+
+================================================================================
+10. CROSS-CAPTURE CONSISTENCY
+================================================================================
+
+Pass types present in ALL captures: ['BLOOM_CHAIN', 'DOF_PASS', 'FINAL_OUTPUT', 'GBUFFER_FILL', 'HALF_RES_POST', 'HDR_PASS', 'HDR_TEMP', 'LDR_PASS', 'LUMINANCE_CHAIN', 'SHADOW_MAP', 'STENCIL_MASK']
+Pass types present in SOME captures: ['CUBEMAP_RENDER', 'UNKNOWN']
+
+Shadow map resolutions across captures: {'4096x4096'}
