@@ -121,13 +121,14 @@ void GameWorld__mainLoop_GPUSensitiveStuff_hook(GameWorld* thisptr, float time)
     if (sLoopCount <= 5 || (sLoopCount <= 600 && (sLoopCount % 60) == 0))
         Log("GameLoop #%llu", (unsigned long long)sLoopCount);
 
-    // Watchdog: if Present hasn't fired after enough game loops, try to recover.
-    // 120 loops ≈ 2 seconds of gameplay — enough for all overlays to finish init.
-    if (sLoopCount == 120 && D3D11Hook::gDeviceCaptured && !D3D11Hook::IsPresentHooked())
+    // Watchdog: if Present hasn't fired, periodically retry swap chain discovery.
+    // Layer 3 fallback — covers cases where both DustBoot and initial discovery missed.
+    // Retries at frame 120, 300, 600, 1200 (then stops — if it hasn't worked by ~20s, give up).
+    if (D3D11Hook::gDeviceCaptured && !D3D11Hook::IsPresentHooked() &&
+        (sLoopCount == 120 || sLoopCount == 300 || sLoopCount == 600 || sLoopCount == 1200))
     {
-        Log("WARNING: Present hook has not fired after %llu game loops!",
+        Log("WARNING: Present hook has not fired after %llu game loops — attempting recovery",
             (unsigned long long)sLoopCount);
-        Log("WARNING: Attempting recovery — may be caused by overlay DLL (Steam/Discord/ReShade)");
         D3D11Hook::TryRecoverPresent();
     }
 

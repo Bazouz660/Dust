@@ -44,6 +44,12 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v3
 
+      - name: Build boot (DustBoot.dll)
+        run: >
+          msbuild boot\DustBoot.vcxproj
+          /p:Configuration=Release
+          /p:Platform=x64
+
       - name: Build host (Dust.dll)
         run: >
           msbuild src\Dust.vcxproj
@@ -118,6 +124,7 @@ jobs:
         run: |
           mkdir release\Dust\effects
           mkdir release\Dust\effects\shaders
+          copy boot\build\Release\DustBoot.dll release\Dust\
           copy src\build\Release\Dust.dll release\Dust\
           copy effects\ssao\build\Release\DustSSAO.dll release\Dust\effects\
           copy effects\lut\build\Release\DustLUT.dll release\Dust\effects\

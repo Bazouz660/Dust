@@ -29,6 +29,9 @@ function Build-Project($vcxproj) {
     if ($LASTEXITCODE -ne 0) { throw "Build failed: $name" }
 }
 
+# Build boot (preload plugin)
+Build-Project (Join-Path $Root "boot\DustBoot.vcxproj")
+
 # Build host
 Build-Project (Join-Path $Root "src\Dust.vcxproj")
 
@@ -48,6 +51,7 @@ New-Item -ItemType Directory -Force -Path "$ModDir\effects\shaders" | Out-Null
 New-Item -ItemType Directory -Force -Path "$ModDir\shaders"         | Out-Null
 New-Item -ItemType Directory -Force -Path "$ModDir\presets"         | Out-Null
 
+Copy-Item "$Root\boot\build\Release\DustBoot.dll" "$ModDir\"
 Copy-Item "$Root\src\build\Release\Dust.dll"  "$ModDir\"
 Copy-Item "$Root\mod\RE_Kenshi.json"          "$ModDir\"
 Copy-Item "$Root\mod\Dust.mod"                "$ModDir\"

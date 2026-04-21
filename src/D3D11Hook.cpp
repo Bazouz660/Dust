@@ -436,6 +436,51 @@ static HRESULT WINAPI HookedD3DCompile(
     return hr;
 }
 
+// ==================== DustBoot integration ====================
+// DustBoot is a preload plugin that hooks IDXGIFactory::CreateSwapChain before
+// the game creates its D3D11 device. If present, it provides the swap chain pointer
+// directly — no runtime discovery needed.
+
+typedef IDXGISwapChain* (*PFN_DustBoot_GetSwapChain)();
+typedef HWND            (*PFN_DustBoot_GetHWND)();
+typedef bool            (*PFN_DustBoot_IsHooked)();
+
+static bool sTryCaptureFromBoot = false; // true if DustBoot provided the swap chain
+
+static IDXGISwapChain* TryGetSwapChainFromBoot()
+{
+    HMODULE boot = GetModuleHandleA("DustBoot.dll");
+    if (!boot)
+    {
+        Log("DustBoot: not loaded (preload plugin not installed)");
+        return nullptr;
+    }
+
+    auto isHooked = (PFN_DustBoot_IsHooked)GetProcAddress(boot, "DustBoot_IsHooked");
+    if (!isHooked || !isHooked())
+    {
+        Log("DustBoot: loaded but factory hooks not active");
+        return nullptr;
+    }
+
+    auto getSC = (PFN_DustBoot_GetSwapChain)GetProcAddress(boot, "DustBoot_GetSwapChain");
+    if (!getSC)
+    {
+        Log("DustBoot: export DustBoot_GetSwapChain not found");
+        return nullptr;
+    }
+
+    IDXGISwapChain* sc = getSC();
+    if (!sc)
+    {
+        Log("DustBoot: hooked but swap chain not captured yet");
+        return nullptr;
+    }
+
+    Log("DustBoot: swap chain captured at %p", sc);
+    return sc;
+}
+
 // ==================== Deferred swap chain hooking ====================
 
 // Forward declarations for hooks defined later (needed by TryInstallSwapChainHooks)
@@ -515,11 +560,22 @@ static void TryInstallSwapChainHooks()
     if (sSwapChainHooked)
         return;
 
-    IDXGISwapChain* realSwapChain = nullptr;
-    if (!TryDiscoverSwapChain(&realSwapChain) || !realSwapChain)
+    // Layer 1: Try DustBoot (preload plugin that intercepted CreateSwapChain)
+    IDXGISwapChain* realSwapChain = TryGetSwapChainFromBoot();
+    if (realSwapChain)
     {
-        Log("SwapChain discovery failed — cannot install Present hooks");
-        return;
+        sTryCaptureFromBoot = true;
+        Log("Using swap chain from DustBoot (preload capture)");
+    }
+    else
+    {
+        // Layer 2: Fall back to runtime discovery from current render target
+        if (!TryDiscoverSwapChain(&realSwapChain) || !realSwapChain)
+        {
+            Log("SwapChain discovery failed — cannot install Present hooks (will retry)");
+            return;
+        }
+        Log("Using swap chain from runtime discovery (fallback)");
     }
 
     bool ok = true;
@@ -548,11 +604,13 @@ static void TryInstallSwapChainHooks()
     }
 
     gHookedSwapChain = realSwapChain;
+    // Both paths hold a reference: discovery via GetParent AddRef, DustBoot via explicit AddRef.
     realSwapChain->Release();
     sSwapChainHooked = true;
 
     if (ok)
-        Log("All swap chain hooks installed successfully (vtable, deferred)");
+        Log("All swap chain hooks installed successfully (via %s)",
+            sTryCaptureFromBoot ? "DustBoot preload" : "runtime discovery");
     else
         Log("WARNING: Some swap chain hooks failed — GUI may not work");
 }
@@ -575,10 +633,7 @@ void TryRecoverPresent()
         return;
     }
 
-    Log("RECOVER: Attempting to re-discover swap chain and re-patch vtable...");
-
-    // With vtable hooks, recovery is simple: re-patch the vtable entry.
-    // Another overlay may have overwritten our pointer after initial install.
+    Log("RECOVER: Attempting swap chain capture (DustBoot → discovery → vtable re-patch)...");
     sSwapChainHooked = false;
     TryInstallSwapChainHooks();
 
@@ -939,10 +994,11 @@ static void TickGuiOnPresent(IDXGISwapChain* swapChain, const char* via)
     if (gPresentHookCallCount <= 5 ||
         (gPresentHookCallCount <= 600 && (gPresentHookCallCount % 60) == 0))
     {
-        Log("Present #%llu via %s: captured=%d guiDone=%d draws=%llu",
+        Log("Present #%llu via %s: captured=%d guiDone=%d boot=%d draws=%llu",
             (unsigned long long)gPresentHookCallCount, via,
             (int)gDeviceCaptured,
             (int)gGuiInitDone,
+            (int)sTryCaptureFromBoot,
             (unsigned long long)gDrawHookCallCount);
     }
 
@@ -969,6 +1025,8 @@ static void TickGuiOnPresent(IDXGISwapChain* swapChain, const char* via)
         if (DustGUI::Init(swapChain, gDevice, gContext))
         {
             gGuiInitDone = true;
+            Log("GUI initialized successfully (swap chain via %s)",
+                sTryCaptureFromBoot ? "DustBoot preload" : "runtime discovery");
         }
         else
         {
