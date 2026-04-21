@@ -52,10 +52,6 @@ static std::string BuildCacheStamp(const std::string& modDir)
     std::string stamp = "dust|dev";
 #endif
 
-    std::string ini = modDir + "Dust.ini";
-    int shadowRes = GetPrivateProfileIntA("Shadows", "ShadowResolution", 0, ini.c_str());
-    stamp += "|sr=" + std::to_string(shadowRes);
-
     return stamp;
 }
 

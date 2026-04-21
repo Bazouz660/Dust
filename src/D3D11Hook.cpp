@@ -27,7 +27,6 @@ bool gDeviceCaptured = false;
 
 static UINT gWidth = 0;
 static UINT gHeight = 0;
-static UINT gShadowResOverride = 0;
 static uint64_t gFrameIndex = 0;
 static bool gDispatchedThisFrame = false;
 
@@ -743,20 +742,6 @@ static HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
                 pDesc->Width, pDesc->Height, fn,
                 hasSRV ? "SRV " : "", hasRTV ? "RTV " : "", hasDSV ? "DSV " : "");
 
-            if (gShadowResOverride > 0 && hasSRV && !pInitialData &&
-                pDesc->Width >= 1024 && pDesc->Width != gShadowResOverride &&
-                pDesc->MipLevels == 1 && pDesc->ArraySize == 1 &&
-                pDesc->SampleDesc.Count == 1 &&
-                (pDesc->Format == DXGI_FORMAT_R32_FLOAT ||
-                 pDesc->Format == DXGI_FORMAT_R32_TYPELESS))
-            {
-                D3D11_TEXTURE2D_DESC modified = *pDesc;
-                modified.Width  = gShadowResOverride;
-                modified.Height = gShadowResOverride;
-                Log("CreateTex2D: shadow map override %ux%u -> %ux%u",
-                    pDesc->Width, pDesc->Height, modified.Width, modified.Height);
-                return oCreateTexture2D(pThis, &modified, pInitialData, ppTexture2D);
-            }
         }
     }
 
@@ -1205,17 +1190,9 @@ bool Install()
         { Log("WARNING: Could not hook D3DCompile, shader patching disabled"); }
     }
 
-    // Read shadow resolution multiplier from Dust.ini
+    // Init survey defaults from INI
     {
         std::string ini = DustLogDir() + "Dust.ini";
-        int val = GetPrivateProfileIntA("Shadows", "ShadowResolution", 0, ini.c_str());
-        if (val >= 1024 && val <= 16384)
-        {
-            gShadowResOverride = (UINT)val;
-            Log("  Shadow map resolution override: %u", gShadowResOverride);
-        }
-
-        // Init survey defaults from INI
         Survey::InitFromINI(ini.c_str());
     }
 

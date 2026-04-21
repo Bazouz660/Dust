@@ -56,12 +56,8 @@ struct FrameworkConfig {
     bool showSurvey = false;
     std::string lastPreset;    // name of last selected preset (empty = custom)
     int toggleKey = VK_F11;    // virtual key code for overlay toggle
-    int shadowResolution = 0;  // 0=default (game's native), index into kShadowResOptions
 };
 
-static const int kShadowResOptions[] = { 0, 2048, 4096, 8192, 16384 };
-static const char* kShadowResLabels[] = { "Default", "2048", "4096", "8192", "16384" };
-static const int kShadowResCount = 5;
 
 static const char* VKKeyName(int vk)
 {
@@ -123,6 +119,7 @@ static float gDisplayFps = 0.0f;
 // Global effects toggle
 static bool gAllEffectsOn = true;
 static std::vector<bool> gEffectWasEnabled; // remembers which effects were on before global disable
+static int gForceCollapseState = 0; // 0=none, 1=expand all, -1=collapse all (consumed each frame)
 
 // Preset system GUI state
 static char gNewPresetName[64] = {};
@@ -629,19 +626,6 @@ static void LoadFrameworkConfig()
 
     gFwConfig.toggleKey = GetPrivateProfileIntA("Dust", "ToggleKey", VK_F11, gDustIniPath.c_str());
 
-    // Shadow resolution: stored as raw pixel value, map to dropdown index
-    {
-        int rawRes = GetPrivateProfileIntA("Shadows", "ShadowResolution", 0, gDustIniPath.c_str());
-        gFwConfig.shadowResolution = 0; // default
-        for (int i = 1; i < kShadowResCount; i++)
-        {
-            if (kShadowResOptions[i] == rawRes)
-            {
-                gFwConfig.shadowResolution = i;
-                break;
-            }
-        }
-    }
 
     char buf[256] = {};
     GetPrivateProfileStringA("Dust", "LastPreset", "", buf, sizeof(buf), gDustIniPath.c_str());
@@ -691,14 +675,6 @@ static void SaveFrameworkConfig()
     WritePrivateProfileStringA("Dust", "ToggleKey", keyBuf, gDustIniPath.c_str());
     WritePrivateProfileStringA("Dust", "LastPreset", gFwConfig.lastPreset.c_str(), gDustIniPath.c_str());
 
-    // Shadow resolution: write raw pixel value to [Shadows] section
-    {
-        int rawRes = kShadowResOptions[gFwConfig.shadowResolution];
-        char resBuf[16];
-        snprintf(resBuf, sizeof(resBuf), "%d", rawRes);
-        WritePrivateProfileStringA("Shadows", "ShadowResolution", resBuf, gDustIniPath.c_str());
-    }
-
     gFwDiskConfig = gFwConfig;
     // Apply logging change immediately
     DustLogEnabled() = gFwConfig.logging;
@@ -717,8 +693,7 @@ static bool IsFrameworkDirty()
            gFwConfig.showStartupMessage != gFwDiskConfig.showStartupMessage ||
            gFwConfig.showSurvey != gFwDiskConfig.showSurvey ||
            gFwConfig.lastPreset != gFwDiskConfig.lastPreset ||
-           gFwConfig.toggleKey != gFwDiskConfig.toggleKey ||
-           gFwConfig.shadowResolution != gFwDiskConfig.shadowResolution;
+           gFwConfig.toggleKey != gFwDiskConfig.toggleKey;
 }
 
 // ==================== Drawing: Framework pane ====================
@@ -759,37 +734,6 @@ static void DrawFrameworkSection()
     ImGui::Checkbox("Show Survey", &gFwConfig.showSurvey);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Show pipeline survey controls (developer tool)");
-
-    ImGui::Spacing();
-
-    // Shadow resolution dropdown (RTWSM only, requires restart)
-    {
-        ImGui::Text("Shadow Resolution");
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Shadow map resolution (RTWSM shadows only). Requires game restart.");
-
-        ImGui::SetNextItemWidth(-1);
-        const char* preview = kShadowResLabels[gFwConfig.shadowResolution];
-        if (ImGui::BeginCombo("##ShadowRes", preview))
-        {
-            for (int i = 0; i < kShadowResCount; i++)
-            {
-                bool selected = (gFwConfig.shadowResolution == i);
-                if (ImGui::Selectable(kShadowResLabels[i], selected))
-                    gFwConfig.shadowResolution = i;
-                if (selected) ImGui::SetItemDefaultFocus();
-            }
-            ImGui::EndCombo();
-        }
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Shadow map resolution (RTWSM shadows only). Requires game restart.");
-
-        if (gFwConfig.shadowResolution != gFwDiskConfig.shadowResolution)
-        {
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "(restart required)");
-        }
-    }
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -1020,6 +964,8 @@ static void DrawEffectSection(size_t idx)
              name, enabled ? "[ON]" : "[OFF]");
 
     // Color the header text
+    if (gForceCollapseState != 0)
+        ImGui::SetNextItemOpen(gForceCollapseState > 0);
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.7f, 0.85f, 1.0f, 1.0f));
     bool open = ImGui::CollapsingHeader(headerLabel, ImGuiTreeNodeFlags_DefaultOpen);
     ImGui::PopStyleColor();
@@ -1595,6 +1541,13 @@ void Render()
                 }
             }
 
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Expand All"))
+                gForceCollapseState = 1;
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Collapse All"))
+                gForceCollapseState = -1;
+
             ImGui::Spacing();
             ImGui::Separator();
             ImGui::Spacing();
@@ -1615,6 +1568,7 @@ void Render()
                     ImGui::Spacing();
                 }
             }
+            gForceCollapseState = 0;
         }
 
         ImGui::EndChild();
