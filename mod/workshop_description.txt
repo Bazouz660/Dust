@@ -1,14 +1,12 @@
 [h1]Dust - Graphics Enhancement for Kenshi[/h1]
 
-Dust modernizes Kenshi's visuals with ambient occlusion, color grading, auto-exposure, depth of field, bloom, and more. The goal is to make the game look better while staying true to its original art style.
+Dust modernizes Kenshi's visuals with global illumination, ambient occlusion, improved shadows, color grading, depth of field, bloom, and more. The goal is to make the game look better while staying true to its original art style.
 
 Everything is tweakable in-game with an F11 settings menu, so you can adjust things to your taste or turn off what you don't like.
 
 Under the hood, Dust works differently from ReShade or other injectors. It hooks directly into the game's rendering pipeline, which means effects like SSAO can work with the actual lighting system instead of being applied on top after the fact. This avoids common issues like fog bleed and UI getting affected.
 
 The mod is also built as a plugin framework. Effects are separate DLLs, so anyone can make and share their own.
-
-[i]This is still an early project, expect bugs. Feedback and suggestions are welcome.[/i]
 
 [h1]Requirements[/h1]
 [list]
@@ -17,11 +15,18 @@ The mod is also built as a plugin framework. Effects are separate DLLs, so anyon
 
 [h1]What it does[/h1]
 
+[h2]Global Illumination (RTGI)[/h2]
+For high end GPUs, its an very expensive effect.
+Screen-space ray-traced indirect lighting. Rays are cast per pixel against the depth buffer and sample the lit scene at hit points, producing colored light bounces and ambient occlusion. Multi-bounce support feeds previous frame GI back into the current frame. Temporal accumulation and wavelet denoising keep the result stable and noise-free. Runs on compute shaders for best GPU utilization.
+
 [h2]Ambient Occlusion (SSAO)[/h2]
 Adds realistic contact shadows in corners, crevices, and where objects meet the ground. Works directly with the game's lighting, so it looks natural even under different weather and time of day. Automatically adjusts for night scenes.
 
+[h2]Improved Shadows[/h2]
+Replaces the game's shadow sampling and filter with PCSS (Percentage-Closer Soft Shadows). Shadows get softer the further they are from the casting object, just like real life. Configurable light size, filter radius, and bias. Shadow map resolution can be increased up to 16384 in the settings (requires restart, RTWSM shadows only).
+
 [h2]Color Grading[/h2]
-Better tonemapping and color control. Includes auto-exposure that adapts to scene brightness (no more pitch black nights or blown out deserts), along with contrast, saturation, temperature, and shadow/highlight toning.
+Full color grading pipeline with selectable tonemapper (ACES, Reinhard, AgX, Khronos PBR Neutral, and more). Includes contrast, saturation, temperature, exposure, and shadow/highlight split toning.
 
 [h2]Depth of Field[/h2]
 Camera-style focus blur with auto-focus. Objects in front of and behind your focus point get blurred separately, with full control over near and far blur curves and intensity.
@@ -32,11 +37,16 @@ Soft glow on bright light sources. Extracted from the HDR scene before tonemappi
 [h2]Clarity[/h2]
 Local contrast enhancement that brings out fine detail in textures without affecting the overall image brightness.
 
-[i]More effects in development.[/i]
+[h2]Outline[/h2]
+Edge detection from depth and normal discontinuities. Configurable thickness, strength, color, and max depth.
+
+[h2]Kuwahara Filter[/h2]
+Anisotropic painterly filter that smooths flat regions while preserving edges for a hand-painted look.
 
 [h1]Features[/h1]
 [list]
 [*] [b]In-game settings (F11)[/b]: Tweak every effect in real-time with sliders, save your settings, reset anytime
+[*] [b]Preset system[/b]: Quick-switch between Low, Medium, High, and Ultra presets, share custom presets within the community
 [*] [b]Performance overlay[/b]: See exactly how much GPU time each effect costs
 [*] [b]Hot-reloadable configs[/b]: Edit .ini files while the game is running
 [*] [b]Plugin system[/b]: Effects are separate DLLs, anyone can create and share new ones
@@ -48,9 +58,9 @@ Press [b]F11[/b] to open the settings overlay. From there you can adjust every e
 
 [h1]Compatibility[/h1]
 
-The mod should be compatible with any other mod, except mods that change the deferred.hlsl shader of the base
-game, or mods that modify the render pipeline directly.
-The mod currently does not support Proton/Wine, it is being worked on. It could work, but I can't guarantee it yet.
+The mod should be compatible with any other mod, except specific mods that hook directly into the render pipeline of the
+game, or mods that modify the render pipeline directly (ReShade REST addon seems to be causing issues).
+The mod currently does not officialy support Proton/Wine for now. It seems to work for a lot of users, but it depends on the version.
 
 A startup notification appears for 30 seconds indicating the mod is active and which key toggles the GUI. This can
 be disabled in the framework settings.
@@ -69,6 +79,7 @@ Effects are loaded as plugin DLLs via a stable C API. The framework handles shad
 [*] [b]disi30[/b] - ShaderSSAO, the original Kenshi SSAO mod that inspired this project
 [*] [b]Bob[/b] - Native Stylise, also an inspiration
 [*] [b]Dear ImGui[/b] - In-game GUI library
+[*] [b]Atlas[/b] - Made the video that gave me the idea of this mod
 [/list]
 
 [h1]Source Code[/h1]

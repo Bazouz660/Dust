@@ -32,7 +32,7 @@ static uint64_t gFrameIndex = 0;
 static bool gDispatchedThisFrame = false;
 
 // Camera extraction from the game's deferred lighting CB
-static ID3D11Buffer* gCameraStagingCB = nullptr;
+// (staging CBs are in gCameraStagingCBs[], declared near ExtractCameraData)
 static DustCameraData gCameraData = {};
 static bool gCameraDataExtracted = false; // per-frame flag
 
@@ -50,18 +50,28 @@ static bool  sSwapChainHooked    = false;
 // Survey: collected frame data for writing after all frames captured
 static std::vector<SurveyFrameData> sSurveyFrames;
 
+static bool gDeviceRemovedThisFrame = false;
+
 void ResetFrameState()
 {
     gPipelineDetector.ResetFrame();
     gResourceRegistry.ResetFrame();
     gDispatchedThisFrame = false;
     gCameraDataExtracted = false;
+    gDeviceRemovedThisFrame = false;
     gFrameIndex++;
 }
 
 // Extract camera basis vectors from the game's deferred lighting PS constant buffer.
 // The inverse view matrix sits at register c8 (offset 128 bytes / 32 floats).
 // Camera axes are the COLUMNS of the inverse view matrix (= rows of the view matrix).
+// Double-buffered staging: CopyResource into slot N this frame, Map slot N-1
+// (which the GPU finished long ago). Eliminates the CPU-GPU sync stall that
+// was blocking the pipeline every frame.
+static ID3D11Buffer* gCameraStagingCBs[2] = {};
+static int gCameraStagingSlot = 0;
+static bool gCameraStagingReady = false; // false until first copy has been issued
+
 static void ExtractCameraData(ID3D11DeviceContext* ctx)
 {
     if (gCameraDataExtracted) return;
@@ -74,43 +84,54 @@ static void ExtractCameraData(ID3D11DeviceContext* ctx)
     psCB->GetDesc(&cbDesc);
     if (cbDesc.ByteWidth < 192) { psCB->Release(); return; }
 
-    if (!gCameraStagingCB)
+    if (!gCameraStagingCBs[0])
     {
         D3D11_BUFFER_DESC sd = cbDesc;
         sd.Usage = D3D11_USAGE_STAGING;
         sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         sd.BindFlags = 0;
         sd.MiscFlags = 0;
-        gDevice->CreateBuffer(&sd, nullptr, &gCameraStagingCB);
+        gDevice->CreateBuffer(&sd, nullptr, &gCameraStagingCBs[0]);
+        gDevice->CreateBuffer(&sd, nullptr, &gCameraStagingCBs[1]);
     }
-    if (!gCameraStagingCB) { psCB->Release(); return; }
+    if (!gCameraStagingCBs[0] || !gCameraStagingCBs[1]) { psCB->Release(); return; }
 
-    ctx->CopyResource(gCameraStagingCB, psCB);
+    int writeSlot = gCameraStagingSlot;
+    int readSlot = 1 - writeSlot;
+
+    // Copy this frame's CB into the write slot (async, no stall)
+    ctx->CopyResource(gCameraStagingCBs[writeSlot], psCB);
     psCB->Release();
 
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    if (SUCCEEDED(ctx->Map(gCameraStagingCB, 0, D3D11_MAP_READ, 0, &mapped)))
+    // Read LAST frame's data from the other slot (GPU finished it long ago)
+    if (gCameraStagingReady)
     {
-        float m[16];
-        memcpy(m, (float*)mapped.pData + 32, 64); // c8 offset
-        ctx->Unmap(gCameraStagingCB, 0);
-
-        bool valid = true;
-        for (int i = 0; i < 16; i++)
-            if (!isfinite(m[i])) { valid = false; break; }
-
-        if (valid)
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        if (SUCCEEDED(ctx->Map(gCameraStagingCBs[readSlot], 0, D3D11_MAP_READ, 0, &mapped)))
         {
-            memcpy(gCameraData.inverseView, m, 64);
-            // Columns of inverse view = camera axes in world space
-            gCameraData.camRight[0]   = m[0]; gCameraData.camRight[1]   = m[4]; gCameraData.camRight[2]   = m[8];
-            gCameraData.camUp[0]      = m[1]; gCameraData.camUp[1]      = m[5]; gCameraData.camUp[2]      = m[9];
-            gCameraData.camForward[0] = m[2]; gCameraData.camForward[1] = m[6]; gCameraData.camForward[2] = m[10];
-            gCameraData.camPosition[0] = m[12]; gCameraData.camPosition[1] = m[13]; gCameraData.camPosition[2] = m[14];
-            gCameraData.valid = 1;
-            gCameraDataExtracted = true;
+            float m[16];
+            memcpy(m, (float*)mapped.pData + 32, 64); // c8 offset
+            ctx->Unmap(gCameraStagingCBs[readSlot], 0);
+
+            bool valid = true;
+            for (int i = 0; i < 16; i++)
+                if (!isfinite(m[i])) { valid = false; break; }
+
+            if (valid)
+            {
+                memcpy(gCameraData.inverseView, m, 64);
+                gCameraData.camRight[0]   = m[0]; gCameraData.camRight[1]   = m[4]; gCameraData.camRight[2]   = m[8];
+                gCameraData.camUp[0]      = m[1]; gCameraData.camUp[1]      = m[5]; gCameraData.camUp[2]      = m[9];
+                gCameraData.camForward[0] = m[2]; gCameraData.camForward[1] = m[6]; gCameraData.camForward[2] = m[10];
+                gCameraData.camPosition[0] = m[12]; gCameraData.camPosition[1] = m[13]; gCameraData.camPosition[2] = m[14];
+                gCameraData.valid = 1;
+                gCameraDataExtracted = true;
+            }
         }
     }
+
+    gCameraStagingSlot = readSlot;
+    gCameraStagingReady = true;
 }
 
 // ==================== Original function pointers ====================
@@ -753,17 +774,21 @@ static void STDMETHODCALLTYPE HookedDraw(
         }
     }
 
-    // Check device health FIRST — before touching any D3D11 resources.
-    // During fullscreen alt-tab, the device can be removed and any
-    // OMGetRenderTargets / GetDesc / PSGetShaderResources call may crash.
+    // Check device health once per frame, not per draw call.
+    // GetDeviceRemovedReason can cause driver synchronization on some hardware.
+    if (!gDeviceRemovedThisFrame)
     {
         HRESULT removeReason = gDevice->GetDeviceRemovedReason();
         if (removeReason != S_OK)
         {
             Log("Device removed (0x%08X), skipping draw hook entirely", removeReason);
-            oDraw(pThis, VertexCount, StartVertexLocation);
-            return;
+            gDeviceRemovedThisFrame = true;
         }
+    }
+    if (gDeviceRemovedThisFrame)
+    {
+        oDraw(pThis, VertexCount, StartVertexLocation);
+        return;
     }
 
     // Detect render pass from GPU state
@@ -790,37 +815,39 @@ static void STDMETHODCALLTYPE HookedDraw(
             }
         }
 
-        // Detect real resolution from the HDR render target
-        ID3D11RenderTargetView* rtv = nullptr;
-        pThis->OMGetRenderTargets(1, &rtv, nullptr);
-        if (rtv)
+        // Detect real resolution from the HDR render target — only on the
+        // lighting pass (first detection per frame) to avoid redundant COM calls.
+        if (result.point == InjectionPoint::POST_LIGHTING)
         {
-            ID3D11Resource* res = nullptr;
-            rtv->GetResource(&res);
-            if (res)
+            ID3D11RenderTargetView* rtv = nullptr;
+            pThis->OMGetRenderTargets(1, &rtv, nullptr);
+            if (rtv)
             {
-                ID3D11Texture2D* tex = nullptr;
-                res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex);
-                if (tex)
+                ID3D11Resource* res = nullptr;
+                rtv->GetResource(&res);
+                if (res)
                 {
-                    D3D11_TEXTURE2D_DESC desc;
-                    tex->GetDesc(&desc);
-                    if (desc.Width != gWidth || desc.Height != gHeight)
+                    ID3D11Texture2D* tex = nullptr;
+                    res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex);
+                    if (tex)
                     {
-                        Log("Resolution changed: %ux%u -> %ux%u", gWidth, gHeight, desc.Width, desc.Height);
-                        gWidth = desc.Width;
-                        gHeight = desc.Height;
-                        gEffectLoader.OnResolutionChanged(gDevice, gWidth, gHeight);
+                        D3D11_TEXTURE2D_DESC desc;
+                        tex->GetDesc(&desc);
+                        if (desc.Width != gWidth || desc.Height != gHeight)
+                        {
+                            Log("Resolution changed: %ux%u -> %ux%u", gWidth, gHeight, desc.Width, desc.Height);
+                            gWidth = desc.Width;
+                            gHeight = desc.Height;
+                            gEffectLoader.OnResolutionChanged(gDevice, gWidth, gHeight);
+                        }
+                        tex->Release();
                     }
-                    tex->Release();
+                    res->Release();
                 }
-                res->Release();
+                rtv->Release();
             }
-            rtv->Release();
         }
 
-        // Skip effect dispatch when resolution not yet detected.
-        // Effects initialized at 1x1 must not render into full-resolution targets.
         if (gWidth <= 1 || gHeight <= 1)
         {
             Log("Skipping effect dispatch (res=%ux%u)", gWidth, gHeight);
@@ -861,10 +888,6 @@ static void STDMETHODCALLTYPE HookedDraw(
         // Execute the game's original draw call
         oDraw(pThis, VertexCount, StartVertexLocation);
 
-        // Snapshot pre-fog HDR right after the lighting draw completes
-        if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
-            gEffectLoader.CapturePreFogHDR(pThis);
-
         // POST: effects that operate after the draw
         fctx.timing = DUST_TIMING_POST;
         gEffectLoader.DispatchPost(dip, &fctx);
@@ -879,12 +902,6 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     ID3D11DeviceContext* pThis, UINT IndexCount, UINT StartIndexLocation,
     INT BaseVertexLocation)
 {
-    ++gDrawHookCallCount;
-    if ((gDrawHookCallCount % 3000) == 0)
-        Log("Hook diag: draws=%llu presents=%llu",
-            (unsigned long long)gDrawHookCallCount,
-            (unsigned long long)gPresentHookCallCount);
-
     if (Survey::IsActive())
         SurveyRecorder::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 
@@ -1134,7 +1151,7 @@ bool Install()
     {
         std::string ini = DustLogDir() + "Dust.ini";
         int val = GetPrivateProfileIntA("Shadows", "ShadowResolution", 0, ini.c_str());
-        if (val >= 1024 && val <= 8192)
+        if (val >= 1024 && val <= 16384)
         {
             gShadowResOverride = (UINT)val;
             Log("  Shadow map resolution override: %u", gShadowResOverride);

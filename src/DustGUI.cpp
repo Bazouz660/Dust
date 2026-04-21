@@ -56,7 +56,12 @@ struct FrameworkConfig {
     bool showSurvey = false;
     std::string lastPreset;    // name of last selected preset (empty = custom)
     int toggleKey = VK_F11;    // virtual key code for overlay toggle
+    int shadowResolution = 0;  // 0=default (game's native), index into kShadowResOptions
 };
+
+static const int kShadowResOptions[] = { 0, 2048, 4096, 8192, 16384 };
+static const char* kShadowResLabels[] = { "Default", "2048", "4096", "8192", "16384" };
+static const int kShadowResCount = 5;
 
 static const char* VKKeyName(int vk)
 {
@@ -271,6 +276,10 @@ static PFN_GetDeviceData  oMouseGetDeviceData  = nullptr;
 static BYTE gKbTrackedState[256] = {};
 static bool gKbWasBlocking = false;
 
+// WM_ stuck-key fix: track which virtual keys had WM_KEYDOWN eaten by the overlay
+// so we can forward WM_KEYUP to the game's WndProc on overlay close.
+static BYTE gWmKeysEaten[256] = {};
+
 static bool ShouldBlockDInput()
 {
     return gInitialized && gOverlayVisible && ImGui::GetIO().WantCaptureMouse;
@@ -461,6 +470,19 @@ static void OnOverlayOpen(HWND hWnd)
 {
     gToastActive = false;
 
+    // Snapshot keys the game currently thinks are held — if we later eat the
+    // WM_KEYUP, OnOverlayClose needs to forward it to the game's WndProc.
+    memset(gWmKeysEaten, 0, sizeof(gWmKeysEaten));
+    BYTE keyState[256];
+    if (GetKeyboardState(keyState))
+    {
+        for (int vk = 0; vk < 256; vk++)
+        {
+            if (keyState[vk] & 0x80)
+                gWmKeysEaten[vk] = 1;
+        }
+    }
+
     // Save cursor clip rect and release it so the cursor can move freely
     gHadClipRect = (GetClipCursor(&gSavedClipRect) != 0);
     ClipCursor(nullptr);
@@ -483,6 +505,23 @@ static void OnOverlayClose()
     memset(io.KeysDown, 0, sizeof(io.KeysDown));
     memset(io.MouseDown, 0, sizeof(io.MouseDown));
     io.KeyCtrl = io.KeyShift = io.KeyAlt = io.KeySuper = false;
+
+    // Forward WM_KEYUP to the game's WndProc for every key we swallowed.
+    // Without this, the game's Win32 key state thinks keys are still held
+    // because it never saw the WM_KEYUP that we ate while the overlay was open.
+    if (oWndProc && gHWnd)
+    {
+        for (int vk = 0; vk < 256; vk++)
+        {
+            if (gWmKeysEaten[vk])
+            {
+                UINT scanCode = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+                LPARAM lp = (1) | (scanCode << 16) | (0x3 << 30); // repeat=1, scancode, release flags
+                CallWindowProcW(oWndProc, gHWnd, WM_KEYUP, (WPARAM)vk, lp);
+            }
+        }
+        memset(gWmKeysEaten, 0, sizeof(gWmKeysEaten));
+    }
 
     // Restore cursor clipping (game usually clips cursor to window)
     if (gHadClipRect)
@@ -536,7 +575,20 @@ static LRESULT CALLBACK DustWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         bool isMouse = (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST);
         bool isKeyboard = (msg >= WM_KEYFIRST && msg <= WM_KEYLAST);
         if ((isMouse || isKeyboard || msg == WM_INPUT) && ImGui::GetIO().WantCaptureMouse)
+        {
+            // Track swallowed key-downs so OnOverlayClose can send matching key-ups
+            if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)
+            {
+                if (wParam < 256)
+                    gWmKeysEaten[wParam] = 1;
+            }
+            else if (msg == WM_KEYUP || msg == WM_SYSKEYUP)
+            {
+                if (wParam < 256)
+                    gWmKeysEaten[wParam] = 0;
+            }
             return 0;
+        }
     }
     else if (gInitialized)
     {
@@ -576,6 +628,20 @@ static void LoadFrameworkConfig()
     gFwConfig.showSurvey = GetPrivateProfileIntA("Dust", "ShowSurvey", 0, gDustIniPath.c_str()) != 0;
 
     gFwConfig.toggleKey = GetPrivateProfileIntA("Dust", "ToggleKey", VK_F11, gDustIniPath.c_str());
+
+    // Shadow resolution: stored as raw pixel value, map to dropdown index
+    {
+        int rawRes = GetPrivateProfileIntA("Shadows", "ShadowResolution", 0, gDustIniPath.c_str());
+        gFwConfig.shadowResolution = 0; // default
+        for (int i = 1; i < kShadowResCount; i++)
+        {
+            if (kShadowResOptions[i] == rawRes)
+            {
+                gFwConfig.shadowResolution = i;
+                break;
+            }
+        }
+    }
 
     char buf[256] = {};
     GetPrivateProfileStringA("Dust", "LastPreset", "", buf, sizeof(buf), gDustIniPath.c_str());
@@ -624,6 +690,15 @@ static void SaveFrameworkConfig()
     snprintf(keyBuf, sizeof(keyBuf), "%d", gFwConfig.toggleKey);
     WritePrivateProfileStringA("Dust", "ToggleKey", keyBuf, gDustIniPath.c_str());
     WritePrivateProfileStringA("Dust", "LastPreset", gFwConfig.lastPreset.c_str(), gDustIniPath.c_str());
+
+    // Shadow resolution: write raw pixel value to [Shadows] section
+    {
+        int rawRes = kShadowResOptions[gFwConfig.shadowResolution];
+        char resBuf[16];
+        snprintf(resBuf, sizeof(resBuf), "%d", rawRes);
+        WritePrivateProfileStringA("Shadows", "ShadowResolution", resBuf, gDustIniPath.c_str());
+    }
+
     gFwDiskConfig = gFwConfig;
     // Apply logging change immediately
     DustLogEnabled() = gFwConfig.logging;
@@ -642,7 +717,8 @@ static bool IsFrameworkDirty()
            gFwConfig.showStartupMessage != gFwDiskConfig.showStartupMessage ||
            gFwConfig.showSurvey != gFwDiskConfig.showSurvey ||
            gFwConfig.lastPreset != gFwDiskConfig.lastPreset ||
-           gFwConfig.toggleKey != gFwDiskConfig.toggleKey;
+           gFwConfig.toggleKey != gFwDiskConfig.toggleKey ||
+           gFwConfig.shadowResolution != gFwDiskConfig.shadowResolution;
 }
 
 // ==================== Drawing: Framework pane ====================
@@ -683,6 +759,37 @@ static void DrawFrameworkSection()
     ImGui::Checkbox("Show Survey", &gFwConfig.showSurvey);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Show pipeline survey controls (developer tool)");
+
+    ImGui::Spacing();
+
+    // Shadow resolution dropdown (RTWSM only, requires restart)
+    {
+        ImGui::Text("Shadow Resolution");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Shadow map resolution (RTWSM shadows only). Requires game restart.");
+
+        ImGui::SetNextItemWidth(-1);
+        const char* preview = kShadowResLabels[gFwConfig.shadowResolution];
+        if (ImGui::BeginCombo("##ShadowRes", preview))
+        {
+            for (int i = 0; i < kShadowResCount; i++)
+            {
+                bool selected = (gFwConfig.shadowResolution == i);
+                if (ImGui::Selectable(kShadowResLabels[i], selected))
+                    gFwConfig.shadowResolution = i;
+                if (selected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Shadow map resolution (RTWSM shadows only). Requires game restart.");
+
+        if (gFwConfig.shadowResolution != gFwDiskConfig.shadowResolution)
+        {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "(restart required)");
+        }
+    }
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -1375,7 +1482,7 @@ void Render()
         const float footerH = logoSize + ImGui::GetStyle().FramePadding.y * 2.0f
                              + ImGui::GetStyle().ItemSpacing.y + 4.0f;
 
-        ImGui::BeginChild("##left", ImVec2(leftW, 0), true);
+        ImGui::BeginChild("##left", ImVec2(leftW, 0), true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 
         // Scrollable content area (everything except footer)
         ImGui::BeginChild("##leftContent", ImVec2(0, -footerH), false);

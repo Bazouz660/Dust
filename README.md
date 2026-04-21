@@ -23,8 +23,8 @@ Game Render Pipeline:
   GBuffer Fill -> Deferred Lighting -> Fog -> Post-Processing -> Tonemapping -> Present
                         |               |                              |
                   POST_LIGHTING      POST_FOG                    POST_TONEMAP
-              (SSAO, SSIL, SSS,                              (LUT, Clarity, Bloom,
-                    Outline)                                        DOF)
+              (SSAO, SSIL, Outline)                          (LUT, Clarity, Bloom,
+                                                                   DOF)
 ```
 
 Effects register at specific injection points. When Dust detects a matching render pass, it dispatches registered effects (in priority order) with full access to the relevant GPU resources.
@@ -87,7 +87,7 @@ The host provides a `DustHostAPI` struct with functions for logging, resource ac
 ### LUT (Color Grading + Tonemapping) — `POST_TONEMAP`, priority 0
 
 - **Full HDR pipeline**: Captures the R11G11B10_FLOAT scene in `preExecute` before the game's tonemapper runs, then completely replaces the LDR output in `postExecute` — only one 8-bit quantization step in the entire chain
-- **ACES filmic tonemapper**: Replaces the vanilla linear tonemapper to eliminate banding artifacts, especially in skies and bright outdoor scenes
+- **Selectable tonemapper**: ACES (Narkowicz/Hill), Reinhard, Reinhard Extended, Uncharted 2 (Hable), AgX, Khronos PBR Neutral, or linear passthrough
 - **Parametric LUT**: 32×32×32 color grading LUT generated from configurable parameters (stored as R32G32B32A32_FLOAT to avoid LUT quantization)
 - **Lift/Gamma/Gain**: Shadow, midtone, and highlight adjustment
 - **Color balance**: Contrast, saturation, temperature, and tint controls
@@ -95,15 +95,6 @@ The host provides a `DustHostAPI` struct with functions for logging, resource ac
 - **Exposure (EV stops)**: Pre-tonemap exposure adjustment
 - **Triangular dithering**: Applied at the final 8-bit write to break up gradient banding
 - **Ships with a cinematic desert preset** tuned for Kenshi's aesthetic
-
-### Screen Space Shadows (SSS) — `POST_LIGHTING`, priority 20
-
-- **Contact shadows**: Ray marches the depth buffer toward the sun direction to add sharp, detailed close-range shadows that mask the low-res shadow map
-- **Automatic sun tracking**: Extracts the sun direction and view matrix from the game's constant buffer each frame — shadows follow the in-game day/night cycle
-- **Quadratic step distribution**: More samples near the surface for fine contact detail, fewer far away
-- **Per-pixel jitter**: Interleaved gradient noise breaks up banding artifacts
-- **Depth-aware bilateral blur**: Smooths the shadow mask without bleeding across depth edges
-- **Debug visualization**: Overlay mode to inspect the raw shadow mask
 
 ### Clarity / Local Contrast — `POST_TONEMAP`, priority 50
 
@@ -125,6 +116,24 @@ The host provides a `DustHostAPI` struct with functions for logging, resource ac
 - **Configurable appearance**: Adjustable thickness, strength/opacity, and outline color (RGB)
 - **Depth-limited**: Max depth parameter prevents outlines on distant objects and sky
 - **Debug visualization**: Overlay mode to inspect edge detection output
+
+### RTGI (Ray-Traced Global Illumination) — `POST_LIGHTING`, priority 5
+
+- **Screen-space indirect lighting**: Casts rays per pixel against the depth buffer and samples lit scene radiance at hit points for physically-based indirect illumination
+- **Ambient occlusion**: Occlusion term computed from ray hits, applied alongside indirect light
+- **Multi-bounce**: Previous frame's GI is fed back for approximate multi-bounce light transport
+- **Temporal accumulation + SVGF denoise**: A-trous wavelet filter with variance-guided edge stopping produces stable, noise-free output
+- **Compute shader pipeline**: Ray trace and denoise passes use compute shaders to eliminate pixel shader quad waste at depth discontinuities
+- **Configurable**: Ray count, step count, ray length, thickness, resolution mode (full/half/quarter), denoise iterations
+- **Debug visualization**: Overlay modes for indirect light, AO, and normals
+
+### Shadows (RTWSM Enhancement) — `POST_LIGHTING`, priority 30
+
+- **Improved shadow filtering**: Replaces the game's basic shadow sampling with PCSS (Percentage-Closer Soft Shadows) via the RTWSM warp map
+- **Variable penumbra**: Light size parameter controls how much shadows soften with distance from the caster
+- **12-sample Poisson disk**: Jittered per-pixel rotation for smooth, low-noise shadow edges
+- **Configurable**: Filter radius, light size, PCSS toggle, bias scale
+- **Shadow map resolution override**: Configurable in the GUI (2048–16384), requires restart
 
 ### Kuwahara Filter — `POST_TONEMAP`, priority 150
 
@@ -181,7 +190,8 @@ A startup toast notification appears for 30 seconds indicating the mod version a
            └── effects/
                ├── DustSSAO.dll
                ├── DustSSIL.dll
-               ├── DustSSS.dll
+               ├── DustRTGI.dll
+               ├── DustShadows.dll
                ├── DustClarity.dll
                ├── DustLUT.dll
                ├── DustBloom.dll
@@ -196,7 +206,7 @@ A startup toast notification appears for 30 seconds indicating the mod version a
                └── shaders/
                    ├── ssao_*.hlsl
                    ├── ssil_*.hlsl
-                   ├── sss_*.hlsl
+                   ├── rtgi_*.hlsl
                    ├── clarity_*.hlsl
                    ├── lut_ps.hlsl
                    ├── bloom_*.hlsl
@@ -221,6 +231,9 @@ Each effect has its own `.ini` file generated automatically in the `effects/` fo
 [Dust]
 Logging=0
 StartupMessage=1
+
+[Shadows]
+ShadowResolution=0   # 0=default, or 2048/4096/8192/16384 (requires restart, RTWSM only)
 ```
 
 ### SSAO.ini
@@ -280,19 +293,35 @@ HighlightG=0.01
 HighlightB=-0.02
 ```
 
-### SSS.ini
+### RTGI.ini
 
 ```ini
-[SSS]
+[RTGI]
 Enabled=1
-Strength=0.7
-MaxDistance=0.005
-StepCount=16
-Thickness=0.001
-DepthBias=0.0001
-MaxDepth=0.1
-BlurSharpness=0.01
+RayLength=0.3
+RaySteps=16
+RaysPerPixel=1
+Thickness=0.01
+ThicknessCurve=0.8
+FadeDistance=1.0
+BounceIntensity=0.5
+AOIntensity=1.5
+GIIntensity=1.0
+TemporalBlend=0.95
+ResolutionMode=1
+DenoiseSteps=4
 DebugView=0
+```
+
+### Shadows.ini
+
+```ini
+[Shadows]
+Enabled=1
+FilterRadius=1.0
+LightSize=3.0
+PCSS=1
+BiasScale=1.0
 ```
 
 ### Clarity.ini
@@ -396,9 +425,10 @@ msbuild src\Dust.vcxproj /p:Configuration=Release /p:Platform=x64
 ```bash
 msbuild effects\ssao\DustSSAO.vcxproj /p:Configuration=Release /p:Platform=x64
 msbuild effects\ssil\DustSSIL.vcxproj /p:Configuration=Release /p:Platform=x64
+msbuild effects\rtgi\DustRTGI.vcxproj /p:Configuration=Release /p:Platform=x64
+msbuild effects\shadows\DustShadows.vcxproj /p:Configuration=Release /p:Platform=x64
 msbuild effects\lut\DustLUT.vcxproj   /p:Configuration=Release /p:Platform=x64
 msbuild effects\bloom\DustBloom.vcxproj /p:Configuration=Release /p:Platform=x64
-msbuild effects\sss\DustSSS.vcxproj   /p:Configuration=Release /p:Platform=x64
 msbuild effects\clarity\DustClarity.vcxproj /p:Configuration=Release /p:Platform=x64
 msbuild effects\dof\DustDOF.vcxproj   /p:Configuration=Release /p:Platform=x64
 msbuild effects\outline\DustOutline.vcxproj /p:Configuration=Release /p:Platform=x64
@@ -418,9 +448,10 @@ Copy the following into `<Kenshi>/mods/Dust/`:
 | `src/shaders/fullscreen_vs.hlsl` | `shaders/fullscreen_vs.hlsl` |
 | `effects/ssao/build/Release/DustSSAO.dll` | `effects/DustSSAO.dll` |
 | `effects/ssil/build/Release/DustSSIL.dll` | `effects/DustSSIL.dll` |
+| `effects/rtgi/build/Release/DustRTGI.dll` | `effects/DustRTGI.dll` |
+| `effects/shadows/build/Release/DustShadows.dll` | `effects/DustShadows.dll` |
 | `effects/lut/build/Release/DustLUT.dll` | `effects/DustLUT.dll` |
 | `effects/bloom/build/Release/DustBloom.dll` | `effects/DustBloom.dll` |
-| `effects/sss/build/Release/DustSSS.dll` | `effects/DustSSS.dll` |
 | `effects/clarity/build/Release/DustClarity.dll` | `effects/DustClarity.dll` |
 | `effects/dof/build/Release/DustDOF.dll` | `effects/DustDOF.dll` |
 | `effects/outline/build/Release/DustOutline.dll` | `effects/DustOutline.dll` |
@@ -462,7 +493,8 @@ GPU costs are measured via D3D11 timestamp queries and displayed in the in-game 
 |----------|--------|----------|
 | SSAO     | 3 (generate + blur H + blur V) | ~1–3 ms |
 | SSIL     | 3 (generate + blur H + blur V) | ~2–5 ms |
-| SSS      | 3 (generate + blur H + blur V) + 1 composite | ~1–3 ms |
+| RTGI     | 5+ (ray trace + temporal + variance + denoise × N) | ~3–8 ms |
+| Shadows  | 0 (inlined in deferred shader) | ~0.5–1.5 ms |
 | Outline  | 1 (edge detect + composite) | ~0.2–0.5 ms |
 | Clarity  | 3 (blur H + blur V + composite) | ~0.3–1 ms |
 | LUT      | 1 (HDR → ACES → LUT → dither) | ~0.1–0.3 ms |

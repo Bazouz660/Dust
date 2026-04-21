@@ -30,10 +30,11 @@ static UINT gRenderWidth = 0;
 static UINT gRenderHeight = 0;
 static int gLastResMode = 0; // Track resolution mode (0=full, 1=half, 2=quarter) for runtime recreation
 
-// Raw ray trace output (RGBA16F)
-static ID3D11Texture2D*          gRawTex = nullptr;
-static ID3D11RenderTargetView*   gRawRTV = nullptr;
-static ID3D11ShaderResourceView* gRawSRV = nullptr;
+// Raw ray trace output (RGBA16F) — UAV for compute shader write
+static ID3D11Texture2D*           gRawTex = nullptr;
+static ID3D11RenderTargetView*    gRawRTV = nullptr;
+static ID3D11ShaderResourceView*  gRawSRV = nullptr;
+static ID3D11UnorderedAccessView* gRawUAV = nullptr;
 
 // Temporal accumulation ping-pong (RGBA16F)
 static ID3D11Texture2D*          gAccumTexA = nullptr;
@@ -76,7 +77,7 @@ static ID3D11ShaderResourceView* gFinalGISRV = nullptr;
 // ==================== Shaders ====================
 
 static ID3D11VertexShader*  gFullscreenVS = nullptr;
-static ID3D11PixelShader*   gRayTracePS = nullptr;
+static ID3D11ComputeShader* gRayTraceCS = nullptr;
 static ID3D11PixelShader*   gTemporalPS = nullptr;
 static ID3D11PixelShader*   gVariancePS = nullptr;
 static ID3D11ComputeShader* gAtrousCS = nullptr;
@@ -183,6 +184,7 @@ struct DebugCBData
     float camUp[4];
     float camForward[4];
 };
+
 
 // ==================== Helpers ====================
 
@@ -302,7 +304,7 @@ static bool CreateR32FTexture(ID3D11Device* device, UINT width, UINT height,
 
 static void ReleaseTextures()
 {
-    SAFE_RELEASE(gRawTex);     SAFE_RELEASE(gRawRTV);     SAFE_RELEASE(gRawSRV);
+    SAFE_RELEASE(gRawTex);     SAFE_RELEASE(gRawRTV);     SAFE_RELEASE(gRawSRV);     SAFE_RELEASE(gRawUAV);
     SAFE_RELEASE(gAccumTexA);  SAFE_RELEASE(gAccumRTVA);  SAFE_RELEASE(gAccumSRVA);
     SAFE_RELEASE(gAccumTexB);  SAFE_RELEASE(gAccumRTVB);  SAFE_RELEASE(gAccumSRVB);
     SAFE_RELEASE(gMomentsTexA);SAFE_RELEASE(gMomentsRTVA);SAFE_RELEASE(gMomentsSRVA);
@@ -324,7 +326,7 @@ static bool CreateTextures(ID3D11Device* device, UINT width, UINT height)
     gRenderWidth = rw;
     gRenderHeight = rh;
 
-    if (!CreateRGBA16FTexture(device, rw, rh, &gRawTex, &gRawRTV, &gRawSRV)) return false;
+    if (!CreateRGBA16FTexture(device, rw, rh, &gRawTex, &gRawRTV, &gRawSRV, &gRawUAV)) return false;
     if (!CreateRGBA16FTexture(device, rw, rh, &gAccumTexA, &gAccumRTVA, &gAccumSRVA)) return false;
     if (!CreateRGBA16FTexture(device, rw, rh, &gAccumTexB, &gAccumRTVB, &gAccumSRVB)) return false;
     if (!CreateRGBA16FTexture(device, rw, rh, &gMomentsTexA, &gMomentsRTVA, &gMomentsSRVA)) return false;
@@ -369,8 +371,8 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
     ID3DBlob* vsBlob = host->CompileShaderFromFile((gShaderDir + "fullscreen_vs.hlsl").c_str(), "main", "vs_5_0");
     if (!vsBlob) { Log("RTGI: Failed to compile fullscreen VS"); return false; }
 
-    ID3DBlob* rtBlob = host->CompileShaderFromFile((gShaderDir + "rtgi_raytrace_ps.hlsl").c_str(), "main", "ps_5_0");
-    if (!rtBlob) { vsBlob->Release(); Log("RTGI: Failed to compile raytrace PS"); return false; }
+    ID3DBlob* rtBlob = host->CompileShaderFromFile((gShaderDir + "rtgi_raytrace_cs.hlsl").c_str(), "main", "cs_5_0");
+    if (!rtBlob) { vsBlob->Release(); Log("RTGI: Failed to compile raytrace CS"); return false; }
 
     ID3DBlob* tempBlob = host->CompileShaderFromFile((gShaderDir + "rtgi_temporal_ps.hlsl").c_str(), "main", "ps_5_0");
     if (!tempBlob) { vsBlob->Release(); rtBlob->Release(); Log("RTGI: Failed to compile temporal PS"); return false; }
@@ -396,7 +398,7 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
     vsBlob->Release();
     if (FAILED(hr)) return false;
 
-    hr = device->CreatePixelShader(rtBlob->GetBufferPointer(), rtBlob->GetBufferSize(), nullptr, &gRayTracePS);
+    hr = device->CreateComputeShader(rtBlob->GetBufferPointer(), rtBlob->GetBufferSize(), nullptr, &gRayTraceCS);
     rtBlob->Release();
     if (FAILED(hr)) return false;
 
@@ -515,7 +517,7 @@ void Shutdown()
     ReleaseTextures();
 
     SAFE_RELEASE(gFullscreenVS);
-    SAFE_RELEASE(gRayTracePS);    SAFE_RELEASE(gTemporalPS);
+    SAFE_RELEASE(gRayTraceCS);    SAFE_RELEASE(gTemporalPS);
     SAFE_RELEASE(gVariancePS);    SAFE_RELEASE(gAtrousCS);
     SAFE_RELEASE(gCompositePS);   SAFE_RELEASE(gAOCompositePS);
     SAFE_RELEASE(gDebugPS);
@@ -656,28 +658,21 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
 
     float aspect = (float)gWidth / (float)gHeight;
 
-    // ---- Pass 1: Ray Trace ----
+    // ---- Pass 1: Ray Trace (compute shader) ----
     {
-        float clearColor[4] = { 0, 0, 0, 1 };
-        ctx->ClearRenderTargetView(gRawRTV, clearColor);
-        ctx->OMSetRenderTargets(1, &gRawRTV, nullptr);
-        ctx->OMSetBlendState(gNoBlend, blendFactor, 0xFFFFFFFF);
-        ctx->RSSetViewports(1, &renderVP);
-        ctx->PSSetShader(gRayTracePS, nullptr, 0);
+        // Unbind any render target so the raw texture UAV is not simultaneously bound as RTV
+        ID3D11RenderTargetView* nullRTV = nullptr;
+        ctx->OMSetRenderTargets(1, &nullRTV, nullptr);
 
-        // Use DENOISED output from previous frame for multi-bounce feedback (not raw accumulation)
-        // After previous frame's RenderGI, gAccumWriteIndex was swapped, so current write target
-        // is the OTHER buffer — the one we wrote to last frame is the read buffer.
-        // For the denoised output, use the last denoise result if available.
+        ctx->CSSetShader(gRayTraceCS, nullptr, 0);
+
         ID3D11ShaderResourceView* prevGISRV = (gAccumWriteIndex == 0) ? gAccumSRVB : gAccumSRVA;
-        // If denoise ran last frame, the denoised result might be in one of the denoise buffers.
-        // For simplicity, use the accumulation buffer (which has temporal filtering applied).
 
         // t0=depth, t1=scene, t2=prevGI, t3=normals
         ID3D11ShaderResourceView* srvs[4] = { depthSRV, sceneSRV, prevGISRV, normalsSRV };
-        ctx->PSSetShaderResources(0, 4, srvs);
+        ctx->CSSetShaderResources(0, 4, srvs);
         ID3D11SamplerState* samplers[2] = { gPointClampSampler, gLinearClampSampler };
-        ctx->PSSetSamplers(0, 2, samplers);
+        ctx->CSSetSamplers(0, 2, samplers);
 
         RayTraceCBData cb = {};
         cb.viewportSize[0] = (float)gRenderWidth;
@@ -707,11 +702,17 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
         cb.camUp[0]      = gInverseView[1]; cb.camUp[1]      = gInverseView[5]; cb.camUp[2]      = gInverseView[9];  cb.camUp[3]      = 0;
         cb.camForward[0] = gInverseView[2]; cb.camForward[1] = gInverseView[6]; cb.camForward[2] = gInverseView[10]; cb.camForward[3] = 0;
         gHost->UpdateConstantBuffer(ctx, gRayTraceCB, &cb, sizeof(cb));
-        ctx->PSSetConstantBuffers(0, 1, &gRayTraceCB);
+        ctx->CSSetConstantBuffers(0, 1, &gRayTraceCB);
 
-        ctx->Draw(3, 0);
+        UINT initialCount = 0;
+        ctx->CSSetUnorderedAccessViews(0, 1, &gRawUAV, &initialCount);
+        ctx->Dispatch((gRenderWidth + 7) / 8, (gRenderHeight + 7) / 8, 1);
+
+        // Unbind CS resources
+        ID3D11UnorderedAccessView* nullUAV = nullptr;
+        ctx->CSSetUnorderedAccessViews(0, 1, &nullUAV, &initialCount);
         ID3D11ShaderResourceView* nullSRVs[4] = {};
-        ctx->PSSetShaderResources(0, 4, nullSRVs);
+        ctx->CSSetShaderResources(0, 4, nullSRVs);
     }
 
     // ---- Pass 2: Temporal Accumulation (single RT: color+AO) ----

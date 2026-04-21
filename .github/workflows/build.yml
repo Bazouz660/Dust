@@ -107,6 +107,12 @@ jobs:
           /p:Configuration=Release
           /p:Platform=x64
 
+      - name: Build Shadows plugin (DustShadows.dll)
+        run: >
+          msbuild effects\shadows\DustShadows.vcxproj
+          /p:Configuration=Release
+          /p:Platform=x64
+
       - name: Package release
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -122,6 +128,7 @@ jobs:
           copy effects\outline\build\Release\DustOutline.dll release\Dust\effects\
           copy effects\kuwahara\build\Release\DustKuwahara.dll release\Dust\effects\
           copy effects\rtgi\build\Release\DustRTGI.dll release\Dust\effects\
+          copy effects\shadows\build\Release\DustShadows.dll release\Dust\effects\
           xcopy /Y effects\ssil\shaders\* release\Dust\effects\shaders\
           xcopy /Y effects\ssao\shaders\* release\Dust\effects\shaders\
           xcopy /Y effects\lut\shaders\* release\Dust\effects\shaders\
