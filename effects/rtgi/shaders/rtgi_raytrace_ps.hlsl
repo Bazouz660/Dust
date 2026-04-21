@@ -35,30 +35,6 @@ float2 ViewPosToUV(float3 vp, float thf, float ar)
     return uv;
 }
 
-// ---- Normal reconstruction ----
-
-float3 ReconstructNormal(Texture2D<float> dt, SamplerState ss,
-                         float2 uv, float depth, float2 iv,
-                         float thf, float ar)
-{
-    float dR = dt.SampleLevel(ss, uv + float2( iv.x, 0), 0);
-    float dL = dt.SampleLevel(ss, uv + float2(-iv.x, 0), 0);
-    float dU = dt.SampleLevel(ss, uv + float2(0, -iv.y), 0);
-    float dD = dt.SampleLevel(ss, uv + float2(0,  iv.y), 0);
-
-    float3 vp = ReconstructViewPos(uv, depth, thf, ar);
-    float3 ddx_, ddy_;
-    if (abs(dR - depth) < abs(dL - depth))
-        ddx_ = ReconstructViewPos(uv + float2(iv.x, 0), dR, thf, ar) - vp;
-    else
-        ddx_ = vp - ReconstructViewPos(uv - float2(iv.x, 0), dL, thf, ar);
-    if (abs(dD - depth) < abs(dU - depth))
-        ddy_ = ReconstructViewPos(uv + float2(0, iv.y), dD, thf, ar) - vp;
-    else
-        ddy_ = vp - ReconstructViewPos(uv - float2(0, iv.y), dU, thf, ar);
-    return normalize(cross(ddx_, ddy_));
-}
-
 // ---- Hemisphere sampling ----
 
 float3 CosineHemisphereSample(float2 xi)
@@ -90,10 +66,11 @@ float Luminance(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
 
 // ---- Resources ----
 
-Texture2D<float>  depthTex   : register(t0);
-Texture2D<float4> sceneTex   : register(t1); // Lit HDR scene
-Texture2D<float4> prevGI     : register(t2); // Previous frame GI (multi-bounce)
-SamplerState      pointClamp : register(s0);
+Texture2D<float>  depthTex    : register(t0);
+Texture2D<float4> sceneTex    : register(t1); // Lit HDR scene
+Texture2D<float4> prevGI      : register(t2); // Previous frame GI (multi-bounce)
+Texture2D<float4> normalsTex  : register(t3); // GBuffer view-space normals
+SamplerState      pointClamp  : register(s0);
 SamplerState      linearClamp : register(s1);
 
 cbuffer RTGIParams : register(b0)
@@ -114,7 +91,9 @@ cbuffer RTGIParams : register(b0)
     float  _pad0;
     float2 sampleJitter; // render-viewport UV pixels, in [-0.5, 0.5]
     float2 _padJitter;
-    float4x4 inverseView;
+    float4 camRight;   // camera right axis in world space
+    float4 camUp;      // camera up axis in world space
+    float4 camForward; // camera forward axis in world space
 };
 
 float4 TraceRay(float2 startUV, float startDepth, float3 startView, float3 rayDirView, int numSteps, float thicknessLimit)
@@ -149,24 +128,29 @@ float4 TraceRay(float2 startUV, float startDepth, float3 startView, float3 rayDi
 
         if (depthDiff > 0.0 && depthDiff < thicknessLimit)
         {
-            // Binary search refinement — locate the exact ray/geometry crossing
-            // between the last-miss step and this hit step. 4 iterations = 1/16th
-            // of a coarse step of precision. Lets us use fewer coarse steps
-            // without losing contact accuracy.
-            float tLo = (float)(i - 1) * stepSize; // last miss (or ray origin)
-            float tHi = t;                         // current hit
-            [unroll]
-            for (int j = 0; j < 4; j++)
+            float hitT = t;
+
+            // Binary search refinement at higher step counts only —
+            // at low step counts, the 4 extra depth samples per hit
+            // cost more than the coarse march itself.
+            if (numSteps >= 8)
             {
-                float tMid = (tLo + tHi) * 0.5;
-                float midRayD = startDepth + deltaDepth * tMid;
-                float midSceneD = depthTex.SampleLevel(pointClamp, startUV + deltaUV * tMid, 0);
-                if (midSceneD > 0.0001 && midRayD > midSceneD)
-                    tHi = tMid;
-                else
-                    tLo = tMid;
+                float tLo = (float)(i - 1) * stepSize;
+                float tHi = t;
+                [unroll]
+                for (int j = 0; j < 4; j++)
+                {
+                    float tMid = (tLo + tHi) * 0.5;
+                    float midRayD = startDepth + deltaDepth * tMid;
+                    float midSceneD = depthTex.SampleLevel(pointClamp, startUV + deltaUV * tMid, 0);
+                    if (midSceneD > 0.0001 && midRayD > midSceneD)
+                        tHi = tMid;
+                    else
+                        tLo = tMid;
+                }
+                hitT = tHi;
             }
-            float hitT = tHi;
+
             float2 hitUV = saturate(startUV + deltaUV * hitT);
 
             // Sample the lit scene color at the hit point
@@ -216,16 +200,21 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     if (depth <= 0.0001 || depth > fadeDistance)
         return float4(0, 0, 0, 1);
 
-    float3 normal = ReconstructNormal(depthTex, pointClamp, uv, depth, invViewportSize,
-                                       tanHalfFov, aspectRatio);
+    // GBuffer normals (world-space) transformed to view-space.
+    // Negate Z: our view space has Z = depth (into scene), OGRE's has Z behind camera.
+    float3 worldN = normalize(normalsTex.SampleLevel(pointClamp, uv, 0).rgb * 2.0 - 1.0);
+    float3 normal;
+    normal.x =  dot(worldN, camRight.xyz);
+    normal.y =  dot(worldN, camUp.xyz);
+    normal.z = -dot(worldN, camForward.xyz);
+    normal = normalize(normal);
 
-    // Cache view-space position and tangent frame (used by all rays)
     float3 startView = ReconstructViewPos(uv, depth, tanHalfFov, aspectRatio);
     float3 tangent, bitangent;
     BuildOrthonormalBasis(normal, tangent, bitangent);
 
     int iRaysPerPixel = max(1, (int)raysPerPixel);
-    int iRaySteps = max(8, (int)raySteps);
+    int iRaySteps = max(1, (int)raySteps);
 
     // Thickness curve: exponent < 1 tightens the "back wall" for distant
     // geometry. Hoisted out of the ray loop — constant per pixel.

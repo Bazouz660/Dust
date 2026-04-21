@@ -196,6 +196,66 @@ physically-based sky model (Hillaire).
 
 ---
 
+## Camera Data (DustCameraData)
+
+The framework extracts camera data from the game's deferred lighting constant buffer
+at `POST_LIGHTING` and provides it to all effects via `DustFrameContext::camera`.
+
+### Available fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `valid` | `int` | Non-zero once camera data has been successfully extracted |
+| `camRight[3]` | `float` | View X axis (right) in world space |
+| `camUp[3]` | `float` | View Y axis (up) in world space |
+| `camForward[3]` | `float` | View Z axis in world space — **OGRE right-handed convention: points behind camera** |
+| `camPosition[3]` | `float` | Camera position in world space |
+| `inverseView[16]` | `float` | Raw 4×4 inverse view matrix (row-major in memory) |
+
+### Coordinate systems
+
+**OGRE view space** (right-handed): X=right, Y=up, Z=behind camera.
+
+**Depth-reconstruction view space** (left-handed): X=right, Y=up, Z=depth (into scene).
+This is the convention used by screen-space effects (SSAO, SSIL, RTGI).
+
+### World-to-view normal transform
+
+To convert GBuffer world-space normals to the left-handed view space used by screen-space
+ray tracing and depth reconstruction:
+
+```hlsl
+float3 worldN = normalize(normalsTex.Sample(samp, uv).rgb * 2.0 - 1.0);
+float3 viewN;
+viewN.x =  dot(worldN, camRight.xyz);
+viewN.y =  dot(worldN, camUp.xyz);
+viewN.z = -dot(worldN, camForward.xyz);  // negate: OGRE Z behind camera → our Z into scene
+viewN = normalize(viewN);
+```
+
+### How the basis vectors are extracted
+
+The camera axes are the **columns** of the inverse view matrix (equivalently, the rows
+of the view matrix). The framework reads the raw matrix from the game's PS CB at register
+c8 (offset 128 bytes) and extracts columns:
+
+```
+camRight   = column 0 = (m[0], m[4], m[8])
+camUp      = column 1 = (m[1], m[5], m[9])
+camForward = column 2 = (m[2], m[6], m[10])
+camPosition = row 3   = (m[12], m[13], m[14])
+```
+
+### Availability
+
+Camera data is extracted once per frame at the `POST_LIGHTING` injection point. Effects
+at `POST_LIGHTING` and later (`POST_FOG`, `POST_TONEMAP`, `PRE_PRESENT`) will have
+`camera.valid == 1`. Effects at `POST_GBUFFER` will see `camera.valid == 0` on the first
+frame, but will have the previous frame's data from the second frame onward (the data
+persists across frames).
+
+---
+
 ## Key Constant Buffers for Implementation
 
 ### Deferred Lighting PS CB0 (352 bytes)

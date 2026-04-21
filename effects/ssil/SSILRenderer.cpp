@@ -55,6 +55,9 @@ struct SSILCBData
     float blurSharpness;
     float numDirections;
     float numSteps;
+    float camRight[4];
+    float camUp[4];
+    float camForward[4];
 };
 static ID3D11Buffer* gSSILCB = nullptr;
 
@@ -246,7 +249,8 @@ ID3D11ShaderResourceView* GetILSRV()
 ID3D11ShaderResourceView* RenderIL(ID3D11DeviceContext* ctx,
                                     ID3D11ShaderResourceView* depthSRV,
                                     ID3D11ShaderResourceView* albedoSRV,
-                                    ID3D11ShaderResourceView* normalsSRV)
+                                    ID3D11ShaderResourceView* normalsSRV,
+                                    const DustCameraData* camera)
 {
     if (!gInitialized || !ctx || !depthSRV || !albedoSRV || !gHost)
         return nullptr;
@@ -312,6 +316,13 @@ ID3D11ShaderResourceView* RenderIL(ID3D11DeviceContext* ctx,
         if (numSteps > 6) numSteps = 6;
         cb.numDirections = (float)numDirs;
         cb.numSteps = (float)numSteps;
+        if (camera && camera->valid)
+        {
+            const float* iv = camera->inverseView;
+            cb.camRight[0]   = iv[0]; cb.camRight[1]   = iv[4]; cb.camRight[2]   = iv[8];  cb.camRight[3]   = 0;
+            cb.camUp[0]      = iv[1]; cb.camUp[1]      = iv[5]; cb.camUp[2]      = iv[9];  cb.camUp[3]      = 0;
+            cb.camForward[0] = iv[2]; cb.camForward[1] = iv[6]; cb.camForward[2] = iv[10]; cb.camForward[3] = 0;
+        }
         gHost->UpdateConstantBuffer(ctx, gSSILCB, &cb, sizeof(cb));
     }
 

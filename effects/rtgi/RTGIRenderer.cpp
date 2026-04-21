@@ -23,9 +23,6 @@ static bool    gHasPrevFrame = false;
 static uint64_t gFrameIndex = 0;
 static float   gSmoothedMotion = 0.0f; // EMA of motion magnitude, decays over ~30 frames
 
-// Staging buffer for reading game's constant buffer
-static ID3D11Buffer* gStagingCB = nullptr;
-
 // ==================== Textures ====================
 
 // Internal render resolution (supports half-res)
@@ -124,10 +121,12 @@ struct RayTraceCBData
     float raysPerPixel;
     float thicknessCurve;
     float _pad0;
-    float sampleJitter[2]; // Halton(2,3)-based sub-pixel offset in render-viewport UV pixels
+    float sampleJitter[2];
     float _pad1;
-    float _pad2;           // pad so inverseView starts on a 16-byte boundary
-    float inverseView[16]; // 4x4 matrix
+    float _pad2;
+    float camRight[4];   // column 0 of inverseView: camera right in world space
+    float camUp[4];      // column 1 of inverseView: camera up in world space
+    float camForward[4]; // column 2 of inverseView: camera forward in world space
 };
 
 struct TemporalCBData
@@ -177,9 +176,12 @@ struct CompositeCBData
 struct DebugCBData
 {
     float debugMode;
+    float tanHalfFov;
+    float aspectRatio;
     float _pad0;
-    float _pad1;
-    float _pad2;
+    float camRight[4];
+    float camUp[4];
+    float camForward[4];
 };
 
 // ==================== Helpers ====================
@@ -524,8 +526,6 @@ void Shutdown()
     SAFE_RELEASE(gRayTraceCB);    SAFE_RELEASE(gTemporalCB);
     SAFE_RELEASE(gVarianceCB);    SAFE_RELEASE(gDenoiseCB);
     SAFE_RELEASE(gCompositeCB);   SAFE_RELEASE(gDebugCB);
-    SAFE_RELEASE(gStagingCB);
-
     gInitialized = false;
     gHasValidCameraData = false;
     gHasPrevFrame = false;
@@ -560,92 +560,16 @@ bool IsInitialized() { return gInitialized; }
 bool HasValidCameraData() { return gHasValidCameraData; }
 void GetRenderSize(UINT* w, UINT* h) { *w = gRenderWidth; *h = gRenderHeight; }
 
-void ExtractCameraData(ID3D11DeviceContext* ctx)
+void UpdateCameraData(const DustCameraData* camera)
 {
-    // Read the game's PS constant buffer (bound for deferred lighting).
-    // Layout: c0 = sunDirection (float3), c8 = inverseView (float4x4, offset 128 bytes)
-    ID3D11Buffer* psCB = nullptr;
-    ctx->PSGetConstantBuffers(0, 1, &psCB);
-    if (!psCB) return;
+    if (!camera || !camera->valid) return;
 
-    D3D11_BUFFER_DESC cbDesc;
-    psCB->GetDesc(&cbDesc);
+    memcpy(gPrevInverseView, gInverseView, sizeof(gInverseView));
+    memcpy(gInverseView, camera->inverseView, sizeof(gInverseView));
 
-    if (cbDesc.ByteWidth < 192)
-    {
-        psCB->Release();
-        return;
-    }
-
-    // Lazy-create staging buffer
-    if (!gStagingCB)
-    {
-        D3D11_BUFFER_DESC stagingDesc = cbDesc;
-        stagingDesc.Usage = D3D11_USAGE_STAGING;
-        stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        stagingDesc.BindFlags = 0;
-        stagingDesc.MiscFlags = 0;
-
-        ID3D11Device* device = nullptr;
-        ctx->GetDevice(&device);
-        if (device)
-        {
-            device->CreateBuffer(&stagingDesc, nullptr, &gStagingCB);
-            device->Release();
-        }
-    }
-
-    if (!gStagingCB)
-    {
-        psCB->Release();
-        return;
-    }
-
-    ctx->CopyResource(gStagingCB, psCB);
-    psCB->Release();
-
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    HRESULT hr = ctx->Map(gStagingCB, 0, D3D11_MAP_READ, 0, &mapped);
-    if (SUCCEEDED(hr))
-    {
-        float* data = (float*)mapped.pData;
-
-        // Save previous frame's matrix before overwriting
-        memcpy(gPrevInverseView, gInverseView, sizeof(gInverseView));
-
-        // inverseView at c8 (offset 32 floats = 128 bytes, 16 floats = 64 bytes)
-        memcpy(gInverseView, data + 32, 64);
-
-        ctx->Unmap(gStagingCB, 0);
-
-        // Basic validation: check that the matrix has reasonable values
-        // Camera position (translation) should be finite
-        bool valid = true;
-        for (int i = 0; i < 16; i++)
-        {
-            if (!isfinite(gInverseView[i]))
-            {
-                valid = false;
-                break;
-            }
-        }
-
-        if (valid)
-        {
-            if (!gHasValidCameraData)
-            {
-                // Log the full matrix on first valid extraction
-                Log("RTGI: InverseView matrix (16 floats, row-by-row as stored in memory):");
-                Log("RTGI:   [%f, %f, %f, %f]", gInverseView[0], gInverseView[1], gInverseView[2], gInverseView[3]);
-                Log("RTGI:   [%f, %f, %f, %f]", gInverseView[4], gInverseView[5], gInverseView[6], gInverseView[7]);
-                Log("RTGI:   [%f, %f, %f, %f]", gInverseView[8], gInverseView[9], gInverseView[10], gInverseView[11]);
-                Log("RTGI:   [%f, %f, %f, %f]", gInverseView[12], gInverseView[13], gInverseView[14], gInverseView[15]);
-            }
-            if (gHasValidCameraData)
-                gHasPrevFrame = true;
-            gHasValidCameraData = true;
-        }
-    }
+    if (gHasValidCameraData)
+        gHasPrevFrame = true;
+    gHasValidCameraData = true;
 }
 
 // ==================== Render Passes ====================
@@ -749,9 +673,9 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
         // If denoise ran last frame, the denoised result might be in one of the denoise buffers.
         // For simplicity, use the accumulation buffer (which has temporal filtering applied).
 
-        // t0=depth, t1=scene, t2=prevGI
-        ID3D11ShaderResourceView* srvs[3] = { depthSRV, sceneSRV, prevGISRV };
-        ctx->PSSetShaderResources(0, 3, srvs);
+        // t0=depth, t1=scene, t2=prevGI, t3=normals
+        ID3D11ShaderResourceView* srvs[4] = { depthSRV, sceneSRV, prevGISRV, normalsSRV };
+        ctx->PSSetShaderResources(0, 4, srvs);
         ID3D11SamplerState* samplers[2] = { gPointClampSampler, gLinearClampSampler };
         ctx->PSSetSamplers(0, 2, samplers);
 
@@ -778,13 +702,16 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
             cb.sampleJitter[0] = Halton(jIdx, 2) - 0.5f;
             cb.sampleJitter[1] = Halton(jIdx, 3) - 0.5f;
         }
-        memcpy(cb.inverseView, gInverseView, 64);
+        // Extract COLUMNS of inverseView (= rows of view matrix = camera axes in world space)
+        cb.camRight[0]   = gInverseView[0]; cb.camRight[1]   = gInverseView[4]; cb.camRight[2]   = gInverseView[8];  cb.camRight[3]   = 0;
+        cb.camUp[0]      = gInverseView[1]; cb.camUp[1]      = gInverseView[5]; cb.camUp[2]      = gInverseView[9];  cb.camUp[3]      = 0;
+        cb.camForward[0] = gInverseView[2]; cb.camForward[1] = gInverseView[6]; cb.camForward[2] = gInverseView[10]; cb.camForward[3] = 0;
         gHost->UpdateConstantBuffer(ctx, gRayTraceCB, &cb, sizeof(cb));
         ctx->PSSetConstantBuffers(0, 1, &gRayTraceCB);
 
         ctx->Draw(3, 0);
-        ID3D11ShaderResourceView* nullSRVs[3] = {};
-        ctx->PSSetShaderResources(0, 3, nullSRVs);
+        ID3D11ShaderResourceView* nullSRVs[4] = {};
+        ctx->PSSetShaderResources(0, 4, nullSRVs);
     }
 
     // ---- Pass 2: Temporal Accumulation (single RT: color+AO) ----
@@ -971,14 +898,14 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
     return finalGI;
 }
 
-void RenderDebugOverlay(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* hdrRTV)
+void RenderDebugOverlay(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* hdrRTV,
+                        ID3D11ShaderResourceView* depthSRV,
+                        ID3D11ShaderResourceView* normalsSRV)
 {
     if (!gInitialized || !ctx || !hdrRTV || gRTGIConfig.debugView == 0 || !gHost)
         return;
 
-    // Use the final denoised output (set by RenderGI)
     if (!gFinalGISRV) return;
-    ID3D11ShaderResourceView* finalGI = gFinalGISRV;
 
     gHost->SaveState(ctx);
 
@@ -998,17 +925,27 @@ void RenderDebugOverlay(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* hdrRTV
     ctx->OMSetRenderTargets(1, &hdrRTV, nullptr);
     ctx->OMSetBlendState(gNoBlend, blendFactor, 0xFFFFFFFF);
     ctx->PSSetShader(gDebugPS, nullptr, 0);
-    ctx->PSSetShaderResources(0, 1, &finalGI);
-    ctx->PSSetSamplers(0, 1, &gPointClampSampler);
 
+    // t0=GI, t1=depth, t2=normals
+    ID3D11ShaderResourceView* srvs[3] = { gFinalGISRV, depthSRV, normalsSRV };
+    ctx->PSSetShaderResources(0, 3, srvs);
+    ID3D11SamplerState* samplers[1] = { gPointClampSampler };
+    ctx->PSSetSamplers(0, 1, samplers);
+
+    float aspect = (float)gWidth / (float)gHeight;
     DebugCBData cb = {};
     cb.debugMode = (float)gRTGIConfig.debugView;
+    cb.tanHalfFov = gRTGIConfig.tanHalfFov;
+    cb.aspectRatio = aspect;
+    cb.camRight[0]   = gInverseView[0]; cb.camRight[1]   = gInverseView[4]; cb.camRight[2]   = gInverseView[8];  cb.camRight[3]   = 0;
+    cb.camUp[0]      = gInverseView[1]; cb.camUp[1]      = gInverseView[5]; cb.camUp[2]      = gInverseView[9];  cb.camUp[3]      = 0;
+    cb.camForward[0] = gInverseView[2]; cb.camForward[1] = gInverseView[6]; cb.camForward[2] = gInverseView[10]; cb.camForward[3] = 0;
     gHost->UpdateConstantBuffer(ctx, gDebugCB, &cb, sizeof(cb));
     ctx->PSSetConstantBuffers(0, 1, &gDebugCB);
 
     ctx->Draw(3, 0);
-    ID3D11ShaderResourceView* nullSRV = nullptr;
-    ctx->PSSetShaderResources(0, 1, &nullSRV);
+    ID3D11ShaderResourceView* nullSRVs[3] = {};
+    ctx->PSSetShaderResources(0, 3, nullSRVs);
 
     gHost->RestoreState(ctx);
 }

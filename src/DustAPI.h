@@ -89,6 +89,20 @@ typedef enum DustCallbackTiming {
     DUST_TIMING_POST = 1    // After the game's draw call
 } DustCallbackTiming;
 
+// Camera data extracted from the game's deferred lighting constant buffer.
+// Basis vectors are columns of the inverse view matrix (= rows of the view matrix).
+// OGRE uses a right-handed view space: X=right, Y=up, Z=behind camera.
+// For a left-handed view space (Z into scene), negate camForward when constructing
+// the view-space Z component.
+typedef struct DustCameraData {
+    int     valid;              // Non-zero if camera data was successfully extracted
+    float   camRight[3];       // View X axis (right) in world space
+    float   camUp[3];          // View Y axis (up) in world space
+    float   camForward[3];     // View Z axis (behind camera) in world space — OGRE RH convention
+    float   camPosition[3];    // Camera position in world space
+    float   inverseView[16];   // Raw 4x4 inverse view matrix (row-major in memory)
+} DustCameraData;
+
 // Per-frame context passed to effect callbacks
 typedef struct DustFrameContext {
     ID3D11Device*           device;
@@ -98,6 +112,7 @@ typedef struct DustFrameContext {
     uint32_t                width;
     uint32_t                height;
     uint64_t                frameIndex;
+    DustCameraData          camera;
 } DustFrameContext;
 
 // Resource name constants for GetSRV / GetRTV / GetSceneCopy

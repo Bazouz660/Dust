@@ -53,6 +53,7 @@ struct EffectGUIState {
 struct FrameworkConfig {
     bool logging = false;
     bool showStartupMessage = true;
+    bool showSurvey = false;
     std::string lastPreset;    // name of last selected preset (empty = custom)
     int toggleKey = VK_F11;    // virtual key code for overlay toggle
 };
@@ -572,6 +573,7 @@ static void LoadFrameworkConfig()
     gDustIniPath = DustLogDir() + "Dust.ini";
     gFwConfig.logging = GetPrivateProfileIntA("Dust", "Logging", 0, gDustIniPath.c_str()) != 0;
     gFwConfig.showStartupMessage = GetPrivateProfileIntA("Dust", "ShowStartupMessage", 1, gDustIniPath.c_str()) != 0;
+    gFwConfig.showSurvey = GetPrivateProfileIntA("Dust", "ShowSurvey", 0, gDustIniPath.c_str()) != 0;
 
     gFwConfig.toggleKey = GetPrivateProfileIntA("Dust", "ToggleKey", VK_F11, gDustIniPath.c_str());
 
@@ -617,6 +619,7 @@ static void SaveFrameworkConfig()
 {
     WritePrivateProfileStringA("Dust", "Logging", gFwConfig.logging ? "1" : "0", gDustIniPath.c_str());
     WritePrivateProfileStringA("Dust", "ShowStartupMessage", gFwConfig.showStartupMessage ? "1" : "0", gDustIniPath.c_str());
+    WritePrivateProfileStringA("Dust", "ShowSurvey", gFwConfig.showSurvey ? "1" : "0", gDustIniPath.c_str());
     char keyBuf[16];
     snprintf(keyBuf, sizeof(keyBuf), "%d", gFwConfig.toggleKey);
     WritePrivateProfileStringA("Dust", "ToggleKey", keyBuf, gDustIniPath.c_str());
@@ -637,6 +640,7 @@ static bool IsFrameworkDirty()
 {
     return gFwConfig.logging != gFwDiskConfig.logging ||
            gFwConfig.showStartupMessage != gFwDiskConfig.showStartupMessage ||
+           gFwConfig.showSurvey != gFwDiskConfig.showSurvey ||
            gFwConfig.lastPreset != gFwDiskConfig.lastPreset ||
            gFwConfig.toggleKey != gFwDiskConfig.toggleKey;
 }
@@ -676,6 +680,10 @@ static void DrawFrameworkSection()
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Show notification on game start");
 
+    ImGui::Checkbox("Show Survey", &gFwConfig.showSurvey);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Show pipeline survey controls (developer tool)");
+
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
@@ -695,39 +703,42 @@ static void DrawFrameworkSection()
     if (ImGui::Button("Reset##fw", ImVec2(80, 0)) && dirty)
         ResetFrameworkConfig();
 
-    // ---- Pipeline Survey ----
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
-
-    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Pipeline Survey");
-
-    if (Survey::IsActive())
+    // ---- Pipeline Survey (hidden by default, dev tool) ----
+    if (gFwConfig.showSurvey)
     {
-        ImGui::TextWrapped("Capturing frame %d / %d...",
-                           Survey::CurrentFrame() + 1, Survey::TotalFrames());
-        if (ImGui::Button("Stop Survey", ImVec2(ImGui::GetContentRegionAvail().x, 0)))
-            Survey::Stop();
-    }
-    else
-    {
-        static int  surveyFrames = 3;
-        static int  surveyDetail = 1;
-        static char surveyLabel[64] = "";
-        ImGui::InputText("Label##survey", surveyLabel, sizeof(surveyLabel));
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Optional label for this capture (e.g. desert_night, hub_city)");
-        ImGui::SliderInt("Frames##survey", &surveyFrames, 1, 30);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Number of frames to capture");
-        ImGui::SliderInt("Detail##survey", &surveyDetail, 0, 3);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("0=Minimal, 1=Standard, 2=Deep (CB data), 3=Full (VB/IB)");
-        if (ImGui::Button("Capture Survey", ImVec2(ImGui::GetContentRegionAvail().x, 0)))
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Pipeline Survey");
+
+        if (Survey::IsActive())
         {
-            SurveyRecorder::Reset();
-            Survey::Start(surveyFrames, surveyDetail,
-                          surveyLabel[0] ? surveyLabel : nullptr);
+            ImGui::TextWrapped("Capturing frame %d / %d...",
+                               Survey::CurrentFrame() + 1, Survey::TotalFrames());
+            if (ImGui::Button("Stop Survey", ImVec2(ImGui::GetContentRegionAvail().x, 0)))
+                Survey::Stop();
+        }
+        else
+        {
+            static int  surveyFrames = 3;
+            static int  surveyDetail = 1;
+            static char surveyLabel[64] = "";
+            ImGui::InputText("Label##survey", surveyLabel, sizeof(surveyLabel));
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Optional label for this capture (e.g. desert_night, hub_city)");
+            ImGui::SliderInt("Frames##survey", &surveyFrames, 1, 30);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Number of frames to capture");
+            ImGui::SliderInt("Detail##survey", &surveyDetail, 0, 3);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("0=Minimal, 1=Standard, 2=Deep (CB data), 3=Full (VB/IB)");
+            if (ImGui::Button("Capture Survey", ImVec2(ImGui::GetContentRegionAvail().x, 0)))
+            {
+                SurveyRecorder::Reset();
+                Survey::Start(surveyFrames, surveyDetail,
+                              surveyLabel[0] ? surveyLabel : nullptr);
+            }
         }
     }
 }
@@ -1359,8 +1370,15 @@ void Render()
         const float minRightW = 200.0f;
         float availW = ImGui::GetContentRegionAvail().x;
 
-        // ---- Left pane: Framework settings + Performance (always visible) ----
+        // ---- Left pane: Framework settings + Performance (scrollable) + fixed footer ----
+        const float logoSize = 36.0f;
+        const float footerH = logoSize + ImGui::GetStyle().FramePadding.y * 2.0f
+                             + ImGui::GetStyle().ItemSpacing.y + 4.0f;
+
         ImGui::BeginChild("##left", ImVec2(leftW, 0), true);
+
+        // Scrollable content area (everything except footer)
+        ImGui::BeginChild("##leftContent", ImVec2(0, -footerH), false);
 
         // Framework settings
         DrawFrameworkSection();
@@ -1371,13 +1389,11 @@ void Render()
         // Performance (always visible)
         DrawPerformanceSection();
 
-        // Social logo buttons pinned to bottom of left pane
-        {
-            const float logoSize = 36.0f;
-            const float framePad = ImGui::GetStyle().FramePadding.y;
-            const float winPad   = ImGui::GetStyle().WindowPadding.y;
-            ImGui::SetCursorPosY(ImGui::GetWindowHeight() - logoSize - framePad * 2.0f - winPad);
+        ImGui::EndChild(); // ##leftContent
 
+        // Fixed footer — always visible at bottom of left pane
+        ImGui::Separator();
+        {
             ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 1.0f, 1.0f, 0.1f));
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(1.0f, 1.0f, 1.0f, 0.2f));
@@ -1406,7 +1422,7 @@ void Render()
             ImGui::PopStyleColor(3);
         }
 
-        ImGui::EndChild();
+        ImGui::EndChild(); // ##left
 
         // ---- Draggable splitter between panes ----
         ImGui::SameLine();

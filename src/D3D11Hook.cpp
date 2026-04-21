@@ -31,6 +31,11 @@ static UINT gShadowResOverride = 0;
 static uint64_t gFrameIndex = 0;
 static bool gDispatchedThisFrame = false;
 
+// Camera extraction from the game's deferred lighting CB
+static ID3D11Buffer* gCameraStagingCB = nullptr;
+static DustCameraData gCameraData = {};
+static bool gCameraDataExtracted = false; // per-frame flag
+
 // VTable indices for swap chain methods (used by both Install() and deferred hooking)
 static const int VTIDX_SC_Present        = 8;
 static const int VTIDX_SC_ResizeBuffers  = 13;
@@ -50,7 +55,62 @@ void ResetFrameState()
     gPipelineDetector.ResetFrame();
     gResourceRegistry.ResetFrame();
     gDispatchedThisFrame = false;
+    gCameraDataExtracted = false;
     gFrameIndex++;
+}
+
+// Extract camera basis vectors from the game's deferred lighting PS constant buffer.
+// The inverse view matrix sits at register c8 (offset 128 bytes / 32 floats).
+// Camera axes are the COLUMNS of the inverse view matrix (= rows of the view matrix).
+static void ExtractCameraData(ID3D11DeviceContext* ctx)
+{
+    if (gCameraDataExtracted) return;
+
+    ID3D11Buffer* psCB = nullptr;
+    ctx->PSGetConstantBuffers(0, 1, &psCB);
+    if (!psCB) return;
+
+    D3D11_BUFFER_DESC cbDesc;
+    psCB->GetDesc(&cbDesc);
+    if (cbDesc.ByteWidth < 192) { psCB->Release(); return; }
+
+    if (!gCameraStagingCB)
+    {
+        D3D11_BUFFER_DESC sd = cbDesc;
+        sd.Usage = D3D11_USAGE_STAGING;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        sd.BindFlags = 0;
+        sd.MiscFlags = 0;
+        gDevice->CreateBuffer(&sd, nullptr, &gCameraStagingCB);
+    }
+    if (!gCameraStagingCB) { psCB->Release(); return; }
+
+    ctx->CopyResource(gCameraStagingCB, psCB);
+    psCB->Release();
+
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (SUCCEEDED(ctx->Map(gCameraStagingCB, 0, D3D11_MAP_READ, 0, &mapped)))
+    {
+        float m[16];
+        memcpy(m, (float*)mapped.pData + 32, 64); // c8 offset
+        ctx->Unmap(gCameraStagingCB, 0);
+
+        bool valid = true;
+        for (int i = 0; i < 16; i++)
+            if (!isfinite(m[i])) { valid = false; break; }
+
+        if (valid)
+        {
+            memcpy(gCameraData.inverseView, m, 64);
+            // Columns of inverse view = camera axes in world space
+            gCameraData.camRight[0]   = m[0]; gCameraData.camRight[1]   = m[4]; gCameraData.camRight[2]   = m[8];
+            gCameraData.camUp[0]      = m[1]; gCameraData.camUp[1]      = m[5]; gCameraData.camUp[2]      = m[9];
+            gCameraData.camForward[0] = m[2]; gCameraData.camForward[1] = m[6]; gCameraData.camForward[2] = m[10];
+            gCameraData.camPosition[0] = m[12]; gCameraData.camPosition[1] = m[13]; gCameraData.camPosition[2] = m[14];
+            gCameraData.valid = 1;
+            gCameraDataExtracted = true;
+        }
+    }
 }
 
 // ==================== Original function pointers ====================
@@ -411,76 +471,67 @@ static bool TryDiscoverSwapChain(IDXGISwapChain** ppSwapChain)
     return true;
 }
 
+// VTable hook: directly replace function pointer in the COM object's vtable.
+// Immune to inline hook conflicts from overlays (Steam, Discord, ReShade).
+static bool VTableHook(void* pObject, int vtableIndex, void* detour, void** original)
+{
+    void** vtable = *reinterpret_cast<void***>(pObject);
+    *original = vtable[vtableIndex];
+
+    DWORD oldProtect;
+    if (!VirtualProtect(&vtable[vtableIndex], sizeof(void*), PAGE_READWRITE, &oldProtect))
+        return false;
+    vtable[vtableIndex] = detour;
+    VirtualProtect(&vtable[vtableIndex], sizeof(void*), oldProtect, &oldProtect);
+    return true;
+}
+
+// The swap chain pointer we vtable-hooked — needed for recovery verification
+static IDXGISwapChain* gHookedSwapChain = nullptr;
+
 static void TryInstallSwapChainHooks()
 {
     if (sSwapChainHooked)
         return;
 
-    // Try to discover the real swap chain and read its VTable
-    void* realAddrPresent  = sSavedAddrPresent;
-    void* realAddrPresent1 = sSavedAddrPresent1;
-    void* realAddrResize   = sSavedAddrResizeBuf;
-
     IDXGISwapChain* realSwapChain = nullptr;
-    if (TryDiscoverSwapChain(&realSwapChain) && realSwapChain)
+    if (!TryDiscoverSwapChain(&realSwapChain) || !realSwapChain)
     {
-        void** scVtable = *reinterpret_cast<void***>(realSwapChain);
-        void* scPresent = scVtable[VTIDX_SC_Present];
-        void* scResize  = scVtable[VTIDX_SC_ResizeBuffers];
-
-        if (scPresent != sSavedAddrPresent)
-            Log("Present address MISMATCH: temp=%p real=%p (using real)",
-                sSavedAddrPresent, scPresent);
-        else
-            Log("Present address matches temp device (%p)", scPresent);
-
-        realAddrPresent = scPresent;
-        realAddrResize  = scResize;
-
-        // Try Present1 on real swap chain
-        IDXGISwapChain1* sc1 = nullptr;
-        if (SUCCEEDED(realSwapChain->QueryInterface(__uuidof(IDXGISwapChain1), (void**)&sc1)) && sc1)
-        {
-            void** sc1Vtable = *reinterpret_cast<void***>(sc1);
-            realAddrPresent1 = sc1Vtable[VTIDX_SC1_Present1];
-            sc1->Release();
-        }
-
-        realSwapChain->Release();
-    }
-    else
-    {
-        Log("SwapChain discovery failed, using temp device addresses for Present hooks");
+        Log("SwapChain discovery failed — cannot install Present hooks");
+        return;
     }
 
-    // Install hooks using the best available addresses
     bool ok = true;
 
-    if (KenshiLib::AddHook(realAddrPresent, (void*)HookedPresent,
-                           (void**)&oPresent) != KenshiLib::SUCCESS)
-    { Log("ERROR: Failed to hook Present (addr=%p)", realAddrPresent); ok = false; }
+    // VTable hook Present (index 8)
+    if (!VTableHook(realSwapChain, VTIDX_SC_Present, (void*)HookedPresent, (void**)&oPresent))
+    { Log("ERROR: Failed to vtable-hook Present"); ok = false; }
     else
-    { Log("  Present hook installed at %p (deferred)", realAddrPresent); }
+    { Log("  Present vtable-hooked on swap chain %p", realSwapChain); }
 
-    if (realAddrPresent1)
+    // VTable hook ResizeBuffers (index 13)
+    if (!VTableHook(realSwapChain, VTIDX_SC_ResizeBuffers, (void*)HookedResizeBuffers, (void**)&oResizeBuffers))
+    { Log("ERROR: Failed to vtable-hook ResizeBuffers"); ok = false; }
+    else
+    { Log("  ResizeBuffers vtable-hooked on swap chain %p", realSwapChain); }
+
+    // VTable hook Present1 (index 22 on IDXGISwapChain1)
+    IDXGISwapChain1* sc1 = nullptr;
+    if (SUCCEEDED(realSwapChain->QueryInterface(__uuidof(IDXGISwapChain1), (void**)&sc1)) && sc1)
     {
-        if (KenshiLib::AddHook(realAddrPresent1, (void*)HookedPresent1,
-                               (void**)&oPresent1) != KenshiLib::SUCCESS)
-        { Log("WARNING: Failed to hook Present1 at %p", realAddrPresent1); }
+        if (!VTableHook(sc1, VTIDX_SC1_Present1, (void*)HookedPresent1, (void**)&oPresent1))
+        { Log("WARNING: Failed to vtable-hook Present1"); }
         else
-        { Log("  Present1 hook installed at %p (deferred)", realAddrPresent1); }
+        { Log("  Present1 vtable-hooked"); }
+        sc1->Release();
     }
 
-    if (KenshiLib::AddHook(realAddrResize, (void*)HookedResizeBuffers,
-                           (void**)&oResizeBuffers) != KenshiLib::SUCCESS)
-    { Log("ERROR: Failed to hook ResizeBuffers (addr=%p)", realAddrResize); ok = false; }
-    else
-    { Log("  ResizeBuffers hook installed at %p (deferred)", realAddrResize); }
-
+    gHookedSwapChain = realSwapChain;
+    realSwapChain->Release();
     sSwapChainHooked = true;
 
     if (ok)
-        Log("All swap chain hooks installed successfully (deferred)");
+        Log("All swap chain hooks installed successfully (vtable, deferred)");
     else
         Log("WARNING: Some swap chain hooks failed — GUI may not work");
 }
@@ -503,23 +554,16 @@ void TryRecoverPresent()
         return;
     }
 
-    Log("RECOVER: Attempting to re-discover swap chain and re-hook Present...");
+    Log("RECOVER: Attempting to re-discover swap chain and re-patch vtable...");
 
-    // Reset the flag so TryInstallSwapChainHooks will retry
-    // NOTE: we can only hook an address once with KenshiLib::AddHook.
-    // If the address is the same as before, the re-hook will fail (already hooked).
-    // But if TryDiscoverSwapChain finds a DIFFERENT address, the new hook will succeed.
-    bool wasHooked = sSwapChainHooked;
+    // With vtable hooks, recovery is simple: re-patch the vtable entry.
+    // Another overlay may have overwritten our pointer after initial install.
     sSwapChainHooked = false;
-
     TryInstallSwapChainHooks();
 
     if (!sSwapChainHooked)
     {
-        // Re-hook failed completely, restore flag
-        sSwapChainHooked = wasHooked;
-        Log("RECOVER: Re-hook failed. Present may be hooked by an overlay that doesn't chain properly.");
-        Log("RECOVER: GUI will not be available this session. Effects still work.");
+        Log("RECOVER: Re-hook failed. GUI will not be available this session. Effects still work.");
     }
 }
 
@@ -797,6 +841,10 @@ static void STDMETHODCALLTYPE HookedDraw(
             }
         }
 
+        // Extract camera data at POST_LIGHTING (deferred CB is bound)
+        if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
+            ExtractCameraData(pThis);
+
         DustFrameContext fctx = {};
         fctx.device = gDevice;
         fctx.context = pThis;
@@ -804,6 +852,7 @@ static void STDMETHODCALLTYPE HookedDraw(
         fctx.width = gWidth;
         fctx.height = gHeight;
         fctx.frameIndex = gFrameIndex;
+        fctx.camera = gCameraData;
 
         // PRE: effects bind resources before the game's draw
         fctx.timing = DUST_TIMING_PRE;
