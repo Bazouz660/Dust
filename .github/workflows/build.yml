@@ -119,6 +119,12 @@ jobs:
           /p:Configuration=Release
           /p:Platform=x64
 
+      - name: Build SMAA plugin (DustSMAA.dll)
+        run: >
+          msbuild effects\smaa\DustSMAA.vcxproj
+          /p:Configuration=Release
+          /p:Platform=x64
+
       - name: Package release
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -136,6 +142,7 @@ jobs:
           copy effects\kuwahara\build\Release\DustKuwahara.dll release\Dust\effects\
           copy effects\rtgi\build\Release\DustRTGI.dll release\Dust\effects\
           copy effects\shadows\build\Release\DustShadows.dll release\Dust\effects\
+          copy effects\smaa\build\Release\DustSMAA.dll release\Dust\effects\
           xcopy /Y effects\ssil\shaders\* release\Dust\effects\shaders\
           xcopy /Y effects\ssao\shaders\* release\Dust\effects\shaders\
           xcopy /Y effects\lut\shaders\* release\Dust\effects\shaders\
@@ -145,6 +152,7 @@ jobs:
           xcopy /Y effects\outline\shaders\* release\Dust\effects\shaders\
           xcopy /Y effects\kuwahara\shaders\* release\Dust\effects\shaders\
           xcopy /Y effects\rtgi\shaders\* release\Dust\effects\shaders\
+          xcopy /Y effects\smaa\shaders\* release\Dust\effects\shaders\
           xcopy /S /Y /I effects\presets release\Dust\presets
           copy mod\Dust.mod release\Dust\
           copy mod\RE_Kenshi.json release\Dust\
