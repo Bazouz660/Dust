@@ -10,15 +10,19 @@ SamplerState     pointClamp : register(s0);
 cbuffer DOFParams : register(b0)
 {
     float2 texelSize;
-    float  focusDistance;   // Resolved focus distance (auto or manual)
-    float  nearStart;      // Near blur begins at this distance from focus
-    float  nearEnd;        // Near blur reaches max at this distance from focus
+    float  focusDistance;
+    float  nearStart;
+    float  nearEnd;
     float  nearStrength;
-    float  farStart;       // Far blur begins at this distance from focus
-    float  farEnd;         // Far blur reaches max at this distance from focus
+    float  farStart;
+    float  farEnd;
     float  farStrength;
     float  blurRadius;
     float  maxDepth;
+    int    cocMode;
+    float  aperture;
+    float  highlightThreshold;
+    float  highlightBoost;
     float  _pad;
 };
 
@@ -26,25 +30,25 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 {
     float depth = depthTex.Sample(pointClamp, uv);
 
-    // Sky and distant pixels: treat as very far geometry so they go
-    // through the same far-field CoC ramp. If focus is far away,
-    // the sky will naturally stay sharp.
     if (depth <= 0.0001 || depth > maxDepth)
         depth = maxDepth;
 
-    float diff = depth - focusDistance;
     float coc = 0.0;
 
-    if (diff > 0.0)
+    if (cocMode > 0)
     {
-        // Far field (behind focus plane)
-        coc = smoothstep(farStart, farEnd, diff) * farStrength;
+        // Physical thin-lens: CoC proportional to |1/focus - 1/depth|
+        float rawCoC = aperture * (1.0 / focusDistance - 1.0 / depth);
+        coc = (rawCoC > 0.0) ? min(rawCoC, farStrength) : max(rawCoC, -nearStrength);
     }
     else
     {
-        // Near field (in front of focus plane)
-        float absDiff = -diff;
-        coc = -smoothstep(nearStart, nearEnd, absDiff) * nearStrength;
+        // Legacy: smoothstep ramps from focus plane
+        float diff = depth - focusDistance;
+        if (diff > 0.0)
+            coc = smoothstep(farStart, farEnd, diff) * farStrength;
+        else
+            coc = -smoothstep(nearStart, nearEnd, -diff) * nearStrength;
     }
 
     return float4(coc, coc, coc, 1);

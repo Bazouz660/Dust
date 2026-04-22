@@ -272,25 +272,25 @@ static const char* const gResolutionLabels[] = {
 };
 
 static DustSettingDesc gSettingsArray[] = {
-    { "Enabled",            DUST_SETTING_BOOL,  &gRTGIConfig.enabled,         0.0f,   1.0f,   "Enabled" },
-    { "GI Intensity",       DUST_SETTING_FLOAT, &gRTGIConfig.giIntensity,     0.0f,   5.0f,   "GIIntensity" },
-    { "AO Intensity",       DUST_SETTING_FLOAT, &gRTGIConfig.aoIntensity,     0.0f,   2.0f,   "AOIntensity" },
-    { "Ray Length",         DUST_SETTING_FLOAT, &gRTGIConfig.rayLength,       0.05f,  1.0f,   "RayLength" },
-    { "Ray Steps",          DUST_SETTING_INT,   &gRTGIConfig.raySteps,        8.0f,   64.0f,  "RaySteps" },
-    { "Rays Per Pixel",     DUST_SETTING_INT,   &gRTGIConfig.raysPerPixel,    1.0f,   16.0f,  "RaysPerPixel" },
-    { "Thickness",          DUST_SETTING_FLOAT, &gRTGIConfig.thickness,       0.005f, 0.5f,   "Thickness" },
-    { "Thickness Curve",    DUST_SETTING_FLOAT, &gRTGIConfig.thicknessCurve,  0.3f,   1.5f,   "ThicknessCurve" },
-    { "Fade Distance",      DUST_SETTING_FLOAT, &gRTGIConfig.fadeDistance,     0.01f,  1.0f,   "FadeDistance" },
-    { "Bounce Intensity",   DUST_SETTING_FLOAT, &gRTGIConfig.bounceIntensity, 0.0f,   2.0f,   "BounceIntensity" },
-    { "Saturation",         DUST_SETTING_FLOAT, &gRTGIConfig.saturation,      0.0f,   2.0f,   "Saturation" },
-    { "Temporal Blend",     DUST_SETTING_FLOAT, &gRTGIConfig.temporalBlend,   0.5f,   0.99f,  "TemporalBlend" },
-    { "Denoise Steps",      DUST_SETTING_INT,   &gRTGIConfig.denoiseSteps,    0.0f,   5.0f,   "DenoiseSteps" },
-    { "Depth Sigma",        DUST_SETTING_FLOAT, &gRTGIConfig.depthSigma,      0.1f,   5.0f,   "DepthSigma" },
-    { "Color Phi",          DUST_SETTING_FLOAT, &gRTGIConfig.phiColor,        1.0f,   10.0f,  "PhiColor" },
-    { "Resolution",         DUST_SETTING_ENUM,  &gRTGIConfig.resolutionMode,  0.0f,   2.0f,   "ResolutionMode", gResolutionLabels },
-    { "Debug View",         DUST_SETTING_INT,   &gRTGIConfig.debugView,       0.0f,   6.0f,   "DebugView" },
+    { "Enabled",            DUST_SETTING_BOOL,  &gRTGIConfig.enabled,         0.0f,   1.0f,  "Enabled",         nullptr, "Enable or disable ray-traced global illumination" },
+    { "GI Intensity",       DUST_SETTING_FLOAT, &gRTGIConfig.giIntensity,     0.0f,   5.0f,  "GIIntensity",     nullptr, "Brightness of indirect light bounces" },
+    { "AO Intensity",       DUST_SETTING_FLOAT, &gRTGIConfig.aoIntensity,     0.0f,   2.0f,  "AOIntensity",     nullptr, "Strength of ambient occlusion darkening" },
+    { "Ray Length",         DUST_SETTING_FLOAT, &gRTGIConfig.rayLength,       0.05f,  1.0f,  "RayLength",       nullptr, "Maximum ray marching distance" },
+    { "Ray Steps",          DUST_SETTING_INT,   &gRTGIConfig.raySteps,        8.0f,   64.0f, "RaySteps",        nullptr, "Steps per ray (more = higher quality, higher cost)" },
+    { "Rays Per Pixel",     DUST_SETTING_INT,   &gRTGIConfig.raysPerPixel,    1.0f,   16.0f, "RaysPerPixel",    nullptr, "Number of rays cast per pixel (more = less noise, higher cost)" },
+    { "Thickness",          DUST_SETTING_FLOAT, &gRTGIConfig.thickness,       0.005f, 0.5f,  "Thickness",       nullptr, "Assumed surface thickness for hit detection" },
+    { "Thickness Curve",    DUST_SETTING_FLOAT, &gRTGIConfig.thicknessCurve,  0.3f,   1.5f,  "ThicknessCurve",  nullptr, "How thickness scales with distance" },
+    { "Fade Distance",      DUST_SETTING_FLOAT, &gRTGIConfig.fadeDistance,     0.01f,  1.0f,  "FadeDistance",    nullptr, "Distance at which the effect fades out" },
+    { "Bounce Intensity",   DUST_SETTING_FLOAT, &gRTGIConfig.bounceIntensity, 0.0f,   2.0f,  "BounceIntensity", nullptr, "Strength of secondary light bounces" },
+    { "Saturation",         DUST_SETTING_FLOAT, &gRTGIConfig.saturation,      0.0f,   2.0f,  "Saturation",      nullptr, "Color saturation of indirect light" },
+    { "Temporal Blend",     DUST_SETTING_FLOAT, &gRTGIConfig.temporalBlend,   0.5f,   0.99f, "TemporalBlend",   nullptr, "Frame blending for noise reduction (higher = smoother but more ghosting)" },
+    { "Denoise Steps",      DUST_SETTING_INT,   &gRTGIConfig.denoiseSteps,    0.0f,   5.0f,  "DenoiseSteps",    nullptr, "Number of spatial denoising passes" },
+    { "Depth Sigma",        DUST_SETTING_FLOAT, &gRTGIConfig.depthSigma,      0.1f,   5.0f,  "DepthSigma",      nullptr, "Depth sensitivity of the denoiser" },
+    { "Color Phi",          DUST_SETTING_FLOAT, &gRTGIConfig.phiColor,        1.0f,   10.0f, "PhiColor",        nullptr, "Color sensitivity of the denoiser" },
+    { "Resolution",         DUST_SETTING_ENUM,  &gRTGIConfig.resolutionMode,  0.0f,   2.0f,  "ResolutionMode",  gResolutionLabels, "Render resolution (lower = faster but less detail)" },
+    { "Debug View",         DUST_SETTING_INT,   &gRTGIConfig.debugView,       0.0f,   6.0f,  "DebugView",       nullptr, "Debug visualization mode (0 = off)" },
     // Hidden
-    { "Tan Half FOV",       DUST_SETTING_HIDDEN_FLOAT, &gRTGIConfig.tanHalfFov, 0.1f, 2.0f,   "TanHalfFov" },
+    { "Tan Half FOV",       DUST_SETTING_HIDDEN_FLOAT, &gRTGIConfig.tanHalfFov, 0.1f, 2.0f,  "TanHalfFov" },
 };
 
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)

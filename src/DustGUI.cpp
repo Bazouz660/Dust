@@ -1066,6 +1066,9 @@ static void DrawEffectSection(size_t idx)
             break;
         }
 
+        if (s.description && ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", s.description);
+
         // Reset button for this parameter
         DrawResetButton(idx, i);
 

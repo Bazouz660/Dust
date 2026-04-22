@@ -197,6 +197,7 @@ typedef struct DustSettingDesc {
     const char*     iniKey;     // INI key name (API v3+, NULL = use display name; ignored for SECTION)
     // v3.1 additions — zero-initialized for older settings
     const char* const* enumLabels;  // NULL-terminated array of labels (DUST_SETTING_ENUM only)
+    const char*     description;    // Tooltip text shown on hover (NULL = no tooltip)
 } DustSettingDesc;
 
 // Effect descriptor flags (API v3+)

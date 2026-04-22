@@ -76,11 +76,11 @@ static void ShadowPostExecute(const DustFrameContext* ctx, const DustHostAPI* ho
 static int ShadowIsEnabled() { return 1; }
 
 static DustSettingDesc gSettings[] = {
-    { "Enabled",       DUST_SETTING_BOOL,  &gConfig.enabled,      0.0f,    1.0f,   "Enabled" },
-    { "Filter Radius", DUST_SETTING_FLOAT, &gConfig.filterRadius, 0.1f, 5.0f, "FilterRadius" },
-    { "Light Size",    DUST_SETTING_FLOAT, &gConfig.lightSize,    0.5f, 10.0f, "LightSize" },
-    { "PCSS",          DUST_SETTING_BOOL,  &gConfig.pcssEnabled,  0.0f,    1.0f,   "PCSS" },
-    { "Bias Scale",    DUST_SETTING_FLOAT, &gConfig.biasScale,    0.0f,    3.0f,   "BiasScale" },
+    { "Enabled",       DUST_SETTING_BOOL,  &gConfig.enabled,      0.0f, 1.0f,  "Enabled",      nullptr, "Enable or disable shadow filtering" },
+    { "Filter Radius", DUST_SETTING_FLOAT, &gConfig.filterRadius, 0.1f, 5.0f,  "FilterRadius", nullptr, "Size of the shadow softening filter" },
+    { "Light Size",    DUST_SETTING_FLOAT, &gConfig.lightSize,    0.5f, 10.0f, "LightSize",    nullptr, "Simulated light source size for contact-hardening shadows" },
+    { "PCSS",          DUST_SETTING_BOOL,  &gConfig.pcssEnabled,  0.0f, 1.0f,  "PCSS",         nullptr, "Enable Percentage-Closer Soft Shadows for distance-based softness" },
+    { "Bias Scale",    DUST_SETTING_FLOAT, &gConfig.biasScale,    0.0f, 3.0f,  "BiasScale",    nullptr, "Shadow bias multiplier to reduce shadow acne artifacts" },
 };
 
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)

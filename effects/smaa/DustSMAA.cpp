@@ -302,14 +302,14 @@ static int SMAAIsEnabled()
 static const char* const gEdgeModeLabels[] = { "Luma", "Depth", "Luma + Depth", nullptr };
 
 static DustSettingDesc gSettings[] = {
-    { "Enabled",         DUST_SETTING_BOOL,  &gConfig.enabled,        0.0f,  1.0f,  "Enabled",  nullptr },
-    { "Edge Detection",  DUST_SETTING_SECTION, nullptr,               0, 0, nullptr, nullptr },
-    { "Mode",            DUST_SETTING_ENUM,  &gConfig.edgeMode,       0.0f,  2.0f,  "EdgeMode", gEdgeModeLabels },
-    { "Luma Threshold",  DUST_SETTING_FLOAT, &gConfig.lumaThreshold,  0.05f, 0.5f,  "LumaThreshold", nullptr },
-    { "Depth Threshold", DUST_SETTING_FLOAT, &gConfig.depthThreshold, 0.001f,0.1f,  "DepthThreshold", nullptr },
-    { "Debug",           DUST_SETTING_SECTION, nullptr,               0, 0, nullptr, nullptr },
-    { "Show Edges",      DUST_SETTING_BOOL,  &gConfig.showEdges,      0.0f,  1.0f,  "ShowEdges", nullptr },
-    { "Show Weights",    DUST_SETTING_BOOL,  &gConfig.showWeights,    0.0f,  1.0f,  "ShowWeights", nullptr },
+    { "Enabled",         DUST_SETTING_BOOL,    &gConfig.enabled,        0.0f,  1.0f, "Enabled",        nullptr,          "Enable or disable anti-aliasing" },
+    { "Edge Detection",  DUST_SETTING_SECTION, nullptr,                 0, 0,        nullptr,          nullptr,          nullptr },
+    { "Mode",            DUST_SETTING_ENUM,    &gConfig.edgeMode,       0.0f,  2.0f, "EdgeMode",       gEdgeModeLabels,  "Edge detection method: Luma, Depth, or both" },
+    { "Luma Threshold",  DUST_SETTING_FLOAT,   &gConfig.lumaThreshold,  0.05f, 0.5f, "LumaThreshold",  nullptr,          "Sensitivity for luma-based edge detection (lower = more edges)" },
+    { "Depth Threshold", DUST_SETTING_FLOAT,   &gConfig.depthThreshold, 0.001f,0.1f, "DepthThreshold", nullptr,          "Sensitivity for depth-based edge detection (lower = more edges)" },
+    { "Debug",           DUST_SETTING_SECTION, nullptr,                 0, 0,        nullptr,          nullptr,          nullptr },
+    { "Show Edges",      DUST_SETTING_BOOL,    &gConfig.showEdges,      0.0f,  1.0f, "ShowEdges",      nullptr,          "Visualize detected edges" },
+    { "Show Weights",    DUST_SETTING_BOOL,    &gConfig.showWeights,    0.0f,  1.0f, "ShowWeights",    nullptr,          "Visualize blending weights" },
 };
 
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
