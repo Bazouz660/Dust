@@ -97,6 +97,11 @@
     <ClCompile Include="DustGUI.cpp" />
     <ClCompile Include="Survey.cpp" />
     <ClCompile Include="SurveyRecorder.cpp" />
+    <ClCompile Include="ShaderMetadata.cpp" />
+    <ClCompile Include="ShaderDatabase.cpp" />
+    <ClCompile Include="GeometryCapture.cpp" />
+    <ClCompile Include="GeometryReplay.cpp" />
+    <ClCompile Include="MSAARedirect.cpp" />
     <ClCompile Include="SurveyWriter.cpp" />
     <ClCompile Include="imgui\imgui.cpp" />
     <ClCompile Include="imgui\imgui_draw.cpp" />
@@ -117,6 +122,11 @@
     <ClInclude Include="D3D11StateBlock.h" />
     <ClInclude Include="Survey.h" />
     <ClInclude Include="SurveyRecorder.h" />
+    <ClInclude Include="ShaderMetadata.h" />
+    <ClInclude Include="ShaderDatabase.h" />
+    <ClInclude Include="GeometryCapture.h" />
+    <ClInclude Include="GeometryReplay.h" />
+    <ClInclude Include="MSAARedirect.h" />
     <ClInclude Include="SurveyWriter.h" />
     <ClInclude Include="imgui\imgui.h" />
     <ClInclude Include="imgui\backends\imgui_impl_win32.h" />

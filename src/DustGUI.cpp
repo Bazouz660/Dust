@@ -1,6 +1,10 @@
 #include "DustGUI.h"
 #include "DustLog.h"
 #include "EffectLoader.h"
+#include "GeometryCapture.h"
+#include "MSAARedirect.h"
+#include "ShaderMetadata.h"
+#include "ShaderDatabase.h"
 #include "Survey.h"
 #include "SurveyRecorder.h"
 #include "imgui/imgui.h"
@@ -56,6 +60,7 @@ struct FrameworkConfig {
     bool showSurvey = false;
     std::string lastPreset;    // name of last selected preset (empty = custom)
     int toggleKey = VK_F11;    // virtual key code for overlay toggle
+    int msaaSampleCount = 0;   // 0=off, 2/4/8
 };
 
 
@@ -625,7 +630,7 @@ static void LoadFrameworkConfig()
     gFwConfig.showSurvey = GetPrivateProfileIntA("Dust", "ShowSurvey", 0, gDustIniPath.c_str()) != 0;
 
     gFwConfig.toggleKey = GetPrivateProfileIntA("Dust", "ToggleKey", VK_F11, gDustIniPath.c_str());
-
+    gFwConfig.msaaSampleCount = GetPrivateProfileIntA("Dust", "MSAASamples", 0, gDustIniPath.c_str());
 
     char buf[256] = {};
     GetPrivateProfileStringA("Dust", "LastPreset", "", buf, sizeof(buf), gDustIniPath.c_str());
@@ -660,6 +665,9 @@ static void LoadFrameworkConfig()
             gToastActive = true; // always show toast on update, even if disabled
     }
 
+    if (gFwConfig.msaaSampleCount >= 2)
+        MSAARedirect::SetEnabled(gFwConfig.msaaSampleCount);
+
     gFwDiskConfig = gFwConfig;
     if (!gNewVersionInstalled)
         gToastActive = gFwConfig.showStartupMessage;
@@ -674,10 +682,15 @@ static void SaveFrameworkConfig()
     snprintf(keyBuf, sizeof(keyBuf), "%d", gFwConfig.toggleKey);
     WritePrivateProfileStringA("Dust", "ToggleKey", keyBuf, gDustIniPath.c_str());
     WritePrivateProfileStringA("Dust", "LastPreset", gFwConfig.lastPreset.c_str(), gDustIniPath.c_str());
+    char msaaBuf[16];
+    snprintf(msaaBuf, sizeof(msaaBuf), "%d", gFwConfig.msaaSampleCount);
+    WritePrivateProfileStringA("Dust", "MSAASamples", msaaBuf, gDustIniPath.c_str());
 
     gFwDiskConfig = gFwConfig;
     // Apply logging change immediately
     DustLogEnabled() = gFwConfig.logging;
+    // Apply MSAA change immediately
+    MSAARedirect::SetEnabled(gFwConfig.msaaSampleCount);
     Log("Framework settings saved");
 }
 
@@ -693,7 +706,8 @@ static bool IsFrameworkDirty()
            gFwConfig.showStartupMessage != gFwDiskConfig.showStartupMessage ||
            gFwConfig.showSurvey != gFwDiskConfig.showSurvey ||
            gFwConfig.lastPreset != gFwDiskConfig.lastPreset ||
-           gFwConfig.toggleKey != gFwDiskConfig.toggleKey;
+           gFwConfig.toggleKey != gFwDiskConfig.toggleKey ||
+           gFwConfig.msaaSampleCount != gFwDiskConfig.msaaSampleCount;
 }
 
 // ==================== Drawing: Framework pane ====================
@@ -734,6 +748,27 @@ static void DrawFrameworkSection()
     ImGui::Checkbox("Show Survey", &gFwConfig.showSurvey);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Show pipeline survey controls (developer tool)");
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    ImGui::TextColored(ImVec4(0.7f, 0.85f, 1.0f, 1.0f), "Anti-Aliasing");
+    ImGui::Spacing();
+
+    const char* msaaLabels[] = { "Off", "2x", "4x", "8x" };
+    int msaaValues[] = { 0, 2, 4, 8 };
+    int msaaIdx = 0;
+    for (int i = 0; i < 4; i++)
+        if (msaaValues[i] == gFwConfig.msaaSampleCount) { msaaIdx = i; break; }
+
+    if (ImGui::Combo("MSAA##msaa", &msaaIdx, msaaLabels, 4))
+        gFwConfig.msaaSampleCount = msaaValues[msaaIdx];
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("MSAA sample count for GBuffer rendering.\nHigher = better edges, more VRAM.\nRequires Save to apply.");
+
+    if (MSAARedirect::IsActive())
+        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "  Active: %ux", MSAARedirect::GetSampleCount());
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -1167,9 +1202,32 @@ static void DrawPerformanceSection()
     ImGui::Spacing();
 
     // Resolution info
-    ImGui::TextDisabled("Resolution info from last frame context");
-    // We don't have direct access to resolution here, but we can show display size
     ImGui::Text("Display: %.0fx%.0f", io.DisplaySize.x, io.DisplaySize.y);
+
+    // Geometry capture stats
+    uint32_t captureCount = GeometryCapture::GetCaptureCount();
+    if (captureCount > 0)
+    {
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.4f, 1.0f), "Geometry Capture");
+        ImGui::Spacing();
+
+        ImGui::Text("  GBuffer Draws: %u", captureCount);
+
+        uint32_t classified = 0;
+        const auto& captures = GeometryCapture::GetCaptures();
+        for (const auto& draw : captures)
+            if (draw.vsMetadata && draw.vsMetadata->transformType != VSTransformType::UNKNOWN)
+                classified++;
+
+        ImGui::Text("  Classified:    %u (%.0f%%)", classified,
+                     captureCount > 0 ? classified * 100.0f / captureCount : 0.0f);
+        ImGui::Text("  Shaders:       %u tracked, %u classified",
+                     ShaderMetadata::GetTrackedCount(), ShaderMetadata::GetClassifiedCount());
+    }
 }
 
 // ==================== Startup toast ====================

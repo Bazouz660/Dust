@@ -3,6 +3,10 @@
 #include "PipelineDetector.h"
 #include "EffectLoader.h"
 #include "ResourceRegistry.h"
+#include "ShaderMetadata.h"
+#include "ShaderDatabase.h"
+#include "GeometryCapture.h"
+#include "MSAARedirect.h"
 #include "Survey.h"
 #include "SurveyRecorder.h"
 #include "SurveyWriter.h"
@@ -53,6 +57,7 @@ static bool gDeviceRemovedThisFrame = false;
 
 void ResetFrameState()
 {
+    GeometryCapture::ResetFrame();
     gPipelineDetector.ResetFrame();
     gResourceRegistry.ResetFrame();
     gDispatchedThisFrame = false;
@@ -653,6 +658,8 @@ static void TryCaptureDevice(ID3D11Device* device)
 
     gDevice = device;
     device->GetImmediateContext(&gContext);
+    GeometryCapture::SetDevice(device);
+    MSAARedirect::SetDevice(device);
 
     Log("Captured real D3D11 device=%p, context=%p", gDevice, gContext);
 
@@ -691,6 +698,8 @@ static void TryCaptureDevice(ID3D11Device* device)
     else
     {
         Log("Detected resolution: %ux%u", gWidth, gHeight);
+        GeometryCapture::SetResolution(gWidth, gHeight);
+        MSAARedirect::SetResolution(gWidth, gHeight);
     }
 
     // Initialize all loaded effect plugins
@@ -759,7 +768,10 @@ static HRESULT STDMETHODCALLTYPE HookedCreatePixelShader(
     HRESULT hr = oCreatePixelShader(pThis, pShaderBytecode, BytecodeLength,
                                      pClassLinkage, ppPixelShader);
     if (SUCCEEDED(hr) && ppPixelShader && *ppPixelShader)
+    {
         SurveyRecorder::OnPixelShaderCreated(pShaderBytecode, BytecodeLength, *ppPixelShader);
+        ShaderDatabase::OnPixelShaderCreated(*ppPixelShader);
+    }
     return hr;
 }
 
@@ -778,7 +790,11 @@ static HRESULT STDMETHODCALLTYPE HookedCreateVertexShader(
     HRESULT hr = oCreateVertexShader(pThis, pShaderBytecode, BytecodeLength,
                                       pClassLinkage, ppVertexShader);
     if (SUCCEEDED(hr) && ppVertexShader && *ppVertexShader)
+    {
         SurveyRecorder::OnVertexShaderCreated(pShaderBytecode, BytecodeLength, *ppVertexShader);
+        ShaderMetadata::OnVertexShaderCreated(pShaderBytecode, BytecodeLength, *ppVertexShader);
+        ShaderDatabase::OnVertexShaderCreated(*ppVertexShader);
+    }
     return hr;
 }
 
@@ -879,6 +895,8 @@ static void STDMETHODCALLTYPE HookedDraw(
                             gWidth = desc.Width;
                             gHeight = desc.Height;
                             gEffectLoader.OnResolutionChanged(gDevice, gWidth, gHeight);
+                            GeometryCapture::SetResolution(gWidth, gHeight);
+                            MSAARedirect::SetResolution(gWidth, gHeight);
                         }
                         tex->Release();
                     }
@@ -945,6 +963,8 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     if (Survey::IsActive())
         SurveyRecorder::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 
+    GeometryCapture::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
+
     oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 }
 
@@ -957,16 +977,53 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
                                                 StartIndexLocation, BaseVertexLocation,
                                                 StartInstanceLocation);
 
+    GeometryCapture::OnDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
+                                            StartIndexLocation, BaseVertexLocation,
+                                            StartInstanceLocation);
+
     oDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
                           StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
 }
+
+static bool sInMSAAResolve = false;
 
 static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
     ID3D11DeviceContext* pThis, UINT NumViews,
     ID3D11RenderTargetView* const* ppRenderTargetViews,
     ID3D11DepthStencilView* pDepthStencilView)
 {
+    if (sInMSAAResolve)
+    {
+        oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView);
+        return;
+    }
+
+    bool wasInGBuffer = GeometryCapture::IsInGBufferPass();
+    bool isGBuffer = GeometryCapture::CheckGBufferConfig(NumViews, ppRenderTargetViews, pDepthStencilView);
+
+    if (MSAARedirect::GetSampleCount() >= 2)
+    {
+        if (!wasInGBuffer && isGBuffer)
+        {
+            ID3D11RenderTargetView* msaaRTVs[3];
+            ID3D11DepthStencilView* msaaDSV;
+            if (MSAARedirect::OnGBufferEnter(ppRenderTargetViews, pDepthStencilView, msaaRTVs, &msaaDSV))
+            {
+                oOMSetRenderTargets(pThis, NumViews, msaaRTVs, msaaDSV);
+                GeometryCapture::OnOMSetRenderTargetsWithResult(isGBuffer);
+                return;
+            }
+        }
+        else if (wasInGBuffer && !isGBuffer && MSAARedirect::IsActive())
+        {
+            sInMSAAResolve = true;
+            MSAARedirect::OnGBufferLeave(pThis);
+            sInMSAAResolve = false;
+        }
+    }
+
     oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView);
+    GeometryCapture::OnOMSetRenderTargetsWithResult(isGBuffer);
 }
 
 // ==================== Swap chain hooks (ImGui) ====================

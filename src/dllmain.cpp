@@ -10,6 +10,11 @@
 #include "D3D11Hook.h"
 #include "DustGUI.h"
 #include "EffectLoader.h"
+#include "ShaderMetadata.h"
+#include "ShaderDatabase.h"
+#include "GeometryCapture.h"
+#include "GeometryReplay.h"
+#include "MSAARedirect.h"
 
 static HMODULE gDllModule = nullptr;
 
@@ -206,6 +211,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
     case DLL_PROCESS_DETACH:
         DustGUI::Shutdown();
         gEffectLoader.ShutdownAll();
+        MSAARedirect::Shutdown();
+        GeometryReplay::Shutdown();
+        GeometryCapture::Shutdown();
+        ShaderDatabase::Shutdown();
+        ShaderMetadata::Shutdown();
         break;
     }
     return TRUE;
