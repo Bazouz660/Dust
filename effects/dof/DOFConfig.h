@@ -27,9 +27,18 @@ struct DOFConfig
     float blurRadius        = 2.565f;  // Gaussian blur kernel radius
     float maxDepth          = 1.0f;    // Max depth to process (skip sky)
     int   blurDownscale     = 2;       // Blur resolution divisor (2 = half, 4 = quarter)
+    int   blurShape         = 0;       // 0=gaussian, 1=disc, 2=hexagonal
 
     // Debug
     bool debugView = false;
+
+    // CoC mode: false = legacy (near/far ramps), true = physical (thin-lens aperture)
+    bool physicalCoC = false;
+    float aperture = 0.01f;
+
+    // Highlight preservation: bright pixels bleed through DoF blur
+    float highlightThreshold = 1.0f;
+    float highlightBoost = 0.0f;
 };
 
 extern DOFConfig gDOFConfig;

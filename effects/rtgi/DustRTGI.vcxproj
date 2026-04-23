@@ -95,8 +95,6 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="shaders\fullscreen_vs.hlsl" />
-    <None Include="shaders\rtgi_common.hlsl" />
-    <None Include="shaders\rtgi_raytrace_ps.hlsl" />
     <None Include="shaders\rtgi_temporal_ps.hlsl" />
     <None Include="shaders\rtgi_atrous_ps.hlsl" />
     <None Include="shaders\rtgi_composite_ps.hlsl" />

@@ -92,16 +92,16 @@ static int OutlineIsEnabled()
 // ==================== GUI Settings ====================
 
 static DustSettingDesc gSettingsArray[] = {
-    { "Enabled",           DUST_SETTING_BOOL,  &gOutlineConfig.enabled,          0.0f,    1.0f,    "Enabled" },
-    { "Depth Threshold",   DUST_SETTING_FLOAT, &gOutlineConfig.depthThreshold,   0.0001f, 0.01f,   "DepthThreshold" },
-    { "Normal Threshold",  DUST_SETTING_FLOAT, &gOutlineConfig.normalThreshold,  0.0f,    1.0f,    "NormalThreshold" },
-    { "Thickness",         DUST_SETTING_INT,   &gOutlineConfig.thickness,        1.0f,    5.0f,    "Thickness" },
-    { "Strength",          DUST_SETTING_FLOAT, &gOutlineConfig.strength,         0.0f,    1.0f,    "Strength" },
-    { "Color R",           DUST_SETTING_FLOAT, &gOutlineConfig.colorR,           0.0f,    1.0f,    "ColorR" },
-    { "Color G",           DUST_SETTING_FLOAT, &gOutlineConfig.colorG,           0.0f,    1.0f,    "ColorG" },
-    { "Color B",           DUST_SETTING_FLOAT, &gOutlineConfig.colorB,           0.0f,    1.0f,    "ColorB" },
-    { "Max Depth",         DUST_SETTING_FLOAT, &gOutlineConfig.maxDepth,         0.01f,   1.0f,    "MaxDepth" },
-    { "Debug View",        DUST_SETTING_BOOL,  &gOutlineConfig.debugView,        0.0f,    1.0f,    "DebugView" },
+    { "Enabled",           DUST_SETTING_BOOL,  &gOutlineConfig.enabled,          0.0f,    1.0f,  "Enabled",         nullptr, "Enable or disable edge outlines" },
+    { "Depth Threshold",   DUST_SETTING_FLOAT, &gOutlineConfig.depthThreshold,   0.0001f, 0.01f, "DepthThreshold",  nullptr, "Minimum depth difference to draw an outline" },
+    { "Normal Threshold",  DUST_SETTING_FLOAT, &gOutlineConfig.normalThreshold,  0.0f,    1.0f,  "NormalThreshold", nullptr, "Minimum normal difference to draw an outline" },
+    { "Thickness",         DUST_SETTING_INT,   &gOutlineConfig.thickness,        1.0f,    5.0f,  "Thickness",       nullptr, "Outline width in pixels" },
+    { "Strength",          DUST_SETTING_FLOAT, &gOutlineConfig.strength,         0.0f,    1.0f,  "Strength",        nullptr, "Outline opacity (0 = invisible, 1 = full)" },
+    { "Color R",           DUST_SETTING_FLOAT, &gOutlineConfig.colorR,           0.0f,    1.0f,  "ColorR",          nullptr, "Red component of the outline color" },
+    { "Color G",           DUST_SETTING_FLOAT, &gOutlineConfig.colorG,           0.0f,    1.0f,  "ColorG",          nullptr, "Green component of the outline color" },
+    { "Color B",           DUST_SETTING_FLOAT, &gOutlineConfig.colorB,           0.0f,    1.0f,  "ColorB",          nullptr, "Blue component of the outline color" },
+    { "Max Depth",         DUST_SETTING_FLOAT, &gOutlineConfig.maxDepth,         0.01f,   1.0f,  "MaxDepth",        nullptr, "Maximum depth to draw outlines (skip distant objects)" },
+    { "Debug View",        DUST_SETTING_BOOL,  &gOutlineConfig.debugView,        0.0f,    1.0f,  "DebugView",       nullptr, "Show raw edge detection result" },
 };
 
 // Plugin entry point

@@ -70,7 +70,7 @@ cbuffer RTGIParams : register(b0)
     float  frameIndex;
     float  raysPerPixel;
     float  thicknessCurve;
-    float  _pad0;
+    float  normalDetail;
     float2 sampleJitter;
     float2 _padJitter;
     float4 camRight;
@@ -138,22 +138,30 @@ float4 TraceRay(float2 startUV, float startDepth, float3 startView, float3 rayDi
             float2 hitUV = saturate(startUV + deltaUV * hitT);
             float3 sceneColor = sceneTex.SampleLevel(linearClamp, hitUV, 0).rgb;
             float lum = Luminance(sceneColor);
-            float3 hitColor = sceneColor / (1.0 + lum);
+            float compress = 1.0 / (1.0 + lum);
+            float3 hitColor = sceneColor * compress * compress;
 
             if (bounceIntensity > 0.0)
             {
                 float3 prevBounce = prevGI.SampleLevel(linearClamp, hitUV, 0).rgb;
                 float prevLum = Luminance(prevBounce);
-                prevBounce = prevBounce / (1.0 + prevLum);
+                float prevCompress = 1.0 / (1.0 + prevLum);
+                prevBounce = prevBounce * prevCompress * prevCompress;
                 hitColor += prevBounce * bounceIntensity;
             }
+
+            // Attenuate shallow hits: on smooth surfaces (terrain), the ray grazes
+            // the starting surface with depthDiff barely above zero.  These marginal
+            // hits toggle frame-to-frame and cause flicker.  Real geometry intersections
+            // penetrate deeper into the thickness zone.
+            float penetration = smoothstep(0.0, 0.3, depthDiff / thicknessLimit);
 
             float attenuation = saturate(1.0 - hitT * hitT * hitT);
             float2 edgeDist = min(hitUV, 1.0 - hitUV);
             float edgeFade = saturate(min(edgeDist.x, edgeDist.y) * 10.0);
             float occlusion = (1.0 - hitT * hitT);
 
-            return float4(hitColor * attenuation * edgeFade, occlusion);
+            return float4(hitColor * attenuation * edgeFade * penetration, occlusion * penetration);
         }
     }
 
@@ -179,14 +187,36 @@ void main(uint3 tid : SV_DispatchThreadID)
         return;
     }
 
-    float3 worldN = normalsTex.SampleLevel(pointClamp, uv, 0).rgb * 2.0 - 1.0;
-    float3 normal;
-    normal.x =  dot(worldN, camRight.xyz);
-    normal.y =  dot(worldN, camUp.xyz);
-    normal.z = -dot(worldN, camForward.xyz);
-    normal = normalize(normal);
-
     float3 startView = ReconstructViewPos(uv, depth, tanHalfFov, aspectRatio);
+
+    float3 geoNormal;
+    {
+        float dL = depthTex.SampleLevel(pointClamp, uv - float2(invViewportSize.x, 0), 0);
+        float dR = depthTex.SampleLevel(pointClamp, uv + float2(invViewportSize.x, 0), 0);
+        float dU = depthTex.SampleLevel(pointClamp, uv - float2(0, invViewportSize.y), 0);
+        float dD = depthTex.SampleLevel(pointClamp, uv + float2(0, invViewportSize.y), 0);
+
+        float3 ddx_pos = (abs(dL - depth) < abs(dR - depth))
+            ? startView - ReconstructViewPos(uv - float2(invViewportSize.x, 0), dL, tanHalfFov, aspectRatio)
+            : ReconstructViewPos(uv + float2(invViewportSize.x, 0), dR, tanHalfFov, aspectRatio) - startView;
+        float3 ddy_pos = (abs(dU - depth) < abs(dD - depth))
+            ? startView - ReconstructViewPos(uv - float2(0, invViewportSize.y), dU, tanHalfFov, aspectRatio)
+            : ReconstructViewPos(uv + float2(0, invViewportSize.y), dD, tanHalfFov, aspectRatio) - startView;
+
+        geoNormal = normalize(cross(ddx_pos, ddy_pos));
+    }
+
+    float3 worldN = normalsTex.SampleLevel(pointClamp, uv, 0).rgb * 2.0 - 1.0;
+    float3 gbufNormal;
+    gbufNormal.x =  dot(worldN, camRight.xyz);
+    gbufNormal.y =  dot(worldN, camUp.xyz);
+    gbufNormal.z = -dot(worldN, camForward.xyz);
+    gbufNormal = normalize(gbufNormal);
+
+    if (dot(geoNormal, gbufNormal) < 0)
+        geoNormal = -geoNormal;
+
+    float3 normal = normalize(lerp(geoNormal, gbufNormal, normalDetail));
     float3 tangent, bitangent;
     BuildOrthonormalBasis(normal, tangent, bitangent);
 

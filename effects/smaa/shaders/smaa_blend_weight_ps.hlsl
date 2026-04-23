@@ -1,5 +1,9 @@
-Texture2D edgeTex : register(t0);
-SamplerState pointSamp : register(s0);
+Texture2D edgeTex   : register(t0);
+Texture2D areaTex   : register(t1);
+Texture2D searchTex : register(t2);
+
+SamplerState pointSamp  : register(s0);
+SamplerState linearSamp : register(s1);
 
 cbuffer SMAACB : register(b0) {
     float4 rtMetrics;
@@ -9,96 +13,122 @@ cbuffer SMAACB : register(b0) {
     float pad;
 };
 
-#define MAX_SEARCH_STEPS 16
+#define SMAA_MAX_SEARCH_STEPS 16
+#define SMAA_AREATEX_MAX_DISTANCE 16
+#define SMAA_AREATEX_PIXEL_SIZE (1.0 / float2(160.0, 560.0))
+#define SMAA_AREATEX_SUBTEX_SIZE (1.0 / 7.0)
+#define SMAA_SEARCHTEX_SIZE float2(66.0, 33.0)
+#define SMAA_SEARCHTEX_PACKED_SIZE float2(64.0, 16.0)
 
-float SearchXLeft(float2 uv) {
-    float d = 0;
-    [loop] for (int i = 0; i < MAX_SEARCH_STEPS; i++) {
-        float2 s = uv + float2(-(d + 1.0) * rtMetrics.x, 0);
-        float2 e = edgeTex.SampleLevel(pointSamp, s, 0).rg;
-        if (e.g < 0.5) break;
-        d += 1.0;
-        if (e.r > 0.5) break;
-    }
-    return d;
+float SMAASearchLength(float2 e, float offset) {
+    float2 scale = SMAA_SEARCHTEX_SIZE * float2(0.5, -1.0);
+    float2 bias = SMAA_SEARCHTEX_SIZE * float2(offset, 1.0);
+    scale += float2(-1.0, 1.0);
+    bias += float2(0.5, -0.5);
+    scale *= 1.0 / SMAA_SEARCHTEX_PACKED_SIZE;
+    bias *= 1.0 / SMAA_SEARCHTEX_PACKED_SIZE;
+    return searchTex.SampleLevel(linearSamp, mad(scale, e, bias), 0).r;
 }
 
-float SearchXRight(float2 uv) {
-    float d = 0;
-    [loop] for (int i = 0; i < MAX_SEARCH_STEPS; i++) {
-        float2 s = uv + float2((d + 1.0) * rtMetrics.x, 0);
-        float2 e = edgeTex.SampleLevel(pointSamp, s, 0).rg;
-        if (e.g < 0.5) break;
-        d += 1.0;
-        if (e.r > 0.5) break;
+float SMAASearchXLeft(float2 texcoord, float end) {
+    float2 e = float2(0.0, 1.0);
+    while (texcoord.x > end && e.g > 0.8281 && e.r == 0.0) {
+        e = edgeTex.SampleLevel(linearSamp, texcoord, 0).rg;
+        texcoord = mad(-float2(2.0, 0.0), rtMetrics.xy, texcoord);
     }
-    return d;
+    float offset = mad(-(255.0 / 127.0), SMAASearchLength(e, 0.0), 3.25);
+    return mad(rtMetrics.x, offset, texcoord.x);
 }
 
-float SearchYUp(float2 uv) {
-    float d = 0;
-    [loop] for (int i = 0; i < MAX_SEARCH_STEPS; i++) {
-        float2 s = uv + float2(0, -(d + 1.0) * rtMetrics.y);
-        float2 e = edgeTex.SampleLevel(pointSamp, s, 0).rg;
-        if (e.r < 0.5) break;
-        d += 1.0;
-        if (e.g > 0.5) break;
+float SMAASearchXRight(float2 texcoord, float end) {
+    float2 e = float2(0.0, 1.0);
+    while (texcoord.x < end && e.g > 0.8281 && e.r == 0.0) {
+        e = edgeTex.SampleLevel(linearSamp, texcoord, 0).rg;
+        texcoord = mad(float2(2.0, 0.0), rtMetrics.xy, texcoord);
     }
-    return d;
+    float offset = mad(-(255.0 / 127.0), SMAASearchLength(e, 0.5), 3.25);
+    return mad(-rtMetrics.x, offset, texcoord.x);
 }
 
-float SearchYDown(float2 uv) {
-    float d = 0;
-    [loop] for (int i = 0; i < MAX_SEARCH_STEPS; i++) {
-        float2 s = uv + float2(0, (d + 1.0) * rtMetrics.y);
-        float2 e = edgeTex.SampleLevel(pointSamp, s, 0).rg;
-        if (e.r < 0.5) break;
-        d += 1.0;
-        if (e.g > 0.5) break;
+float SMAASearchYUp(float2 texcoord, float end) {
+    float2 e = float2(1.0, 0.0);
+    while (texcoord.y > end && e.r > 0.8281 && e.g == 0.0) {
+        e = edgeTex.SampleLevel(linearSamp, texcoord, 0).rg;
+        texcoord = mad(-float2(0.0, 2.0), rtMetrics.xy, texcoord);
     }
-    return d;
+    float offset = mad(-(255.0 / 127.0), SMAASearchLength(e.gr, 0.0), 3.25);
+    return mad(rtMetrics.y, offset, texcoord.y);
 }
 
-float2 Area(float d1, float d2, float e1, float e2) {
-    float L = d1 + d2;
-    if (L < 1e-5) return float2(0, 0);
+float SMAASearchYDown(float2 texcoord, float end) {
+    float2 e = float2(1.0, 0.0);
+    while (texcoord.y < end && e.r > 0.8281 && e.g == 0.0) {
+        e = edgeTex.SampleLevel(linearSamp, texcoord, 0).rg;
+        texcoord = mad(float2(0.0, 2.0), rtMetrics.xy, texcoord);
+    }
+    float offset = mad(-(255.0 / 127.0), SMAASearchLength(e.gr, 0.5), 3.25);
+    return mad(-rtMetrics.y, offset, texcoord.y);
+}
 
-    // Sub-pixel position of the real geometric edge relative to the pixel boundary.
-    // Positive h: edge is on the neighbor side -> neighbor needs blending.
-    // Negative h: edge is on the current pixel side -> current pixel needs blending.
-    float h = 0.5 * (e1 * d2 - e2 * d1) / L;
-
-    // .x = current pixel blends toward neighbor (when h < 0)
-    // .y = neighbor blends toward current pixel (when h > 0)
-    return sqrt(float2(saturate(-h), saturate(h)));
+float2 SMAAArea(float2 dist, float e1, float e2) {
+    float2 texcoord = mad(float2(SMAA_AREATEX_MAX_DISTANCE, SMAA_AREATEX_MAX_DISTANCE),
+                          round(4.0 * float2(e1, e2)), dist);
+    texcoord = mad(SMAA_AREATEX_PIXEL_SIZE, texcoord, 0.5 * SMAA_AREATEX_PIXEL_SIZE);
+    return areaTex.SampleLevel(linearSamp, texcoord, 0).rg;
 }
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
     float4 weights = float4(0, 0, 0, 0);
     float2 e = edgeTex.SampleLevel(pointSamp, uv, 0).rg;
 
-    [branch] if (e.g > 0.5) {
-        float d1 = SearchXLeft(uv);
-        float d2 = SearchXRight(uv);
+    float2 pixcoord = uv * rtMetrics.zw;
 
-        float e1 = edgeTex.SampleLevel(pointSamp,
-            uv + float2((-d1 - 1.0) * rtMetrics.x, rtMetrics.y), 0).r;
-        float e2 = edgeTex.SampleLevel(pointSamp,
-            uv + float2((d2 + 1.0) * rtMetrics.x, rtMetrics.y), 0).r;
+    float4 off0 = mad(rtMetrics.xyxy, float4(-0.25, -0.125, 1.25, -0.125), uv.xyxy);
+    float4 off1 = mad(rtMetrics.xyxy, float4(-0.125, -0.25, -0.125, 1.25), uv.xyxy);
+    float4 off2 = mad(rtMetrics.xxyy,
+        float4(-2.0, 2.0, -2.0, 2.0) * float(SMAA_MAX_SEARCH_STEPS),
+        float4(off0.xz, off1.yw));
 
-        weights.rg = Area(d1, d2, e1, e2);
+    [branch] if (e.g > 0.0) {
+        float2 d;
+        float3 coords;
+
+        coords.x = SMAASearchXLeft(off0.xy, off2.x);
+        coords.y = off1.y;
+        d.x = coords.x;
+
+        float e1 = edgeTex.SampleLevel(linearSamp, coords.xy, 0).r;
+
+        coords.z = SMAASearchXRight(off0.zw, off2.y);
+        d.y = coords.z;
+
+        d = abs(round(mad(rtMetrics.zz, d, -pixcoord.xx)));
+        float2 sqrt_d = sqrt(d);
+
+        float e2 = edgeTex.SampleLevel(linearSamp, coords.zy, 0, int2(1, 0)).r;
+
+        weights.rg = SMAAArea(sqrt_d, e1, e2);
     }
 
-    [branch] if (e.r > 0.5) {
-        float d1 = SearchYUp(uv);
-        float d2 = SearchYDown(uv);
+    [branch] if (e.r > 0.0) {
+        float2 d;
+        float3 coords;
 
-        float e1 = edgeTex.SampleLevel(pointSamp,
-            uv + float2(rtMetrics.x, -d1 * rtMetrics.y), 0).g;
-        float e2 = edgeTex.SampleLevel(pointSamp,
-            uv + float2(rtMetrics.x, (d2 + 1.0) * rtMetrics.y), 0).g;
+        coords.y = SMAASearchYUp(off1.xy, off2.z);
+        coords.x = off0.x;
+        d.x = coords.y;
 
-        weights.ba = Area(d1, d2, e1, e2);
+        float e1 = edgeTex.SampleLevel(linearSamp, coords.xy, 0).g;
+
+        coords.z = SMAASearchYDown(off1.zw, off2.w);
+        d.y = coords.z;
+
+        d = abs(round(mad(rtMetrics.ww, d, -pixcoord.yy)));
+        float2 sqrt_d = sqrt(d);
+
+        float e2 = edgeTex.SampleLevel(linearSamp, coords.xz, 0, int2(0, 1)).g;
+
+        weights.ba = SMAAArea(sqrt_d, e1, e2);
     }
 
     return weights;

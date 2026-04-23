@@ -35,6 +35,8 @@ static ID3D11PixelShader* gBlurHPS = nullptr;
 static ID3D11PixelShader* gBlurVPS = nullptr;
 static ID3D11PixelShader* gCompositePS = nullptr;
 static ID3D11PixelShader* gDebugPS = nullptr;
+static ID3D11PixelShader* gBlurDiscPS = nullptr;
+static ID3D11PixelShader* gBlurHexPS = nullptr;
 
 // Pipeline states
 static ID3D11BlendState*        gNoBlend = nullptr;
@@ -47,7 +49,7 @@ static ID3D11SamplerState*      gLinearClampSampler = nullptr;
 struct DOFCBData
 {
     float texelSize[2];
-    float focusDistance;   // Resolved (auto or manual)
+    float focusDistance;
     float nearStart;
     float nearEnd;
     float nearStrength;
@@ -56,6 +58,10 @@ struct DOFCBData
     float farStrength;
     float blurRadius;
     float maxDepth;
+    int   cocMode;
+    float aperture;
+    float highlightThreshold;
+    float highlightBoost;
     float _pad;
 };
 static ID3D11Buffer* gDOFCB = nullptr;
@@ -155,6 +161,8 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
         { "dof_blur_v_ps.hlsl",      &gBlurVPS },
         { "dof_composite_ps.hlsl",   &gCompositePS },
         { "dof_debug_ps.hlsl",       &gDebugPS },
+        { "dof_blur_disc_ps.hlsl",   &gBlurDiscPS },
+        { "dof_blur_hex_ps.hlsl",    &gBlurHexPS },
     };
 
     for (auto& s : shaders)
@@ -241,6 +249,7 @@ void Shutdown()
     SAFE_RELEASE(gCocPS);        SAFE_RELEASE(gDownsamplePS);
     SAFE_RELEASE(gBlurHPS);      SAFE_RELEASE(gBlurVPS);
     SAFE_RELEASE(gCompositePS);  SAFE_RELEASE(gDebugPS);
+    SAFE_RELEASE(gBlurDiscPS);   SAFE_RELEASE(gBlurHexPS);
     SAFE_RELEASE(gNoBlend);
     SAFE_RELEASE(gNoDepthDSS);   SAFE_RELEASE(gNoCullRS);
     SAFE_RELEASE(gPointClampSampler); SAFE_RELEASE(gLinearClampSampler);
@@ -336,6 +345,10 @@ void Render(ID3D11DeviceContext* ctx,
         cb.farStrength = gDOFConfig.farStrength;
         cb.blurRadius = gDOFConfig.blurRadius;
         cb.maxDepth = gDOFConfig.maxDepth;
+        cb.cocMode = gDOFConfig.physicalCoC ? 1 : 0;
+        cb.aperture = gDOFConfig.aperture;
+        cb.highlightThreshold = gDOFConfig.highlightThreshold;
+        cb.highlightBoost = gDOFConfig.highlightBoost;
         gHost->UpdateConstantBuffer(ctx, gDOFCB, &cb, sizeof(cb));
 
         ctx->OMSetRenderTargets(1, &gCocRTV, nullptr);
@@ -361,48 +374,60 @@ void Render(ID3D11DeviceContext* ctx,
         ctx->PSSetShaderResources(0, 1, &nullSRV);
     }
 
-    // --- Pass 3: Horizontal blur ---
+    // --- Passes 3-4: Blur (shape-dependent) ---
     {
         DOFCBData cb = {};
         cb.texelSize[0] = 1.0f / (float)bw;
         cb.texelSize[1] = 1.0f / (float)bh;
         cb.blurRadius = gDOFConfig.blurRadius;
+        cb.highlightThreshold = gDOFConfig.highlightThreshold;
+        cb.highlightBoost = gDOFConfig.highlightBoost;
         gHost->UpdateConstantBuffer(ctx, gDOFCB, &cb, sizeof(cb));
 
-        ctx->OMSetRenderTargets(1, &gBlurTempRTV, nullptr);
         D3D11_VIEWPORT vp = { 0, 0, (float)bw, (float)bh, 0, 1 };
         ctx->RSSetViewports(1, &vp);
-        ctx->PSSetShaderResources(0, 1, &gHalfSRV);
         ctx->PSSetSamplers(0, 1, &gLinearClampSampler);
         ctx->PSSetConstantBuffers(0, 1, &gDOFCB);
-        gHost->DrawFullscreenTriangle(ctx, gBlurHPS);
-        ctx->PSSetShaderResources(0, 1, &nullSRV);
-    }
 
-    // --- Pass 4: Vertical blur ---
-    {
-        ctx->OMSetRenderTargets(1, &gHalfRTV, nullptr);
-        D3D11_VIEWPORT vp = { 0, 0, (float)bw, (float)bh, 0, 1 };
-        ctx->RSSetViewports(1, &vp);
-        ctx->PSSetShaderResources(0, 1, &gBlurTempSRV);
-        ctx->PSSetSamplers(0, 1, &gLinearClampSampler);
-        ctx->PSSetConstantBuffers(0, 1, &gDOFCB);
-        gHost->DrawFullscreenTriangle(ctx, gBlurVPS);
-        ctx->PSSetShaderResources(0, 1, &nullSRV);
+        if (gDOFConfig.blurShape == 0)
+        {
+            // Gaussian: separable H + V
+            ctx->OMSetRenderTargets(1, &gBlurTempRTV, nullptr);
+            ctx->PSSetShaderResources(0, 1, &gHalfSRV);
+            gHost->DrawFullscreenTriangle(ctx, gBlurHPS);
+            ctx->PSSetShaderResources(0, 1, &nullSRV);
+
+            ctx->OMSetRenderTargets(1, &gHalfRTV, nullptr);
+            ctx->PSSetShaderResources(0, 1, &gBlurTempSRV);
+            gHost->DrawFullscreenTriangle(ctx, gBlurVPS);
+            ctx->PSSetShaderResources(0, 1, &nullSRV);
+        }
+        else
+        {
+            // Disc (1) or Hex (2): single-pass gather
+            ctx->OMSetRenderTargets(1, &gBlurTempRTV, nullptr);
+            ctx->PSSetShaderResources(0, 1, &gHalfSRV);
+            ID3D11PixelShader* blurPS = (gDOFConfig.blurShape == 1) ? gBlurDiscPS : gBlurHexPS;
+            gHost->DrawFullscreenTriangle(ctx, blurPS);
+            ctx->PSSetShaderResources(0, 1, &nullSRV);
+        }
     }
 
     // --- Pass 5: Composite (sharp + blurred + CoC → LDR) ---
-    // Restore full-res texelSize (changed in pass 3 to half-res)
     {
         DOFCBData cb = {};
         cb.texelSize[0] = 1.0f / (float)gWidth;
         cb.texelSize[1] = 1.0f / (float)gHeight;
+        cb.highlightThreshold = gDOFConfig.highlightThreshold;
+        cb.highlightBoost = gDOFConfig.highlightBoost;
         gHost->UpdateConstantBuffer(ctx, gDOFCB, &cb, sizeof(cb));
 
         ctx->OMSetRenderTargets(1, &ldrRTV, nullptr);
         D3D11_VIEWPORT vp = { 0, 0, (float)gWidth, (float)gHeight, 0, 1 };
         ctx->RSSetViewports(1, &vp);
-        ID3D11ShaderResourceView* srvs[3] = { sceneCopySRV, gHalfSRV, gCocSRV };
+
+        ID3D11ShaderResourceView* blurResultSRV = (gDOFConfig.blurShape == 0) ? gHalfSRV : gBlurTempSRV;
+        ID3D11ShaderResourceView* srvs[3] = { sceneCopySRV, blurResultSRV, gCocSRV };
         ctx->PSSetShaderResources(0, 3, srvs);
         ctx->PSSetSamplers(0, 1, &gLinearClampSampler);
         ctx->PSSetConstantBuffers(0, 1, &gDOFCB);
@@ -436,6 +461,8 @@ void RenderDebugOverlay(ID3D11DeviceContext* ctx,
         cb.farStrength = gDOFConfig.farStrength;
         cb.blurRadius = gDOFConfig.blurRadius;
         cb.maxDepth = gDOFConfig.maxDepth;
+        cb.cocMode = gDOFConfig.physicalCoC ? 1 : 0;
+        cb.aperture = gDOFConfig.aperture;
         gHost->UpdateConstantBuffer(ctx, gDOFCB, &cb, sizeof(cb));
 
         ctx->OMSetDepthStencilState(gNoDepthDSS, 0);

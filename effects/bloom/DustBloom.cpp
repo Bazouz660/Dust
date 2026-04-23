@@ -26,12 +26,16 @@ static std::string GetPluginDir()
 // ==================== Config ====================
 
 struct BloomConfig {
-    bool  enabled   = true;
-    float intensity = 0.5f;
-    float threshold = 1.0f;
-    float radius    = 2.814f;
-    float curve     = 1.0f;
-    bool  debugView = false;
+    bool  enabled    = true;
+    float intensity  = 0.5f;
+    float threshold  = 1.0f;
+    float softKnee   = 0.5f;
+    float radius     = 2.814f;
+    float curve      = 1.0f;
+    float scatter    = 0.7f;
+    float glowAmount = 0.0f;
+    int   mipLevels  = 5;
+    bool  debugView  = false;
 };
 
 static BloomConfig gConfig;
@@ -63,7 +67,7 @@ struct BloomCB {
 
 // ==================== Mip Chain ====================
 
-#define BLOOM_MIP_COUNT 5
+#define BLOOM_MIP_MAX 8
 
 struct BloomMip {
     ID3D11Texture2D*          tex = nullptr;
@@ -72,11 +76,12 @@ struct BloomMip {
     uint32_t width = 0, height = 0;
 };
 
-static BloomMip gMips[BLOOM_MIP_COUNT];
+static BloomMip gMips[BLOOM_MIP_MAX];
+static int gActiveMipCount = 5;
 
 static void ReleaseMips()
 {
-    for (int i = 0; i < BLOOM_MIP_COUNT; i++)
+    for (int i = 0; i < BLOOM_MIP_MAX; i++)
     {
         if (gMips[i].srv) { gMips[i].srv->Release(); gMips[i].srv = nullptr; }
         if (gMips[i].rtv) { gMips[i].rtv->Release(); gMips[i].rtv = nullptr; }
@@ -85,14 +90,15 @@ static void ReleaseMips()
     }
 }
 
-static bool CreateMips(ID3D11Device* device, uint32_t w, uint32_t h)
+static bool CreateMips(ID3D11Device* device, uint32_t w, uint32_t h, int mipCount)
 {
     ReleaseMips();
+    gActiveMipCount = mipCount;
 
     uint32_t mw = w / 2;
     uint32_t mh = h / 2;
 
-    for (int i = 0; i < BLOOM_MIP_COUNT; i++)
+    for (int i = 0; i < mipCount; i++)
     {
         if (mw < 1) mw = 1;
         if (mh < 1) mh = 1;
@@ -202,9 +208,12 @@ static int BloomInit(ID3D11Device* device, uint32_t width, uint32_t height, cons
     if (FAILED(device->CreateRasterizerState(&rd, &gRasterState))) return -7;
 
     // Mip chain
-    if (!CreateMips(device, width, height)) return -8;
+    int mipCount = gConfig.mipLevels;
+    if (mipCount < 3) mipCount = 3;
+    if (mipCount > BLOOM_MIP_MAX) mipCount = BLOOM_MIP_MAX;
+    if (!CreateMips(device, width, height, mipCount)) return -8;
 
-    Log("Bloom: Initialized (%ux%u, %d mip levels)", width, height, BLOOM_MIP_COUNT);
+    Log("Bloom: Initialized (%ux%u, %d mip levels)", width, height, gActiveMipCount);
     return 0;
 }
 
@@ -227,7 +236,7 @@ static void BloomShutdown()
 
 static void BloomOnResolutionChanged(ID3D11Device* device, uint32_t w, uint32_t h)
 {
-    CreateMips(device, w, h);
+    CreateMips(device, w, h, gActiveMipCount);
     Log("Bloom: Resolution changed to %ux%u", w, h);
 }
 
@@ -257,6 +266,22 @@ static void BloomPostExecute(const DustFrameContext* ctx, const DustHostAPI* hos
     ID3D11DeviceContext* dc = ctx->context;
     host->SaveState(dc);
 
+    // Check if mip count changed at runtime
+    {
+        int wantedMips = gConfig.mipLevels;
+        if (wantedMips < 3) wantedMips = 3;
+        if (wantedMips > BLOOM_MIP_MAX) wantedMips = BLOOM_MIP_MAX;
+        if (wantedMips != gActiveMipCount)
+        {
+            ID3D11Device* device = nullptr;
+            dc->GetDevice(&device);
+            if (device) {
+                CreateMips(device, ctx->width, ctx->height, wantedMips);
+                device->Release();
+            }
+        }
+    }
+
     // Common state for all passes
     dc->OMSetDepthStencilState(gNoDepth, 0);
     dc->RSSetState(gRasterState);
@@ -269,9 +294,9 @@ static void BloomPostExecute(const DustFrameContext* ctx, const DustHostAPI* hos
         cb.texelSizeX = 1.0f / (float)ctx->width;
         cb.texelSizeY = 1.0f / (float)ctx->height;
         cb.threshold  = gConfig.threshold;
-        cb.softKnee   = 0.5f;
+        cb.softKnee   = gConfig.softKnee;
         cb.intensity  = gConfig.intensity;
-        cb.scatter    = 0.7f;
+        cb.scatter    = gConfig.scatter;
         host->UpdateConstantBuffer(dc, gCB, &cb, sizeof(cb));
 
         dc->OMSetBlendState(gNoBlend, nullptr, 0xFFFFFFFF);
@@ -285,12 +310,12 @@ static void BloomPostExecute(const DustFrameContext* ctx, const DustHostAPI* hos
     }
 
     // --- Passes 2..N: Downsample chain ---
-    for (int i = 0; i < BLOOM_MIP_COUNT - 1; i++)
+    for (int i = 0; i < gActiveMipCount - 1; i++)
     {
         BloomCB cb = {};
         cb.texelSizeX = 1.0f / (float)gMips[i].width;
         cb.texelSizeY = 1.0f / (float)gMips[i].height;
-        cb.scatter    = 0.7f;
+        cb.scatter    = gConfig.scatter;
         host->UpdateConstantBuffer(dc, gCB, &cb, sizeof(cb));
 
         // Unbind source from SRV before it was an RTV, set new RTV first
@@ -306,12 +331,15 @@ static void BloomPostExecute(const DustFrameContext* ctx, const DustHostAPI* hos
     // --- Passes N+1..2N: Upsample chain (additive onto each larger mip) ---
     dc->OMSetBlendState(gAdditiveBlend, nullptr, 0xFFFFFFFF);
 
-    for (int i = BLOOM_MIP_COUNT - 1; i > 0; i--)
+    for (int i = gActiveMipCount - 1; i > 0; i--)
     {
+        float levelFactor = (float)(i - 1) / (float)(gActiveMipCount - 2);
+        float effectiveScatter = gConfig.scatter + gConfig.glowAmount * levelFactor;
+
         BloomCB cb = {};
         cb.texelSizeX = 1.0f / (float)gMips[i].width;
         cb.texelSizeY = 1.0f / (float)gMips[i].height;
-        cb.scatter    = 0.7f;
+        cb.scatter    = effectiveScatter;
         cb.radius     = gConfig.radius;
         host->UpdateConstantBuffer(dc, gCB, &cb, sizeof(cb));
 
@@ -366,12 +394,16 @@ static int BloomIsEnabled()
 // ==================== GUI Settings ====================
 
 static DustSettingDesc gBloomSettingsArray[] = {
-    { "Enabled",    DUST_SETTING_BOOL,  &gConfig.enabled,   0.0f, 1.0f, "Enabled" },
-    { "Intensity",  DUST_SETTING_FLOAT, &gConfig.intensity,  0.0f, 2.0f, "Intensity" },
-    { "Threshold",  DUST_SETTING_FLOAT, &gConfig.threshold,  0.0f, 5.0f, "Threshold" },
-    { "Radius",     DUST_SETTING_FLOAT, &gConfig.radius,    0.5f, 3.0f, "Radius" },
-    { "Curve",      DUST_SETTING_FLOAT, &gConfig.curve,     0.5f, 3.0f, "Curve" },
-    { "Debug View", DUST_SETTING_BOOL,  &gConfig.debugView,  0.0f, 1.0f, "DebugView" },
+    { "Enabled",     DUST_SETTING_BOOL,  &gConfig.enabled,    0.0f, 1.0f, "Enabled",   nullptr, "Enable or disable the bloom effect" },
+    { "Intensity",   DUST_SETTING_FLOAT, &gConfig.intensity,  0.0f, 2.0f, "Intensity",  nullptr, "Overall bloom brightness multiplier" },
+    { "Threshold",   DUST_SETTING_FLOAT, &gConfig.threshold,  0.0f, 5.0f, "Threshold",  nullptr, "Minimum brightness for a pixel to contribute to bloom" },
+    { "Soft Knee",   DUST_SETTING_FLOAT, &gConfig.softKnee,   0.0f, 1.0f, "SoftKnee",   nullptr, "Smoothness of the threshold cutoff (0 = hard, 1 = soft)" },
+    { "Radius",      DUST_SETTING_FLOAT, &gConfig.radius,     0.5f, 3.0f, "Radius",     nullptr, "Size of the bloom blur kernel" },
+    { "Curve",       DUST_SETTING_FLOAT, &gConfig.curve,      0.5f, 3.0f, "Curve",      nullptr, "Controls how bloom fades with distance from bright areas" },
+    { "Scatter",     DUST_SETTING_FLOAT, &gConfig.scatter,    0.1f, 1.0f, "Scatter",    nullptr, "How far bloom spreads across mip levels (higher = wider glow)" },
+    { "Glow Amount", DUST_SETTING_FLOAT, &gConfig.glowAmount, 0.0f, 1.0f, "GlowAmount", nullptr, "Extra scatter on deeper mips for visible halos around bright objects" },
+    { "Mip Levels",  DUST_SETTING_INT,   &gConfig.mipLevels,  3.0f, 8.0f, "MipLevels",  nullptr, "Number of blur passes (more = wider bloom, higher cost)" },
+    { "Debug View",  DUST_SETTING_BOOL,  &gConfig.debugView,  0.0f, 1.0f, "DebugView",  nullptr, "Show raw bloom contribution before compositing" },
 };
 
 // ==================== Plugin entry ====================

@@ -110,17 +110,17 @@ static int SSSIsEnabled()
 // ==================== GUI Settings ====================
 
 static DustSettingDesc gSettingsArray[] = {
-    { "Enabled",        DUST_SETTING_BOOL,  &gSSSConfig.enabled,        0.0f,    1.0f,     "Enabled" },
-    { "Strength",       DUST_SETTING_FLOAT, &gSSSConfig.strength,       0.0f,    1.0f,     "Strength" },
-    { "Max Distance",   DUST_SETTING_FLOAT, &gSSSConfig.maxDistance,    0.0005f, 0.05f,    "MaxDistance" },
-    { "Step Count",     DUST_SETTING_INT,   &gSSSConfig.stepCount,      4.0f,    64.0f,    "StepCount" },
-    { "Thickness",      DUST_SETTING_FLOAT, &gSSSConfig.thickness,      0.0001f, 0.01f,    "Thickness" },
-    { "Depth Bias",     DUST_SETTING_FLOAT, &gSSSConfig.depthBias,      0.0f,    0.001f,   "DepthBias" },
-    { "Max Depth",      DUST_SETTING_FLOAT, &gSSSConfig.maxDepth,       0.01f,   1.0f,     "MaxDepth" },
-    { "Blur Sharpness", DUST_SETTING_FLOAT, &gSSSConfig.blurSharpness,  0.0f,    0.1f,     "BlurSharpness" },
-    { "Debug View",     DUST_SETTING_BOOL,  &gSSSConfig.debugView,      0.0f,    1.0f,     "DebugView" },
+    { "Enabled",        DUST_SETTING_BOOL,  &gSSSConfig.enabled,        0.0f,    1.0f,   "Enabled",       nullptr, "Enable or disable screen space shadows" },
+    { "Strength",       DUST_SETTING_FLOAT, &gSSSConfig.strength,       0.0f,    1.0f,   "Strength",      nullptr, "Shadow darkening intensity" },
+    { "Max Distance",   DUST_SETTING_FLOAT, &gSSSConfig.maxDistance,    0.0005f, 0.05f,  "MaxDistance",   nullptr, "Maximum ray marching distance in screen space" },
+    { "Step Count",     DUST_SETTING_INT,   &gSSSConfig.stepCount,      4.0f,    64.0f,  "StepCount",     nullptr, "Number of ray marching steps (more = higher quality, higher cost)" },
+    { "Thickness",      DUST_SETTING_FLOAT, &gSSSConfig.thickness,      0.0001f, 0.01f,  "Thickness",     nullptr, "Assumed surface thickness for shadow testing" },
+    { "Depth Bias",     DUST_SETTING_FLOAT, &gSSSConfig.depthBias,      0.0f,    0.001f, "DepthBias",     nullptr, "Offset to prevent self-shadowing artifacts" },
+    { "Max Depth",      DUST_SETTING_FLOAT, &gSSSConfig.maxDepth,       0.01f,   1.0f,   "MaxDepth",      nullptr, "Maximum depth to apply shadows (skip distant objects)" },
+    { "Blur Sharpness", DUST_SETTING_FLOAT, &gSSSConfig.blurSharpness,  0.0f,    0.1f,   "BlurSharpness", nullptr, "Edge-aware blur sharpness (higher = preserves more detail)" },
+    { "Debug View",     DUST_SETTING_BOOL,  &gSSSConfig.debugView,      0.0f,    1.0f,   "DebugView",     nullptr, "Show raw shadow mask before compositing" },
     // Hidden settings
-    { "Tan Half FOV",   DUST_SETTING_HIDDEN_FLOAT, &gSSSConfig.tanHalfFov, 0.1f, 2.0f,     "TanHalfFov" },
+    { "Tan Half FOV",   DUST_SETTING_HIDDEN_FLOAT, &gSSSConfig.tanHalfFov, 0.1f, 2.0f,   "TanHalfFov" },
 };
 
 // Plugin entry point

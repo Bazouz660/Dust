@@ -222,21 +222,28 @@ static int DOFIsEnabled()
 
 // ==================== GUI Settings ====================
 
+static const char* const gBlurShapeLabels[] = { "Gaussian", "Disc (Bokeh)", "Hexagonal", nullptr };
+
 static DustSettingDesc gSettingsArray[] = {
-    { "Enabled",          DUST_SETTING_BOOL,  &gDOFConfig.enabled,          0.0f,   1.0f,   "Enabled" },
-    { "Auto Focus",       DUST_SETTING_BOOL,  &gDOFConfig.autoFocus,        0.0f,   1.0f,   "AutoFocus" },
-    { "Focus Speed",      DUST_SETTING_FLOAT, &gDOFConfig.autoFocusSpeed,   0.5f,   20.0f,  "AutoFocusSpeed" },
-    { "Focus Distance",   DUST_SETTING_FLOAT, &gDOFConfig.focusDistance,    0.001f, 0.1f,   "FocusDistance" },
-    { "Near Start",       DUST_SETTING_FLOAT, &gDOFConfig.nearStart,       0.0001f, 0.05f,  "NearStart" },
-    { "Near End",         DUST_SETTING_FLOAT, &gDOFConfig.nearEnd,         0.001f,  0.1f,   "NearEnd" },
-    { "Near Strength",    DUST_SETTING_FLOAT, &gDOFConfig.nearStrength,    0.0f,    1.0f,   "NearStrength" },
-    { "Far Start",        DUST_SETTING_FLOAT, &gDOFConfig.farStart,        0.0001f, 0.05f,  "FarStart" },
-    { "Far End",          DUST_SETTING_FLOAT, &gDOFConfig.farEnd,          0.001f,  0.1f,   "FarEnd" },
-    { "Far Strength",     DUST_SETTING_FLOAT, &gDOFConfig.farStrength,     0.0f,    1.0f,   "FarStrength" },
-    { "Blur Radius",      DUST_SETTING_FLOAT, &gDOFConfig.blurRadius,      1.0f,    32.0f,  "BlurRadius" },
-    { "Blur Downscale",   DUST_SETTING_INT,   &gDOFConfig.blurDownscale,   2.0f,    4.0f,   "BlurDownscale" },
-    { "Max Depth",        DUST_SETTING_FLOAT, &gDOFConfig.maxDepth,        0.01f,   1.0f,   "MaxDepth" },
-    { "Debug View",       DUST_SETTING_BOOL,  &gDOFConfig.debugView,       0.0f,    1.0f,   "DebugView" },
+    { "Enabled",             DUST_SETTING_BOOL,  &gDOFConfig.enabled,            0.0f,   1.0f,   "Enabled",            nullptr, "Enable or disable depth of field" },
+    { "Auto Focus",          DUST_SETTING_BOOL,  &gDOFConfig.autoFocus,          0.0f,   1.0f,   "AutoFocus",          nullptr, "Automatically focus on the object at screen center" },
+    { "Focus Speed",         DUST_SETTING_FLOAT, &gDOFConfig.autoFocusSpeed,     0.5f,   20.0f,  "AutoFocusSpeed",     nullptr, "How quickly auto-focus adapts to new targets" },
+    { "Focus Distance",      DUST_SETTING_FLOAT, &gDOFConfig.focusDistance,      0.001f, 0.1f,   "FocusDistance",      nullptr, "Manual focus distance (used when Auto Focus is off)" },
+    { "Near Start",          DUST_SETTING_FLOAT, &gDOFConfig.nearStart,          0.0001f, 0.05f, "NearStart",          nullptr, "Distance before focus where near blur begins" },
+    { "Near End",            DUST_SETTING_FLOAT, &gDOFConfig.nearEnd,            0.001f,  0.1f,  "NearEnd",            nullptr, "Distance before focus where near blur reaches maximum" },
+    { "Near Strength",       DUST_SETTING_FLOAT, &gDOFConfig.nearStrength,       0.0f,    1.0f,  "NearStrength",       nullptr, "Maximum near blur intensity (0 = no near blur)" },
+    { "Far Start",           DUST_SETTING_FLOAT, &gDOFConfig.farStart,           0.0001f, 0.05f, "FarStart",           nullptr, "Distance past focus where far blur begins" },
+    { "Far End",             DUST_SETTING_FLOAT, &gDOFConfig.farEnd,             0.001f,  0.1f,  "FarEnd",             nullptr, "Distance past focus where far blur reaches maximum" },
+    { "Far Strength",        DUST_SETTING_FLOAT, &gDOFConfig.farStrength,        0.0f,    1.0f,  "FarStrength",        nullptr, "Maximum far blur intensity (0 = no far blur)" },
+    { "Blur Radius",         DUST_SETTING_FLOAT, &gDOFConfig.blurRadius,         1.0f,    32.0f, "BlurRadius",         nullptr, "Size of the blur kernel in pixels" },
+    { "Blur Downscale",      DUST_SETTING_INT,   &gDOFConfig.blurDownscale,      2.0f,    4.0f,  "BlurDownscale",      nullptr, "Resolution divisor for blur passes (2 = half, 4 = quarter)" },
+    { "Blur Shape",          DUST_SETTING_ENUM,  &gDOFConfig.blurShape,          0.0f,    2.0f,  "BlurShape",          gBlurShapeLabels, "Blur kernel shape for out-of-focus areas" },
+    { "Max Depth",           DUST_SETTING_FLOAT, &gDOFConfig.maxDepth,           0.01f,   1.0f,  "MaxDepth",           nullptr, "Maximum depth to process (skip distant objects and sky)" },
+    { "Physical DoF",        DUST_SETTING_BOOL,  &gDOFConfig.physicalCoC,        0.0f,    1.0f,  "PhysicalCoC",        nullptr, "Use thin-lens aperture model instead of manual near/far ramps" },
+    { "Aperture",            DUST_SETTING_FLOAT, &gDOFConfig.aperture,           0.001f,  0.1f,  "Aperture",           nullptr, "Lens aperture size for physical DoF (smaller = deeper focus)" },
+    { "Highlight Threshold", DUST_SETTING_FLOAT, &gDOFConfig.highlightThreshold, 0.0f,    1.0f,  "HighlightThreshold", nullptr, "Brightness above which highlights bleed through blur" },
+    { "Highlight Boost",     DUST_SETTING_FLOAT, &gDOFConfig.highlightBoost,     0.0f,    5.0f,  "HighlightBoost",     nullptr, "Strength of highlight bleed-through in blurred areas" },
+    { "Debug View",          DUST_SETTING_BOOL,  &gDOFConfig.debugView,          0.0f,    1.0f,  "DebugView",          nullptr, "Visualize the circle of confusion as a color overlay" },
 };
 
 // Plugin entry point

@@ -87,11 +87,11 @@ static int ClarityIsEnabled()
 // ==================== GUI Settings ====================
 
 static DustSettingDesc gSettingsArray[] = {
-    { "Enabled",          DUST_SETTING_BOOL,  &gClarityConfig.enabled,        0.0f, 1.0f,  "Enabled" },
-    { "Strength",         DUST_SETTING_FLOAT, &gClarityConfig.strength,       0.0f, 2.0f,  "Strength" },
-    { "Midtone Protect",  DUST_SETTING_FLOAT, &gClarityConfig.midtoneProtect, 0.0f, 1.0f,  "MidtoneProtect" },
-    { "Blur Radius",      DUST_SETTING_FLOAT, &gClarityConfig.blurRadius,     1.0f, 32.0f, "BlurRadius" },
-    { "Debug View",       DUST_SETTING_BOOL,  &gClarityConfig.debugView,      0.0f, 1.0f,  "DebugView" },
+    { "Enabled",          DUST_SETTING_BOOL,  &gClarityConfig.enabled,        0.0f, 1.0f,  "Enabled",        nullptr, "Enable or disable the clarity effect" },
+    { "Strength",         DUST_SETTING_FLOAT, &gClarityConfig.strength,       0.0f, 2.0f,  "Strength",       nullptr, "Intensity of local contrast enhancement" },
+    { "Midtone Protect",  DUST_SETTING_FLOAT, &gClarityConfig.midtoneProtect, 0.0f, 1.0f,  "MidtoneProtect", nullptr, "Protect midtones from over-sharpening (0 = no protection)" },
+    { "Blur Radius",      DUST_SETTING_FLOAT, &gClarityConfig.blurRadius,     1.0f, 32.0f, "BlurRadius",     nullptr, "Size of the detail extraction blur" },
+    { "Debug View",       DUST_SETTING_BOOL,  &gClarityConfig.debugView,      0.0f, 1.0f,  "DebugView",      nullptr, "Show the extracted detail layer" },
 };
 
 // Plugin entry point
