@@ -211,12 +211,14 @@ bool PipelineDetector::IsFogPass(ID3D11DeviceContext* ctx)
 }
 
 // Detect tonemap pass: fullscreen draw where:
-//   1. RT format = B8G8R8A8_UNORM (LDR output) at full resolution
+//   1. RT format = 8-bit UNORM LDR (B8G8R8A8 or R8G8B8A8) at full resolution
 //   2. SRV[0] = R11G11B10_FLOAT (HDR scene — the same target lighting wrote to)
-// This distinguishes tonemap from FXAA/heat haze which read B8G8R8A8_UNORM, not R11G11B10.
+// This distinguishes tonemap from FXAA/heat haze which read LDR, not R11G11B10.
+// Both BGRA and RGBA variants are accepted because Ogre's compositor chain may
+// write to an intermediate B8G8R8A8 texture (when post-tonemap effects exist)
+// or directly to the R8G8B8A8 swap chain backbuffer (when they're all disabled).
 bool PipelineDetector::IsTonemapPass(ID3D11DeviceContext* ctx)
 {
-    // Check RT format is B8G8R8A8_UNORM
     ID3D11RenderTargetView* rt = nullptr;
     ctx->OMGetRenderTargets(1, &rt, nullptr);
     if (!rt)
@@ -225,12 +227,13 @@ bool PipelineDetector::IsTonemapPass(ID3D11DeviceContext* ctx)
     D3D11_RENDER_TARGET_VIEW_DESC rtDesc;
     rt->GetDesc(&rtDesc);
 
-    // Also check the RT is at full resolution (not a downscale pass)
     ID3D11Resource* rtResource = nullptr;
     rt->GetResource(&rtResource);
     rt->Release();
 
-    if (rtDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM)
+    bool isLDR = (rtDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                  rtDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM);
+    if (!isLDR)
     {
         if (rtResource) rtResource->Release();
         return false;
@@ -276,8 +279,12 @@ void PipelineDetector::CaptureTonemapResources(ID3D11DeviceContext* ctx)
     // Capture LDR RTV (tonemap output)
     ID3D11RenderTargetView* rtv = nullptr;
     ctx->OMGetRenderTargets(1, &rtv, nullptr);
+    DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
     if (rtv)
     {
+        D3D11_RENDER_TARGET_VIEW_DESC desc;
+        rtv->GetDesc(&desc);
+        fmt = desc.Format;
         gResourceRegistry.SetRTV(ResourceName::LDR_RTV, rtv);
         rtv->Release();
     }
@@ -285,8 +292,8 @@ void PipelineDetector::CaptureTonemapResources(ID3D11DeviceContext* ctx)
     static bool sLogged = false;
     if (!sLogged)
     {
-        Log("Pipeline: Tonemap pass detected (ldrRT=%p)",
-            gResourceRegistry.GetRTV(ResourceName::LDR_RTV));
+        Log("Pipeline: Tonemap pass detected (ldrRT=%p, fmt=%u)",
+            gResourceRegistry.GetRTV(ResourceName::LDR_RTV), (unsigned)fmt);
         sLogged = true;
     }
 }

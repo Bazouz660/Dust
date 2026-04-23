@@ -1,5 +1,6 @@
 // Hexagonal blur - 6-blade aperture bokeh shape (replaces separable Gaussian)
-// Single-pass gather with grid sampling and hex distance masking
+// Single-pass gather with grid sampling and hex distance masking.
+// Brightness-weighted: bright samples dominate, creating visible hex bokeh.
 
 Texture2D sceneTex       : register(t0);
 SamplerState linearClamp : register(s0);
@@ -39,15 +40,17 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         {
             float2 p = float2(x, y) * invGrid;
 
-            // Flat-top hexagonal distance
             float2 q = abs(p);
             float hexDist = max(q.x * 0.866025 + q.y * 0.5, q.y);
 
             if (hexDist <= 1.0)
             {
                 float2 offset = p * blurRadius * texelSize;
-                total += sceneTex.SampleLevel(linearClamp, uv + offset, 0).rgb;
-                totalWeight += 1.0;
+                float3 s = sceneTex.SampleLevel(linearClamp, uv + offset, 0).rgb;
+                float b = max(s.r, max(s.g, s.b));
+                float w = 1.0 + max(0.0, b - highlightThreshold) * highlightBoost;
+                total += s * w;
+                totalWeight += w;
             }
         }
     }

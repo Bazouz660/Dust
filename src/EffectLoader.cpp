@@ -683,6 +683,8 @@ void EffectLoader::EffectConfigSaveTo(LoadedEffect& le, const std::string& prese
     std::string iniPath = presetDir + "\\" + std::string(section) + ".ini";
     char buf[64];
 
+    WritePrivateProfileStringA(section, nullptr, nullptr, iniPath.c_str());
+
     for (uint32_t i = 0; i < le.desc.settingCount; i++)
     {
         const DustSettingDesc& s = le.desc.settings[i];

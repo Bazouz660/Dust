@@ -1,5 +1,7 @@
 #include "../../src/DustAPI.h"
 #include "DustLog.h"
+#include "SMAAAreaTex.h"
+#include "SMAASearchTex.h"
 
 #include <d3d11.h>
 #include <cstring>
@@ -50,6 +52,11 @@ struct SMAATexture {
 static SMAATexture gEdgeTex;
 static SMAATexture gBlendTex;
 static uint32_t gWidth = 0, gHeight = 0;
+
+static ID3D11Texture2D*          gAreaTexture  = nullptr;
+static ID3D11ShaderResourceView* gAreaSRV      = nullptr;
+static ID3D11Texture2D*          gSearchTexture = nullptr;
+static ID3D11ShaderResourceView* gSearchSRV    = nullptr;
 
 struct SMAACB {
     float invWidth, invHeight, width, height;
@@ -159,6 +166,47 @@ static int SMAAInit(ID3D11Device* device, uint32_t width, uint32_t height, const
 
     if (!CreateTextures(device, width, height)) return -8;
 
+    {
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width            = AREATEX_WIDTH;
+        td.Height           = AREATEX_HEIGHT;
+        td.MipLevels        = 1;
+        td.ArraySize        = 1;
+        td.Format           = DXGI_FORMAT_R8G8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage            = D3D11_USAGE_IMMUTABLE;
+        td.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
+
+        D3D11_SUBRESOURCE_DATA init = {};
+        init.pSysMem    = areaTexBytes;
+        init.SysMemPitch = AREATEX_PITCH;
+
+        if (FAILED(device->CreateTexture2D(&td, &init, &gAreaTexture)))
+        { Log("SMAA: Failed to create area texture"); return -9; }
+        if (FAILED(device->CreateShaderResourceView(gAreaTexture, nullptr, &gAreaSRV)))
+        { Log("SMAA: Failed to create area SRV"); return -10; }
+    }
+    {
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width            = SEARCHTEX_WIDTH;
+        td.Height           = SEARCHTEX_HEIGHT;
+        td.MipLevels        = 1;
+        td.ArraySize        = 1;
+        td.Format           = DXGI_FORMAT_R8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage            = D3D11_USAGE_IMMUTABLE;
+        td.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
+
+        D3D11_SUBRESOURCE_DATA init = {};
+        init.pSysMem    = searchTexBytes;
+        init.SysMemPitch = SEARCHTEX_PITCH;
+
+        if (FAILED(device->CreateTexture2D(&td, &init, &gSearchTexture)))
+        { Log("SMAA: Failed to create search texture"); return -11; }
+        if (FAILED(device->CreateShaderResourceView(gSearchTexture, nullptr, &gSearchSRV)))
+        { Log("SMAA: Failed to create search SRV"); return -12; }
+    }
+
     Log("SMAA: Initialized (%ux%u)", width, height);
     return 0;
 }
@@ -167,15 +215,19 @@ static void SMAAShutdown()
 {
     ReleaseTexture(gEdgeTex);
     ReleaseTexture(gBlendTex);
-    if (gRasterState)   { gRasterState->Release();   gRasterState = nullptr; }
-    if (gNoDepth)       { gNoDepth->Release();       gNoDepth = nullptr; }
-    if (gNoBlend)       { gNoBlend->Release();       gNoBlend = nullptr; }
-    if (gLinearSampler) { gLinearSampler->Release();  gLinearSampler = nullptr; }
-    if (gPointSampler)  { gPointSampler->Release();   gPointSampler = nullptr; }
-    if (gCB)            { gCB->Release();             gCB = nullptr; }
-    if (gResolvePS)     { gResolvePS->Release();      gResolvePS = nullptr; }
-    if (gBlendWeightPS) { gBlendWeightPS->Release();  gBlendWeightPS = nullptr; }
-    if (gEdgeDetectPS)  { gEdgeDetectPS->Release();   gEdgeDetectPS = nullptr; }
+    if (gSearchSRV)     { gSearchSRV->Release();      gSearchSRV = nullptr; }
+    if (gSearchTexture) { gSearchTexture->Release();   gSearchTexture = nullptr; }
+    if (gAreaSRV)       { gAreaSRV->Release();         gAreaSRV = nullptr; }
+    if (gAreaTexture)   { gAreaTexture->Release();     gAreaTexture = nullptr; }
+    if (gRasterState)   { gRasterState->Release();     gRasterState = nullptr; }
+    if (gNoDepth)       { gNoDepth->Release();         gNoDepth = nullptr; }
+    if (gNoBlend)       { gNoBlend->Release();         gNoBlend = nullptr; }
+    if (gLinearSampler) { gLinearSampler->Release();   gLinearSampler = nullptr; }
+    if (gPointSampler)  { gPointSampler->Release();    gPointSampler = nullptr; }
+    if (gCB)            { gCB->Release();              gCB = nullptr; }
+    if (gResolvePS)     { gResolvePS->Release();       gResolvePS = nullptr; }
+    if (gBlendWeightPS) { gBlendWeightPS->Release();   gBlendWeightPS = nullptr; }
+    if (gEdgeDetectPS)  { gEdgeDetectPS->Release();    gEdgeDetectPS = nullptr; }
     gDevice = nullptr;
     Log("SMAA: Shut down");
 }
@@ -256,11 +308,16 @@ static void SMAAPostExecute(const DustFrameContext* ctx, const DustHostAPI* host
         dc->OMSetRenderTargets(1, &gBlendTex.rtv, nullptr);
 
         dc->PSSetShaderResources(0, 1, &gEdgeTex.srv);
-        dc->PSSetSamplers(0, 1, &gPointSampler);
+        dc->PSSetShaderResources(1, 1, &gAreaSRV);
+        dc->PSSetShaderResources(2, 1, &gSearchSRV);
+        ID3D11SamplerState* bwSamplers[2] = { gPointSampler, gLinearSampler };
+        dc->PSSetSamplers(0, 2, bwSamplers);
 
         host->DrawFullscreenTriangle(dc, gBlendWeightPS);
 
         dc->PSSetShaderResources(0, 1, &nullSRV);
+        dc->PSSetShaderResources(1, 1, &nullSRV);
+        dc->PSSetShaderResources(2, 1, &nullSRV);
     }
 
     if (gConfig.showWeights)
@@ -303,11 +360,9 @@ static const char* const gEdgeModeLabels[] = { "Luma", "Depth", "Luma + Depth", 
 
 static DustSettingDesc gSettings[] = {
     { "Enabled",         DUST_SETTING_BOOL,    &gConfig.enabled,        0.0f,  1.0f, "Enabled",        nullptr,          "Enable or disable anti-aliasing" },
-    { "Edge Detection",  DUST_SETTING_SECTION, nullptr,                 0, 0,        nullptr,          nullptr,          nullptr },
     { "Mode",            DUST_SETTING_ENUM,    &gConfig.edgeMode,       0.0f,  2.0f, "EdgeMode",       gEdgeModeLabels,  "Edge detection method: Luma, Depth, or both" },
     { "Luma Threshold",  DUST_SETTING_FLOAT,   &gConfig.lumaThreshold,  0.05f, 0.5f, "LumaThreshold",  nullptr,          "Sensitivity for luma-based edge detection (lower = more edges)" },
     { "Depth Threshold", DUST_SETTING_FLOAT,   &gConfig.depthThreshold, 0.001f,0.1f, "DepthThreshold", nullptr,          "Sensitivity for depth-based edge detection (lower = more edges)" },
-    { "Debug",           DUST_SETTING_SECTION, nullptr,                 0, 0,        nullptr,          nullptr,          nullptr },
     { "Show Edges",      DUST_SETTING_BOOL,    &gConfig.showEdges,      0.0f,  1.0f, "ShowEdges",      nullptr,          "Visualize detected edges" },
     { "Show Weights",    DUST_SETTING_BOOL,    &gConfig.showWeights,    0.0f,  1.0f, "ShowWeights",    nullptr,          "Visualize blending weights" },
 };

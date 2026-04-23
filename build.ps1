@@ -36,7 +36,7 @@ Build-Project (Join-Path $Root "boot\DustBoot.vcxproj")
 Build-Project (Join-Path $Root "src\Dust.vcxproj")
 
 # Build effect plugins (SSS excluded — not release-ready)
-$Effects = @("ssao", "lut", "bloom", "dof", "ssil", "clarity", "outline", "kuwahara", "rtgi", "shadows")
+$Effects = @("ssao", "lut", "bloom", "dof", "ssil", "clarity", "outline", "kuwahara", "rtgi", "shadows", "smaa", "chromaticaberration", "deband", "filmgrain", "letterbox", "vignette")
 foreach ($effect in $Effects) {
     $vcxproj = Get-ChildItem (Join-Path $Root "effects\$effect\*.vcxproj") | Select-Object -First 1
     Build-Project $vcxproj.FullName

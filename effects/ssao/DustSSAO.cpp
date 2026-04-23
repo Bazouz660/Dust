@@ -272,6 +272,7 @@ static DustSettingDesc gSettingsArray[] = {
     { "Max Screen Radius",  DUST_SETTING_FLOAT, &gSSAOConfig.maxScreenRadius,     0.005f,  0.2f,   "MaxScreenRadius",nullptr, "Maximum sample radius in screen space" },
     { "Min Screen Radius",  DUST_SETTING_FLOAT, &gSSAOConfig.minScreenRadius,     0.0001f, 0.01f,  "MinScreenRadius",nullptr, "Minimum sample radius in screen space" },
     { "Blur Sharpness",     DUST_SETTING_FLOAT, &gSSAOConfig.blurSharpness,       0.0f,    0.1f,   "BlurSharpness",  nullptr, "Edge-aware blur sharpness (higher = preserves more detail)" },
+    { "Normal Detail",     DUST_SETTING_FLOAT, &gSSAOConfig.normalDetail,        0.0f,    1.0f,   "NormalDetail",   nullptr, "Normal map influence (0 = smooth geometry, 1 = full detail)" },
     { "Direct Light AO",   DUST_SETTING_FLOAT, &gSSAOConfig.directLightOcclusion, 0.0f,    1.0f,   "DirectLightAO",  nullptr, "How much AO affects directly lit areas" },
     { "Samples",            DUST_SETTING_INT,   &gSSAOConfig.sampleCount,         4.0f,    12.0f,  "Samples",        nullptr, "Number of sampling directions per pixel" },
     { "Steps",              DUST_SETTING_INT,   &gSSAOConfig.stepCount,           2.0f,    6.0f,   "Steps",          nullptr, "Number of samples per direction" },

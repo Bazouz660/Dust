@@ -12,6 +12,7 @@ struct RTGIConfig
     float thickness     = 0.1f;    // depth thickness for hit detection
     float thicknessCurve = 0.8f;   // depth exponent (1 = linear, <1 = thinner far away)
     float fadeDistance   = 0.15f;   // depth at which GI fades out
+    float normalDetail   = 0.5f;   // blend between geometric (0) and gbuffer normals (1)
 
     // Lighting
     float giIntensity   = 3.0f;    // final indirect light brightness (applied at composite)
@@ -27,9 +28,9 @@ struct RTGIConfig
     float depthSigma    = 2.0f;    // depth weight sensitivity (higher = more permissive on smooth surfaces)
     float phiColor      = 4.0f;    // luminance sensitivity (variance-guided, higher = smoother)
 
-    // Quality — 0=full, 1=half, 2=quarter. Sub-pixel temporal jitter
-    // (Halton 2,3) reclaims most of the detail lost at reduced resolution.
-    int   resolutionMode = 0;
+    // Quality — render resolution as percentage of native (25-100).
+    // Sub-pixel temporal jitter (Halton 2,3) reclaims detail at reduced resolution.
+    int   resolutionScale = 50;
 
     // Camera (hidden)
     float tanHalfFov    = 0.5218f;

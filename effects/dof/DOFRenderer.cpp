@@ -347,6 +347,8 @@ void Render(ID3D11DeviceContext* ctx,
         cb.maxDepth = gDOFConfig.maxDepth;
         cb.cocMode = gDOFConfig.physicalCoC ? 1 : 0;
         cb.aperture = gDOFConfig.aperture;
+        cb.highlightThreshold = gDOFConfig.highlightThreshold;
+        cb.highlightBoost = gDOFConfig.highlightBoost;
         gHost->UpdateConstantBuffer(ctx, gDOFCB, &cb, sizeof(cb));
 
         ctx->OMSetRenderTargets(1, &gCocRTV, nullptr);
@@ -378,6 +380,8 @@ void Render(ID3D11DeviceContext* ctx,
         cb.texelSize[0] = 1.0f / (float)bw;
         cb.texelSize[1] = 1.0f / (float)bh;
         cb.blurRadius = gDOFConfig.blurRadius;
+        cb.highlightThreshold = gDOFConfig.highlightThreshold;
+        cb.highlightBoost = gDOFConfig.highlightBoost;
         gHost->UpdateConstantBuffer(ctx, gDOFCB, &cb, sizeof(cb));
 
         D3D11_VIEWPORT vp = { 0, 0, (float)bw, (float)bh, 0, 1 };

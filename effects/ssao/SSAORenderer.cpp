@@ -70,7 +70,8 @@ struct SSAOCBData
     float noiseScale;
     float numDirections;
     float numSteps;
-    float _pad0[3];
+    float normalDetail;
+    float _pad0[2];
     float camRight[4];
     float camUp[4];
     float camForward[4];
@@ -372,6 +373,7 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
         cb.noiseScale = 1.0f;
         cb.numDirections = (float)numDirs;
         cb.numSteps = (float)numSteps;
+        cb.normalDetail = gSSAOConfig.normalDetail;
         if (camera && camera->valid)
         {
             const float* iv = camera->inverseView;

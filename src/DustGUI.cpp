@@ -520,6 +520,9 @@ static void OnOverlayClose()
         memset(gWmKeysEaten, 0, sizeof(gWmKeysEaten));
     }
 
+    // Reset DI blocking state so no stale transition fires on next poll
+    gKbWasBlocking = false;
+
     // Restore cursor clipping (game usually clips cursor to window)
     if (gHadClipRect)
         ClipCursor(&gSavedClipRect);
@@ -568,12 +571,12 @@ static LRESULT CALLBACK DustWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         // Let ImGui process the message for its own UI state
         ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
 
-        // Block all game input when the mouse is hovering over the GUI
+        // Block game input when the mouse is hovering over the GUI
         bool isMouse = (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST);
         bool isKeyboard = (msg >= WM_KEYFIRST && msg <= WM_KEYLAST);
-        if ((isMouse || isKeyboard || msg == WM_INPUT) && ImGui::GetIO().WantCaptureMouse)
+        bool eatInput = (isMouse || isKeyboard || msg == WM_INPUT) && ImGui::GetIO().WantCaptureMouse;
+        if (eatInput)
         {
-            // Track swallowed key-downs so OnOverlayClose can send matching key-ups
             if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)
             {
                 if (wParam < 256)
@@ -581,11 +584,19 @@ static LRESULT CALLBACK DustWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             }
             else if (msg == WM_KEYUP || msg == WM_SYSKEYUP)
             {
-                if (wParam < 256)
+                // Don't eat key-UPs whose key-DOWN went to the game
+                if (wParam < 256 && !gWmKeysEaten[wParam])
+                    eatInput = false;
+                else if (wParam < 256)
                     gWmKeysEaten[wParam] = 0;
             }
-            return 0;
+            if (eatInput)
+                return 0;
         }
+
+        // Clear eaten-key tracking when key-UPs pass through to the game
+        if ((msg == WM_KEYUP || msg == WM_SYSKEYUP) && wParam < 256)
+            gWmKeysEaten[wParam] = 0;
     }
     else if (gInitialized)
     {
@@ -1125,16 +1136,27 @@ static void DrawPerformanceSection()
     ImGui::Separator();
     ImGui::Spacing();
 
-    // Per-effect GPU timing
+    // Per-effect GPU timing (only active effects)
     ImGui::Text("Effect GPU Times:");
     ImGui::Spacing();
 
     float totalEffectMs = 0.0f;
     size_t count = gEffectLoader.Count();
+
+    int maxNameLen = 0;
     for (size_t i = 0; i < count; i++)
     {
         const LoadedEffect& le = gEffectLoader.GetEffect(i);
-        if (!le.initialized) continue;
+        if (!le.initialized || !IsEffectEnabled(le)) continue;
+        const char* name = le.desc.name ? le.desc.name : "Unnamed";
+        int len = (int)strlen(name);
+        if (len > maxNameLen) maxNameLen = len;
+    }
+
+    for (size_t i = 0; i < count; i++)
+    {
+        const LoadedEffect& le = gEffectLoader.GetEffect(i);
+        if (!le.initialized || !IsEffectEnabled(le)) continue;
 
         const char* name = le.desc.name ? le.desc.name : "Unnamed";
         float gpuMs = gEffectLoader.GetEffectGpuTime(i);
@@ -1143,18 +1165,17 @@ static void DrawPerformanceSection()
 
         totalEffectMs += gpuMs;
 
-        // Color based on cost
-        ImVec4 color = ImVec4(0.4f, 1.0f, 0.4f, 1.0f); // green
-        if (gpuMs > 2.0f) color = ImVec4(1.0f, 1.0f, 0.4f, 1.0f); // yellow
-        if (gpuMs > 5.0f) color = ImVec4(1.0f, 0.4f, 0.4f, 1.0f); // red
+        ImVec4 color = ImVec4(0.4f, 1.0f, 0.4f, 1.0f);
+        if (gpuMs > 2.0f) color = ImVec4(1.0f, 1.0f, 0.4f, 1.0f);
+        if (gpuMs > 5.0f) color = ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
 
         if (hasTiming)
         {
-            ImGui::TextColored(color, "  %-12s %.2f ms", name, gpuMs);
+            ImGui::TextColored(color, "  %-*s %.2f ms", maxNameLen, name, gpuMs);
         }
         else
         {
-            ImGui::TextDisabled("  %-12s (no timing)", name);
+            ImGui::TextDisabled("  %-*s (no timing)", maxNameLen, name);
         }
     }
 
@@ -1496,7 +1517,7 @@ void Render()
         ImGui::SameLine();
 
         // ---- Right pane: Effect settings ----
-        ImGui::BeginChild("##right", ImVec2(0, 0), true);
+        ImGui::BeginChild("##right", ImVec2(0, 0), true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
 
         size_t count = gEffectLoader.Count();
 
@@ -1506,17 +1527,14 @@ void Render()
         }
         else
         {
-            // Global preset selector
+            // Sticky header: preset selector + toggle + expand/collapse
             DrawPresetSection();
 
-            // Global effects toggle
             {
-                bool prev = gAllEffectsOn;
                 if (ImGui::Checkbox("Toggle Effects", &gAllEffectsOn))
                 {
                     if (!gAllEffectsOn)
                     {
-                        // Save which effects are currently enabled, then disable all
                         gEffectWasEnabled.resize(count);
                         for (size_t i = 0; i < count; i++)
                         {
@@ -1530,7 +1548,6 @@ void Render()
                     }
                     else
                     {
-                        // Restore only effects that were previously enabled
                         for (size_t i = 0; i < count && i < gEffectWasEnabled.size(); i++)
                         {
                             const LoadedEffect& le = gEffectLoader.GetEffect(i);
@@ -1555,6 +1572,9 @@ void Render()
             ImGui::Separator();
             ImGui::Spacing();
 
+            // Scrollable effects area
+            ImGui::BeginChild("##effects", ImVec2(0, 0), false);
+
             for (size_t i = 0; i < count; i++)
             {
                 const LoadedEffect& le = gEffectLoader.GetEffect(i);
@@ -1564,7 +1584,6 @@ void Render()
                 DrawEffectSection(i);
                 ImGui::PopID();
 
-                // Spacing between effects
                 if (i + 1 < count)
                 {
                     ImGui::Spacing();
@@ -1572,9 +1591,11 @@ void Render()
                 }
             }
             gForceCollapseState = 0;
+
+            ImGui::EndChild(); // ##effects
         }
 
-        ImGui::EndChild();
+        ImGui::EndChild(); // ##right
 
         ImGui::End();
     }

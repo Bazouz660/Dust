@@ -83,6 +83,20 @@ static void ExtractCameraData(ID3D11DeviceContext* ctx)
     psCB->GetDesc(&cbDesc);
     if (cbDesc.ByteWidth < 192) { psCB->Release(); return; }
 
+    if (gCameraStagingCBs[0])
+    {
+        D3D11_BUFFER_DESC stagingDesc;
+        gCameraStagingCBs[0]->GetDesc(&stagingDesc);
+        if (stagingDesc.ByteWidth != cbDesc.ByteWidth)
+        {
+            gCameraStagingCBs[0]->Release();
+            gCameraStagingCBs[1]->Release();
+            gCameraStagingCBs[0] = nullptr;
+            gCameraStagingCBs[1] = nullptr;
+            gCameraStagingReady = false;
+        }
+    }
+
     if (!gCameraStagingCBs[0])
     {
         D3D11_BUFFER_DESC sd = cbDesc;
@@ -249,10 +263,24 @@ static std::string PatchDeferredShader(const std::string& src)
     // Injection 3: Add cbuffer declaration + DustRTWShadow function.
     // Insert before main_vs so it's defined after includes (GetOffsetLocationS, ShadowMap)
     // but before use in main_fs.
+    // If the "Cliff Face Shadow Fix" workshop mod is present, its steep bias is already
+    // baked into the shadow_bias parameter passed to RTWShadow — skip our own to avoid doubling.
+    bool workshopSteepBias = (result.find("steepBias") != std::string::npos);
+    if (workshopSteepBias)
+        Log("ShaderPatch: detected workshop steep bias mod, skipping internal steep bias");
+
     const char* anchor3 = "void main_vs (";
     size_t pos3 = result.find(anchor3);
     if (pos3 != std::string::npos)
     {
+        std::string steepBlock = workshopSteepBias ? "" :
+            "\t// Steep surface bias: reduce shadow acne on cliffs and vertical faces\n"
+            "\tfloat ny = abs(normal.y);\n"
+            "\tfloat steep = saturate((0.42 - ny) * 4.25);\n"
+            "\tfloat farGate = saturate((dist - shadowRange * 0.10) * 0.0035);\n"
+            "\tb += (steep * steep) * farGate * 0.0032;\n"
+            "\n";
+
         std::string inject3 =
             "// [Dust] Shadow filtering parameters (bound by Shadows plugin at b2)\n"
             "cbuffer DustShadowParams : register(b2) {\n"
@@ -264,13 +292,15 @@ static std::string PatchDeferredShader(const std::string& src)
             "};\n\n"
             "// [Dust] Improved RTWSM shadow filtering (post-warp offsets)\n"
             "float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,\n"
-            "                     float3 worldPos, float b, float edgeBias, float2 screenPos) {\n"
+            "                     float3 worldPos, float b, float edgeBias, float2 screenPos,\n"
+            "                     float3 normal, float dist, float shadowRange) {\n"
             "\tfloat4 sc = mul(shadowMatrix, float4(worldPos, 1));\n"
             "\tfloat2 center = GetOffsetLocationS(wMap, sc.xy);\n"
             "\tfloat2 edge = saturate(abs(center - 0.5) * 20 - 9);\n"
             "\tb += edgeBias * (edge.x + edge.y);\n"
             "\tfloat sd = saturate(sc.z);\n"
             "\n"
+            + steepBlock +
             "\tfloat noise = frac(52.9829189 * frac(dot(screenPos, float2(0.06711056, 0.00583715))));\n"
             "\tfloat ang = noise * 6.28318530718;\n"
             "\tfloat sa, ca;\n"
@@ -316,6 +346,12 @@ static std::string PatchDeferredShader(const std::string& src)
             "\t\t}\n"
             "\t}\n"
             "\n"
+            "\t// Scale filter by NdotL: shadow texels stretch at grazing light angles,\n"
+            "\t// making the fixed UV-space filter appear wider on the surface.\n"
+            "\tfloat3 ld = normalize(shadowMatrix[2].xyz);\n"
+            "\tfloat NdotL = abs(dot(normal, ld));\n"
+            "\tfr *= max(sqrt(NdotL), 0.15);\n"
+            "\n"
             "\tfloat shadow = 0;\n"
             "\t[unroll]\n"
             "\tfor (int i = 0; i < 12; i++) {\n"
@@ -359,7 +395,7 @@ static std::string PatchDeferredShader(const std::string& src)
 
         std::string newExpr =
             "(dustShadowEnabled > 0.5) "
-            "? DustRTWShadow(" + params + ", pixel.xy) "
+            "? DustRTWShadow(" + params + ", pixel.xy, normal, distance, shadow_range) "
             ": " + originalCall;
 
         result.replace(funcStart, closeParen - funcStart + 1, newExpr);
@@ -369,6 +405,79 @@ static std::string PatchDeferredShader(const std::string& src)
     else
     {
         Log("ShaderPatch: '= RTWShadow(' not found, shadow redirect skipped");
+    }
+
+    return result;
+}
+
+// Patch vanilla objects.hlsl to fix foliage alpha threshold instability.
+// Replaces the hard binary clip with Bayer-dithered alpha testing and
+// stabilizes the threshold uniform against NaN / out-of-range values.
+static std::string PatchObjectsShader(const std::string& src)
+{
+    std::string result = src;
+
+    const char* anchor = "void main_vs(";
+    size_t pos = result.find(anchor);
+    if (pos == std::string::npos)
+    {
+        Log("ShaderPatch: objects anchor 'main_vs' not found, skipping");
+        return src;
+    }
+
+    std::string helpers =
+        "// [Dust] Foliage alpha threshold stabilizer\n"
+        "float DustStabilizeThreshold(float t)\n"
+        "{\n"
+        "\tif (!(t == t)) t = 0.30;\n"
+        "\tt = clamp(t, 0.02, 0.98);\n"
+        "\tconst float CENTER = 0.32;\n"
+        "\tconst float MAX_DEV = 0.08;\n"
+        "\tif (abs(t - CENTER) > MAX_DEV) t = CENTER;\n"
+        "\treturn t;\n"
+        "}\n\n"
+        "// [Dust] 4x4 ordered dither (Bayer)\n"
+        "float DustBayer4x4(float2 fragXY)\n"
+        "{\n"
+        "\tint2 p = int2(fragXY) & 3;\n"
+        "\tfloat4 r0 = float4(0.0, 8.0, 2.0, 10.0);\n"
+        "\tfloat4 r1 = float4(12.0, 4.0, 14.0, 6.0);\n"
+        "\tfloat4 r2 = float4(3.0, 11.0, 1.0, 9.0);\n"
+        "\tfloat4 r3 = float4(15.0, 7.0, 13.0, 5.0);\n"
+        "\tfloat v;\n"
+        "\tif (p.y == 0) v = r0[p.x];\n"
+        "\telse if (p.y == 1) v = r1[p.x];\n"
+        "\telse if (p.y == 2) v = r2[p.x];\n"
+        "\telse v = r3[p.x];\n"
+        "\treturn (v + 0.5) / 16.0;\n"
+        "}\n\n";
+    result.insert(pos, helpers);
+
+    const char* vanillaClip = "clip(normalTex.a - threshold);";
+    size_t clipPos = result.find(vanillaClip);
+    if (clipPos != std::string::npos)
+    {
+        std::string ditherClip =
+            "{\n"
+            "\t\tconst float FOL_BAND = 0.01;\n"
+            "\t\tfloat fol_t = DustStabilizeThreshold(threshold);\n"
+            "\t\tfloat fol_d = normalTex.a - fol_t;\n"
+            "\t\tif (fol_d >= FOL_BAND) clip(fol_d);\n"
+            "\t\telse if (fol_d <= -FOL_BAND) clip(-1.0);\n"
+            "\t\telse clip(saturate(fol_d / (2.0 * FOL_BAND) + 0.5) - DustBayer4x4(fragCoord.xy));\n"
+            "\t\t}";
+        result.replace(clipPos, strlen(vanillaClip), ditherClip);
+        Log("ShaderPatch: replaced vanilla alpha test with dithered version");
+    }
+
+    const char* vanillaTrans = "(normalTex.a - threshold) / (1.0 - threshold)";
+    size_t transPos = result.find(vanillaTrans);
+    if (transPos != std::string::npos)
+    {
+        std::string stabTrans =
+            "(normalTex.a - DustStabilizeThreshold(threshold)) / (1.0 - DustStabilizeThreshold(threshold))";
+        result.replace(transPos, strlen(vanillaTrans), stabTrans);
+        Log("ShaderPatch: stabilized translucency threshold");
     }
 
     return result;
@@ -416,6 +525,43 @@ static HRESULT WINAPI HookedD3DCompile(
                     *ppErrorMsgs = nullptr;
                 }
                 // Fall through to compile original below
+            }
+        }
+    }
+
+    // Detect objects shader for foliage alpha fix: entry point is "main_ps"
+    // and source contains the vanilla hard-cutoff alpha test.
+    if (pEntrypoint && pSrcData && SrcDataSize > 0 &&
+        strcmp(pEntrypoint, "main_ps") == 0)
+    {
+        std::string src((const char*)pSrcData, SrcDataSize);
+        if (src.find("clip(normalTex.a - threshold)") != std::string::npos &&
+            src.find("DustStabilizeThreshold") == std::string::npos)
+        {
+            std::string patched = PatchObjectsShader(src);
+            if (patched.size() != src.size())
+            {
+                Log("ShaderPatch: patched objects main_ps (%zu -> %zu bytes)",
+                    src.size(), patched.size());
+                HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
+                                          pDefines, pInclude, pEntrypoint, pTarget,
+                                          Flags1, Flags2, ppCode, ppErrorMsgs);
+                if (SUCCEEDED(hr))
+                {
+                    if (ppCode && *ppCode)
+                        SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
+                            pEntrypoint, pTarget, pSourceName,
+                            (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+                    return hr;
+                }
+
+                Log("ShaderPatch: patched objects shader failed to compile, falling back");
+                if (ppErrorMsgs && *ppErrorMsgs)
+                {
+                    Log("ShaderPatch: error: %s", (const char*)(*ppErrorMsgs)->GetBufferPointer());
+                    (*ppErrorMsgs)->Release();
+                    *ppErrorMsgs = nullptr;
+                }
             }
         }
     }

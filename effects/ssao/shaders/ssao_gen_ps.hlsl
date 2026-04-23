@@ -26,7 +26,8 @@ cbuffer SSAOParams : register(b0)
     float  noiseScale;
     float  numDirections;
     float  numSteps;
-    float3 _pad0;
+    float  normalDetail;
+    float2 _pad0;
     float4 camRight;
     float4 camUp;
     float4 camForward;
@@ -56,13 +57,55 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     viewPos.y = (1.0 - uv.y * 2.0) * uvScale.y * depth;
     viewPos.z = depth;
 
-    // GBuffer world-space normals transformed to view-space
+    // Geometric normal from depth derivatives (smooth, no normal-map detail)
+    float3 geoNormal;
+    {
+        float dL = depthTex.Sample(pointClamp, uv - float2(invViewportSize.x, 0));
+        float dR = depthTex.Sample(pointClamp, uv + float2(invViewportSize.x, 0));
+        float dU = depthTex.Sample(pointClamp, uv - float2(0, invViewportSize.y));
+        float dD = depthTex.Sample(pointClamp, uv + float2(0, invViewportSize.y));
+
+        float3 ddx_pos, ddy_pos;
+        if (abs(dL - depth) < abs(dR - depth)) {
+            float3 posL;
+            posL.x = ((uv.x - invViewportSize.x) * 2.0 - 1.0) * uvScale.x * dL;
+            posL.y = (1.0 - (uv.y) * 2.0) * uvScale.y * dL;
+            posL.z = dL;
+            ddx_pos = viewPos - posL;
+        } else {
+            float3 posR;
+            posR.x = ((uv.x + invViewportSize.x) * 2.0 - 1.0) * uvScale.x * dR;
+            posR.y = (1.0 - (uv.y) * 2.0) * uvScale.y * dR;
+            posR.z = dR;
+            ddx_pos = posR - viewPos;
+        }
+        if (abs(dU - depth) < abs(dD - depth)) {
+            float3 posU;
+            posU.x = ((uv.x) * 2.0 - 1.0) * uvScale.x * dU;
+            posU.y = (1.0 - (uv.y - invViewportSize.y) * 2.0) * uvScale.y * dU;
+            posU.z = dU;
+            ddy_pos = viewPos - posU;
+        } else {
+            float3 posD;
+            posD.x = ((uv.x) * 2.0 - 1.0) * uvScale.x * dD;
+            posD.y = (1.0 - (uv.y + invViewportSize.y) * 2.0) * uvScale.y * dD;
+            posD.z = dD;
+            ddy_pos = posD - viewPos;
+        }
+        geoNormal = normalize(cross(ddx_pos, ddy_pos));
+    }
+
     float3 worldN = normalize(normalsTex.Sample(pointClamp, uv).rgb * 2.0 - 1.0);
-    float3 normal;
-    normal.x =  dot(worldN, camRight.xyz);
-    normal.y =  dot(worldN, camUp.xyz);
-    normal.z = -dot(worldN, camForward.xyz);
-    normal = normalize(normal);
+    float3 gbufNormal;
+    gbufNormal.x =  dot(worldN, camRight.xyz);
+    gbufNormal.y =  dot(worldN, camUp.xyz);
+    gbufNormal.z = -dot(worldN, camForward.xyz);
+    gbufNormal = normalize(gbufNormal);
+
+    if (dot(geoNormal, gbufNormal) < 0)
+        geoNormal = -geoNormal;
+
+    float3 normal = normalize(lerp(geoNormal, gbufNormal, normalDetail));
 
     // Per-pixel rotation using interleaved gradient noise
     float noiseAngle = InterleavedGradientNoise(pos.xy * noiseScale) * PI;

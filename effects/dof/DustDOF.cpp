@@ -222,6 +222,8 @@ static int DOFIsEnabled()
 
 // ==================== GUI Settings ====================
 
+static const char* const gBlurShapeLabels[] = { "Gaussian", "Disc (Bokeh)", "Hexagonal", nullptr };
+
 static DustSettingDesc gSettingsArray[] = {
     { "Enabled",             DUST_SETTING_BOOL,  &gDOFConfig.enabled,            0.0f,   1.0f,   "Enabled",            nullptr, "Enable or disable depth of field" },
     { "Auto Focus",          DUST_SETTING_BOOL,  &gDOFConfig.autoFocus,          0.0f,   1.0f,   "AutoFocus",          nullptr, "Automatically focus on the object at screen center" },
@@ -235,7 +237,7 @@ static DustSettingDesc gSettingsArray[] = {
     { "Far Strength",        DUST_SETTING_FLOAT, &gDOFConfig.farStrength,        0.0f,    1.0f,  "FarStrength",        nullptr, "Maximum far blur intensity (0 = no far blur)" },
     { "Blur Radius",         DUST_SETTING_FLOAT, &gDOFConfig.blurRadius,         1.0f,    32.0f, "BlurRadius",         nullptr, "Size of the blur kernel in pixels" },
     { "Blur Downscale",      DUST_SETTING_INT,   &gDOFConfig.blurDownscale,      2.0f,    4.0f,  "BlurDownscale",      nullptr, "Resolution divisor for blur passes (2 = half, 4 = quarter)" },
-    { "Blur Shape",          DUST_SETTING_INT,   &gDOFConfig.blurShape,          0.0f,    2.0f,  "BlurShape",          nullptr, "Blur kernel shape: 0 = Gaussian, 1 = Disc (bokeh), 2 = Hexagonal" },
+    { "Blur Shape",          DUST_SETTING_ENUM,  &gDOFConfig.blurShape,          0.0f,    2.0f,  "BlurShape",          gBlurShapeLabels, "Blur kernel shape for out-of-focus areas" },
     { "Max Depth",           DUST_SETTING_FLOAT, &gDOFConfig.maxDepth,           0.01f,   1.0f,  "MaxDepth",           nullptr, "Maximum depth to process (skip distant objects and sky)" },
     { "Physical DoF",        DUST_SETTING_BOOL,  &gDOFConfig.physicalCoC,        0.0f,    1.0f,  "PhysicalCoC",        nullptr, "Use thin-lens aperture model instead of manual near/far ramps" },
     { "Aperture",            DUST_SETTING_FLOAT, &gDOFConfig.aperture,           0.001f,  0.1f,  "Aperture",           nullptr, "Lens aperture size for physical DoF (smaller = deeper focus)" },

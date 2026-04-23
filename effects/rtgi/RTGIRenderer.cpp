@@ -28,7 +28,7 @@ static float   gSmoothedMotion = 0.0f; // EMA of motion magnitude, decays over ~
 // Internal render resolution (supports half-res)
 static UINT gRenderWidth = 0;
 static UINT gRenderHeight = 0;
-static int gLastResMode = 0; // Track resolution mode (0=full, 1=half, 2=quarter) for runtime recreation
+static int gLastResScale = 50; // Track resolution scale (25-100%) for runtime texture recreation
 
 // Raw ray trace output (RGBA16F) — UAV for compute shader write
 static ID3D11Texture2D*           gRawTex = nullptr;
@@ -121,7 +121,7 @@ struct RayTraceCBData
     float frameIndex;
     float raysPerPixel;
     float thicknessCurve;
-    float _pad0;
+    float normalDetail;
     float sampleJitter[2];
     float _pad1;
     float _pad2;
@@ -316,11 +316,11 @@ static void ReleaseTextures()
 
 static bool CreateTextures(ID3D11Device* device, UINT width, UINT height)
 {
-    int mode = gRTGIConfig.resolutionMode;
-    if (mode < 0) mode = 0;
-    if (mode > 2) mode = 2;
-    UINT rw = width >> mode;
-    UINT rh = height >> mode;
+    int scale = gRTGIConfig.resolutionScale;
+    if (scale < 25) scale = 25;
+    if (scale > 100) scale = 100;
+    UINT rw = (width * scale + 50) / 100;   // round to nearest
+    UINT rh = (height * scale + 50) / 100;
     if (rw == 0) rw = 1;
     if (rh == 0) rh = 1;
     gRenderWidth = rw;
@@ -506,7 +506,7 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
     if (!gRayTraceCB || !gTemporalCB || !gVarianceCB || !gDenoiseCB || !gCompositeCB || !gDebugCB)
         return false;
 
-    gLastResMode = gRTGIConfig.resolutionMode;
+    gLastResScale = gRTGIConfig.resolutionScale;
     gInitialized = true;
     Log("RTGI: Initialized successfully (%ux%u, render %ux%u)", width, height, gRenderWidth, gRenderHeight);
     return true;
@@ -616,11 +616,11 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
         if (!gInitialized) return nullptr;
     }
 
-    // Detect resolution-mode change at runtime and recreate textures
-    if (gRTGIConfig.resolutionMode != gLastResMode)
+    // Detect resolution-scale change at runtime and recreate textures
+    if (gRTGIConfig.resolutionScale != gLastResScale)
     {
-        Log("RTGI: Resolution mode changed: %d -> %d, recreating textures", gLastResMode, gRTGIConfig.resolutionMode);
-        gLastResMode = gRTGIConfig.resolutionMode;
+        Log("RTGI: Resolution scale changed: %d%% -> %d%%, recreating textures", gLastResScale, gRTGIConfig.resolutionScale);
+        gLastResScale = gRTGIConfig.resolutionScale;
         ReleaseTextures();
         ID3D11Device* device = nullptr;
         ctx->GetDevice(&device);
@@ -690,6 +690,7 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
         cb.frameIndex = (float)gFrameIndex;
         cb.raysPerPixel = (float)gRTGIConfig.raysPerPixel;
         cb.thicknessCurve = gRTGIConfig.thicknessCurve;
+        cb.normalDetail = gRTGIConfig.normalDetail;
         // Sub-pixel jitter: Halton(2,3) indexed by a 16-frame cycle. Skip i=0
         // (which Halton returns as (0,0)) so every frame contributes a unique offset.
         {

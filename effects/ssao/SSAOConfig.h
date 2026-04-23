@@ -19,6 +19,7 @@ struct SSAOConfig
     float maxScreenRadius = 0.03f;
     float minScreenRadius = 0.001f;
     float depthFadeStart = 0.0f;
+    float normalDetail = 0.5f;
 
     // Blur
     float blurSharpness = 0.01f;
