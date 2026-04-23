@@ -124,6 +124,36 @@ jobs:
           /p:Configuration=Release
           /p:Platform=x64
 
+      - name: Build Chromatic Aberration plugin (DustChromaticAberration.dll)
+        run: >
+          msbuild effects\chromaticaberration\DustChromaticAberration.vcxproj
+          /p:Configuration=Release
+          /p:Platform=x64
+
+      - name: Build Deband plugin (DustDeband.dll)
+        run: >
+          msbuild effects\deband\DustDeband.vcxproj
+          /p:Configuration=Release
+          /p:Platform=x64
+
+      - name: Build Film Grain plugin (DustFilmGrain.dll)
+        run: >
+          msbuild effects\filmgrain\DustFilmGrain.vcxproj
+          /p:Configuration=Release
+          /p:Platform=x64
+
+      - name: Build Letterbox plugin (DustLetterbox.dll)
+        run: >
+          msbuild effects\letterbox\DustLetterbox.vcxproj
+          /p:Configuration=Release
+          /p:Platform=x64
+
+      - name: Build Vignette plugin (DustVignette.dll)
+        run: >
+          msbuild effects\vignette\DustVignette.vcxproj
+          /p:Configuration=Release
+          /p:Platform=x64
+
       - name: Package release
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -142,6 +172,11 @@ jobs:
           copy effects\rtgi\build\Release\DustRTGI.dll release\Dust\effects\
           copy effects\shadows\build\Release\DustShadows.dll release\Dust\effects\
           copy effects\smaa\build\Release\DustSMAA.dll release\Dust\effects\
+          copy effects\chromaticaberration\build\Release\DustChromaticAberration.dll release\Dust\effects\
+          copy effects\deband\build\Release\DustDeband.dll release\Dust\effects\
+          copy effects\filmgrain\build\Release\DustFilmGrain.dll release\Dust\effects\
+          copy effects\letterbox\build\Release\DustLetterbox.dll release\Dust\effects\
+          copy effects\vignette\build\Release\DustVignette.dll release\Dust\effects\
           xcopy /Y effects\ssil\shaders\* release\Dust\effects\shaders\
           xcopy /Y effects\ssao\shaders\* release\Dust\effects\shaders\
           xcopy /Y effects\lut\shaders\* release\Dust\effects\shaders\
@@ -152,6 +187,11 @@ jobs:
           xcopy /Y effects\kuwahara\shaders\* release\Dust\effects\shaders\
           xcopy /Y effects\rtgi\shaders\* release\Dust\effects\shaders\
           xcopy /Y effects\smaa\shaders\* release\Dust\effects\shaders\
+          xcopy /Y effects\chromaticaberration\shaders\* release\Dust\effects\shaders\
+          xcopy /Y effects\deband\shaders\* release\Dust\effects\shaders\
+          xcopy /Y effects\filmgrain\shaders\* release\Dust\effects\shaders\
+          xcopy /Y effects\letterbox\shaders\* release\Dust\effects\shaders\
+          xcopy /Y effects\vignette\shaders\* release\Dust\effects\shaders\
           xcopy /S /Y /I effects\presets release\Dust\presets
           copy mod\Dust.mod release\Dust\
           copy mod\RE_Kenshi.json release\Dust\
