@@ -273,9 +273,9 @@ static PFN_GetDeviceData  oMouseGetDeviceData  = nullptr;
 static BYTE gKbTrackedState[256] = {};
 static bool gKbWasBlocking = false;
 
-// WM_ stuck-key fix: track which virtual keys had WM_KEYDOWN eaten by the overlay
-// so we can forward WM_KEYUP to the game's WndProc on overlay close.
-static BYTE gWmKeysEaten[256] = {};
+// Track which keys the game's WndProc has seen as pressed (WM_KEYDOWN reached it).
+// Used to: (1) never eat a WM_KEYUP the game needs, (2) send compensating WM_KEYUPs on close.
+static BYTE gGameKeyHeld[256] = {};
 
 static bool ShouldBlockDInput()
 {
@@ -467,18 +467,7 @@ static void OnOverlayOpen(HWND hWnd)
 {
     gToastActive = false;
 
-    // Snapshot keys the game currently thinks are held — if we later eat the
-    // WM_KEYUP, OnOverlayClose needs to forward it to the game's WndProc.
-    memset(gWmKeysEaten, 0, sizeof(gWmKeysEaten));
-    BYTE keyState[256];
-    if (GetKeyboardState(keyState))
-    {
-        for (int vk = 0; vk < 256; vk++)
-        {
-            if (keyState[vk] & 0x80)
-                gWmKeysEaten[vk] = 1;
-        }
-    }
+
 
     // Save cursor clip rect and release it so the cursor can move freely
     gHadClipRect = (GetClipCursor(&gSavedClipRect) != 0);
@@ -503,25 +492,20 @@ static void OnOverlayClose()
     memset(io.MouseDown, 0, sizeof(io.MouseDown));
     io.KeyCtrl = io.KeyShift = io.KeyAlt = io.KeySuper = false;
 
-    // Forward WM_KEYUP to the game's WndProc for every key we swallowed.
-    // Without this, the game's Win32 key state thinks keys are still held
-    // because it never saw the WM_KEYUP that we ate while the overlay was open.
+    // Send WM_KEYUP for every key the game thinks is held, so nothing stays stuck.
     if (oWndProc && gHWnd)
     {
         for (int vk = 0; vk < 256; vk++)
         {
-            if (gWmKeysEaten[vk])
+            if (gGameKeyHeld[vk])
             {
                 UINT scanCode = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
-                LPARAM lp = (1) | (scanCode << 16) | (0x3 << 30); // repeat=1, scancode, release flags
+                LPARAM lp = (1) | (scanCode << 16) | (0x3 << 30);
                 CallWindowProcW(oWndProc, gHWnd, WM_KEYUP, (WPARAM)vk, lp);
             }
         }
-        memset(gWmKeysEaten, 0, sizeof(gWmKeysEaten));
+        memset(gGameKeyHeld, 0, sizeof(gGameKeyHeld));
     }
-
-    // Reset DI blocking state so no stale transition fires on next poll
-    gKbWasBlocking = false;
 
     // Restore cursor clipping (game usually clips cursor to window)
     if (gHadClipRect)
@@ -577,26 +561,14 @@ static LRESULT CALLBACK DustWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         bool eatInput = (isMouse || isKeyboard || msg == WM_INPUT) && ImGui::GetIO().WantCaptureMouse;
         if (eatInput)
         {
-            if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)
+            if (msg == WM_KEYUP || msg == WM_SYSKEYUP)
             {
-                if (wParam < 256)
-                    gWmKeysEaten[wParam] = 1;
-            }
-            else if (msg == WM_KEYUP || msg == WM_SYSKEYUP)
-            {
-                // Don't eat key-UPs whose key-DOWN went to the game
-                if (wParam < 256 && !gWmKeysEaten[wParam])
+                if (wParam < 256 && gGameKeyHeld[wParam])
                     eatInput = false;
-                else if (wParam < 256)
-                    gWmKeysEaten[wParam] = 0;
             }
             if (eatInput)
                 return 0;
         }
-
-        // Clear eaten-key tracking when key-UPs pass through to the game
-        if ((msg == WM_KEYUP || msg == WM_SYSKEYUP) && wParam < 256)
-            gWmKeysEaten[wParam] = 0;
     }
     else if (gInitialized)
     {
@@ -608,6 +580,14 @@ static LRESULT CALLBACK DustWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         {
             ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam);
         }
+    }
+
+    if (wParam < 256)
+    {
+        if (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN)
+            gGameKeyHeld[wParam] = 1;
+        else if (msg == WM_KEYUP || msg == WM_SYSKEYUP)
+            gGameKeyHeld[wParam] = 0;
     }
 
     return CallWindowProcW(oWndProc, hWnd, msg, wParam, lParam);
