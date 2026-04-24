@@ -1150,6 +1150,9 @@ int EffectLoader::LoadAll(const char* effectsDir)
         });
 
     Log("Loaded %d effect plugin(s)", loaded);
+
+    ScanPresets();
+
     return loaded;
 }
 
@@ -1207,8 +1210,9 @@ bool EffectLoader::InitAll(ID3D11Device* device, uint32_t w, uint32_t h)
         Log("Initialized effect: %s", le.desc.name ? le.desc.name : "unnamed");
     }
 
-    // Scan global presets after all effects are ready
-    ScanPresets();
+    initialized_ = true;
+
+    // Validate presets now that effects are initialized (presets scanned in LoadAll)
     for (int i = 0; i < (int)presets_.size(); i++)
         ValidatePreset(i);
 
@@ -1220,6 +1224,7 @@ bool EffectLoader::InitAll(ID3D11Device* device, uint32_t w, uint32_t h)
 bool EffectLoader::ReinitAll(ID3D11Device* device, uint32_t w, uint32_t h)
 {
     Log("Reinitializing all effects on device=%p at %ux%u", device, w, h);
+    initialized_ = false;
 
     for (auto& le : effects_)
     {
@@ -1350,6 +1355,7 @@ void EffectLoader::OnResolutionChanged(ID3D11Device* device, uint32_t w, uint32_
 
 void EffectLoader::ShutdownAll()
 {
+    initialized_ = false;
     for (auto& le : effects_)
     {
         if (le.initialized && le.desc.Shutdown)

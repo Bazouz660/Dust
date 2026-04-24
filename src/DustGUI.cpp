@@ -626,18 +626,8 @@ static void LoadFrameworkConfig()
     if (gFwConfig.lastPreset.empty())
         gFwConfig.lastPreset = "dust_high";
 
-    // Auto-load last preset
-    {
-        const auto& presets = gEffectLoader.GetPresets();
-        for (int i = 0; i < (int)presets.size(); i++)
-        {
-            if (presets[i].name == gFwConfig.lastPreset)
-            {
-                gEffectLoader.LoadPreset(i);
-                break;
-            }
-        }
-    }
+    // Preset auto-load is deferred to Render() — effects may not be initialized yet
+    // when the GUI starts (e.g. GUI inits from DustBoot swap chain before device capture).
 
     // Detect version change (Steam Workshop overwrites DLL but not Dust.ini)
     char lastVersion[128] = {};
@@ -1264,31 +1254,24 @@ bool Init(IDXGISwapChain* swapChain, ID3D11Device* device, ID3D11DeviceContext* 
 
     Log("GUI: Init starting (swap=%p, dev=%p, ctx=%p)", swapChain, device, context);
 
-    if (!swapChain || !device || !context)
-    { Log("GUI: Init aborted — null swap/device/context"); return false; }
+    if (!swapChain)
+    { Log("GUI: Init aborted — null swap chain"); return false; }
 
-    // The swap chain's device is authoritative — we must render the GUI with it,
-    // otherwise CreateRenderTargetView on its back buffer returns E_INVALIDARG.
-    // On some systems OGRE creates multiple D3D11 devices and the one our Draw
-    // hook captured may differ from the one that owns the swap chain.
+    // Always use the swap chain's own device — it's the only one that can create
+    // views on the swap chain's back buffer. On multi-device systems (e.g. iGPU +
+    // discrete GPU) this may differ from the effects pipeline's captured device.
     {
         ID3D11Device* scDevice = nullptr;
         HRESULT hr = swapChain->GetDevice(__uuidof(ID3D11Device), (void**)&scDevice);
         if (FAILED(hr) || !scDevice)
-        { Log("GUI: swapChain->GetDevice failed hr=0x%08X", (unsigned)hr); if (scDevice) scDevice->Release(); return false; }
+        { Log("GUI: swapChain->GetDevice failed hr=0x%08X", (unsigned)hr); return false; }
 
-        if (scDevice != device)
-        {
-            Log("GUI: swapChain device (%p) != captured device (%p) — using swap chain's device for GUI", scDevice, device);
-            gDevice = scDevice;
-            gDevice->GetImmediateContext(&gContext);
-            gContext->Release();
-        }
-        else
-        {
-            gDevice = device;
-            gContext = context;
-        }
+        if (device && scDevice != device)
+            Log("GUI: note: swapChain device (%p) != captured device (%p)", scDevice, device);
+
+        gDevice = scDevice;
+        gDevice->GetImmediateContext(&gContext);
+        gContext->Release();
         scDevice->Release();
     }
 
@@ -1410,6 +1393,41 @@ void Render()
 {
     if (!gInitialized || gResizeInProgress) return;
     if (!gDevice || !gContext || !gBackBufferRTV) return;
+
+    // Deferred preset auto-load: GUI can start before effects are initialized
+    // (DustBoot provides the swap chain before device capture / effect init).
+    // Phase 1: set display name early (presets scanned in LoadAll).
+    // Phase 2: apply values once effects are initialized.
+    {
+        static bool sPresetDisplaySet = false;
+        static bool sPresetApplied = false;
+        static int  sPendingIdx = -1;
+
+        if (!sPresetApplied && !gFwConfig.lastPreset.empty())
+        {
+            if (!sPresetDisplaySet)
+            {
+                const auto& presets = gEffectLoader.GetPresets();
+                for (int i = 0; i < (int)presets.size(); i++)
+                {
+                    if (presets[i].name == gFwConfig.lastPreset)
+                    {
+                        gEffectLoader.SetCurrentPreset(i);
+                        sPendingIdx = i;
+                        sPresetDisplaySet = true;
+                        break;
+                    }
+                }
+            }
+
+            if (sPresetDisplaySet && sPendingIdx >= 0 && gEffectLoader.IsInitialized())
+            {
+                gEffectLoader.LoadPreset(sPendingIdx);
+                Log("Loaded global preset '%s'", gFwConfig.lastPreset.c_str());
+                sPresetApplied = true;
+            }
+        }
+    }
 
     // Skip rendering if device has been removed (alt-tab, resolution change, etc.)
     HRESULT removeReason = gDevice->GetDeviceRemovedReason();

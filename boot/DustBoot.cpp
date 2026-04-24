@@ -114,8 +114,16 @@ typedef HRESULT(STDMETHODCALLTYPE* PFN_CreateSwapChainForHwnd)(
     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc,
     IDXGIOutput* pRestrictToOutput, IDXGISwapChain1** ppSwapChain);
 
-static PFN_CreateSwapChain          oCreateSwapChain          = nullptr;
-static PFN_CreateSwapChainForHwnd   oCreateSwapChainForHwnd   = nullptr;
+typedef HRESULT(WINAPI* PFN_D3D11CreateDeviceAndSwapChain)(
+    IDXGIAdapter* pAdapter, D3D_DRIVER_TYPE DriverType, HMODULE Software,
+    UINT Flags, const D3D_FEATURE_LEVEL* pFeatureLevels, UINT FeatureLevels,
+    UINT SDKVersion, const DXGI_SWAP_CHAIN_DESC* pSwapChainDesc,
+    IDXGISwapChain** ppSwapChain, ID3D11Device** ppDevice,
+    D3D_FEATURE_LEVEL* pFeatureLevel, ID3D11DeviceContext** ppImmediateContext);
+
+static PFN_CreateSwapChain              oCreateSwapChain              = nullptr;
+static PFN_CreateSwapChainForHwnd       oCreateSwapChainForHwnd       = nullptr;
+static PFN_D3D11CreateDeviceAndSwapChain oD3D11CreateDeviceAndSwapChain = nullptr;
 
 static HRESULT STDMETHODCALLTYPE HookedCreateSwapChain(
     IDXGIFactory* pThis, IUnknown* pDevice,
@@ -164,6 +172,33 @@ static HRESULT STDMETHODCALLTYPE HookedCreateSwapChainForHwnd(
     else
     {
         BootLog("CreateSwapChainForHwnd called but failed or returned null (hr=0x%08X)", (unsigned)hr);
+    }
+
+    return hr;
+}
+
+static HRESULT WINAPI HookedD3D11CreateDeviceAndSwapChain(
+    IDXGIAdapter* pAdapter, D3D_DRIVER_TYPE DriverType, HMODULE Software,
+    UINT Flags, const D3D_FEATURE_LEVEL* pFeatureLevels, UINT FeatureLevels,
+    UINT SDKVersion, const DXGI_SWAP_CHAIN_DESC* pSwapChainDesc,
+    IDXGISwapChain** ppSwapChain, ID3D11Device** ppDevice,
+    D3D_FEATURE_LEVEL* pFeatureLevel, ID3D11DeviceContext** ppImmediateContext)
+{
+    HRESULT hr = oD3D11CreateDeviceAndSwapChain(
+        pAdapter, DriverType, Software, Flags, pFeatureLevels, FeatureLevels,
+        SDKVersion, pSwapChainDesc, ppSwapChain, ppDevice, pFeatureLevel, ppImmediateContext);
+
+    if (SUCCEEDED(hr) && ppSwapChain && *ppSwapChain && pSwapChainDesc &&
+        pSwapChainDesc->BufferDesc.Width > 1 && pSwapChainDesc->BufferDesc.Height > 1)
+    {
+        if (gCapturedSwapChain)
+            gCapturedSwapChain->Release();
+        gCapturedSwapChain = *ppSwapChain;
+        gCapturedSwapChain->AddRef();
+        gCapturedHWND = pSwapChainDesc->OutputWindow;
+        BootLog("Captured swap chain %p (HWND=%p, %ux%u) via D3D11CreateDeviceAndSwapChain",
+                gCapturedSwapChain, gCapturedHWND,
+                pSwapChainDesc->BufferDesc.Width, pSwapChainDesc->BufferDesc.Height);
     }
 
     return hr;
@@ -326,6 +361,26 @@ static bool InstallFactoryHooks()
         else
         {
             BootLog("WARNING: Failed to hook CreateSwapChainForHwnd");
+        }
+    }
+
+    // Hook D3D11CreateDeviceAndSwapChain — catches games that create device+swap chain
+    // in one call, bypassing IDXGIFactory::CreateSwapChain entirely.
+    {
+        HMODULE hD3D11 = GetModuleHandleA("d3d11.dll");
+        if (!hD3D11)
+            hD3D11 = LoadLibraryA("d3d11.dll");
+        if (hD3D11)
+        {
+            void* addr = (void*)GetProcAddress(hD3D11, "D3D11CreateDeviceAndSwapChain");
+            if (addr)
+            {
+                if (KenshiLib::AddHook(addr, (void*)HookedD3D11CreateDeviceAndSwapChain,
+                                       (void**)&oD3D11CreateDeviceAndSwapChain) == KenshiLib::SUCCESS)
+                    BootLog("  D3D11CreateDeviceAndSwapChain hook installed");
+                else
+                    BootLog("WARNING: Failed to hook D3D11CreateDeviceAndSwapChain");
+            }
         }
     }
 

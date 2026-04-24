@@ -56,6 +56,7 @@ public:
 
     size_t Count() const { return effects_.size(); }
     const LoadedEffect& GetEffect(size_t index) const { return effects_[index]; }
+    bool IsInitialized() const { return initialized_; }
 
     // v3: Framework config helpers (called by DustGUI)
     void SaveEffectConfig(size_t index);
@@ -78,6 +79,8 @@ public:
 private:
     std::vector<LoadedEffect> effects_;
     DustHostAPI hostAPI_ = {};
+
+    bool initialized_ = false;
 
     // Preset state
     std::string presetsDir_;            // <effectsDir>/presets/

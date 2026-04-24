@@ -120,7 +120,7 @@ void GameWorld__mainLoop_GPUSensitiveStuff_hook(GameWorld* thisptr, float time)
     // Watchdog: if Present hasn't fired, periodically retry swap chain discovery.
     // Layer 3 fallback — covers cases where both DustBoot and initial discovery missed.
     // Retries at frame 120, 300, 600, 1200 (then stops — if it hasn't worked by ~20s, give up).
-    if (D3D11Hook::gDeviceCaptured && !D3D11Hook::IsPresentHooked() &&
+    if (!D3D11Hook::IsPresentHooked() &&
         (sLoopCount == 120 || sLoopCount == 300 || sLoopCount == 600 || sLoopCount == 1200))
     {
         Log("WARNING: Present hook has not fired after %llu game loops — attempting recovery",
