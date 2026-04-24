@@ -1,9 +1,11 @@
 // GTAO — Ground Truth Ambient Occlusion (Jimenez et al. 2016)
 // Marches in structured screen-space directions, tracks horizon angles.
 
-Texture2D<float>  depthTex   : register(t0);
-Texture2D<float4> normalsTex : register(t1);
-SamplerState      pointClamp : register(s0);
+Texture2D<float>  depthTex      : register(t0);
+Texture2D<float4> normalsTex    : register(t1);
+Texture2D<float>  blueNoiseTex  : register(t2);
+SamplerState      pointClamp    : register(s0);
+SamplerState      pointWrap     : register(s1);
 
 cbuffer SSAOParams : register(b0)
 {
@@ -34,12 +36,6 @@ cbuffer SSAOParams : register(b0)
 };
 
 static const float PI = 3.14159265;
-
-// Interleaved gradient noise — better spatial distribution than sin hash
-float InterleavedGradientNoise(float2 screenPos)
-{
-    return frac(52.9829189 * frac(0.06711056 * screenPos.x + 0.00583715 * screenPos.y));
-}
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 {
@@ -107,8 +103,8 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
     float3 normal = normalize(lerp(geoNormal, gbufNormal, normalDetail));
 
-    // Per-pixel rotation using interleaved gradient noise
-    float noiseAngle = InterleavedGradientNoise(pos.xy * noiseScale) * PI;
+    // Per-pixel rotation using blue noise (R2 low-discrepancy, tiled 64x64)
+    float noiseAngle = blueNoiseTex.Sample(pointWrap, pos.xy / 64.0) * PI;
 
     // View-space AO radius, projected to UV space
     float viewSpaceRadius = aoRadius;
