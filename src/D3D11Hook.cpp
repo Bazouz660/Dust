@@ -7,6 +7,7 @@
 #include "ShaderDatabase.h"
 #include "GeometryCapture.h"
 #include "MSAARedirect.h"
+#include "DeferredMSAA.h"
 #include "Survey.h"
 #include "SurveyRecorder.h"
 #include "SurveyWriter.h"
@@ -178,6 +179,14 @@ typedef void(STDMETHODCALLTYPE* PFN_OMSetRenderTargets)(
     ID3D11RenderTargetView* const* ppRenderTargetViews,
     ID3D11DepthStencilView* pDepthStencilView);
 
+typedef void(STDMETHODCALLTYPE* PFN_OMSetRenderTargetsAndUAVs)(
+    ID3D11DeviceContext* pThis, UINT NumRTVs,
+    ID3D11RenderTargetView* const* ppRenderTargetViews,
+    ID3D11DepthStencilView* pDepthStencilView,
+    UINT UAVStartSlot, UINT NumUAVs,
+    ID3D11UnorderedAccessView* const* ppUnorderedAccessViews,
+    const UINT* pUAVInitialCounts);
+
 typedef HRESULT(STDMETHODCALLTYPE* PFN_Present)(
     IDXGISwapChain* pThis, UINT SyncInterval, UINT Flags);
 
@@ -191,6 +200,7 @@ static PFN_Draw                     oDraw = nullptr;
 static PFN_DrawIndexed              oDrawIndexed = nullptr;
 static PFN_DrawIndexedInstanced     oDrawIndexedInstanced = nullptr;
 static PFN_OMSetRenderTargets       oOMSetRenderTargets = nullptr;
+static PFN_OMSetRenderTargetsAndUAVs oOMSetRenderTargetsAndUAVs = nullptr;
 static PFN_Present                  oPresent = nullptr;
 static PFN_ResizeBuffers            oResizeBuffers = nullptr;
 
@@ -204,6 +214,7 @@ static PFN_Present1                 oPresent1 = nullptr;
 static uint64_t gDrawHookCallCount = 0;
 static uint64_t gPresentHookCallCount = 0;
 static bool gGuiInitDone = false;
+static bool sInDeferredMSAA = false;
 
 // ==================== D3DCompile hook (runtime shader patching) ====================
 
@@ -806,6 +817,7 @@ static void TryCaptureDevice(ID3D11Device* device)
     device->GetImmediateContext(&gContext);
     GeometryCapture::SetDevice(device);
     MSAARedirect::SetDevice(device);
+    DeferredMSAA::SetDevice(device);
 
     Log("Captured real D3D11 device=%p, context=%p", gDevice, gContext);
 
@@ -846,6 +858,7 @@ static void TryCaptureDevice(ID3D11Device* device)
         Log("Detected resolution: %ux%u", gWidth, gHeight);
         GeometryCapture::SetResolution(gWidth, gHeight);
         MSAARedirect::SetResolution(gWidth, gHeight);
+        DeferredMSAA::SetResolution(gWidth, gHeight);
     }
 
     // Initialize all loaded effect plugins
@@ -947,6 +960,13 @@ static HRESULT STDMETHODCALLTYPE HookedCreateVertexShader(
 static void STDMETHODCALLTYPE HookedDraw(
     ID3D11DeviceContext* pThis, UINT VertexCount, UINT StartVertexLocation)
 {
+    // Bypass all hook logic for internal draws (DeferredMSAA correction pass)
+    if (sInDeferredMSAA)
+    {
+        oDraw(pThis, VertexCount, StartVertexLocation);
+        return;
+    }
+
     // Survey: record ALL draws (before fullscreen filter)
     if (Survey::IsActive())
         SurveyRecorder::OnDraw(pThis, VertexCount, StartVertexLocation);
@@ -1043,6 +1063,7 @@ static void STDMETHODCALLTYPE HookedDraw(
                             gEffectLoader.OnResolutionChanged(gDevice, gWidth, gHeight);
                             GeometryCapture::SetResolution(gWidth, gHeight);
                             MSAARedirect::SetResolution(gWidth, gHeight);
+                            DeferredMSAA::SetResolution(gWidth, gHeight);
                         }
                         tex->Release();
                     }
@@ -1074,7 +1095,10 @@ static void STDMETHODCALLTYPE HookedDraw(
 
         // Extract camera data at POST_LIGHTING (deferred CB is bound)
         if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
+        {
             ExtractCameraData(pThis);
+            DeferredMSAA::CaptureLightingCB(pThis);
+        }
 
         DustFrameContext fctx = {};
         fctx.device = gDevice;
@@ -1091,6 +1115,14 @@ static void STDMETHODCALLTYPE HookedDraw(
 
         // Execute the game's original draw call
         oDraw(pThis, VertexCount, StartVertexLocation);
+
+        // MSAA edge correction (after vanilla lighting, before POST effects)
+        if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
+        {
+            sInDeferredMSAA = true;
+            DeferredMSAA::Execute(pThis);
+            sInDeferredMSAA = false;
+        }
 
         // POST: effects that operate after the draw
         fctx.timing = DUST_TIMING_POST;
@@ -1111,6 +1143,9 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
 
     GeometryCapture::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 
+    if (MSAARedirect::IsActive())
+        MSAARedirect::OnDraw();
+
     oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 }
 
@@ -1127,6 +1162,9 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
                                             StartIndexLocation, BaseVertexLocation,
                                             StartInstanceLocation);
 
+    if (MSAARedirect::IsActive())
+        MSAARedirect::OnDraw();
+
     oDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
                           StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
 }
@@ -1138,7 +1176,7 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
     ID3D11RenderTargetView* const* ppRenderTargetViews,
     ID3D11DepthStencilView* pDepthStencilView)
 {
-    if (sInMSAAResolve)
+    if (sInMSAAResolve || sInDeferredMSAA)
     {
         oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView);
         return;
@@ -1153,7 +1191,7 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
         {
             ID3D11RenderTargetView* msaaRTVs[3];
             ID3D11DepthStencilView* msaaDSV;
-            if (MSAARedirect::OnGBufferEnter(ppRenderTargetViews, pDepthStencilView, msaaRTVs, &msaaDSV))
+            if (MSAARedirect::OnGBufferEnter(pThis, ppRenderTargetViews, pDepthStencilView, msaaRTVs, &msaaDSV))
             {
                 oOMSetRenderTargets(pThis, NumViews, msaaRTVs, msaaDSV);
                 GeometryCapture::OnOMSetRenderTargetsWithResult(isGBuffer);
@@ -1169,6 +1207,59 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
     }
 
     oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView);
+    GeometryCapture::OnOMSetRenderTargetsWithResult(isGBuffer);
+}
+
+static void STDMETHODCALLTYPE HookedOMSetRenderTargetsAndUAVs(
+    ID3D11DeviceContext* pThis, UINT NumRTVs,
+    ID3D11RenderTargetView* const* ppRenderTargetViews,
+    ID3D11DepthStencilView* pDepthStencilView,
+    UINT UAVStartSlot, UINT NumUAVs,
+    ID3D11UnorderedAccessView* const* ppUnorderedAccessViews,
+    const UINT* pUAVInitialCounts)
+{
+    if (sInMSAAResolve || sInDeferredMSAA)
+    {
+        oOMSetRenderTargetsAndUAVs(pThis, NumRTVs, ppRenderTargetViews, pDepthStencilView,
+                                   UAVStartSlot, NumUAVs, ppUnorderedAccessViews, pUAVInitialCounts);
+        return;
+    }
+
+    // 0xffffffff = D3D11_KEEP_RENDER_TARGETS_UNCHANGED (RTVs aren't changing)
+    if (NumRTVs == 0xffffffff)
+    {
+        oOMSetRenderTargetsAndUAVs(pThis, NumRTVs, ppRenderTargetViews, pDepthStencilView,
+                                   UAVStartSlot, NumUAVs, ppUnorderedAccessViews, pUAVInitialCounts);
+        return;
+    }
+
+    bool wasInGBuffer = GeometryCapture::IsInGBufferPass();
+    bool isGBuffer = GeometryCapture::CheckGBufferConfig(NumRTVs, ppRenderTargetViews, pDepthStencilView);
+
+    if (MSAARedirect::GetSampleCount() >= 2)
+    {
+        if (!wasInGBuffer && isGBuffer)
+        {
+            ID3D11RenderTargetView* msaaRTVs[3];
+            ID3D11DepthStencilView* msaaDSV;
+            if (MSAARedirect::OnGBufferEnter(pThis, ppRenderTargetViews, pDepthStencilView, msaaRTVs, &msaaDSV))
+            {
+                oOMSetRenderTargetsAndUAVs(pThis, NumRTVs, msaaRTVs, msaaDSV,
+                                           UAVStartSlot, NumUAVs, ppUnorderedAccessViews, pUAVInitialCounts);
+                GeometryCapture::OnOMSetRenderTargetsWithResult(isGBuffer);
+                return;
+            }
+        }
+        else if (wasInGBuffer && !isGBuffer && MSAARedirect::IsActive())
+        {
+            sInMSAAResolve = true;
+            MSAARedirect::OnGBufferLeave(pThis);
+            sInMSAAResolve = false;
+        }
+    }
+
+    oOMSetRenderTargetsAndUAVs(pThis, NumRTVs, ppRenderTargetViews, pDepthStencilView,
+                               UAVStartSlot, NumUAVs, ppUnorderedAccessViews, pUAVInitialCounts);
     GeometryCapture::OnOMSetRenderTargetsWithResult(isGBuffer);
 }
 
@@ -1271,6 +1362,7 @@ static const int VTIDX_CTX_DrawIndexed              = 12;
 static const int VTIDX_CTX_Draw                     = 13;
 static const int VTIDX_CTX_DrawIndexedInstanced     = 20;
 static const int VTIDX_CTX_OMSetRenderTargets       = 33;
+static const int VTIDX_CTX_OMSetRenderTargetsAndUAVs = 34;
 // VTIDX_SC_* constants moved to top of file (needed by deferred hook code)
 
 bool Install()
@@ -1325,6 +1417,7 @@ bool Install()
     void* addrDrawIndexed  = ctxVtable[VTIDX_CTX_DrawIndexed];
     void* addrDrawIdxInst  = ctxVtable[VTIDX_CTX_DrawIndexedInstanced];
     void* addrOMSetRT      = ctxVtable[VTIDX_CTX_OMSetRenderTargets];
+    void* addrOMSetRTUAV   = ctxVtable[VTIDX_CTX_OMSetRenderTargetsAndUAVs];
     void* addrPresent      = scVtable[VTIDX_SC_Present];
     void* addrResizeBuf    = scVtable[VTIDX_SC_ResizeBuffers];
 
@@ -1348,6 +1441,7 @@ bool Install()
     Log("  DrawIndexed           = %p", addrDrawIndexed);
     Log("  DrawIndexedInstanced  = %p", addrDrawIdxInst);
     Log("  OMSetRenderTargets    = %p", addrOMSetRT);
+    Log("  OMSetRTsAndUAVs       = %p", addrOMSetRTUAV);
     Log("  Present               = %p", addrPresent);
     Log("  Present1              = %p", addrPresent1);
     Log("  ResizeBuffers         = %p", addrResizeBuf);
@@ -1426,6 +1520,10 @@ bool Install()
     if (KenshiLib::AddHook(addrOMSetRT, (void*)HookedOMSetRenderTargets,
                            (void**)&oOMSetRenderTargets) != KenshiLib::SUCCESS)
     { Log("ERROR: Failed to hook OMSetRenderTargets"); ok = false; }
+
+    if (KenshiLib::AddHook(addrOMSetRTUAV, (void*)HookedOMSetRenderTargetsAndUAVs,
+                           (void**)&oOMSetRenderTargetsAndUAVs) != KenshiLib::SUCCESS)
+    { Log("ERROR: Failed to hook OMSetRenderTargetsAndUnorderedAccessViews"); ok = false; }
 
     // Present/Present1/ResizeBuffers hooks are DEFERRED until the first Draw call.
     // This avoids a race with overlay DLLs (Steam, Discord, ReShade) that also hook

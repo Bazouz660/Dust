@@ -14,9 +14,11 @@ static uint32_t sRequestedSamples = 0;
 static uint32_t sActiveSamples = 0;
 static bool sResourcesValid = false;
 static bool sRedirectedThisPass = false;
+static bool sHadDrawsThisPass = false;
 
 static ID3D11Texture2D*          sMSAARTs[3]   = {};
 static ID3D11RenderTargetView*   sMSAARTVs[3]  = {};
+static ID3D11ShaderResourceView* sMSAAColorSRVs[3] = {};
 static ID3D11Texture2D*          sMSAADepthTex  = nullptr;
 static ID3D11DepthStencilView*   sMSAADSV       = nullptr;
 static ID3D11ShaderResourceView* sMSAADepthSRV  = nullptr;
@@ -36,6 +38,7 @@ static void ReleaseResources()
 {
     for (int i = 0; i < 3; i++)
     {
+        if (sMSAAColorSRVs[i]) { sMSAAColorSRVs[i]->Release(); sMSAAColorSRVs[i] = nullptr; }
         if (sMSAARTVs[i]) { sMSAARTVs[i]->Release(); sMSAARTVs[i] = nullptr; }
         if (sMSAARTs[i])  { sMSAARTs[i]->Release();  sMSAARTs[i] = nullptr; }
     }
@@ -51,6 +54,7 @@ static void ReleaseOriginals()
         if (sOrigRTVs[i]) { sOrigRTVs[i]->Release(); sOrigRTVs[i] = nullptr; }
     if (sOrigDSV) { sOrigDSV->Release(); sOrigDSV = nullptr; }
     sRedirectedThisPass = false;
+    sHadDrawsThisPass = false;
 }
 
 static bool CompileResolveShaders()
@@ -67,15 +71,26 @@ static bool CompileResolveShaders()
         "    return o;\n"
         "}\n";
 
-    char psSrc[512];
+    char psSrc[1024];
     snprintf(psSrc, sizeof(psSrc),
-        "Texture2DMS<float> t : register(t0);\n"
-        "float main(float4 p : SV_Position) : SV_Depth {\n"
-        "    int2 c = int2(p.xy);\n"
-        "    float d = 1.0;\n"
-        "    [unroll] for (uint i = 0; i < %u; i++)\n"
-        "        d = min(d, t.Load(c, i).x);\n"
-        "    return d;\n"
+        "Texture2DMS<float4> g0 : register(t0);\n"
+        "Texture2DMS<float4> g1 : register(t1);\n"
+        "Texture2DMS<float>  g2 : register(t2);\n"
+        "Texture2DMS<float>  gD : register(t3);\n"
+        "struct O { float4 r0:SV_Target0; float4 r1:SV_Target1;\n"
+        "           float r2:SV_Target2; float d:SV_Depth; };\n"
+        "O main(float4 p : SV_Position) {\n"
+        "    int2 c = int2(p.xy); O o;\n"
+        "    float md = 1.0; uint s = 0;\n"
+        "    [unroll] for (uint i = 0; i < %u; i++) {\n"
+        "        float d = gD.Load(c, i).x;\n"
+        "        if (d < md) { md = d; s = i; }\n"
+        "    }\n"
+        "    o.r0 = g0.Load(c, s);\n"
+        "    o.r1 = g1.Load(c, s);\n"
+        "    o.r2 = g2.Load(c, s).x;\n"
+        "    o.d = md;\n"
+        "    return o;\n"
         "}\n", sActiveSamples);
 
     ID3DBlob* blob = nullptr;
@@ -159,11 +174,17 @@ static bool CreateResources()
         desc.Format = COLOR_FORMATS[i];
         desc.SampleDesc.Count = sActiveSamples;
         desc.Usage = D3D11_USAGE_DEFAULT;
-        desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+        desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
 
         if (FAILED(sDevice->CreateTexture2D(&desc, nullptr, &sMSAARTs[i])))
             { ReleaseResources(); return false; }
         if (FAILED(sDevice->CreateRenderTargetView(sMSAARTs[i], nullptr, &sMSAARTVs[i])))
+            { ReleaseResources(); return false; }
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Format = COLOR_FORMATS[i];
+        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMS;
+        if (FAILED(sDevice->CreateShaderResourceView(sMSAARTs[i], &srvDesc, &sMSAAColorSRVs[i])))
             { ReleaseResources(); return false; }
     }
 
@@ -271,7 +292,8 @@ void SetResolution(UINT width, UINT height)
     }
 }
 
-bool OnGBufferEnter(ID3D11RenderTargetView* const* origRTVs,
+bool OnGBufferEnter(ID3D11DeviceContext* ctx,
+                    ID3D11RenderTargetView* const* origRTVs,
                     ID3D11DepthStencilView* origDSV,
                     ID3D11RenderTargetView** outMSAARTVs,
                     ID3D11DepthStencilView** outMSAADSV)
@@ -297,40 +319,52 @@ bool OnGBufferEnter(ID3D11RenderTargetView* const* origRTVs,
     sOrigDSV = origDSV;
     if (sOrigDSV) sOrigDSV->AddRef();
 
+    // OGRE clears via the original RTV/DSV handles directly, so our MSAA
+    // targets never receive the engine's clear calls. Clear them here.
+    const float clearColor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    for (int i = 0; i < 3; i++)
+        if (sMSAARTVs[i]) ctx->ClearRenderTargetView(sMSAARTVs[i], clearColor);
+    if (sMSAADSV)
+        ctx->ClearDepthStencilView(sMSAADSV, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+
     for (int i = 0; i < 3; i++)
         outMSAARTVs[i] = sMSAARTVs[i];
     *outMSAADSV = sMSAADSV;
 
     sRedirectedThisPass = true;
+    sHadDrawsThisPass = false;
     return true;
+}
+
+void OnDraw()
+{
+    sHadDrawsThisPass = true;
 }
 
 void OnGBufferLeave(ID3D11DeviceContext* ctx)
 {
     if (!sRedirectedThisPass || !sResourcesValid)
-        return;
-
-    // Resolve color RTs
-    for (int i = 0; i < 3; i++)
     {
-        if (!sMSAARTs[i] || !sOrigRTVs[i])
-            continue;
-        ID3D11Resource* origRes = nullptr;
-        sOrigRTVs[i]->GetResource(&origRes);
-        if (origRes)
-        {
-            ctx->ResolveSubresource(origRes, 0, sMSAARTs[i], 0, COLOR_FORMATS[i]);
-            origRes->Release();
-        }
+        ReleaseOriginals();
+        return;
     }
 
-    // Resolve depth via custom shader (ResolveSubresource doesn't support depth)
-    if (sMSAADepthSRV && sOrigDSV && sResolveVS && sResolvePS && sDepthWriteAll)
+    if (!sHadDrawsThisPass)
+    {
+        ReleaseOriginals();
+        return;
+    }
+
+    // Combined resolve: closest-sample for color + min-depth
+    // ResolveSubresource averages ALL samples — at geometry edges, this averages
+    // valid GBuffer data with the cleared background (0,0,0,0), producing garbage
+    // normals/albedo that cause dark outlines after deferred lighting.
+    // Instead, find the closest depth sample and use that sample's data for all RTs.
+    if (sMSAAColorSRVs[0] && sMSAADepthSRV && sResolveVS && sResolvePS && sDepthWriteAll)
     {
         sStateBlock.Capture(ctx);
 
-        ID3D11RenderTargetView* nullRTV = nullptr;
-        ctx->OMSetRenderTargets(1, &nullRTV, sOrigDSV);
+        ctx->OMSetRenderTargets(3, sOrigRTVs, sOrigDSV);
         ctx->OMSetDepthStencilState(sDepthWriteAll, 0);
 
         float blendFactor[4] = { 1, 1, 1, 1 };
@@ -343,7 +377,10 @@ void OnGBufferLeave(ID3D11DeviceContext* ctx)
         ctx->RSSetViewports(1, &vp);
         ctx->RSSetState(nullptr);
 
-        ctx->PSSetShaderResources(0, 1, &sMSAADepthSRV);
+        ID3D11ShaderResourceView* srvs[4] = {
+            sMSAAColorSRVs[0], sMSAAColorSRVs[1], sMSAAColorSRVs[2], sMSAADepthSRV
+        };
+        ctx->PSSetShaderResources(0, 4, srvs);
         ctx->VSSetShader(sResolveVS, nullptr, 0);
         ctx->PSSetShader(sResolvePS, nullptr, 0);
         ctx->IASetInputLayout(nullptr);
@@ -351,13 +388,24 @@ void OnGBufferLeave(ID3D11DeviceContext* ctx)
         ctx->GSSetShader(nullptr, nullptr, 0);
         ctx->Draw(3, 0);
 
-        ID3D11ShaderResourceView* nullSRV = nullptr;
-        ctx->PSSetShaderResources(0, 1, &nullSRV);
+        ID3D11ShaderResourceView* nullSRVs[4] = {};
+        ctx->PSSetShaderResources(0, 4, nullSRVs);
 
         sStateBlock.Restore(ctx);
     }
 
     ReleaseOriginals();
+}
+
+ID3D11ShaderResourceView* GetColorSRV(int index)
+{
+    if (index < 0 || index > 2 || !sResourcesValid) return nullptr;
+    return sMSAAColorSRVs[index];
+}
+
+ID3D11ShaderResourceView* GetDepthSRV()
+{
+    return sResourcesValid ? sMSAADepthSRV : nullptr;
 }
 
 void Shutdown()

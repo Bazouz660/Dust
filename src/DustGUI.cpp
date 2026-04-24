@@ -3,6 +3,7 @@
 #include "EffectLoader.h"
 #include "GeometryCapture.h"
 #include "MSAARedirect.h"
+#include "DeferredMSAA.h"
 #include "ShaderMetadata.h"
 #include "ShaderDatabase.h"
 #include "Survey.h"
@@ -760,6 +761,19 @@ static void DrawFrameworkSection()
 
     if (MSAARedirect::IsActive())
         ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "  Active: %ux", MSAARedirect::GetSampleCount());
+
+    float threshold = DeferredMSAA::GetEdgeThreshold();
+    if (DustSliderFloat("Edge Threshold##msaa", &threshold, 0.001f, 0.2f))
+        DeferredMSAA::SetEdgeThreshold(threshold);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Relative depth threshold for edge detection.\nLower = more edges corrected.");
+
+    int debugMode = DeferredMSAA::GetDebugMode();
+    const char* debugLabels[] = { "Off", "Passthrough", "Green/Red Edges", "unused", "Depth Spread" };
+    if (ImGui::Combo("Debug##msaa_debug", &debugMode, debugLabels, 5))
+        DeferredMSAA::SetDebugMode(debugMode);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Off: Normal correction\nPassthrough: Skip correction entirely\nGreen/Red Edges: Green=geometry edges, Red=sky edges\nDepth Spread: Edge depth variation");
 
     ImGui::Spacing();
     ImGui::Separator();
