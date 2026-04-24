@@ -1267,21 +1267,29 @@ bool Init(IDXGISwapChain* swapChain, ID3D11Device* device, ID3D11DeviceContext* 
     if (!swapChain || !device || !context)
     { Log("GUI: Init aborted — null swap/device/context"); return false; }
 
-    gDevice = device;
-    gContext = context;
-
-    // Sanity: the swap chain must belong to the same device we'll render with,
-    // otherwise CreateRenderTargetView on its back buffer fails with E_INVALIDARG.
-    // This happens when Kenshi creates extra swap chains on a different device.
+    // The swap chain's device is authoritative — we must render the GUI with it,
+    // otherwise CreateRenderTargetView on its back buffer returns E_INVALIDARG.
+    // On some systems OGRE creates multiple D3D11 devices and the one our Draw
+    // hook captured may differ from the one that owns the swap chain.
     {
         ID3D11Device* scDevice = nullptr;
         HRESULT hr = swapChain->GetDevice(__uuidof(ID3D11Device), (void**)&scDevice);
         if (FAILED(hr) || !scDevice)
         { Log("GUI: swapChain->GetDevice failed hr=0x%08X", (unsigned)hr); if (scDevice) scDevice->Release(); return false; }
-        bool match = (scDevice == gDevice);
+
+        if (scDevice != device)
+        {
+            Log("GUI: swapChain device (%p) != captured device (%p) — using swap chain's device for GUI", scDevice, device);
+            gDevice = scDevice;
+            gDevice->GetImmediateContext(&gContext);
+            gContext->Release();
+        }
+        else
+        {
+            gDevice = device;
+            gContext = context;
+        }
         scDevice->Release();
-        if (!match)
-        { Log("GUI: swapChain device (%p) != captured device (%p) — skipping this swap chain", scDevice, gDevice); return false; }
     }
 
     DXGI_SWAP_CHAIN_DESC desc = {};

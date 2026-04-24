@@ -281,7 +281,6 @@ static DustSettingDesc gSettingsArray[] = {
     { "Denoise Steps",      DUST_SETTING_INT,   &gRTGIConfig.denoiseSteps,    0.0f,   5.0f,  "DenoiseSteps",    nullptr, "Number of spatial denoising passes" },
     { "Depth Sigma",        DUST_SETTING_FLOAT, &gRTGIConfig.depthSigma,      0.1f,   5.0f,  "DepthSigma",      nullptr, "Depth sensitivity of the denoiser" },
     { "Color Phi",          DUST_SETTING_FLOAT, &gRTGIConfig.phiColor,        1.0f,   10.0f, "PhiColor",        nullptr, "Color sensitivity of the denoiser" },
-    { "Filter Smoothness",  DUST_SETTING_FLOAT, &gRTGIConfig.filterSmoothness, 0.0f, 1.0f,  "FilterSmoothness", nullptr, "Spatial filter aggressiveness (0 = sharp detail, 1 = smooth)" },
     { "Resolution %",       DUST_SETTING_INT,   &gRTGIConfig.resolutionScale, 25.0f,  100.0f, "ResolutionScale", nullptr, "Render resolution as percentage of native (lower = faster)" },
     { "Debug View",         DUST_SETTING_INT,   &gRTGIConfig.debugView,       0.0f,   6.0f,  "DebugView",       nullptr, "Debug visualization mode (0 = off)" },
     // Hidden

@@ -1,9 +1,11 @@
-// RTGI Variance Extraction Pass
-// Reads the temporal metadata texture and extracts the encoded per-pixel
-// variance into a dedicated variance texture for the A-Trous denoiser.
-// This decouples the temporal data format from the denoise pipeline.
+// RTGI Variance Pass
+// Computes per-pixel luminance standard deviation in a 3x3 window from the
+// temporal accumulation output, stored in .r of a single-channel RT.
+// The a-trous denoiser reads this pre-computed value once per iteration
+// instead of recomputing it locally (which was ~9 taps per iteration × 4).
 
-Texture2D<float4> metadataTex : register(t0);
+Texture2D<float4> giTex      : register(t0);
+SamplerState      pointClamp : register(s0);
 
 cbuffer VarianceParams : register(b0)
 {
@@ -11,9 +13,30 @@ cbuffer VarianceParams : register(b0)
     float2 invViewportSize;
 };
 
+float Luminance(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
+
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 {
-    float encoded = metadataTex.Load(int3(int2(pos.xy), 0)).a;
-    float variance = encoded * encoded / 128.0;
-    return float4(variance, 0, 0, 0);
+    int2 pix = int2(pos.xy);
+    float centerLum = Luminance(giTex.Load(int3(pix, 0)).rgb);
+    float lumSum = centerLum;
+    float lumSumSq = centerLum * centerLum;
+
+    [unroll]
+    for (int vy = -1; vy <= 1; vy++)
+    {
+        [unroll]
+        for (int vx = -1; vx <= 1; vx++)
+        {
+            if (vx == 0 && vy == 0) continue;
+            float3 vc = giTex.Load(int3(pix + int2(vx, vy), 0)).rgb;
+            float vl = Luminance(vc);
+            lumSum += vl;
+            lumSumSq += vl * vl;
+        }
+    }
+
+    float lumMean = lumSum * (1.0 / 9.0);
+    float lumStdDev = sqrt(max(lumSumSq * (1.0 / 9.0) - lumMean * lumMean, 0.0));
+    return float4(lumStdDev, 0, 0, 0);
 }

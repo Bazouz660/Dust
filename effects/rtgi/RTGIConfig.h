@@ -23,11 +23,10 @@ struct RTGIConfig
     // Temporal
     float temporalBlend = 0.97f;   // accumulation factor (higher = smoother, more ghosting)
 
-    // Denoise (SVGF — Schied et al. 2017)
-    int   denoiseSteps     = 4;    // a-trous filter iterations (1-5)
-    float depthSigma       = 2.0f; // depth weight sensitivity (higher = more permissive on smooth surfaces)
-    float phiColor         = 4.0f; // luminance sensitivity (variance-guided, higher = smoother)
-    float filterSmoothness = 0.5f; // spatial filter aggressiveness (0 = sharp, 1 = smooth)
+    // Denoise (SVGF)
+    int   denoiseSteps  = 4;       // a-trous filter iterations (1-5)
+    float depthSigma    = 2.0f;    // depth weight sensitivity (higher = more permissive on smooth surfaces)
+    float phiColor      = 4.0f;    // luminance sensitivity (variance-guided, higher = smoother)
 
     // Quality — render resolution as percentage of native (25-100).
     // Sub-pixel temporal jitter (Halton 2,3) reclaims detail at reduced resolution.

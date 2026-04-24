@@ -47,30 +47,14 @@ static ID3D11ShaderResourceView* gAccumSRVB = nullptr;
 
 static int gAccumWriteIndex = 0; // 0 = write to A (read B as history), 1 = write to B (read A)
 
-// Variance ping-pong for SVGF A-Trous (RGBA16F: R=variance, GBA unused)
-static ID3D11Texture2D*           gMomentsTexA = nullptr;
-static ID3D11RenderTargetView*    gMomentsRTVA = nullptr;
-static ID3D11ShaderResourceView*  gMomentsSRVA = nullptr;
-static ID3D11UnorderedAccessView* gMomentsUAVA = nullptr;
+// Moments ping-pong for SVGF (RGBA16F: R=m1, G=m2, B=historyLength, A=variance)
+static ID3D11Texture2D*          gMomentsTexA = nullptr;
+static ID3D11RenderTargetView*   gMomentsRTVA = nullptr;
+static ID3D11ShaderResourceView* gMomentsSRVA = nullptr;
 
-static ID3D11Texture2D*           gMomentsTexB = nullptr;
-static ID3D11RenderTargetView*    gMomentsRTVB = nullptr;
-static ID3D11ShaderResourceView*  gMomentsSRVB = nullptr;
-static ID3D11UnorderedAccessView* gMomentsUAVB = nullptr;
-
-// Temporal metadata ping-pong (RGBA16F: R=z, GB=octahedral normal, A=encoded variance)
-static ID3D11Texture2D*          gTemporalDataTexA = nullptr;
-static ID3D11RenderTargetView*   gTemporalDataRTVA = nullptr;
-static ID3D11ShaderResourceView* gTemporalDataSRVA = nullptr;
-
-static ID3D11Texture2D*          gTemporalDataTexB = nullptr;
-static ID3D11RenderTargetView*   gTemporalDataRTVB = nullptr;
-static ID3D11ShaderResourceView* gTemporalDataSRVB = nullptr;
-
-// Spatial moments (RGBA16F, half render res, UAV for compute)
-static ID3D11Texture2D*           gSpatialMomentsTex = nullptr;
-static ID3D11ShaderResourceView*  gSpatialMomentsSRV = nullptr;
-static ID3D11UnorderedAccessView* gSpatialMomentsUAV = nullptr;
+static ID3D11Texture2D*          gMomentsTexB = nullptr;
+static ID3D11RenderTargetView*   gMomentsRTVB = nullptr;
+static ID3D11ShaderResourceView* gMomentsSRVB = nullptr;
 
 // Denoise ping-pong (RGBA16F) — UAV for compute-shader atrous
 static ID3D11Texture2D*           gDenoiseTexA = nullptr;
@@ -94,7 +78,6 @@ static ID3D11ShaderResourceView* gFinalGISRV = nullptr;
 
 static ID3D11VertexShader*  gFullscreenVS = nullptr;
 static ID3D11ComputeShader* gRayTraceCS = nullptr;
-static ID3D11ComputeShader* gSpatialMomentsCS = nullptr;
 static ID3D11PixelShader*   gTemporalPS = nullptr;
 static ID3D11PixelShader*   gVariancePS = nullptr;
 static ID3D11ComputeShader* gAtrousCS = nullptr;
@@ -115,7 +98,6 @@ static ID3D11SamplerState*      gLinearClampSampler = nullptr;
 // ==================== Constant Buffers ====================
 
 static ID3D11Buffer* gRayTraceCB = nullptr;
-static ID3D11Buffer* gSpatialMomentsCB = nullptr;
 static ID3D11Buffer* gTemporalCB = nullptr;
 static ID3D11Buffer* gVarianceCB = nullptr;
 static ID3D11Buffer* gDenoiseCB = nullptr;
@@ -148,14 +130,6 @@ struct RayTraceCBData
     float camForward[4]; // column 2 of inverseView: camera forward in world space
 };
 
-struct SpatialMomentsCBData
-{
-    float halfResSize[2];
-    float invHalfResSize[2];
-    float fullResSize[2];
-    float invFullResSize[2];
-};
-
 struct TemporalCBData
 {
     float viewportSize[2];
@@ -165,7 +139,7 @@ struct TemporalCBData
     float temporalBlend;
     float frameIndex;
     float reprojMatrix[16]; // currentInvView * prevView — direct view-to-prevView transform
-    float motionMagnitude;
+    float motionMagnitude;  // length of translation in reprojection matrix (pixels approx)
     float _pad0;
     float _pad1;
     float _pad2;
@@ -181,8 +155,8 @@ struct DenoiseCBData
     float depthSigma;
     float phiColor;
     float fadeDistance;
-    float filterSmoothness;
-    float iteration;
+    float _pad0;
+    float _pad1;
 };
 
 struct VarianceCBData
@@ -333,13 +307,10 @@ static void ReleaseTextures()
     SAFE_RELEASE(gRawTex);     SAFE_RELEASE(gRawRTV);     SAFE_RELEASE(gRawSRV);     SAFE_RELEASE(gRawUAV);
     SAFE_RELEASE(gAccumTexA);  SAFE_RELEASE(gAccumRTVA);  SAFE_RELEASE(gAccumSRVA);
     SAFE_RELEASE(gAccumTexB);  SAFE_RELEASE(gAccumRTVB);  SAFE_RELEASE(gAccumSRVB);
-    SAFE_RELEASE(gMomentsTexA);SAFE_RELEASE(gMomentsRTVA);SAFE_RELEASE(gMomentsSRVA);SAFE_RELEASE(gMomentsUAVA);
-    SAFE_RELEASE(gMomentsTexB);SAFE_RELEASE(gMomentsRTVB);SAFE_RELEASE(gMomentsSRVB);SAFE_RELEASE(gMomentsUAVB);
+    SAFE_RELEASE(gMomentsTexA);SAFE_RELEASE(gMomentsRTVA);SAFE_RELEASE(gMomentsSRVA);
+    SAFE_RELEASE(gMomentsTexB);SAFE_RELEASE(gMomentsRTVB);SAFE_RELEASE(gMomentsSRVB);
     SAFE_RELEASE(gDenoiseTexA);SAFE_RELEASE(gDenoiseRTVA);SAFE_RELEASE(gDenoiseSRVA);SAFE_RELEASE(gDenoiseUAVA);
     SAFE_RELEASE(gDenoiseTexB);SAFE_RELEASE(gDenoiseRTVB);SAFE_RELEASE(gDenoiseSRVB);SAFE_RELEASE(gDenoiseUAVB);
-    SAFE_RELEASE(gTemporalDataTexA);SAFE_RELEASE(gTemporalDataRTVA);SAFE_RELEASE(gTemporalDataSRVA);
-    SAFE_RELEASE(gTemporalDataTexB);SAFE_RELEASE(gTemporalDataRTVB);SAFE_RELEASE(gTemporalDataSRVB);
-    SAFE_RELEASE(gSpatialMomentsTex);SAFE_RELEASE(gSpatialMomentsSRV);SAFE_RELEASE(gSpatialMomentsUAV);
     SAFE_RELEASE(gPrevDepthTex);SAFE_RELEASE(gPrevDepthSRV);
 }
 
@@ -358,32 +329,10 @@ static bool CreateTextures(ID3D11Device* device, UINT width, UINT height)
     if (!CreateRGBA16FTexture(device, rw, rh, &gRawTex, &gRawRTV, &gRawSRV, &gRawUAV)) return false;
     if (!CreateRGBA16FTexture(device, rw, rh, &gAccumTexA, &gAccumRTVA, &gAccumSRVA)) return false;
     if (!CreateRGBA16FTexture(device, rw, rh, &gAccumTexB, &gAccumRTVB, &gAccumSRVB)) return false;
-    if (!CreateRGBA16FTexture(device, rw, rh, &gMomentsTexA, &gMomentsRTVA, &gMomentsSRVA, &gMomentsUAVA)) return false;
-    if (!CreateRGBA16FTexture(device, rw, rh, &gMomentsTexB, &gMomentsRTVB, &gMomentsSRVB, &gMomentsUAVB)) return false;
+    if (!CreateRGBA16FTexture(device, rw, rh, &gMomentsTexA, &gMomentsRTVA, &gMomentsSRVA)) return false;
+    if (!CreateRGBA16FTexture(device, rw, rh, &gMomentsTexB, &gMomentsRTVB, &gMomentsSRVB)) return false;
     if (!CreateRGBA16FTexture(device, rw, rh, &gDenoiseTexA, &gDenoiseRTVA, &gDenoiseSRVA, &gDenoiseUAVA)) return false;
     if (!CreateRGBA16FTexture(device, rw, rh, &gDenoiseTexB, &gDenoiseRTVB, &gDenoiseSRVB, &gDenoiseUAVB)) return false;
-    if (!CreateRGBA16FTexture(device, rw, rh, &gTemporalDataTexA, &gTemporalDataRTVA, &gTemporalDataSRVA)) return false;
-    if (!CreateRGBA16FTexture(device, rw, rh, &gTemporalDataTexB, &gTemporalDataRTVB, &gTemporalDataSRVB)) return false;
-    // Spatial moments at half render resolution
-    {
-        UINT hrw = max(1u, rw / 2);
-        UINT hrh = max(1u, rh / 2);
-        D3D11_TEXTURE2D_DESC desc = {};
-        desc.Width = hrw;
-        desc.Height = hrh;
-        desc.MipLevels = 1;
-        desc.ArraySize = 1;
-        desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-        desc.SampleDesc.Count = 1;
-        desc.Usage = D3D11_USAGE_DEFAULT;
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-        HRESULT hr = device->CreateTexture2D(&desc, nullptr, &gSpatialMomentsTex);
-        if (FAILED(hr)) { Log("RTGI: Failed to create spatial moments texture: 0x%08X", hr); return false; }
-        hr = device->CreateShaderResourceView(gSpatialMomentsTex, nullptr, &gSpatialMomentsSRV);
-        if (FAILED(hr)) { Log("RTGI: Failed to create spatial moments SRV: 0x%08X", hr); return false; }
-        hr = device->CreateUnorderedAccessView(gSpatialMomentsTex, nullptr, &gSpatialMomentsUAV);
-        if (FAILED(hr)) { Log("RTGI: Failed to create spatial moments UAV: 0x%08X", hr); return false; }
-    }
     // Previous frame depth — full res, CopyResource target + SRV for temporal pass
     {
         D3D11_TEXTURE2D_DESC desc = {};
@@ -422,38 +371,31 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
     ID3DBlob* vsBlob = host->CompileShaderFromFile((gShaderDir + "fullscreen_vs.hlsl").c_str(), "main", "vs_5_0");
     if (!vsBlob) { Log("RTGI: Failed to compile fullscreen VS"); return false; }
 
-    ID3DBlob* smBlob = host->CompileShaderFromFile((gShaderDir + "rtgi_spatial_moments_cs.hlsl").c_str(), "main", "cs_5_0");
-    if (!smBlob) { vsBlob->Release(); Log("RTGI: Failed to compile spatial moments CS"); return false; }
-
     ID3DBlob* rtBlob = host->CompileShaderFromFile((gShaderDir + "rtgi_raytrace_cs.hlsl").c_str(), "main", "cs_5_0");
-    if (!rtBlob) { vsBlob->Release(); smBlob->Release(); Log("RTGI: Failed to compile raytrace CS"); return false; }
+    if (!rtBlob) { vsBlob->Release(); Log("RTGI: Failed to compile raytrace CS"); return false; }
 
     ID3DBlob* tempBlob = host->CompileShaderFromFile((gShaderDir + "rtgi_temporal_ps.hlsl").c_str(), "main", "ps_5_0");
-    if (!tempBlob) { vsBlob->Release(); smBlob->Release(); rtBlob->Release(); Log("RTGI: Failed to compile temporal PS"); return false; }
+    if (!tempBlob) { vsBlob->Release(); rtBlob->Release(); Log("RTGI: Failed to compile temporal PS"); return false; }
 
     ID3DBlob* varBlob = host->CompileShaderFromFile((gShaderDir + "rtgi_variance_ps.hlsl").c_str(), "main", "ps_5_0");
-    if (!varBlob) { vsBlob->Release(); smBlob->Release(); rtBlob->Release(); tempBlob->Release(); Log("RTGI: Failed to compile variance PS"); return false; }
+    if (!varBlob) { vsBlob->Release(); rtBlob->Release(); tempBlob->Release(); Log("RTGI: Failed to compile variance PS"); return false; }
 
     ID3DBlob* denoiseBlob = host->CompileShaderFromFile((gShaderDir + "rtgi_atrous_cs.hlsl").c_str(), "main", "cs_5_0");
-    if (!denoiseBlob) { vsBlob->Release(); smBlob->Release(); rtBlob->Release(); tempBlob->Release(); varBlob->Release(); Log("RTGI: Failed to compile atrous CS"); return false; }
+    if (!denoiseBlob) { vsBlob->Release(); rtBlob->Release(); tempBlob->Release(); varBlob->Release(); Log("RTGI: Failed to compile atrous CS"); return false; }
 
     ID3DBlob* compBlob = host->CompileShaderFromFile((gShaderDir + "rtgi_composite_ps.hlsl").c_str(), "main", "ps_5_0");
-    if (!compBlob) { vsBlob->Release(); smBlob->Release(); rtBlob->Release(); tempBlob->Release(); varBlob->Release(); denoiseBlob->Release(); Log("RTGI: Failed to compile composite PS"); return false; }
+    if (!compBlob) { vsBlob->Release(); rtBlob->Release(); tempBlob->Release(); varBlob->Release(); denoiseBlob->Release(); Log("RTGI: Failed to compile composite PS"); return false; }
 
     ID3DBlob* aoCompBlob = host->CompileShaderFromFile((gShaderDir + "rtgi_ao_composite_ps.hlsl").c_str(), "main", "ps_5_0");
-    if (!aoCompBlob) { vsBlob->Release(); smBlob->Release(); rtBlob->Release(); tempBlob->Release(); varBlob->Release(); denoiseBlob->Release(); compBlob->Release(); Log("RTGI: Failed to compile AO composite PS"); return false; }
+    if (!aoCompBlob) { vsBlob->Release(); rtBlob->Release(); tempBlob->Release(); varBlob->Release(); denoiseBlob->Release(); compBlob->Release(); Log("RTGI: Failed to compile AO composite PS"); return false; }
 
     ID3DBlob* dbgBlob = host->CompileShaderFromFile((gShaderDir + "rtgi_debug_ps.hlsl").c_str(), "main", "ps_5_0");
-    if (!dbgBlob) { vsBlob->Release(); smBlob->Release(); rtBlob->Release(); tempBlob->Release(); varBlob->Release(); denoiseBlob->Release(); compBlob->Release(); aoCompBlob->Release(); Log("RTGI: Failed to compile debug PS"); return false; }
+    if (!dbgBlob) { vsBlob->Release(); rtBlob->Release(); tempBlob->Release(); varBlob->Release(); denoiseBlob->Release(); compBlob->Release(); aoCompBlob->Release(); Log("RTGI: Failed to compile debug PS"); return false; }
 
     HRESULT hr;
 
     hr = device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &gFullscreenVS);
     vsBlob->Release();
-    if (FAILED(hr)) return false;
-
-    hr = device->CreateComputeShader(smBlob->GetBufferPointer(), smBlob->GetBufferSize(), nullptr, &gSpatialMomentsCS);
-    smBlob->Release();
     if (FAILED(hr)) return false;
 
     hr = device->CreateComputeShader(rtBlob->GetBufferPointer(), rtBlob->GetBufferSize(), nullptr, &gRayTraceCS);
@@ -556,13 +498,12 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
 
     // Constant buffers
     gRayTraceCB = host->CreateConstantBuffer(device, sizeof(RayTraceCBData));
-    gSpatialMomentsCB = host->CreateConstantBuffer(device, sizeof(SpatialMomentsCBData));
     gTemporalCB = host->CreateConstantBuffer(device, sizeof(TemporalCBData));
     gVarianceCB = host->CreateConstantBuffer(device, sizeof(VarianceCBData));
     gDenoiseCB = host->CreateConstantBuffer(device, sizeof(DenoiseCBData));
     gCompositeCB = host->CreateConstantBuffer(device, sizeof(CompositeCBData));
     gDebugCB = host->CreateConstantBuffer(device, sizeof(DebugCBData));
-    if (!gRayTraceCB || !gSpatialMomentsCB || !gTemporalCB || !gVarianceCB || !gDenoiseCB || !gCompositeCB || !gDebugCB)
+    if (!gRayTraceCB || !gTemporalCB || !gVarianceCB || !gDenoiseCB || !gCompositeCB || !gDebugCB)
         return false;
 
     gLastResScale = gRTGIConfig.resolutionScale;
@@ -576,19 +517,17 @@ void Shutdown()
     ReleaseTextures();
 
     SAFE_RELEASE(gFullscreenVS);
-    SAFE_RELEASE(gRayTraceCS);    SAFE_RELEASE(gSpatialMomentsCS);
-    SAFE_RELEASE(gTemporalPS);    SAFE_RELEASE(gVariancePS);
-    SAFE_RELEASE(gAtrousCS);
+    SAFE_RELEASE(gRayTraceCS);    SAFE_RELEASE(gTemporalPS);
+    SAFE_RELEASE(gVariancePS);    SAFE_RELEASE(gAtrousCS);
     SAFE_RELEASE(gCompositePS);   SAFE_RELEASE(gAOCompositePS);
     SAFE_RELEASE(gDebugPS);
     SAFE_RELEASE(gNoBlend);       SAFE_RELEASE(gAdditiveBlend);
     SAFE_RELEASE(gMultiplyBlend); SAFE_RELEASE(gNoDepthDSS);
     SAFE_RELEASE(gNoCullRS);      SAFE_RELEASE(gPointClampSampler);
     SAFE_RELEASE(gLinearClampSampler);
-    SAFE_RELEASE(gRayTraceCB);    SAFE_RELEASE(gSpatialMomentsCB);
-    SAFE_RELEASE(gTemporalCB);    SAFE_RELEASE(gVarianceCB);
-    SAFE_RELEASE(gDenoiseCB);     SAFE_RELEASE(gCompositeCB);
-    SAFE_RELEASE(gDebugCB);
+    SAFE_RELEASE(gRayTraceCB);    SAFE_RELEASE(gTemporalCB);
+    SAFE_RELEASE(gVarianceCB);    SAFE_RELEASE(gDenoiseCB);
+    SAFE_RELEASE(gCompositeCB);   SAFE_RELEASE(gDebugCB);
     gInitialized = false;
     gHasValidCameraData = false;
     gHasPrevFrame = false;
@@ -777,63 +716,20 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
         ctx->CSSetShaderResources(0, 4, nullSRVs);
     }
 
-    // ---- Pass 1b: Spatial Moments (half render res, compute) ----
-    // Computes mean + stddev of luminance for current raw GI and previous accumulated GI.
-    // The temporal pass uses this to compute variance-guided blending alpha.
-    // Reference: Schied et al. 2017, Section 4.2
+    // ---- Pass 2: Temporal Accumulation (single RT: color+AO) ----
     {
-        ID3D11RenderTargetView* nullRTV = nullptr;
-        ctx->OMSetRenderTargets(1, &nullRTV, nullptr);
-
-        ctx->CSSetShader(gSpatialMomentsCS, nullptr, 0);
-
-        ID3D11ShaderResourceView* accumHistorySRV = (gAccumWriteIndex == 0) ? gAccumSRVB : gAccumSRVA;
-        ID3D11ShaderResourceView* smSRVs[2] = { gRawSRV, accumHistorySRV };
-        ctx->CSSetShaderResources(0, 2, smSRVs);
-        ctx->CSSetSamplers(0, 1, &gLinearClampSampler);
-
-        UINT hrw = max(1u, gRenderWidth / 2);
-        UINT hrh = max(1u, gRenderHeight / 2);
-        SpatialMomentsCBData smcb = {};
-        smcb.halfResSize[0] = (float)hrw;
-        smcb.halfResSize[1] = (float)hrh;
-        smcb.invHalfResSize[0] = 1.0f / (float)hrw;
-        smcb.invHalfResSize[1] = 1.0f / (float)hrh;
-        smcb.fullResSize[0] = (float)gRenderWidth;
-        smcb.fullResSize[1] = (float)gRenderHeight;
-        smcb.invFullResSize[0] = 1.0f / (float)gRenderWidth;
-        smcb.invFullResSize[1] = 1.0f / (float)gRenderHeight;
-        gHost->UpdateConstantBuffer(ctx, gSpatialMomentsCB, &smcb, sizeof(smcb));
-        ctx->CSSetConstantBuffers(0, 1, &gSpatialMomentsCB);
-
-        UINT initialCount = 0;
-        ctx->CSSetUnorderedAccessViews(0, 1, &gSpatialMomentsUAV, &initialCount);
-        ctx->Dispatch((hrw + 7) / 8, (hrh + 7) / 8, 1);
-
-        ID3D11UnorderedAccessView* nullUAV = nullptr;
-        ctx->CSSetUnorderedAccessViews(0, 1, &nullUAV, &initialCount);
-        ID3D11ShaderResourceView* nullSRVs2[2] = {};
-        ctx->CSSetShaderResources(0, 2, nullSRVs2);
-    }
-
-    // ---- Pass 2: Temporal Accumulation (MRT: accum + metadata) ----
-    // Motion-compensated bilateral reprojection with variance-guided alpha.
-    // Reference: Schied et al. 2017, Karis 2014
-    {
+        // Write to current accumulation buffer, read history from the other
         ID3D11RenderTargetView* accumWriteRTV = (gAccumWriteIndex == 0) ? gAccumRTVA : gAccumRTVB;
-        ID3D11RenderTargetView* temporalDataWriteRTV = (gAccumWriteIndex == 0) ? gTemporalDataRTVA : gTemporalDataRTVB;
         ID3D11ShaderResourceView* accumHistorySRV = (gAccumWriteIndex == 0) ? gAccumSRVB : gAccumSRVA;
-        ID3D11ShaderResourceView* prevTemporalDataSRV = (gAccumWriteIndex == 0) ? gTemporalDataSRVB : gTemporalDataSRVA;
 
-        ID3D11RenderTargetView* rtvs[2] = { accumWriteRTV, temporalDataWriteRTV };
-        ctx->OMSetRenderTargets(2, rtvs, nullptr);
+        ctx->OMSetRenderTargets(1, &accumWriteRTV, nullptr);
         ctx->OMSetBlendState(gNoBlend, blendFactor, 0xFFFFFFFF);
         ctx->RSSetViewports(1, &renderVP);
         ctx->PSSetShader(gTemporalPS, nullptr, 0);
 
-        // t0=rawGI, t1=historyAccum, t2=depth, t3=prevTemporalData, t4=normals, t5=spatialMoments
-        ID3D11ShaderResourceView* srvs[6] = { gRawSRV, accumHistorySRV, depthSRV, prevTemporalDataSRV, normalsSRV, gSpatialMomentsSRV };
-        ctx->PSSetShaderResources(0, 6, srvs);
+        // t0=currentGI, t1=historyColor, t2=depth, t3=prevDepth
+        ID3D11ShaderResourceView* srvs[4] = { gRawSRV, accumHistorySRV, depthSRV, gPrevDepthSRV };
+        ctx->PSSetShaderResources(0, 4, srvs);
         ID3D11SamplerState* samplers[2] = { gPointClampSampler, gLinearClampSampler };
         ctx->PSSetSamplers(0, 2, samplers);
 
@@ -851,6 +747,7 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
             ComputeReprojectionMatrix(gInverseView, gPrevInverseView, cb.reprojMatrix);
             float tx = cb.reprojMatrix[12], ty = cb.reprojMatrix[13], tz = cb.reprojMatrix[14];
             float instantMotion = sqrtf(tx * tx + ty * ty + tz * tz);
+            // EMA smoothing: fast attack, slow decay (~20 frames to halve)
             if (instantMotion > gSmoothedMotion)
                 gSmoothedMotion = instantMotion;
             else
@@ -868,23 +765,23 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
         ctx->PSSetConstantBuffers(0, 1, &gTemporalCB);
 
         ctx->Draw(3, 0);
-        ID3D11ShaderResourceView* nullSRVs6[6] = {};
-        ctx->PSSetShaderResources(0, 6, nullSRVs6);
+        ID3D11ShaderResourceView* nullSRVs[4] = {};
+        ctx->PSSetShaderResources(0, 4, nullSRVs);
     }
 
+    // The accumulation result to denoise
     ID3D11ShaderResourceView* accumResultSRV = (gAccumWriteIndex == 0) ? gAccumSRVA : gAccumSRVB;
-    ID3D11ShaderResourceView* temporalDataResultSRV = (gAccumWriteIndex == 0) ? gTemporalDataSRVA : gTemporalDataSRVB;
 
-    // ---- Pass 2b: Variance Extraction ----
-    // Extracts per-pixel temporal variance from metadata into the variance
-    // ping-pong texture for the A-Trous denoiser to read/propagate.
+    // ---- Pass 2b: Variance estimate (3x3 luminance stddev) ----
+    // Computed once from the temporal output; atrous reads this value across
+    // all denoise iterations instead of recomputing it 4 times.
     {
         ctx->OMSetRenderTargets(1, &gMomentsRTVA, nullptr);
         ctx->OMSetBlendState(gNoBlend, blendFactor, 0xFFFFFFFF);
         ctx->RSSetViewports(1, &renderVP);
         ctx->PSSetShader(gVariancePS, nullptr, 0);
 
-        ctx->PSSetShaderResources(0, 1, &temporalDataResultSRV);
+        ctx->PSSetShaderResources(0, 1, &accumResultSRV);
         ctx->PSSetSamplers(0, 1, &gPointClampSampler);
 
         VarianceCBData cb = {};
@@ -900,11 +797,11 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
         ctx->PSSetShaderResources(0, 1, &nullSRV);
     }
 
-    // ---- Pass 3: A-Trous Denoise with Variance Propagation ----
-    // Schied et al. 2017: variance-guided edge-stopping + w^2 propagation rule.
-    // Dual UAV: u0=filtered color, u1=propagated variance.
+    // ---- Pass 3: A-Trous Denoise (compute shader, multiple iterations) ----
+    // State that's invariant across iterations is bound once before the loop —
+    // trims ~6 redundant D3D11 calls per iteration.
     ID3D11ShaderResourceView* denoiseInputSRV = accumResultSRV;
-    ID3D11ShaderResourceView* denoiseOutputSRV = accumResultSRV;
+    ID3D11ShaderResourceView* denoiseOutputSRV = accumResultSRV; // fallback if 0 iterations
 
     int numDenoiseSteps = gRTGIConfig.denoiseSteps;
     if (numDenoiseSteps < 0) numDenoiseSteps = 0;
@@ -912,6 +809,7 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
 
     if (numDenoiseSteps > 0)
     {
+        // Unbind the temporal RT so its SRV (accumResultSRV) is safe to use as input
         ID3D11RenderTargetView* nullRTV = nullptr;
         ctx->OMSetRenderTargets(1, &nullRTV, nullptr);
 
@@ -919,47 +817,38 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
         ctx->CSSetSamplers(0, 1, &gPointClampSampler);
         ctx->CSSetConstantBuffers(0, 1, &gDenoiseCB);
 
+        // t1=depth, t2=normals, t3=variance — same resources across all iterations
+        ID3D11ShaderResourceView* invariantSrvs[3] = { depthSRV, normalsSRV, gMomentsSRVA };
+        ctx->CSSetShaderResources(1, 3, invariantSrvs);
+
         UINT dispatchX = (gRenderWidth + 7) / 8;
         UINT dispatchY = (gRenderHeight + 7) / 8;
-        UINT initialCounts[2] = { 0, 0 };
+        UINT initialCount = 0;
 
         for (int i = 0; i < numDenoiseSteps; i++)
         {
-            ID3D11UnorderedAccessView* writeColorUAV;
-            ID3D11UnorderedAccessView* writeVarUAV;
-            ID3D11ShaderResourceView* readVarSRV;
-
+            ID3D11UnorderedAccessView* writeUAV;
             if (i == 0)
             {
-                writeColorUAV = gDenoiseUAVA;
-                writeVarUAV = gMomentsUAVB;
+                writeUAV = gDenoiseUAVA;
                 denoiseOutputSRV = gDenoiseSRVA;
                 denoiseInputSRV = accumResultSRV;
-                readVarSRV = gMomentsSRVA;
             }
             else if (i % 2 == 1)
             {
-                writeColorUAV = gDenoiseUAVB;
-                writeVarUAV = gMomentsUAVA;
+                writeUAV = gDenoiseUAVB;
                 denoiseOutputSRV = gDenoiseSRVB;
                 denoiseInputSRV = gDenoiseSRVA;
-                readVarSRV = gMomentsSRVB;
             }
             else
             {
-                writeColorUAV = gDenoiseUAVA;
-                writeVarUAV = gMomentsUAVB;
+                writeUAV = gDenoiseUAVA;
                 denoiseOutputSRV = gDenoiseSRVA;
                 denoiseInputSRV = gDenoiseSRVB;
-                readVarSRV = gMomentsSRVA;
             }
 
-            // t0=color, t1=depth, t2=normals, t3=variance
-            ID3D11ShaderResourceView* srvs[4] = { denoiseInputSRV, depthSRV, normalsSRV, readVarSRV };
-            ctx->CSSetShaderResources(0, 4, srvs);
-
-            ID3D11UnorderedAccessView* uavs[2] = { writeColorUAV, writeVarUAV };
-            ctx->CSSetUnorderedAccessViews(0, 2, uavs, initialCounts);
+            ctx->CSSetShaderResources(0, 1, &denoiseInputSRV);
+            ctx->CSSetUnorderedAccessViews(0, 1, &writeUAV, &initialCount);
 
             DenoiseCBData cb = {};
             cb.viewportSize[0] = (float)gRenderWidth;
@@ -968,20 +857,20 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
             cb.invViewportSize[1] = 1.0f / (float)gRenderHeight;
             cb.tanHalfFov = gRTGIConfig.tanHalfFov;
             cb.aspectRatio = aspect;
-            cb.stepSize = (float)(1 << i);
+            cb.stepSize = (float)(1 << i); // 1, 2, 4, 8, 16
             cb.depthSigma = gRTGIConfig.depthSigma;
             cb.phiColor = gRTGIConfig.phiColor;
             cb.fadeDistance = gRTGIConfig.fadeDistance;
-            cb.filterSmoothness = gRTGIConfig.filterSmoothness;
-            cb.iteration = (float)i;
             gHost->UpdateConstantBuffer(ctx, gDenoiseCB, &cb, sizeof(cb));
 
             ctx->Dispatch(dispatchX, dispatchY, 1);
 
-            ID3D11UnorderedAccessView* nullUAVs[2] = { nullptr, nullptr };
-            ctx->CSSetUnorderedAccessViews(0, 2, nullUAVs, initialCounts);
+            // Unbind UAV so the same texture can be bound as SRV next iteration
+            ID3D11UnorderedAccessView* nullUAV = nullptr;
+            ctx->CSSetUnorderedAccessViews(0, 1, &nullUAV, &initialCount);
         }
 
+        // Clear CS SRVs so the bindings don't linger past RenderGI
         ID3D11ShaderResourceView* nullSRVs[4] = {};
         ctx->CSSetShaderResources(0, 4, nullSRVs);
     }

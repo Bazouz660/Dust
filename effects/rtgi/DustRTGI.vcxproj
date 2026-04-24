@@ -95,11 +95,8 @@
   </ItemGroup>
   <ItemGroup>
     <None Include="shaders\fullscreen_vs.hlsl" />
-    <None Include="shaders\rtgi_raytrace_cs.hlsl" />
-    <None Include="shaders\rtgi_spatial_moments_cs.hlsl" />
     <None Include="shaders\rtgi_temporal_ps.hlsl" />
-    <None Include="shaders\rtgi_variance_ps.hlsl" />
-    <None Include="shaders\rtgi_atrous_cs.hlsl" />
+    <None Include="shaders\rtgi_atrous_ps.hlsl" />
     <None Include="shaders\rtgi_composite_ps.hlsl" />
     <None Include="shaders\rtgi_ao_composite_ps.hlsl" />
     <None Include="shaders\rtgi_debug_ps.hlsl" />
