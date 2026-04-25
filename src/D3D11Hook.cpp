@@ -8,6 +8,7 @@
 #include "GeometryCapture.h"
 #include "MSAARedirect.h"
 #include "DeferredMSAA.h"
+
 #include "Survey.h"
 #include "SurveyRecorder.h"
 #include "SurveyWriter.h"
@@ -40,6 +41,7 @@ static bool gDispatchedThisFrame = false;
 static DustCameraData gCameraData = {};
 static bool gCameraDataExtracted = false; // per-frame flag
 
+
 // VTable indices for swap chain methods (used by both Install() and deferred hooking)
 static const int VTIDX_SC_Present        = 8;
 static const int VTIDX_SC_ResizeBuffers  = 13;
@@ -61,6 +63,7 @@ void ResetFrameState()
     GeometryCapture::ResetFrame();
     gPipelineDetector.ResetFrame();
     gResourceRegistry.ResetFrame();
+
     gDispatchedThisFrame = false;
     gCameraDataExtracted = false;
     gDeviceRemovedThisFrame = false;
@@ -151,6 +154,7 @@ static void ExtractCameraData(ID3D11DeviceContext* ctx)
 
     gCameraStagingSlot = readSlot;
     gCameraStagingReady = true;
+
 }
 
 // ==================== Original function pointers ====================
@@ -214,7 +218,6 @@ static PFN_Present1                 oPresent1 = nullptr;
 static uint64_t gDrawHookCallCount = 0;
 static uint64_t gPresentHookCallCount = 0;
 static bool gGuiInitDone = false;
-static bool sInDeferredMSAA = false;
 
 // ==================== D3DCompile hook (runtime shader patching) ====================
 
@@ -270,6 +273,31 @@ static std::string PatchDeferredShader(const std::string& src)
         "\tsunLight.diffuse *= directFade;\n"
         "\tsunLight.specular *= directFade;\n\n\t";
     result.insert(pos2, inject2);
+
+    // === Specular AA Patch ===
+    // Geometric specular anti-aliasing (Kaplanyan & Hill 2016): widen roughness
+    // based on screen-space normal derivatives to eliminate specular flickering.
+    // Injected before LightingData so it affects sun + point light specular.
+    // IBL specular (CalcEnvironmentLight) runs earlier with original roughness,
+    // which is fine — IBL is low-frequency and doesn't alias.
+
+    const char* specAAAnchor = "LightingData ld = (LightingData)0.0f;";
+    size_t specAAPos = result.find(specAAAnchor);
+    if (specAAPos != std::string::npos)
+    {
+        std::string specAA =
+            "// [Dust] Geometric specular anti-aliasing\n"
+            "\t{\n"
+            "\t\tfloat3 _dNdx = ddx(normal);\n"
+            "\t\tfloat3 _dNdy = ddy(normal);\n"
+            "\t\tfloat _specAAVar = max(dot(_dNdx, _dNdx), dot(_dNdy, _dNdy));\n"
+            "\t\tfloat _roughness = 1.0 - gloss;\n"
+            "\t\t_roughness = sqrt(_roughness * _roughness + min(2.0 * _specAAVar, 0.18));\n"
+            "\t\tgloss = 1.0 - _roughness;\n"
+            "\t}\n\n\t";
+        result.insert(specAAPos, specAA);
+        Log("ShaderPatch: injected geometric specular AA");
+    }
 
     // === Shadow Patches ===
     // Replace vanilla RTWShadow (3x3 PCF with 0.0001 texel size — essentially a single sample)
@@ -423,6 +451,131 @@ static std::string PatchDeferredShader(const std::string& src)
         Log("ShaderPatch: '= RTWShadow(' not found, shadow redirect skipped");
     }
 
+    // === MSAA Per-Sample Lighting Patch ===
+    // Inject Texture2DMS declarations + config CB + per-sample decode helper
+    // before main_vs, then per-sample branch at end of main_fs.
+
+    const char* msaaAnchor1 = "void main_vs (";
+    size_t msaaPos1 = result.find(msaaAnchor1);
+    if (msaaPos1 != std::string::npos)
+    {
+        std::string msaaDecls =
+            "// [Dust] MSAA per-sample lighting\n"
+            "Texture2DMS<float4> dustMSAA0 : register(t10);\n"
+            "Texture2DMS<float4> dustMSAA1 : register(t11);\n"
+            "Texture2DMS<float>  dustMSAA2 : register(t12);\n"
+            "\n"
+            "cbuffer DustMSAACB : register(b3) {\n"
+            "\tuint dustMSAASamples;\n"
+            "\tfloat dustEdgeThresh;\n"
+            "\tfloat dustDebugMode;\n"
+            "\tfloat dustMSAAPad;\n"
+            "};\n"
+            "\n"
+            "float3 DustDecodeAlbedoMS(int2 c, uint si, float sd) {\n"
+            "\tfloat2 yg = dustMSAA0.Load(c, si).rg;\n"
+            "\tfloat mis = 0.5;\n"
+            "\tfloat bd = sd * 0.05;\n"
+            "\tint2 dd[4] = { int2(-1,0), int2(1,0), int2(0,-1), int2(0,1) };\n"
+            "\t[unroll] for (int d = 0; d < 4; d++) {\n"
+            "\t\tfloat nd = dustMSAA2.Load(c + dd[d], 0);\n"
+            "\t\tfloat df = abs(nd - sd);\n"
+            "\t\tif (nd > 0.00001 && df < bd) { bd = df; mis = dustMSAA0.Load(c + dd[d], 0).g; }\n"
+            "\t}\n"
+            "\tbool ev = ((c.x & 1) == (c.y & 1));\n"
+            "\tfloat Co = ev ? mis : yg.y;\n"
+            "\tfloat Cg = ev ? yg.y : mis;\n"
+            "\tCo -= 0.5; Cg -= 0.5;\n"
+            "\treturn saturate(float3(yg.x + Co - Cg, yg.x + Cg, yg.x - Co - Cg));\n"
+            "}\n\n";
+        result.insert(msaaPos1, msaaDecls);
+        Log("ShaderPatch: injected MSAA declarations + DustDecodeAlbedoMS");
+    }
+
+    // Inject per-sample branch in main_fs, after final color computation.
+    // Anchor: "ld.specular + ld.diffuse * albedo" in the color assignment.
+    const char* msaaAnchor2 = "ld.specular + ld.diffuse * albedo + albedo*emissive";
+    size_t msaaPos2 = result.find(msaaAnchor2);
+    if (msaaPos2 != std::string::npos)
+    {
+        // Find the end of the statement (semicolon)
+        size_t semiPos = result.find(';', msaaPos2);
+        if (semiPos != std::string::npos)
+        {
+            std::string msaaBranch =
+                "\n\n\t// [Dust] MSAA per-sample deferred lighting\n"
+                "\tif (dustMSAASamples >= 2) {\n"
+                "\t\tint2 mc = int2(pixel.xy);\n"
+                "\t\tfloat mDepths[8];\n"
+                "\t\tfloat mMinD = 1e30, mMaxD = 0;\n"
+                "\t\tuint mValid = 0;\n"
+                "\t\t[loop] for (uint mi = 0; mi < dustMSAASamples; mi++) {\n"
+                "\t\t\tmDepths[mi] = dustMSAA2.Load(mc, mi);\n"
+                "\t\t\tif (mDepths[mi] > 0.00001) {\n"
+                "\t\t\t\tmMinD = min(mMinD, mDepths[mi]);\n"
+                "\t\t\t\tmMaxD = max(mMaxD, mDepths[mi]);\n"
+                "\t\t\t\tmValid++;\n"
+                "\t\t\t}\n"
+                "\t\t}\n"
+                "\t\tfloat mDepthRel = (mMaxD - mMinD) / max((mMinD + mMaxD) * 0.5, 0.0001);\n"
+                "\t\tbool mIsEdge = mValid == dustMSAASamples && mDepthRel >= dustEdgeThresh;\n"
+                "\t\tif (mIsEdge) {\n"
+                "\t\t\tif (dustDebugMode > 1.5 && dustDebugMode < 2.5) {\n"
+                "\t\t\t\tcolor = float3(0, 1, 0);\n"
+                "\t\t\t} else if (dustDebugMode > 2.5 && dustDebugMode < 3.5) {\n"
+                "\t\t\t\tcolor = DustDecodeAlbedoMS(mc, 0, mDepths[0]);\n"
+                "\t\t\t} else if (dustDebugMode > 3.5 && dustDebugMode < 4.5) {\n"
+                "\t\t\t\tcolor = float3(mDepthRel * 10.0, float(mValid) / float(dustMSAASamples), 0);\n"
+                "\t\t\t} else if (dustDebugMode < 0.5) {\n"
+                "\t\t\t\tfloat mRefD = mMinD;\n"
+                "\t\t\t\tfloat3 mFarSum = (float3)0;\n"
+                "\t\t\t\tuint mFarCount = 0;\n"
+                "\t\t\t\t[loop] for (uint si = 0; si < dustMSAASamples; si++) {\n"
+                "\t\t\t\t\tif (abs(mDepths[si] - mRefD) / max(mRefD, 0.0001) < dustEdgeThresh)\n"
+                "\t\t\t\t\t\tcontinue;\n"
+                "\t\t\t\t\tfloat3 mAlb = DustDecodeAlbedoMS(mc, si, mDepths[si]);\n"
+                "\t\t\t\t\tfloat4 mG0 = dustMSAA0.Load(mc, si);\n"
+                "\t\t\t\t\tfloat4 mNE = dustMSAA1.Load(mc, si);\n"
+                "\t\t\t\t\tfloat3 mNrm = normalize(mNE.xyz * 2.0 - 1.0);\n"
+                "\t\t\t\t\tfloat mMet = mG0.b;\n"
+                "\t\t\t\t\tfloat mGls = mG0.a;\n"
+                "\t\t\t\t\tfloat mTr = mNE.w < 0.5 ? mNE.w * 2.0 : 0.0;\n"
+                "\t\t\t\t\tfloat mEm = max(0.0, mNE.w - 0.5) * 6.4;\n"
+                "\t\t\t\t\tfloat mDist = mDepths[si] * pFogParams.x;\n"
+                "\t\t\t\t\tfloat4 mVP = float4(normalize(ray) * mDist, 1.0);\n"
+                "\t\t\t\t\tfloat3 mWP = mul(mVP, inverseView).xyz;\n"
+                "\t\t\t\t\tfloat3 mVD = -normalize(mWP);\n"
+                "\t\t\t\t\tfloat3 mSC = lerp(dielectric_spec, mAlb, mMet);\n"
+                "\t\t\t\t\tfloat3 mAM = lerp(mAlb, 0.0, mMet);\n"
+                "\t\t\t\t\tfloat mShad = shadow;\n"
+                "\t\t\t\t\tLightingData mSun = CalcPunctualLight(mNrm, lightDir, mVD, mGls, mSC, lightColor * mShad, mTr);\n"
+                "\t\t\t\t\tLightingData mEnv = CalcEnvironmentLight(irradianceCube, specularityCube, mNrm, mVD, mGls, mSC);\n"
+                "\t\t\t\t\tmEnv.diffuse *= ambientMult.rgb * envColour.w;\n"
+                "\t\t\t\t\tmEnv.specular *= ambientMult.rgb * envColour.w;\n"
+                "\t\t\t\t\tmEnv.diffuse *= ao;\n"
+                "\t\t\t\t\tmEnv.specular *= ao;\n"
+                "\t\t\t\t\tfloat mDF = lerp(1.0, ao, directAO);\n"
+                "\t\t\t\t\tmSun.diffuse *= mDF;\n"
+                "\t\t\t\t\tmSun.specular *= mDF;\n"
+                "\t\t\t\t\tmFarSum += (mSun.specular + mEnv.specular) + (mSun.diffuse + mEnv.diffuse) * mAM + mAM * mEm;\n"
+                "\t\t\t\t\tmFarCount++;\n"
+                "\t\t\t\t}\n"
+                "\t\t\t\tif (mFarCount > 0) {\n"
+                "\t\t\t\t\tfloat3 mFC = mFarSum / float(mFarCount);\n"
+                "\t\t\t\t\tcolor = lerp(color, mFC, float(mFarCount) / float(dustMSAASamples));\n"
+                "\t\t\t\t}\n"
+                "\t\t\t}\n"
+                "\t\t}\n"
+                "\t}\n";
+            result.insert(semiPos + 1, msaaBranch);
+            Log("ShaderPatch: injected MSAA per-sample lighting branch");
+        }
+    }
+    else
+    {
+        Log("ShaderPatch: MSAA anchor not found, per-sample lighting skipped");
+    }
+
     return result;
 }
 
@@ -515,17 +668,19 @@ static HRESULT WINAPI HookedD3DCompile(
         if (src.find("CalcEnvironmentLight") != std::string::npos &&
             src.find("aoMap") == std::string::npos)  // not already patched
         {
+
             std::string patched = PatchDeferredShader(src);
             if (patched.size() != src.size())
             {
                 Log("ShaderPatch: patched deferred main_fs (%zu -> %zu bytes)",
                     src.size(), patched.size());
+                const char* msaaTarget = (patched.find("dustMSAA0") != std::string::npos) ? "ps_5_0" : pTarget;
                 HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
-                                          pDefines, pInclude, pEntrypoint, pTarget,
+                                          pDefines, pInclude, pEntrypoint, msaaTarget,
                                           Flags1, Flags2, ppCode, ppErrorMsgs);
                 if (SUCCEEDED(hr))
                 {
-                    // Record shader source for survey (use patched source)
+                    Log("ShaderPatch: compiled deferred as %s", msaaTarget);
                     if (ppCode && *ppCode)
                         SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
                             pEntrypoint, pTarget, pSourceName,
@@ -819,6 +974,7 @@ static void TryCaptureDevice(ID3D11Device* device)
     MSAARedirect::SetDevice(device);
     DeferredMSAA::SetDevice(device);
 
+
     Log("Captured real D3D11 device=%p, context=%p", gDevice, gContext);
 
     // Try to get resolution from current RT
@@ -858,7 +1014,6 @@ static void TryCaptureDevice(ID3D11Device* device)
         Log("Detected resolution: %ux%u", gWidth, gHeight);
         GeometryCapture::SetResolution(gWidth, gHeight);
         MSAARedirect::SetResolution(gWidth, gHeight);
-        DeferredMSAA::SetResolution(gWidth, gHeight);
     }
 
     // Initialize all loaded effect plugins
@@ -957,16 +1112,12 @@ static HRESULT STDMETHODCALLTYPE HookedCreateVertexShader(
     return hr;
 }
 
+static bool sInMSAAResolve = false;
+
+
 static void STDMETHODCALLTYPE HookedDraw(
     ID3D11DeviceContext* pThis, UINT VertexCount, UINT StartVertexLocation)
 {
-    // Bypass all hook logic for internal draws (DeferredMSAA correction pass)
-    if (sInDeferredMSAA)
-    {
-        oDraw(pThis, VertexCount, StartVertexLocation);
-        return;
-    }
-
     // Survey: record ALL draws (before fullscreen filter)
     if (Survey::IsActive())
         SurveyRecorder::OnDraw(pThis, VertexCount, StartVertexLocation);
@@ -1063,8 +1214,7 @@ static void STDMETHODCALLTYPE HookedDraw(
                             gEffectLoader.OnResolutionChanged(gDevice, gWidth, gHeight);
                             GeometryCapture::SetResolution(gWidth, gHeight);
                             MSAARedirect::SetResolution(gWidth, gHeight);
-                            DeferredMSAA::SetResolution(gWidth, gHeight);
-                        }
+                                            }
                         tex->Release();
                     }
                     res->Release();
@@ -1097,7 +1247,7 @@ static void STDMETHODCALLTYPE HookedDraw(
         if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
         {
             ExtractCameraData(pThis);
-            DeferredMSAA::CaptureLightingCB(pThis);
+            DeferredMSAA::BindForLighting(pThis);
         }
 
         DustFrameContext fctx = {};
@@ -1116,13 +1266,8 @@ static void STDMETHODCALLTYPE HookedDraw(
         // Execute the game's original draw call
         oDraw(pThis, VertexCount, StartVertexLocation);
 
-        // MSAA edge correction (after vanilla lighting, before POST effects)
         if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
-        {
-            sInDeferredMSAA = true;
-            DeferredMSAA::Execute(pThis);
-            sInDeferredMSAA = false;
-        }
+            DeferredMSAA::UnbindAfterLighting(pThis);
 
         // POST: effects that operate after the draw
         fctx.timing = DUST_TIMING_POST;
@@ -1169,14 +1314,12 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
                           StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
 }
 
-static bool sInMSAAResolve = false;
-
 static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
     ID3D11DeviceContext* pThis, UINT NumViews,
     ID3D11RenderTargetView* const* ppRenderTargetViews,
     ID3D11DepthStencilView* pDepthStencilView)
 {
-    if (sInMSAAResolve || sInDeferredMSAA)
+    if (sInMSAAResolve)
     {
         oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView);
         return;
@@ -1218,7 +1361,7 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargetsAndUAVs(
     ID3D11UnorderedAccessView* const* ppUnorderedAccessViews,
     const UINT* pUAVInitialCounts)
 {
-    if (sInMSAAResolve || sInDeferredMSAA)
+    if (sInMSAAResolve)
     {
         oOMSetRenderTargetsAndUAVs(pThis, NumRTVs, ppRenderTargetViews, pDepthStencilView,
                                    UAVStartSlot, NumUAVs, ppUnorderedAccessViews, pUAVInitialCounts);

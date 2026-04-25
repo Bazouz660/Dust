@@ -103,6 +103,7 @@
     <ClCompile Include="GeometryReplay.cpp" />
     <ClCompile Include="MSAARedirect.cpp" />
     <ClCompile Include="DeferredMSAA.cpp" />
+
     <ClCompile Include="SurveyWriter.cpp" />
     <ClCompile Include="imgui\imgui.cpp" />
     <ClCompile Include="imgui\imgui_draw.cpp" />
@@ -129,6 +130,7 @@
     <ClInclude Include="GeometryReplay.h" />
     <ClInclude Include="MSAARedirect.h" />
     <ClInclude Include="DeferredMSAA.h" />
+
     <ClInclude Include="SurveyWriter.h" />
     <ClInclude Include="imgui\imgui.h" />
     <ClInclude Include="imgui\backends\imgui_impl_win32.h" />

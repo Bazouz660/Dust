@@ -17,6 +17,7 @@
 #include "MSAARedirect.h"
 #include "DeferredMSAA.h"
 
+
 static HMODULE gDllModule = nullptr;
 
 // ==================== Utility ====================
@@ -212,6 +213,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
     case DLL_PROCESS_DETACH:
         DustGUI::Shutdown();
         gEffectLoader.ShutdownAll();
+
         DeferredMSAA::Shutdown();
         MSAARedirect::Shutdown();
         GeometryReplay::Shutdown();

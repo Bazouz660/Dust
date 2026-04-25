@@ -4,6 +4,7 @@
 #include "GeometryCapture.h"
 #include "MSAARedirect.h"
 #include "DeferredMSAA.h"
+
 #include "ShaderMetadata.h"
 #include "ShaderDatabase.h"
 #include "Survey.h"
@@ -62,6 +63,7 @@ struct FrameworkConfig {
     std::string lastPreset;    // name of last selected preset (empty = custom)
     int toggleKey = VK_F11;    // virtual key code for overlay toggle
     int msaaSampleCount = 0;   // 0=off, 2/4/8
+
 };
 
 
@@ -762,18 +764,19 @@ static void DrawFrameworkSection()
     if (MSAARedirect::IsActive())
         ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "  Active: %ux", MSAARedirect::GetSampleCount());
 
-    float threshold = DeferredMSAA::GetEdgeThreshold();
-    if (DustSliderFloat("Edge Threshold##msaa", &threshold, 0.001f, 0.2f))
-        DeferredMSAA::SetEdgeThreshold(threshold);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Relative depth threshold for edge detection.\nLower = more edges corrected.");
+    if (gFwConfig.msaaSampleCount >= 2)
+    {
+        float edgeThresh = DeferredMSAA::GetEdgeThreshold();
+        if (ImGui::SliderFloat("Edge Threshold##msaaEdge", &edgeThresh, 0.001f, 0.1f, "%.4f"))
+            DeferredMSAA::SetEdgeThreshold(edgeThresh);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Depth ratio threshold for MSAA edge detection.\nLower = more edges corrected.\nDefault: 0.02");
 
-    int debugMode = DeferredMSAA::GetDebugMode();
-    const char* debugLabels[] = { "Off", "Passthrough", "Green/Red Edges", "unused", "Depth Spread" };
-    if (ImGui::Combo("Debug##msaa_debug", &debugMode, debugLabels, 5))
-        DeferredMSAA::SetDebugMode(debugMode);
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Off: Normal correction\nPassthrough: Skip correction entirely\nGreen/Red Edges: Green=geometry edges, Red=sky edges\nDepth Spread: Edge depth variation");
+        const char* debugLabels[] = { "Off", "Skip", "Edge Vis", "Albedo", "Depth Ratio" };
+        int debugMode = DeferredMSAA::GetDebugMode();
+        if (ImGui::Combo("MSAA Debug##msaaDbg", &debugMode, debugLabels, 5))
+            DeferredMSAA::SetDebugMode(debugMode);
+    }
 
     ImGui::Spacing();
     ImGui::Separator();

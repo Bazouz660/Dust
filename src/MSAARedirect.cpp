@@ -15,6 +15,7 @@ static uint32_t sActiveSamples = 0;
 static bool sResourcesValid = false;
 static bool sRedirectedThisPass = false;
 static bool sHadDrawsThisPass = false;
+static int  sCreateFailCount = 0;
 
 static ID3D11Texture2D*          sMSAARTs[3]   = {};
 static ID3D11RenderTargetView*   sMSAARTVs[3]  = {};
@@ -71,7 +72,7 @@ static bool CompileResolveShaders()
         "    return o;\n"
         "}\n";
 
-    char psSrc[1024];
+    char psSrc[2048];
     snprintf(psSrc, sizeof(psSrc),
         "Texture2DMS<float4> g0 : register(t0);\n"
         "Texture2DMS<float4> g1 : register(t1);\n"
@@ -81,15 +82,18 @@ static bool CompileResolveShaders()
         "           float r2:SV_Target2; float d:SV_Depth; };\n"
         "O main(float4 p : SV_Position) {\n"
         "    int2 c = int2(p.xy); O o;\n"
-        "    float md = 1.0; uint s = 0;\n"
+        "    float minD = 1.0; uint best = 0; bool found = false;\n"
         "    [unroll] for (uint i = 0; i < %u; i++) {\n"
         "        float d = gD.Load(c, i).x;\n"
-        "        if (d < md) { md = d; s = i; }\n"
+        "        if (d < 1.0 && d < minD) {\n"
+        "            minD = d; best = i; found = true;\n"
+        "        }\n"
         "    }\n"
-        "    o.r0 = g0.Load(c, s);\n"
-        "    o.r1 = g1.Load(c, s);\n"
-        "    o.r2 = g2.Load(c, s).x;\n"
-        "    o.d = md;\n"
+        "    if (!found) discard;\n"
+        "    o.r0 = g0.Load(c, best);\n"
+        "    o.r1 = g1.Load(c, best);\n"
+        "    o.r2 = g2.Load(c, best).x;\n"
+        "    o.d = minD;\n"
         "    return o;\n"
         "}\n", sActiveSamples);
 
@@ -242,10 +246,12 @@ void SetEnabled(uint32_t sampleCount)
         return;
 
     sRequestedSamples = sampleCount;
+    sCreateFailCount = 0;
 
     if (sampleCount < 2)
     {
         ReleaseResources();
+        if (sResolvePS) { sResolvePS->Release(); sResolvePS = nullptr; }
         sActiveSamples = 0;
         Log("MSAARedirect: disabled");
         return;
@@ -303,11 +309,16 @@ bool OnGBufferEnter(ID3D11DeviceContext* ctx,
 
     if (!sResourcesValid)
     {
+        if (sCreateFailCount >= 10)
+            return false;
         if (!CreateResources())
         {
-            sRequestedSamples = 0;
+            sCreateFailCount++;
+            if (sCreateFailCount >= 10)
+                Log("MSAARedirect: creation failed %d times, giving up (toggle MSAA to retry)", sCreateFailCount);
             return false;
         }
+        sCreateFailCount = 0;
     }
 
     ReleaseOriginals();
