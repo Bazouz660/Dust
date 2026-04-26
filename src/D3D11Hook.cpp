@@ -451,29 +451,32 @@ static std::string PatchDeferredShader(const std::string& src)
         Log("ShaderPatch: '= RTWShadow(' not found, shadow redirect skipped");
     }
 
-    // === MSAA Per-Sample Lighting Patch ===
-    // Inject Texture2DMS declarations + config CB + per-sample decode helper
-    // before main_vs, then per-sample branch at end of main_fs.
+    // === MSAA Per-Sample Shading ===
+    // When MSAA is active, the deferred draw targets an MSAA render target and the
+    // GPU runs the pixel shader once per sample (driven by SV_SampleIndex). Each
+    // invocation reads its own GBuffer sample from the MSAA textures, producing
+    // correct per-sample lighting with proper shadow lookups (no divergent loops).
 
     const char* msaaAnchor1 = "void main_vs (";
     size_t msaaPos1 = result.find(msaaAnchor1);
     if (msaaPos1 != std::string::npos)
     {
         std::string msaaDecls =
-            "// [Dust] MSAA per-sample lighting\n"
+            "// [Dust] MSAA per-sample shading\n"
             "Texture2DMS<float4> dustMSAA0 : register(t10);\n"
             "Texture2DMS<float4> dustMSAA1 : register(t11);\n"
             "Texture2DMS<float>  dustMSAA2 : register(t12);\n"
             "\n"
             "cbuffer DustMSAACB : register(b3) {\n"
             "\tuint dustMSAASamples;\n"
-            "\tfloat dustEdgeThresh;\n"
+            "\tfloat dustMSAAPad0;\n"
             "\tfloat dustDebugMode;\n"
-            "\tfloat dustMSAAPad;\n"
+            "\tfloat dustMSAAPad1;\n"
             "};\n"
             "\n"
-            "float3 DustDecodeAlbedoMS(int2 c, uint si, float sd) {\n"
+            "float3 DustDecodeAlbedoMS(int2 c, uint si) {\n"
             "\tfloat2 yg = dustMSAA0.Load(c, si).rg;\n"
+            "\tfloat sd = dustMSAA2.Load(c, si).r;\n"
             "\tfloat mis = 0.5;\n"
             "\tfloat bd = sd * 0.05;\n"
             "\tint2 dd[4] = { int2(-1,0), int2(1,0), int2(0,-1), int2(0,1) };\n"
@@ -492,88 +495,76 @@ static std::string PatchDeferredShader(const std::string& src)
         Log("ShaderPatch: injected MSAA declarations + DustDecodeAlbedoMS");
     }
 
-    // Inject per-sample branch in main_fs, after final color computation.
-    // Anchor: "ld.specular + ld.diffuse * albedo" in the color assignment.
-    const char* msaaAnchor2 = "ld.specular + ld.diffuse * albedo + albedo*emissive";
-    size_t msaaPos2 = result.find(msaaAnchor2);
-    if (msaaPos2 != std::string::npos)
+    // Inject SV_SampleIndex in main_fs parameter list.
+    // Must go AFTER all TEXCOORD inputs to avoid shifting interpolator registers.
+    // Search from main_fs to avoid matching main_vs's TEXCOORD1 output.
     {
-        // Find the end of the statement (semicolon)
-        size_t semiPos = result.find(';', msaaPos2);
-        if (semiPos != std::string::npos)
+        size_t mainFsPos = result.find("main_fs");
+        const char* texcoordAnchor = ": TEXCOORD1,";
+        size_t tcPos = (mainFsPos != std::string::npos)
+            ? result.find(texcoordAnchor, mainFsPos) : std::string::npos;
+        if (tcPos != std::string::npos)
         {
-            std::string msaaBranch =
-                "\n\n\t// [Dust] MSAA per-sample deferred lighting\n"
-                "\tif (dustMSAASamples >= 2) {\n"
-                "\t\tint2 mc = int2(pixel.xy);\n"
-                "\t\tfloat mDepths[8];\n"
-                "\t\tfloat mMinD = 1e30, mMaxD = 0;\n"
-                "\t\tuint mValid = 0;\n"
-                "\t\t[loop] for (uint mi = 0; mi < dustMSAASamples; mi++) {\n"
-                "\t\t\tmDepths[mi] = dustMSAA2.Load(mc, mi);\n"
-                "\t\t\tif (mDepths[mi] > 0.00001) {\n"
-                "\t\t\t\tmMinD = min(mMinD, mDepths[mi]);\n"
-                "\t\t\t\tmMaxD = max(mMaxD, mDepths[mi]);\n"
-                "\t\t\t\tmValid++;\n"
-                "\t\t\t}\n"
-                "\t\t}\n"
-                "\t\tfloat mDepthRel = (mMaxD - mMinD) / max((mMinD + mMaxD) * 0.5, 0.0001);\n"
-                "\t\tbool mIsEdge = mValid == dustMSAASamples && mDepthRel >= dustEdgeThresh;\n"
-                "\t\tif (mIsEdge) {\n"
-                "\t\t\tif (dustDebugMode > 1.5 && dustDebugMode < 2.5) {\n"
-                "\t\t\t\tcolor = float3(0, 1, 0);\n"
-                "\t\t\t} else if (dustDebugMode > 2.5 && dustDebugMode < 3.5) {\n"
-                "\t\t\t\tcolor = DustDecodeAlbedoMS(mc, 0, mDepths[0]);\n"
-                "\t\t\t} else if (dustDebugMode > 3.5 && dustDebugMode < 4.5) {\n"
-                "\t\t\t\tcolor = float3(mDepthRel * 10.0, float(mValid) / float(dustMSAASamples), 0);\n"
-                "\t\t\t} else if (dustDebugMode < 0.5) {\n"
-                "\t\t\t\tfloat mRefD = mMinD;\n"
-                "\t\t\t\tfloat3 mFarSum = (float3)0;\n"
-                "\t\t\t\tuint mFarCount = 0;\n"
-                "\t\t\t\t[loop] for (uint si = 0; si < dustMSAASamples; si++) {\n"
-                "\t\t\t\t\tif (abs(mDepths[si] - mRefD) / max(mRefD, 0.0001) < dustEdgeThresh)\n"
-                "\t\t\t\t\t\tcontinue;\n"
-                "\t\t\t\t\tfloat3 mAlb = DustDecodeAlbedoMS(mc, si, mDepths[si]);\n"
-                "\t\t\t\t\tfloat4 mG0 = dustMSAA0.Load(mc, si);\n"
-                "\t\t\t\t\tfloat4 mNE = dustMSAA1.Load(mc, si);\n"
-                "\t\t\t\t\tfloat3 mNrm = normalize(mNE.xyz * 2.0 - 1.0);\n"
-                "\t\t\t\t\tfloat mMet = mG0.b;\n"
-                "\t\t\t\t\tfloat mGls = mG0.a;\n"
-                "\t\t\t\t\tfloat mTr = mNE.w < 0.5 ? mNE.w * 2.0 : 0.0;\n"
-                "\t\t\t\t\tfloat mEm = max(0.0, mNE.w - 0.5) * 6.4;\n"
-                "\t\t\t\t\tfloat mDist = mDepths[si] * pFogParams.x;\n"
-                "\t\t\t\t\tfloat4 mVP = float4(normalize(ray) * mDist, 1.0);\n"
-                "\t\t\t\t\tfloat3 mWP = mul(mVP, inverseView).xyz;\n"
-                "\t\t\t\t\tfloat3 mVD = -normalize(mWP);\n"
-                "\t\t\t\t\tfloat3 mSC = lerp(dielectric_spec, mAlb, mMet);\n"
-                "\t\t\t\t\tfloat3 mAM = lerp(mAlb, 0.0, mMet);\n"
-                "\t\t\t\t\tfloat mShad = shadow;\n"
-                "\t\t\t\t\tLightingData mSun = CalcPunctualLight(mNrm, lightDir, mVD, mGls, mSC, lightColor * mShad, mTr);\n"
-                "\t\t\t\t\tLightingData mEnv = CalcEnvironmentLight(irradianceCube, specularityCube, mNrm, mVD, mGls, mSC);\n"
-                "\t\t\t\t\tmEnv.diffuse *= ambientMult.rgb * envColour.w;\n"
-                "\t\t\t\t\tmEnv.specular *= ambientMult.rgb * envColour.w;\n"
-                "\t\t\t\t\tmEnv.diffuse *= ao;\n"
-                "\t\t\t\t\tmEnv.specular *= ao;\n"
-                "\t\t\t\t\tfloat mDF = lerp(1.0, ao, directAO);\n"
-                "\t\t\t\t\tmSun.diffuse *= mDF;\n"
-                "\t\t\t\t\tmSun.specular *= mDF;\n"
-                "\t\t\t\t\tmFarSum += (mSun.specular + mEnv.specular) + (mSun.diffuse + mEnv.diffuse) * mAM + mAM * mEm;\n"
-                "\t\t\t\t\tmFarCount++;\n"
-                "\t\t\t\t}\n"
-                "\t\t\t\tif (mFarCount > 0) {\n"
-                "\t\t\t\t\tfloat3 mFC = mFarSum / float(mFarCount);\n"
-                "\t\t\t\t\tcolor = lerp(color, mFC, float(mFarCount) / float(dustMSAASamples));\n"
-                "\t\t\t\t}\n"
-                "\t\t\t}\n"
-                "\t\t}\n"
-                "\t}\n";
-            result.insert(semiPos + 1, msaaBranch);
-            Log("ShaderPatch: injected MSAA per-sample lighting branch");
+            size_t lineEnd = result.find('\n', tcPos);
+            if (lineEnd != std::string::npos)
+            {
+                result.insert(lineEnd + 1, "\tuint dustSampleIdx : SV_SampleIndex,\n");
+                Log("ShaderPatch: injected SV_SampleIndex in main_fs (after TEXCOORD1)");
+            }
         }
     }
-    else
+
+    // Replace GBuffer reads with MSAA-conditional versions.
+    // When dustMSAASamples >= 2, read from Texture2DMS at the current sample.
+    // When 0, use the original tex2D reads from the resolved single-sample GBuffer.
     {
-        Log("ShaderPatch: MSAA anchor not found, per-sample lighting skipped");
+        const char* albedoOld = "decodePixel(gBuf0, texCoord, viewport, pixel.xy)";
+        size_t albedoPos = result.find(albedoOld);
+        if (albedoPos != std::string::npos)
+        {
+            std::string albedoNew =
+                "(dustMSAASamples >= 2 "
+                "? DustDecodeAlbedoMS(int2(pixel.xy), dustSampleIdx) "
+                ": decodePixel(gBuf0, texCoord, viewport, pixel.xy))";
+            result.replace(albedoPos, strlen(albedoOld), albedoNew);
+            Log("ShaderPatch: MSAA-conditional albedo read");
+        }
+
+        const char* metGlossOld = "tex2D(gBuf0, texCoord).ba";
+        size_t metGlossPos = result.find(metGlossOld);
+        if (metGlossPos != std::string::npos)
+        {
+            std::string metGlossNew =
+                "(dustMSAASamples >= 2 "
+                "? dustMSAA0.Load(int2(pixel.xy), dustSampleIdx).ba "
+                ": tex2D(gBuf0, texCoord).ba)";
+            result.replace(metGlossPos, strlen(metGlossOld), metGlossNew);
+            Log("ShaderPatch: MSAA-conditional metalness/gloss read");
+        }
+
+        const char* normalOld = "tex2D(gBuf1, texCoord)";
+        size_t normalPos = result.find(normalOld);
+        if (normalPos != std::string::npos)
+        {
+            std::string normalNew =
+                "(dustMSAASamples >= 2 "
+                "? dustMSAA1.Load(int2(pixel.xy), dustSampleIdx) "
+                ": tex2D(gBuf1, texCoord))";
+            result.replace(normalPos, strlen(normalOld), normalNew);
+            Log("ShaderPatch: MSAA-conditional normal read");
+        }
+
+        const char* depthOld = "tex2D(gBuf2, texCoord).r";
+        size_t depthPos = result.find(depthOld);
+        if (depthPos != std::string::npos)
+        {
+            std::string depthNew =
+                "(dustMSAASamples >= 2 "
+                "? dustMSAA2.Load(int2(pixel.xy), dustSampleIdx).r "
+                ": tex2D(gBuf2, texCoord).r)";
+            result.replace(depthPos, strlen(depthOld), depthNew);
+            Log("ShaderPatch: MSAA-conditional depth read");
+        }
     }
 
     return result;
@@ -1243,10 +1234,15 @@ static void STDMETHODCALLTYPE HookedDraw(
             }
         }
 
-        // Extract camera data at POST_LIGHTING (deferred CB is bound)
+        // Extract camera data at POST_LIGHTING (deferred CB is bound).
+        // Begin per-sample MSAA draw BEFORE BindForLighting so the CB
+        // knows whether per-sample shading is actually active.
         if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
         {
             ExtractCameraData(pThis);
+            sInMSAAResolve = true;
+            DeferredMSAA::BeginPerSampleDraw(pThis);
+            sInMSAAResolve = false;
             DeferredMSAA::BindForLighting(pThis);
         }
 
@@ -1267,7 +1263,12 @@ static void STDMETHODCALLTYPE HookedDraw(
         oDraw(pThis, VertexCount, StartVertexLocation);
 
         if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
+        {
+            sInMSAAResolve = true;
+            DeferredMSAA::EndPerSampleDraw(pThis);
+            sInMSAAResolve = false;
             DeferredMSAA::UnbindAfterLighting(pThis);
+        }
 
         // POST: effects that operate after the draw
         fctx.timing = DUST_TIMING_POST;

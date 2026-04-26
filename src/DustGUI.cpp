@@ -766,16 +766,12 @@ static void DrawFrameworkSection()
 
     if (gFwConfig.msaaSampleCount >= 2)
     {
-        float edgeThresh = DeferredMSAA::GetEdgeThreshold();
-        if (ImGui::SliderFloat("Edge Threshold##msaaEdge", &edgeThresh, 0.001f, 0.1f, "%.4f"))
-            DeferredMSAA::SetEdgeThreshold(edgeThresh);
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Depth ratio threshold for MSAA edge detection.\nLower = more edges corrected.\nDefault: 0.02");
-
-        const char* debugLabels[] = { "Off", "Skip", "Edge Vis", "Albedo", "Depth Ratio" };
+        const char* debugLabels[] = { "Off", "Bypass" };
         int debugMode = DeferredMSAA::GetDebugMode();
-        if (ImGui::Combo("MSAA Debug##msaaDbg", &debugMode, debugLabels, 5))
+        if (ImGui::Combo("MSAA Debug##msaaDbg", &debugMode, debugLabels, 2))
             DeferredMSAA::SetDebugMode(debugMode);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Bypass: disable per-sample MSAA shading\n(compare with/without)");
     }
 
     ImGui::Spacing();
