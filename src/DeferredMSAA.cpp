@@ -88,16 +88,41 @@ static bool CompileResolveShaders(uint32_t samples)
         "    return o;\n"
         "}\n";
 
-    char psSrc[512];
+    char psSrc[2048];
     snprintf(psSrc, sizeof(psSrc),
         "Texture2DMS<float4> src : register(t0);\n"
+        "Texture2DMS<float4> depthBuf : register(t1);\n"
         "float4 main(float4 pos : SV_Position) : SV_Target {\n"
         "    int2 c = int2(pos.xy);\n"
+        "    float minD = 1.0, maxD = 0.0;\n"
+        "    float vN = 0.0;\n"
+        "    [unroll] for (uint i = 0; i < %u; i++) {\n"
+        "        float d = depthBuf.Load(c, i).r;\n"
+        "        if (d > 0.00001) { minD = min(minD, d); maxD = max(maxD, d); vN += 1.0; }\n"
+        "    }\n"
+        "    if (vN < 0.5) return (float4)0;\n"
+        "    float thr = max(minD * 0.15, 0.002);\n"
+        "    bool geomEdge = (maxD - minD >= thr);\n"
+        "    if (!geomEdge) {\n"
+        "        float4 s = (float4)0;\n"
+        "        [unroll] for (uint j = 0; j < %u; j++) {\n"
+        "            float v = step(0.00001, depthBuf.Load(c, j).r);\n"
+        "            s += src.Load(c, j) * v;\n"
+        "        }\n"
+        "        return float4(s.rgb / vN, 1.0);\n"
+        "    }\n"
         "    float4 sum = (float4)0;\n"
-        "    [unroll] for (uint i = 0; i < %u; i++)\n"
-        "        sum += src.Load(c, i);\n"
-        "    return sum / %u.0;\n"
-        "}\n", samples, samples);
+        "    float tw = 0.0;\n"
+        "    [unroll] for (uint k = 0; k < %u; k++) {\n"
+        "        float d = depthBuf.Load(c, k).r;\n"
+        "        float v = step(0.00001, d);\n"
+        "        float w = v * ((abs(d - minD) < thr) ? %u.0 : 1.0);\n"
+        "        sum += src.Load(c, k) * w;\n"
+        "        tw += w;\n"
+        "    }\n"
+        "    return float4(sum.rgb / max(tw, 0.001), 1.0);\n"
+        "}\n",
+        samples, samples, samples, samples);
 
     ID3DBlob* blob = nullptr;
     ID3DBlob* errors = nullptr;
@@ -345,15 +370,17 @@ void EndPerSampleDraw(ID3D11DeviceContext* ctx)
         ctx->RSSetViewports(1, &vp);
         ctx->RSSetState(nullptr);
 
-        ctx->PSSetShaderResources(0, 1, &sLightingMSAASRV);
+        ID3D11ShaderResourceView* depthSRV = MSAARedirect::GetColorSRV(2);
+        ID3D11ShaderResourceView* srvs[2] = { sLightingMSAASRV, depthSRV };
+        ctx->PSSetShaderResources(0, 2, srvs);
         ctx->VSSetShader(sResolveVS, nullptr, 0);
         ctx->PSSetShader(sResolvePS, nullptr, 0);
         ctx->IASetInputLayout(nullptr);
         ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx->Draw(3, 0);
 
-        ID3D11ShaderResourceView* nullSRV = nullptr;
-        ctx->PSSetShaderResources(0, 1, &nullSRV);
+        ID3D11ShaderResourceView* nullSRVs[2] = {};
+        ctx->PSSetShaderResources(0, 2, nullSRVs);
 
         sStateBlock.Restore(ctx);
     }

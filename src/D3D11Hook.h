@@ -20,4 +20,7 @@ namespace D3D11Hook
     // Present hook diagnostics and recovery
     bool IsPresentHooked();     // true if Present hook has actually fired
     void TryRecoverPresent();   // re-attempt swap chain discovery + hook
+
+    // Signal all hooks to pass through (game shutting down)
+    void SignalShutdown();
 }

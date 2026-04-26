@@ -1,5 +1,6 @@
 #include "DustGUI.h"
 #include "DustLog.h"
+#include "D3D11Hook.h"
 #include "EffectLoader.h"
 #include "GeometryCapture.h"
 #include "MSAARedirect.h"
@@ -525,6 +526,9 @@ static void OnOverlayClose()
 
 static LRESULT CALLBACK DustWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+    if (msg == WM_DESTROY || msg == WM_CLOSE)
+        D3D11Hook::SignalShutdown();
+
     // Capture key binding when waiting for a new toggle key
     // WM_SYSKEYDOWN is required for F10 (Windows treats it as a menu-activation key)
     if (gWaitingForKey && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN))

@@ -57,6 +57,7 @@ static bool  sSwapChainHooked    = false;
 static std::vector<SurveyFrameData> sSurveyFrames;
 
 static bool gDeviceRemovedThisFrame = false;
+static volatile bool gShutdownSignaled = false;
 
 void ResetFrameState()
 {
@@ -477,14 +478,20 @@ static std::string PatchDeferredShader(const std::string& src)
             "float3 DustDecodeAlbedoMS(int2 c, uint si) {\n"
             "\tfloat2 yg = dustMSAA0.Load(c, si).rg;\n"
             "\tfloat sd = dustMSAA2.Load(c, si).r;\n"
-            "\tfloat mis = 0.5;\n"
-            "\tfloat bd = sd * 0.05;\n"
-            "\tint2 dd[4] = { int2(-1,0), int2(1,0), int2(0,-1), int2(0,1) };\n"
-            "\t[unroll] for (int d = 0; d < 4; d++) {\n"
-            "\t\tfloat nd = dustMSAA2.Load(c + dd[d], 0);\n"
-            "\t\tfloat df = abs(nd - sd);\n"
-            "\t\tif (nd > 0.00001 && df < bd) { bd = df; mis = dustMSAA0.Load(c + dd[d], 0).g; }\n"
-            "\t}\n"
+            "\tfloat thr = max(sd * 0.04, 0.001);\n"
+            "\tfloat4 nd = float4(\n"
+            "\t\tdustMSAA2.Load(c + int2(-1,0), si).r,\n"
+            "\t\tdustMSAA2.Load(c + int2( 1,0), si).r,\n"
+            "\t\tdustMSAA2.Load(c + int2(0,-1), si).r,\n"
+            "\t\tdustMSAA2.Load(c + int2(0, 1), si).r);\n"
+            "\tfloat4 nc = float4(\n"
+            "\t\tdustMSAA0.Load(c + int2(-1,0), si).g,\n"
+            "\t\tdustMSAA0.Load(c + int2( 1,0), si).g,\n"
+            "\t\tdustMSAA0.Load(c + int2(0,-1), si).g,\n"
+            "\t\tdustMSAA0.Load(c + int2(0, 1), si).g);\n"
+            "\tfloat4 w = step(0.00001, nd) * (1.0 - step(thr, abs(nd - sd)));\n"
+            "\tfloat W = dot(w, 1.0);\n"
+            "\tfloat mis = (W > 0.0) ? dot(w, nc) / W : yg.g;\n"
             "\tbool ev = ((c.x & 1) == (c.y & 1));\n"
             "\tfloat Co = ev ? mis : yg.y;\n"
             "\tfloat Cg = ev ? yg.y : mis;\n"
@@ -566,6 +573,7 @@ static std::string PatchDeferredShader(const std::string& src)
             Log("ShaderPatch: MSAA-conditional depth read");
         }
     }
+
 
     return result;
 }
@@ -1109,6 +1117,7 @@ static bool sInMSAAResolve = false;
 static void STDMETHODCALLTYPE HookedDraw(
     ID3D11DeviceContext* pThis, UINT VertexCount, UINT StartVertexLocation)
 {
+    if (gShutdownSignaled) { oDraw(pThis, VertexCount, StartVertexLocation); return; }
     // Survey: record ALL draws (before fullscreen filter)
     if (Survey::IsActive())
         SurveyRecorder::OnDraw(pThis, VertexCount, StartVertexLocation);
@@ -1284,6 +1293,7 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     ID3D11DeviceContext* pThis, UINT IndexCount, UINT StartIndexLocation,
     INT BaseVertexLocation)
 {
+    if (gShutdownSignaled) { oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation); return; }
     if (Survey::IsActive())
         SurveyRecorder::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 
@@ -1299,6 +1309,7 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
     ID3D11DeviceContext* pThis, UINT IndexCountPerInstance, UINT InstanceCount,
     UINT StartIndexLocation, INT BaseVertexLocation, UINT StartInstanceLocation)
 {
+    if (gShutdownSignaled) { oDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation); return; }
     if (Survey::IsActive())
         SurveyRecorder::OnDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
                                                 StartIndexLocation, BaseVertexLocation,
@@ -1320,6 +1331,7 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
     ID3D11RenderTargetView* const* ppRenderTargetViews,
     ID3D11DepthStencilView* pDepthStencilView)
 {
+    if (gShutdownSignaled) { oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView); return; }
     if (sInMSAAResolve)
     {
         oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView);
@@ -1362,6 +1374,7 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargetsAndUAVs(
     ID3D11UnorderedAccessView* const* ppUnorderedAccessViews,
     const UINT* pUAVInitialCounts)
 {
+    if (gShutdownSignaled) { oOMSetRenderTargetsAndUAVs(pThis, NumRTVs, ppRenderTargetViews, pDepthStencilView, UAVStartSlot, NumUAVs, ppUnorderedAccessViews, pUAVInitialCounts); return; }
     if (sInMSAAResolve)
     {
         oOMSetRenderTargetsAndUAVs(pThis, NumRTVs, ppRenderTargetViews, pDepthStencilView,
@@ -1465,7 +1478,7 @@ static void TickGuiOnPresent(IDXGISwapChain* swapChain, const char* via)
 static HRESULT STDMETHODCALLTYPE HookedPresent(
     IDXGISwapChain* pThis, UINT SyncInterval, UINT Flags)
 {
-    TickGuiOnPresent(pThis, "Present");
+    if (!gShutdownSignaled) TickGuiOnPresent(pThis, "Present");
     return oPresent(pThis, SyncInterval, Flags);
 }
 
@@ -1473,7 +1486,7 @@ static HRESULT STDMETHODCALLTYPE HookedPresent1(
     IDXGISwapChain1* pThis, UINT SyncInterval, UINT PresentFlags,
     const DXGI_PRESENT_PARAMETERS* pPresentParameters)
 {
-    TickGuiOnPresent(pThis, "Present1");
+    if (!gShutdownSignaled) TickGuiOnPresent(pThis, "Present1");
     return oPresent1(pThis, SyncInterval, PresentFlags, pPresentParameters);
 }
 
@@ -1481,6 +1494,7 @@ static HRESULT STDMETHODCALLTYPE HookedResizeBuffers(
     IDXGISwapChain* pThis, UINT BufferCount, UINT Width, UINT Height,
     DXGI_FORMAT NewFormat, UINT SwapChainFlags)
 {
+    if (gShutdownSignaled) return oResizeBuffers(pThis, BufferCount, Width, Height, NewFormat, SwapChainFlags);
     // Block Render() while we tear down and recreate the back buffer
     DustGUI::SetResizeInProgress(true);
 
@@ -1683,6 +1697,11 @@ bool Install()
         Log("Device/Context hooks installed, swap chain hooks deferred to first Draw");
 
     return ok;
+}
+
+void SignalShutdown()
+{
+    gShutdownSignaled = true;
 }
 
 } // namespace D3D11Hook

@@ -1,5 +1,7 @@
 #include <d3d11.h>
 #include <string>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
 
 // KenshiLib headers
 #include <kenshi/GameWorld.h>
@@ -19,6 +21,74 @@
 
 
 static HMODULE gDllModule = nullptr;
+
+// ==================== Crash handler ====================
+
+static LONG WINAPI DustCrashHandler(EXCEPTION_POINTERS* ep)
+{
+    // Build crash log path next to the DLL
+    char logPath[MAX_PATH] = {};
+    GetModuleFileNameA(gDllModule, logPath, MAX_PATH);
+    char* slash = strrchr(logPath, '\\');
+    if (slash) *(slash + 1) = '\0';
+    strcat_s(logPath, "dust_crash.log");
+
+    FILE* f = fopen(logPath, "w");
+    if (f)
+    {
+        EXCEPTION_RECORD* rec = ep->ExceptionRecord;
+        CONTEXT* ctx = ep->ContextRecord;
+
+        fprintf(f, "Dust Crash Report\n");
+        fprintf(f, "Exception code: 0x%08lX\n", rec->ExceptionCode);
+        fprintf(f, "Fault address:  0x%p\n", rec->ExceptionAddress);
+#ifdef _WIN64
+        fprintf(f, "RIP: 0x%016llX  RSP: 0x%016llX\n", ctx->Rip, ctx->Rsp);
+#else
+        fprintf(f, "EIP: 0x%08lX  ESP: 0x%08lX\n", ctx->Eip, ctx->Esp);
+#endif
+
+        // Identify which module the fault is in
+        HMODULE hFault = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)rec->ExceptionAddress, &hFault);
+        char modName[MAX_PATH] = {};
+        if (hFault)
+            GetModuleFileNameA(hFault, modName, MAX_PATH);
+        fprintf(f, "Faulting module: %s\n", hFault ? modName : "(unknown)");
+
+        // Stack trace via dbghelp
+        HANDLE proc = GetCurrentProcess();
+        SymInitialize(proc, NULL, TRUE);
+        void* stack[64] = {};
+        USHORT frames = CaptureStackBackTrace(0, 64, stack, NULL);
+        fprintf(f, "\nStack trace (%u frames):\n", frames);
+        char symBuf[sizeof(SYMBOL_INFO) + 256];
+        SYMBOL_INFO* sym = (SYMBOL_INFO*)symBuf;
+        sym->SizeOfStruct = sizeof(SYMBOL_INFO);
+        sym->MaxNameLen = 255;
+        for (USHORT i = 0; i < frames; i++)
+        {
+            DWORD64 addr = (DWORD64)stack[i];
+            HMODULE hMod = nullptr;
+            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)stack[i], &hMod);
+            char mName[MAX_PATH] = {};
+            if (hMod) GetModuleFileNameA(hMod, mName, MAX_PATH);
+
+            if (SymFromAddr(proc, addr, NULL, sym))
+                fprintf(f, "  [%2u] 0x%p  %s  (%s)\n", i, stack[i], sym->Name, mName);
+            else
+                fprintf(f, "  [%2u] 0x%p  (%s)\n", i, stack[i], mName);
+        }
+        SymCleanup(proc);
+        fclose(f);
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 
 // ==================== Utility ====================
 
@@ -148,6 +218,9 @@ void GameWorld__mainLoop_GPUSensitiveStuff_hook(GameWorld* thisptr, float time)
 // Do NOT use extern "C" here.
 __declspec(dllexport) void startPlugin()
 {
+    // Install crash handler FIRST so we capture any fault during init
+    SetUnhandledExceptionFilter(DustCrashHandler);
+
     // Init logging (reads Logging=1/0 from Dust.ini next to the DLL)
     DustLogInit(gDllModule);
 
@@ -209,8 +282,17 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hModule);
         gDllModule = hModule;
+        // Pin the DLL so FreeLibrary never unmaps it while hooks are active.
+        // KenshiLib trampoline hooks can't be removed, so we must stay loaded.
+        {
+            char selfPath[MAX_PATH];
+            GetModuleFileNameA(hModule, selfPath, MAX_PATH);
+            LoadLibraryA(selfPath);
+        }
         break;
     case DLL_PROCESS_DETACH:
+        D3D11Hook::SignalShutdown();
+        if (lpReserved) break; // process terminating — OS reclaims everything
         DustGUI::Shutdown();
         gEffectLoader.ShutdownAll();
 
