@@ -429,6 +429,14 @@ static uint32_t HostReplayGeometry(ID3D11DeviceContext* ctx, ID3D11Device* devic
     return GeometryReplay::Replay(ctx, device, replacementVP);
 }
 
+static uint32_t HostReplayGeometryEx(ID3D11DeviceContext* ctx, ID3D11Device* device,
+                                      const float* replacementVP,
+                                      void (*preDrawCB)(ID3D11DeviceContext*, uint32_t, uint32_t, void*),
+                                      void* userdata)
+{
+    return GeometryReplay::ReplayEx(ctx, device, replacementVP, preDrawCB, userdata);
+}
+
 static const char* HostGetShaderCategoryName(DustShaderCategory category)
 {
     switch (category)
@@ -573,6 +581,7 @@ void EffectLoader::BuildHostAPI()
     hostAPI_.GetGeometryDrawCount     = HostGetGeometryDrawCount;
     hostAPI_.GetGeometryDrawInfo      = HostGetGeometryDrawInfo;
     hostAPI_.ReplayGeometry           = HostReplayGeometry;
+    hostAPI_.ReplayGeometryEx         = HostReplayGeometryEx;
     hostAPI_.GetShaderCategoryName    = HostGetShaderCategoryName;
     hostAPI_.BindGeometryDraw         = HostBindGeometryDraw;
     hostAPI_.IssueGeometryDraw        = HostIssueGeometryDraw;

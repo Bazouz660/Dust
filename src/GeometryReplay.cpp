@@ -208,6 +208,117 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
     return replayed;
 }
 
+uint32_t ReplayEx(ID3D11DeviceContext* ctx, ID3D11Device* device,
+                  const float* replacementVP,
+                  void (*preDrawCB)(ID3D11DeviceContext* ctx,
+                                   uint32_t drawIndex,
+                                   uint32_t priorTriangles,
+                                   void* userdata),
+                  void* userdata)
+{
+    const auto& captures = GeometryCapture::GetCaptures();
+    if (captures.empty())
+        return 0;
+
+    ReplayStateBlock saved;
+    saved.Capture(ctx);
+
+    uint32_t replayed        = 0;
+    uint32_t priorTriangles  = 0;
+    static std::vector<uint8_t> cbDataBufEx;
+
+    for (uint32_t i = 0; i < (uint32_t)captures.size(); i++)
+    {
+        const CapturedDraw& draw = captures[i];
+
+        if (!draw.vsMetadata || draw.vsMetadata->transformType == VSTransformType::UNKNOWN)
+            continue;
+        if (!draw.cbStagingCopy)
+            continue;
+
+        const VSConstantBufferInfo& meta = *draw.vsMetadata;
+
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        HRESULT hr = ctx->Map(draw.cbStagingCopy, 0, D3D11_MAP_READ, 0, &mapped);
+        if (FAILED(hr))
+            continue;
+
+        if (cbDataBufEx.size() < draw.cbStagingSize)
+            cbDataBufEx.resize(draw.cbStagingSize);
+        memcpy(cbDataBufEx.data(), mapped.pData, draw.cbStagingSize);
+        ctx->Unmap(draw.cbStagingCopy, 0);
+
+        if (meta.clipMatrixOffset + 64 > draw.cbStagingSize)
+            continue;
+
+        float* clipDst = reinterpret_cast<float*>(cbDataBufEx.data() + meta.clipMatrixOffset);
+
+        bool useWorldFromCB = (meta.transformType == VSTransformType::STATIC &&
+                               draw.instanceCount <= 1);
+        if (useWorldFromCB)
+        {
+            if (meta.worldMatrixOffset + 64 <= draw.cbStagingSize &&
+                meta.worldMatrixSize >= 64)
+            {
+                const float* world = reinterpret_cast<const float*>(
+                    cbDataBufEx.data() + meta.worldMatrixOffset);
+                MatMul4x4(clipDst, world, replacementVP);
+            }
+            else
+            {
+                memcpy(clipDst, replacementVP, 64);
+            }
+        }
+        else
+        {
+            memcpy(clipDst, replacementVP, 64);
+        }
+
+        ID3D11Buffer* scratchCB = GetScratchCB(device, draw.cbStagingSize);
+        if (!scratchCB)
+            continue;
+
+        ctx->UpdateSubresource(scratchCB, 0, nullptr, cbDataBufEx.data(), 0, 0);
+
+        ctx->IASetInputLayout(draw.inputLayout);
+        ctx->IASetPrimitiveTopology(draw.topology);
+        ctx->IASetVertexBuffers(0, CapturedDraw::MAX_VB_SLOTS, draw.vertexBuffers,
+                                draw.vbStrides, draw.vbOffsets);
+        ctx->IASetIndexBuffer(draw.indexBuffer, draw.indexFormat, draw.ibOffset);
+
+        ctx->VSSetShader(draw.vs, nullptr, 0);
+        for (UINT j = 0; j < CapturedDraw::MAX_VS_CBS; j++)
+        {
+            if (j == meta.cbSlot)
+                ctx->VSSetConstantBuffers(j, 1, &scratchCB);
+            else if (draw.vsCBs[j])
+                ctx->VSSetConstantBuffers(j, 1, &draw.vsCBs[j]);
+        }
+
+        // Fire the pre-draw callback AFTER VS state is set but BEFORE the draw call.
+        if (preDrawCB)
+            preDrawCB(ctx, i, priorTriangles, userdata);
+
+        if (draw.instanceCount > 1)
+        {
+            ctx->DrawIndexedInstanced(draw.indexCount, draw.instanceCount,
+                                      draw.startIndexLocation, draw.baseVertexLocation,
+                                      draw.startInstanceLocation);
+        }
+        else
+        {
+            ctx->DrawIndexed(draw.indexCount, draw.startIndexLocation,
+                             draw.baseVertexLocation);
+        }
+
+        priorTriangles += draw.indexCount / 3;
+        replayed++;
+    }
+
+    saved.Restore(ctx);
+    return replayed;
+}
+
 void Shutdown()
 {
     for (auto& entry : sScratchCBs)

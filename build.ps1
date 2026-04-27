@@ -4,7 +4,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$MSBUILD = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\amd64\MSBuild.exe"
+$MSBUILD = "C:\Program Files\Microsoft Visual Studio\18\Community\MSBuild\Current\Bin\amd64\MSBuild.exe"
+if (-not (Test-Path $MSBUILD)) {
+    $MSBUILD = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\amd64\MSBuild.exe"
+}
+if (-not (Test-Path $MSBUILD)) {
+    Write-Error "ERROR: MSBuild.exe not found. Update build.ps1 with the correct path."
+}
 $Root = $PSScriptRoot
 
 if ($Deploy) {
@@ -29,6 +35,14 @@ function Build-Project($vcxproj) {
     if ($LASTEXITCODE -ne 0) { throw "Build failed: $name" }
 }
 
+# Pre-build math validation: ensures the sun-frustum matrix math in DPMRenderer
+# stays correct. Fails the build if the roundtrip / identity assertions break.
+Write-Host "==> Validating sun-frustum math" -ForegroundColor Cyan
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root "tools\validate_sun_frustum.ps1") | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Sun-frustum math validation FAILED. Run tools\validate_sun_frustum.ps1 directly to see details."
+}
+
 # Build boot (preload plugin)
 Build-Project (Join-Path $Root "boot\DustBoot.vcxproj")
 
@@ -36,7 +50,7 @@ Build-Project (Join-Path $Root "boot\DustBoot.vcxproj")
 Build-Project (Join-Path $Root "src\Dust.vcxproj")
 
 # Build effect plugins (SSS excluded — not release-ready)
-$Effects = @("ssao", "lut", "bloom", "dof", "ssil", "clarity", "outline", "kuwahara", "rtgi", "shadows", "smaa", "chromaticaberration", "deband", "filmgrain", "letterbox", "vignette")
+$Effects = @("ssao", "lut", "bloom", "dof", "ssil", "clarity", "outline", "kuwahara", "rtgi", "shadows", "dustshadows-rt", "smaa", "chromaticaberration", "deband", "filmgrain", "letterbox", "vignette", "debugviews")
 foreach ($effect in $Effects) {
     $vcxproj = Get-ChildItem (Join-Path $Root "effects\$effect\*.vcxproj") | Select-Object -First 1
     Build-Project $vcxproj.FullName

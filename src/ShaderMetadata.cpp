@@ -122,6 +122,28 @@ void OnVertexShaderCreated(const void* bytecode, SIZE_T bytecodeSize,
         }
     }
 
+    // Dump output signature for classified shaders so we can verify a downstream GS
+    // (e.g. for the DPM build pass) will link. Logged once per shader at creation time.
+    char sigBuf[1024] = {};
+    if (info.transformType != VSTransformType::UNKNOWN)
+    {
+        size_t off = 0;
+        for (UINT i = 0; i < shaderDesc.OutputParameters; i++)
+        {
+            D3D11_SIGNATURE_PARAMETER_DESC sigDesc;
+            if (FAILED(reflector->GetOutputParameterDesc(i, &sigDesc)))
+                continue;
+            const char* sem = sigDesc.SemanticName ? sigDesc.SemanticName : "(null)";
+            int n = _snprintf_s(sigBuf + off, sizeof(sigBuf) - off, _TRUNCATE,
+                                "%s%s%u(r%u m0x%X)",
+                                (off ? ", " : ""),
+                                sem, sigDesc.SemanticIndex,
+                                sigDesc.Register, sigDesc.Mask);
+            if (n > 0) off += (size_t)n;
+            if (off >= sizeof(sigBuf) - 32) break;
+        }
+    }
+
     reflector->Release();
 
     sVSMap[vs] = info;
@@ -134,6 +156,7 @@ void OnVertexShaderCreated(const void* bytecode, SIZE_T bytecodeSize,
             info.clipMatrixOffset, info.clipMatrixSize,
             info.worldMatrixOffset, info.worldMatrixSize,
             info.cbSlot, info.cbTotalSize);
+        Log("ShaderMetadata: VS %p output sig: %s", vs, sigBuf);
     }
 }
 

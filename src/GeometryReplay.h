@@ -23,5 +23,15 @@ namespace GeometryReplay
     uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
                     const float* replacementVP);
 
+    // Like Replay but fires preDrawCB(ctx, drawIndex, priorTriangles, userdata) immediately
+    // before each draw is issued, so the plugin can bind per-draw constant buffers.
+    uint32_t ReplayEx(ID3D11DeviceContext* ctx, ID3D11Device* device,
+                      const float* replacementVP,
+                      void (*preDrawCB)(ID3D11DeviceContext* ctx,
+                                       uint32_t drawIndex,
+                                       uint32_t priorTriangles,
+                                       void* userdata),
+                      void* userdata);
+
     void Shutdown();
 }

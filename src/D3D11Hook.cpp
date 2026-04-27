@@ -251,7 +251,8 @@ static std::string PatchDeferredShader(const std::string& src)
 
     std::string inject1 =
         "uniform sampler aoMap : register(s8),\n"
-        "\tuniform sampler aoParams : register(s9),\n\n\t";
+        "\tuniform sampler aoParams : register(s9),\n"
+        "\tuniform sampler dustShadowMask : register(s13),\n\n\t";
     result.insert(pos1, inject1);
 
     // Injection 2: Add AO application code.
@@ -327,6 +328,12 @@ static std::string PatchDeferredShader(const std::string& src)
             "\n";
 
         std::string inject3 =
+            "// [Dust] RT shadow mask — screen-space binary mask produced by DustShadowsRT (Phase 3)\n"
+            "// When dustRTShadowEnabled > 0 the ray-traced result overrides the RTW shadow entirely.\n"
+            "cbuffer DustRTShadowCB : register(b4) {\n"
+            "\tfloat dustRTShadowEnabled;\n"
+            "\tfloat3 _dustRTShadowPad;\n"
+            "};\n\n"
             "// [Dust] Shadow filtering parameters (bound by Shadows plugin at b2)\n"
             "cbuffer DustShadowParams : register(b2) {\n"
             "\tfloat dustShadowEnabled;\n"
@@ -438,10 +445,15 @@ static std::string PatchDeferredShader(const std::string& src)
         std::string originalCall = result.substr(funcStart, closeParen - funcStart + 1);
         std::string params = result.substr(openParen + 1, closeParen - openParen - 1);
 
+        // Three-way branch: RT shadow mask takes priority, then improved PCF, then vanilla.
+        // tex2D is always evaluated (HLSL ternary is not short-circuit), so dustShadowMask
+        // must always be bound to a valid (possibly fully-lit) texture — handled in plugin.
         std::string newExpr =
-            "(dustShadowEnabled > 0.5) "
+            "dustRTShadowEnabled > 0.5 "
+            "? tex2D(dustShadowMask, texCoord).r "
+            ": ((dustShadowEnabled > 0.5) "
             "? DustRTWShadow(" + params + ", pixel.xy, normal, distance, shadow_range) "
-            ": " + originalCall;
+            ": " + originalCall + ")";
 
         result.replace(funcStart, closeParen - funcStart + 1, newExpr);
         Log("ShaderPatch: redirected RTWShadow -> conditional DustRTWShadow");

@@ -232,6 +232,18 @@ typedef struct DustHostAPI {
     // Shader database — returns a human-readable description for a shader category.
     const char* (*GetShaderCategoryName)(DustShaderCategory category);
 
+    // Like ReplayGeometry but fires a per-draw callback before each draw is issued,
+    // letting the plugin bind per-draw CBs (e.g. a drawCallOffset for the DPM build pass)
+    // without reimplementing VS clip-matrix patching. priorTriangles = sum of indexCount/3
+    // for all draws issued so far this batch — use as the prim buffer drawCallOffset.
+    uint32_t (*ReplayGeometryEx)(ID3D11DeviceContext* ctx, ID3D11Device* device,
+                                  const float* replacementVP,
+                                  void (*preDrawCB)(ID3D11DeviceContext* ctx,
+                                                   uint32_t drawIndex,
+                                                   uint32_t priorTriangles,
+                                                   void* userdata),
+                                  void* userdata);
+
     // Per-draw geometry access — bind IA state and issue individual draws with custom shaders.
     // Enables voxelization, SSS, material-specific rendering. Plugin sets its own VS/GS/PS.
     // Use SaveState/RestoreState around custom rendering.
