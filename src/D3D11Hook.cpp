@@ -1249,10 +1249,13 @@ static void STDMETHODCALLTYPE HookedDraw(
         if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
         {
             ExtractCameraData(pThis);
-            sInMSAAResolve = true;
-            DeferredMSAA::BeginPerSampleDraw(pThis);
-            sInMSAAResolve = false;
-            DeferredMSAA::BindForLighting(pThis);
+            if (MSAARedirect::GetSampleCount() >= 2)
+            {
+                sInMSAAResolve = true;
+                DeferredMSAA::BeginPerSampleDraw(pThis);
+                sInMSAAResolve = false;
+                DeferredMSAA::BindForLighting(pThis);
+            }
         }
 
         DustFrameContext fctx = {};
@@ -1273,10 +1276,13 @@ static void STDMETHODCALLTYPE HookedDraw(
 
         if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
         {
-            sInMSAAResolve = true;
-            DeferredMSAA::EndPerSampleDraw(pThis);
-            sInMSAAResolve = false;
-            DeferredMSAA::UnbindAfterLighting(pThis);
+            if (MSAARedirect::GetSampleCount() >= 2)
+            {
+                sInMSAAResolve = true;
+                DeferredMSAA::EndPerSampleDraw(pThis);
+                sInMSAAResolve = false;
+                DeferredMSAA::UnbindAfterLighting(pThis);
+            }
         }
 
         // POST: effects that operate after the draw
