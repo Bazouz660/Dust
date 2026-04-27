@@ -1,6 +1,7 @@
 #include "DustGUI.h"
 #include "DustLog.h"
 #include "EffectLoader.h"
+#include "FilePicker.h"
 #include "Survey.h"
 #include "SurveyRecorder.h"
 #include "imgui/imgui.h"
@@ -123,6 +124,24 @@ static int gForceCollapseState = 0; // 0=none, 1=expand all, -1=collapse all (co
 
 // Preset system GUI state
 static char gNewPresetName[64] = {};
+
+// Async picker tracking. The picker runs on a worker thread; we set one of
+// these to indicate what the next polled result should be used for.
+enum class PickerPurpose { None, Import, Export };
+static PickerPurpose gPickerPurpose = PickerPurpose::None;
+static int  gPickerExportPresetIdx = -1; // valid only for PickerPurpose::Export
+static std::string gPickerError;          // last error message (cleared when popup closes)
+static std::string gPickerInfo;           // last info message (e.g. "Imported 'X'")
+static int  gPickerInfoFrames = 0;        // countdown for transient info display
+
+// Edit Info popup state
+static char gEditInfoAuthor[128] = {};
+static char gEditInfoDesc[512]   = {};
+static int  gEditInfoPresetIdx   = -1;
+
+// Overwrite-on-import confirmation state
+static std::string gPendingImportSrc;     // source folder waiting for user to OK overwrite
+static std::string gPendingImportName;    // colliding name
 
 // Double-click to input mode
 static ImGuiID gInputModeID = 0;
@@ -788,8 +807,116 @@ static void SnapshotAllEffects()
     }
 }
 
+// Tooltip showing preset metadata (author, description, etc.)
+static void DrawPresetMetaTooltip(const PresetInfo& p)
+{
+    ImGui::BeginTooltip();
+    ImGui::TextUnformatted(p.name.c_str());
+    if (p.hasMetadata)
+    {
+        if (!p.metaAuthor.empty())
+            ImGui::Text("Author: %s", p.metaAuthor.c_str());
+        if (!p.metaDescription.empty())
+        {
+            ImGui::Separator();
+            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
+            ImGui::TextUnformatted(p.metaDescription.c_str());
+            ImGui::PopTextWrapPos();
+        }
+        if (p.metaApiVersion > 0)
+            ImGui::TextDisabled("API v%d, preset v%d", p.metaApiVersion, p.metaVersion);
+    }
+    else
+    {
+        ImGui::TextDisabled("(no metadata)");
+    }
+    ImGui::EndTooltip();
+}
+
+// Lightweight visual-only "disable": grey the button out by pushing alpha.
+// This ImGui version doesn't have BeginDisabled/EndDisabled (1.85+) so we
+// pair this with manual click gating (`if (clicked && !disabled)`).
+static void PushVisualDisabled(bool disabled)
+{
+    if (disabled)
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.5f);
+}
+static void PopVisualDisabled(bool disabled)
+{
+    if (disabled)
+        ImGui::PopStyleVar();
+}
+
+// Try to consume an async picker result. Called once per frame.
+static void PollFilePicker()
+{
+    std::string path;
+    if (!FilePicker::Poll(path)) return;
+
+    PickerPurpose purpose = gPickerPurpose;
+    gPickerPurpose = PickerPurpose::None;
+
+    if (path.empty()) return; // user cancelled
+
+    if (purpose == PickerPurpose::Import)
+    {
+        std::string err;
+        int idx = gEffectLoader.ImportPresetFromFolder(path.c_str(), false, &err);
+        if (idx >= 0)
+        {
+            gEffectLoader.LoadPreset(idx);
+            const auto& presets = gEffectLoader.GetPresets();
+            if (idx < (int)presets.size())
+            {
+                gFwConfig.lastPreset = presets[idx].name;
+                SaveFrameworkConfig();
+            }
+            SnapshotAllEffects();
+            gPickerInfo = "Imported '" + presets[idx].name + "'";
+            gPickerInfoFrames = 240; // ~4 seconds at 60fps
+            gPickerError.clear();
+        }
+        else if (err.find("already exists") != std::string::npos)
+        {
+            // Defer overwrite confirmation to a popup
+            gPendingImportSrc = path;
+            // Extract name for display from error message ("preset named 'X' ...")
+            size_t a = err.find('\'');
+            size_t b = (a != std::string::npos) ? err.find('\'', a + 1) : std::string::npos;
+            if (a != std::string::npos && b != std::string::npos)
+                gPendingImportName = err.substr(a + 1, b - a - 1);
+            else
+                gPendingImportName = "<unknown>";
+            gPickerError.clear();
+        }
+        else
+        {
+            gPickerError = err.empty() ? "Import failed" : err;
+        }
+    }
+    else if (purpose == PickerPurpose::Export)
+    {
+        std::string err;
+        if (gEffectLoader.ExportPreset(gPickerExportPresetIdx, path.c_str(), &err))
+        {
+            const auto& presets = gEffectLoader.GetPresets();
+            const char* name = (gPickerExportPresetIdx >= 0 && gPickerExportPresetIdx < (int)presets.size())
+                ? presets[gPickerExportPresetIdx].name.c_str() : "preset";
+            gPickerInfo = std::string("Exported '") + name + "' to " + path;
+            gPickerInfoFrames = 240;
+            gPickerError.clear();
+        }
+        else
+        {
+            gPickerError = err.empty() ? "Export failed" : err;
+        }
+    }
+}
+
 static void DrawPresetSection()
 {
+    PollFilePicker();
+
     const auto& presets = gEffectLoader.GetPresets();
     int currentPreset = gEffectLoader.GetCurrentPreset();
 
@@ -820,9 +947,13 @@ static void DrawPresetSection()
                 SaveFrameworkConfig();
                 SnapshotAllEffects();
             }
+            if (ImGui::IsItemHovered())
+                DrawPresetMetaTooltip(presets[p]);
         }
         ImGui::EndCombo();
     }
+    if (currentPreset >= 0 && currentPreset < (int)presets.size() && ImGui::IsItemHovered())
+        DrawPresetMetaTooltip(presets[currentPreset]);
 
     // Show warnings for outdated presets
     if (currentPreset >= 0 && !presets[currentPreset].warnings.empty())
@@ -832,9 +963,43 @@ static void DrawPresetSection()
             ImGui::SetTooltip("%s", presets[currentPreset].warnings.c_str());
     }
 
-    // Save As
+    // Picker-busy banner (so the user knows the dialog is open somewhere)
+    if (FilePicker::IsBusy())
+        ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "Waiting for folder picker...");
+
+    // Transient info / error
+    if (gPickerInfoFrames > 0 && !gPickerInfo.empty())
+    {
+        ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "%s", gPickerInfo.c_str());
+        gPickerInfoFrames--;
+    }
+    if (!gPickerError.empty())
+    {
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.4f, 1.0f), "%s", gPickerError.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Dismiss##PickerErr")) gPickerError.clear();
+    }
+
+    // ---- Row 1: Save As / Import ----
+    bool pickerBusy = FilePicker::IsBusy();
+
     if (ImGui::Button("Save As...", ImVec2(0, 0)))
         ImGui::OpenPopup("##GlobalSavePresetAs");
+
+    ImGui::SameLine();
+    PushVisualDisabled(pickerBusy);
+    if (ImGui::Button("Import...") && !pickerBusy)
+    {
+        gPickerPurpose = PickerPurpose::Import;
+        gPickerError.clear();
+        if (!FilePicker::StartFolderPicker("Choose a Dust preset folder to import"))
+            gPickerPurpose = PickerPurpose::None;
+    }
+    PopVisualDisabled(pickerBusy);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s",
+            pickerBusy ? "A folder picker is already open"
+                       : "Import a preset from a folder on disk");
 
     if (ImGui::BeginPopup("##GlobalSavePresetAs"))
     {
@@ -856,10 +1021,9 @@ static void DrawPresetSection()
         ImGui::EndPopup();
     }
 
-    // Overwrite / Delete for active preset
+    // ---- Row 2: Save / Export / Edit Info / Delete (only when a preset is selected) ----
     if (currentPreset >= 0)
     {
-        ImGui::SameLine();
         if (ImGui::Button("Save", ImVec2(0, 0)))
         {
             gEffectLoader.SavePreset(currentPreset);
@@ -867,6 +1031,41 @@ static void DrawPresetSection()
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Save current settings into '%s'", presets[currentPreset].name.c_str());
+
+        ImGui::SameLine();
+        PushVisualDisabled(pickerBusy);
+        if (ImGui::Button("Export...") && !pickerBusy)
+        {
+            gPickerPurpose = PickerPurpose::Export;
+            gPickerExportPresetIdx = currentPreset;
+            gPickerError.clear();
+            if (!FilePicker::StartFolderPicker("Choose a destination folder to export the preset"))
+                gPickerPurpose = PickerPurpose::None;
+        }
+        PopVisualDisabled(pickerBusy);
+        if (ImGui::IsItemHovered())
+        {
+            if (pickerBusy)
+                ImGui::SetTooltip("A folder picker is already open");
+            else
+                ImGui::SetTooltip("Copy '%s' into another folder for sharing",
+                                  presets[currentPreset].name.c_str());
+        }
+
+        ImGui::SameLine();
+        if (ImGui::Button("Edit Info..."))
+        {
+            gEditInfoPresetIdx = currentPreset;
+            const PresetInfo& p = presets[currentPreset];
+            // Pre-fill from existing metadata
+            strncpy_s(gEditInfoAuthor, sizeof(gEditInfoAuthor),
+                      p.metaAuthor.c_str(), _TRUNCATE);
+            strncpy_s(gEditInfoDesc, sizeof(gEditInfoDesc),
+                      p.metaDescription.c_str(), _TRUNCATE);
+            ImGui::OpenPopup("##EditPresetInfo");
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Edit author / description metadata");
 
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.15f, 0.15f, 1.0f));
@@ -887,6 +1086,75 @@ static void DrawPresetSection()
                 ImGui::CloseCurrentPopup();
             ImGui::EndPopup();
         }
+    }
+
+    // ---- Edit Info popup ----
+    if (ImGui::BeginPopup("##EditPresetInfo"))
+    {
+        ImGui::Text("Preset metadata");
+        ImGui::Separator();
+        ImGui::SetNextItemWidth(280);
+        ImGui::InputText("Author##editinfoauthor", gEditInfoAuthor, sizeof(gEditInfoAuthor));
+        ImGui::SetNextItemWidth(280);
+        ImGui::InputTextMultiline("Description##editinfodesc",
+                                  gEditInfoDesc, sizeof(gEditInfoDesc),
+                                  ImVec2(280, 80));
+        ImGui::Spacing();
+        if (ImGui::Button("Save##editinfo", ImVec2(80, 0)))
+        {
+            if (gEditInfoPresetIdx >= 0 && gEditInfoPresetIdx < (int)presets.size())
+                gEffectLoader.UpdatePresetMetadata(gEditInfoPresetIdx,
+                                                  gEditInfoAuthor, gEditInfoDesc);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel##editinfo", ImVec2(80, 0)))
+            ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    // ---- Overwrite-on-import confirmation ----
+    if (!gPendingImportSrc.empty())
+        ImGui::OpenPopup("##ConfirmImportOverwrite");
+    if (ImGui::BeginPopupModal("##ConfirmImportOverwrite", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        ImGui::Text("A preset named '%s' already exists.", gPendingImportName.c_str());
+        ImGui::Text("Overwrite it?");
+        ImGui::Spacing();
+        if (ImGui::Button("Overwrite", ImVec2(100, 0)))
+        {
+            std::string err;
+            int idx = gEffectLoader.ImportPresetFromFolder(gPendingImportSrc.c_str(), true, &err);
+            if (idx >= 0)
+            {
+                gEffectLoader.LoadPreset(idx);
+                const auto& ps = gEffectLoader.GetPresets();
+                if (idx < (int)ps.size())
+                {
+                    gFwConfig.lastPreset = ps[idx].name;
+                    SaveFrameworkConfig();
+                }
+                SnapshotAllEffects();
+                gPickerInfo = "Imported '" + gPendingImportName + "' (overwrote existing)";
+                gPickerInfoFrames = 240;
+            }
+            else
+            {
+                gPickerError = err.empty() ? "Import failed" : err;
+            }
+            gPendingImportSrc.clear();
+            gPendingImportName.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(100, 0)))
+        {
+            gPendingImportSrc.clear();
+            gPendingImportName.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
     }
 
     ImGui::Spacing();
@@ -1356,6 +1624,8 @@ void Shutdown()
     if (gBackBufferRTV)  { gBackBufferRTV->Release();  gBackBufferRTV = nullptr; }
     if (gDiscordLogoSRV) { gDiscordLogoSRV->Release(); gDiscordLogoSRV = nullptr; }
     if (gGithubLogoSRV)  { gGithubLogoSRV->Release();  gGithubLogoSRV = nullptr; }
+
+    FilePicker::Shutdown();
 
     gEffectStates.clear();
     gInitialized = false;

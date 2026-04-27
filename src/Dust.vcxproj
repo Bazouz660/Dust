@@ -95,6 +95,7 @@
     <ClCompile Include="ResourceRegistry.cpp" />
     <ClCompile Include="EffectLoader.cpp" />
     <ClCompile Include="DustGUI.cpp" />
+    <ClCompile Include="FilePicker.cpp" />
     <ClCompile Include="Survey.cpp" />
     <ClCompile Include="SurveyRecorder.cpp" />
     <ClCompile Include="SurveyWriter.cpp" />
@@ -113,6 +114,7 @@
     <ClInclude Include="PipelineDetector.h" />
     <ClInclude Include="ResourceRegistry.h" />
     <ClInclude Include="EffectLoader.h" />
+    <ClInclude Include="FilePicker.h" />
     <ClInclude Include="D3D11Hook.h" />
     <ClInclude Include="D3D11StateBlock.h" />
     <ClInclude Include="Survey.h" />
