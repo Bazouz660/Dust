@@ -5,6 +5,7 @@
 #include "ResourceRegistry.h"
 #include "ShaderMetadata.h"
 #include "ShaderDatabase.h"
+#include "ShaderSourceCatalog.h"
 #include "GeometryCapture.h"
 #include "MSAARedirect.h"
 #include "DeferredMSAA.h"
@@ -236,10 +237,46 @@ typedef HRESULT(WINAPI* PFN_D3DCompileHook)(
 
 static PFN_D3DCompileHook oD3DCompile = nullptr;
 
+// Diagnostic flags read once from Dust.ini for bisecting the deferred patch.
+//   DisableShadowRedirect=1  → skip the RTWShadow → conditional ternary swap
+//   DisableMSAAPatch=1       → skip MSAA-conditional GBuffer reads + Texture2DMS decls
+//   DisableAOPatch=1         → skip AO injection (samplers + envLight *= ao)
+//   DisableSpecAAPatch=1     → skip geometric specular AA
+struct DustPatchFlags
+{
+    int disableShadowRedirect = 0;
+    int disableMSAAPatch      = 0;
+    int disableAOPatch        = 0;
+    int disableSpecAAPatch    = 0;
+};
+
+static DustPatchFlags ReadPatchFlags()
+{
+    DustPatchFlags f = {};
+    HMODULE hSelf = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCSTR)&ReadPatchFlags, &hSelf);
+    char selfPath[MAX_PATH] = {};
+    if (hSelf) GetModuleFileNameA(hSelf, selfPath, MAX_PATH);
+    char* slash = strrchr(selfPath, '\\');
+    if (slash) { *(slash + 1) = '\0'; strcat_s(selfPath, "Dust.ini"); }
+    f.disableShadowRedirect = GetPrivateProfileIntA("Dust", "DisableShadowRedirect", 0, selfPath);
+    f.disableMSAAPatch      = GetPrivateProfileIntA("Dust", "DisableMSAAPatch",      0, selfPath);
+    f.disableAOPatch        = GetPrivateProfileIntA("Dust", "DisableAOPatch",        0, selfPath);
+    f.disableSpecAAPatch    = GetPrivateProfileIntA("Dust", "DisableSpecAAPatch",    0, selfPath);
+    if (f.disableShadowRedirect) DustLog("ShaderPatch: shadow redirect DISABLED");
+    if (f.disableMSAAPatch)      DustLog("ShaderPatch: MSAA patch DISABLED");
+    if (f.disableAOPatch)        DustLog("ShaderPatch: AO patch DISABLED");
+    if (f.disableSpecAAPatch)    DustLog("ShaderPatch: SpecAA patch DISABLED");
+    return f;
+}
+
 // Patch vanilla deferred.hlsl source to add AO support and improved shadow filtering.
 // Returns the modified source, or the original if patterns weren't found.
 static std::string PatchDeferredShader(const std::string& src)
 {
+    static DustPatchFlags flags = ReadPatchFlags();
     std::string result = src;
 
     // === AO Patches ===
@@ -270,16 +307,19 @@ static std::string PatchDeferredShader(const std::string& src)
         return src;
     }
 
-    std::string inject2 =
-        "// [Dust] Ambient occlusion\n"
-        "\tfloat ao = tex2D(aoMap, texCoord).r;\n"
-        "\tfloat directAO = tex2D(aoParams, texCoord).r;\n"
-        "\tenvLight.diffuse *= ao;\n"
-        "\tenvLight.specular *= ao;\n"
-        "\tfloat directFade = lerp(1.0, ao, directAO);\n"
-        "\tsunLight.diffuse *= directFade;\n"
-        "\tsunLight.specular *= directFade;\n\n\t";
-    result.insert(pos2, inject2);
+    if (!flags.disableAOPatch)
+    {
+        std::string inject2 =
+            "// [Dust] Ambient occlusion\n"
+            "\tfloat ao = tex2D(aoMap, texCoord).r;\n"
+            "\tfloat directAO = tex2D(aoParams, texCoord).r;\n"
+            "\tenvLight.diffuse *= ao;\n"
+            "\tenvLight.specular *= ao;\n"
+            "\tfloat directFade = lerp(1.0, ao, directAO);\n"
+            "\tsunLight.diffuse *= directFade;\n"
+            "\tsunLight.specular *= directFade;\n\n\t";
+        result.insert(pos2, inject2);
+    }
 
     // === Specular AA Patch ===
     // Geometric specular anti-aliasing (Kaplanyan & Hill 2016): widen roughness
@@ -290,7 +330,7 @@ static std::string PatchDeferredShader(const std::string& src)
 
     const char* specAAAnchor = "LightingData ld = (LightingData)0.0f;";
     size_t specAAPos = result.find(specAAAnchor);
-    if (specAAPos != std::string::npos)
+    if (specAAPos != std::string::npos && !flags.disableSpecAAPatch)
     {
         std::string specAA =
             "// [Dust] Geometric specular anti-aliasing\n"
@@ -333,13 +373,15 @@ static std::string PatchDeferredShader(const std::string& src)
             "\n";
 
         std::string inject3 =
-            "// [Dust] RT shadow mask — screen-space binary mask produced by DustShadowsRT (Phase 3)\n"
-            "// When dustRTShadowEnabled > 0 the ray-traced result overrides the RTW shadow entirely.\n"
+            "// [Dust] RT shadow mask — screen-space binary mask produced by DustShadowsRT.\n"
+            "// When dustRTShadowEnabled > 0 the ray-traced result overrides the RTW shadow.\n"
             "cbuffer DustRTShadowCB : register(b4) {\n"
             "\tfloat dustRTShadowEnabled;\n"
             "\tfloat3 _dustRTShadowPad;\n"
             "};\n\n"
-            "// [Dust] Shadow filtering parameters (bound by Shadows plugin at b2)\n"
+            "// [Dust] Shadow filtering parameters cbuffer reserved at b2 (currently unused\n"
+            "// in the deferred patch — the Shadows effect plugin still binds it for legacy\n"
+            "// reasons but no DustRTWShadow function is used in RTW mode).\n"
             "cbuffer DustShadowParams : register(b2) {\n"
             "\tfloat dustShadowEnabled;\n"
             "\tfloat dustFilterRadius;\n"
@@ -347,13 +389,28 @@ static std::string PatchDeferredShader(const std::string& src)
             "\tfloat dustPCSSEnabled;\n"
             "\tfloat dustBiasScale;\n"
             "};\n\n"
-            "// [Dust] Improved RTWSM shadow filtering (post-warp offsets)\n"
+            "#if 0  // DustRTWShadow disabled — see commit notes\n"
+            "// [Dust] DustRTWShadow — currently a passthrough to vanilla RTWShadow.\n"
+            "// The previous PCF/PCSS filter logic produced wrong values in RTWSM\n"
+            "// (scene went shiny/metallic). Pending a proper rewrite, just call\n"
+            "// vanilla so enabling the Shadows effect doesn't break rendering.\n"
+            "// The extra params (screenPos, normal, dist, shadowRange) are kept\n"
+            "// in the signature so the redirect call site doesn't need to change.\n"
             "float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,\n"
             "                     float3 worldPos, float b, float edgeBias, float2 screenPos,\n"
             "                     float3 normal, float dist, float shadowRange) {\n"
+            "\treturn RTWShadow(sMap, wMap, shadowMatrix, worldPos, b, edgeBias);\n"
+            "}\n"
+            "#endif // outer DustRTWShadow guard\n"
+            "// (legacy filter body retained below, but never reached)\n"
+            "#if 0\n"
+            "float _DustRTWShadowLegacy(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,\n"
+            "                     float3 worldPos, float b, float edgeBias, float2 screenPos,\n"
+            "                     float3 normal, float dist, float shadowRange) {\n"
             "\tfloat4 sc = mul(shadowMatrix, float4(worldPos, 1));\n"
-            "\tfloat2 center = GetOffsetLocationS(wMap, sc.xy);\n"
-            "\tfloat2 edge = saturate(abs(center - 0.5) * 20 - 9);\n"
+            "\t// Edge bias from the warped centre location (matches vanilla RTWShadow).\n"
+            "\tfloat2 centerWarp = GetOffsetLocationS(wMap, sc.xy);\n"
+            "\tfloat2 edge = saturate(abs(centerWarp - 0.5) * 20 - 9);\n"
             "\tb += edgeBias * (edge.x + edge.y);\n"
             "\tfloat sd = saturate(sc.z);\n"
             "\n"
@@ -389,8 +446,9 @@ static std::string PatchDeferredShader(const std::string& src)
             "\t\t[unroll]\n"
             "\t\tfor (int j = 0; j < 12; j++) {\n"
             "\t\t\tfloat2 off = mul(rot, pd[j]) * ls;\n"
-            "\t\t\tfloat2 suv = center + off;\n"
-            "\t\t\tfloat dd = tex2Dlod(sMap, float4(suv, 0, 0)).x;\n"
+            "\t\t\tfloat2 sampleClip = sc.xy + off;\n"
+            "\t\t\tfloat2 sampleUV   = GetOffsetLocationS(wMap, sampleClip);\n"
+            "\t\t\tfloat dd = tex2Dlod(sMap, float4(sampleUV, 0, 0)).x;\n"
             "\t\t\tif (dd < sd - b) {\n"
             "\t\t\t\tbSum += dd;\n"
             "\t\t\t\tbCnt += 1.0;\n"
@@ -413,12 +471,15 @@ static std::string PatchDeferredShader(const std::string& src)
             "\t[unroll]\n"
             "\tfor (int i = 0; i < 12; i++) {\n"
             "\t\tfloat2 off = mul(rot, pd[i]) * fr;\n"
-            "\t\tfloat2 suv = center + off;\n"
-            "\t\tshadow += ShadowMap(sMap, suv, sd, b, 0);\n"
+            "\t\tfloat2 sampleClip = sc.xy + off;\n"
+            "\t\tfloat2 sampleUV   = GetOffsetLocationS(wMap, sampleClip);\n"
+            "\t\tshadow += ShadowMap(sMap, sampleUV, sd, b, 0);\n"
             "\t}\n"
             "\tshadow /= 12.0;\n"
             "\treturn shadow;\n"
-            "}\n\n";
+            "}\n"
+            "#endif\n"
+            "\n";
         result.insert(pos3, inject3);
         Log("ShaderPatch: injected DustShadowParams cbuffer + DustRTWShadow function");
     }
@@ -428,11 +489,25 @@ static std::string PatchDeferredShader(const std::string& src)
     }
 
     // Injection 4: Replace RTWShadow call with conditional.
-    // Search for "= RTWShadow(" to find the call site (skips DustRTWShadow definition).
-    // Extracts parameters dynamically so it works regardless of spacing or extra bias terms.
+    // DISABLED BY DEFAULT — every form of "modify shadow with the tex2Dlod
+    // result of dustShadowMask" produces shiny/metallic rendering in RTWSM
+    // mode (extensive diagnostic bisection in this commit's session). The
+    // codegen issue is mode-specific: same patches in CSM look fine. Until
+    // that's understood, RTWSM uses vanilla shadow. Re-enable for testing
+    // via Dust.ini  [Dust] EnableShadowRedirect=1.
+    HMODULE _hSelf = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCSTR)&PatchDeferredShader, &_hSelf);
+    char _selfP[MAX_PATH] = {};
+    if (_hSelf) GetModuleFileNameA(_hSelf, _selfP, MAX_PATH);
+    char* _slash = strrchr(_selfP, '\\');
+    if (_slash) { *(_slash + 1) = '\0'; strcat_s(_selfP, "Dust.ini"); }
+    int _enableRedirect = GetPrivateProfileIntA("Dust", "EnableShadowRedirect", 0, _selfP);
+
     const char* callAnchor = "= RTWShadow(";
     size_t anchorPos = result.find(callAnchor);
-    if (anchorPos != std::string::npos)
+    if (anchorPos != std::string::npos && _enableRedirect && !flags.disableShadowRedirect)
     {
         size_t funcStart = anchorPos + 2; // position of 'R' in RTWShadow
         size_t openParen = result.find('(', funcStart);
@@ -450,19 +525,35 @@ static std::string PatchDeferredShader(const std::string& src)
         std::string originalCall = result.substr(funcStart, closeParen - funcStart + 1);
         std::string params = result.substr(openParen + 1, closeParen - openParen - 1);
 
-        // Three-way branch: RT shadow mask takes priority, then improved PCF, then vanilla.
-        // tex2D is always evaluated (HLSL ternary is not short-circuit), so dustShadowMask
-        // must always be bound to a valid (possibly fully-lit) texture — handled in plugin.
-        std::string newExpr =
-            "dustRTShadowEnabled > 0.5 "
-            "? tex2D(dustShadowMask, texCoord).r "
-            ": ((dustShadowEnabled > 0.5) "
-            "? DustRTWShadow(" + params + ", pixel.xy, normal, distance, shadow_range) "
-            ": " + originalCall + ")";
-
-        result.replace(funcStart, closeParen - funcStart + 1, newExpr);
-        Log("ShaderPatch: redirected RTWShadow -> conditional DustRTWShadow");
-        Log("ShaderPatch: original call: %s", originalCall.c_str());
+        // Originally a ternary, but ternaries are non-short-circuit in HLSL —
+        // both arms are evaluated. DustRTWShadow has 24+ tex2Dlod calls and
+        // its always-on evaluation produced wrong output on the vanilla
+        // fallback path in RTWSM (scene went wet/metallic). Use [branch] if
+        // statements so only the taken branch executes.
+        //
+        // Strategy: keep the original `shadow = RTWShadow(...);` as the
+        // baseline, then append two conditional overrides. Find the trailing
+        // ';' so we can splice in after it without disturbing the original.
+        size_t stmtEnd = result.find(';', closeParen);
+        if (stmtEnd != std::string::npos)
+        {
+            // RT shadow mask override via lerp (no if-statement). Use step()
+            // to convert the float flag into a 0/1 lerp factor. FXC compiles
+            // this as a straight cmov-equivalent without any [branch] / if
+            // pattern that triggered the codegen issue we've been chasing.
+            (void)params;
+            std::string overrides =
+                "\n\tfloat _dustRTMask = tex2Dlod(dustShadowMask, float4(texCoord, 0, 0)).r;"
+                "\n\tshadow = lerp(shadow, _dustRTMask, step(0.5, dustRTShadowEnabled));";
+            result.insert(stmtEnd + 1, overrides);
+            Log("ShaderPatch: appended RT shadow mask override (lerp-based)");
+            Log("ShaderPatch: original call: %s", originalCall.c_str());
+            Log("ShaderPatch: original call: %s", originalCall.c_str());
+        }
+        else
+        {
+            Log("ShaderPatch: no trailing ';' found after RTWShadow call, redirect skipped");
+        }
     }
     else
     {
@@ -477,7 +568,7 @@ static std::string PatchDeferredShader(const std::string& src)
 
     const char* msaaAnchor1 = "void main_vs (";
     size_t msaaPos1 = result.find(msaaAnchor1);
-    if (msaaPos1 != std::string::npos)
+    if (msaaPos1 != std::string::npos && !flags.disableMSAAPatch)
     {
         std::string msaaDecls =
             "// [Dust] MSAA per-sample shading\n"
@@ -522,6 +613,7 @@ static std::string PatchDeferredShader(const std::string& src)
     // Inject SV_SampleIndex in main_fs parameter list.
     // Must go AFTER all TEXCOORD inputs to avoid shifting interpolator registers.
     // Search from main_fs to avoid matching main_vs's TEXCOORD1 output.
+    if (!flags.disableMSAAPatch)
     {
         size_t mainFsPos = result.find("main_fs");
         const char* texcoordAnchor = ": TEXCOORD1,";
@@ -541,6 +633,7 @@ static std::string PatchDeferredShader(const std::string& src)
     // Replace GBuffer reads with MSAA-conditional versions.
     // When dustMSAASamples >= 2, read from Texture2DMS at the current sample.
     // When 0, use the original tex2D reads from the resolved single-sample GBuffer.
+    if (!flags.disableMSAAPatch)
     {
         const char* albedoOld = "decodePixel(gBuf0, texCoord, viewport, pixel.xy)";
         size_t albedoPos = result.find(albedoOld);
@@ -668,6 +761,133 @@ static std::string PatchObjectsShader(const std::string& src)
     return result;
 }
 
+// Default CB/SRV bindings for the patched deferred shader.
+// The shader patches reference dustShadowEnabled (b2), dustRTShadowEnabled (b4),
+// aoMap (s8), aoParams (s9), and dustShadowMask (s13). When no plugin is
+// active, those slots stay unbound and read garbage — `dustRTShadowEnabled`
+// can land >0.5, triggering the RT shadow branch which then samples an unbound
+// dustShadowMask (=0), tanking the sun term. Symptom: scene goes wet/metallic.
+// CSM mode dodges this because its shadow path doesn't go through the patched
+// ternary; RTW mode is hit hard.
+//
+// Fix: the framework binds known-safe defaults before any plugin runs.
+namespace DustDeferredDefaults
+{
+    // Zero CB for b2 (DustShadowParams) and b4 (DustRTShadowCB). Both fields
+    // we care about (dustShadowEnabled, dustRTShadowEnabled) read 0, so the
+    // ternary picks the vanilla RTWShadow branch.
+    static ID3D11Buffer*            sZeroCB        = nullptr;
+    // 1x1 white texture for aoMap (s8) and dustShadowMask (s13) so reads
+    // multiply by 1 (no tint) instead of 0 (kills env light).
+    static ID3D11Texture2D*         sWhiteTex      = nullptr;
+    static ID3D11ShaderResourceView* sWhiteSRV     = nullptr;
+    // 1x1 black texture for aoParams (s9). directAO=0 → directFade=1 → sun
+    // light unaffected.
+    static ID3D11Texture2D*         sBlackTex      = nullptr;
+    static ID3D11ShaderResourceView* sBlackSRV     = nullptr;
+    static ID3D11SamplerState*       sPointSamp    = nullptr;
+
+    static bool Ensure(ID3D11Device* device)
+    {
+        if (sZeroCB && sWhiteSRV && sBlackSRV && sPointSamp) return true;
+        if (!device) return false;
+
+        // 32-byte zero CB — covers DustShadowParams (5 floats) and DustRTShadowCB (4 floats).
+        if (!sZeroCB)
+        {
+            D3D11_BUFFER_DESC cd = {};
+            cd.ByteWidth      = 32;
+            cd.Usage          = D3D11_USAGE_IMMUTABLE;
+            cd.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
+            uint32_t zeros[8] = {0};
+            D3D11_SUBRESOURCE_DATA srd = { zeros, 0, 0 };
+            if (FAILED(device->CreateBuffer(&cd, &srd, &sZeroCB)))
+                return false;
+        }
+
+        auto make1x1 = [&](uint32_t color, ID3D11Texture2D** outTex, ID3D11ShaderResourceView** outSRV)
+        {
+            D3D11_TEXTURE2D_DESC td = {};
+            td.Width = td.Height = 1;
+            td.MipLevels = td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+            td.SampleDesc.Count = 1;
+            td.Usage = D3D11_USAGE_IMMUTABLE;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            D3D11_SUBRESOURCE_DATA srd = { &color, 4, 0 };
+            return SUCCEEDED(device->CreateTexture2D(&td, &srd, outTex)) &&
+                   SUCCEEDED(device->CreateShaderResourceView(*outTex, nullptr, outSRV));
+        };
+
+        if (!sWhiteSRV && !make1x1(0xFFFFFFFFu, &sWhiteTex, &sWhiteSRV)) return false;
+        if (!sBlackSRV && !make1x1(0x00000000u, &sBlackTex, &sBlackSRV)) return false;
+
+        if (!sPointSamp)
+        {
+            D3D11_SAMPLER_DESC sd = {};
+            sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+            sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+            sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+            sd.MaxLOD = D3D11_FLOAT32_MAX;
+            if (FAILED(device->CreateSamplerState(&sd, &sPointSamp))) return false;
+        }
+        return true;
+    }
+
+    static void BindBeforeDeferred(ID3D11DeviceContext* ctx, ID3D11Device* device)
+    {
+        if (!Ensure(device)) return;
+        // CBs at b2, b3, b4. b3 is DustMSAACB which DeferredMSAA::BindForLighting
+        // only binds when MSAA is active — without that, dustMSAASamples reads
+        // garbage and may drive the patched shader into the MSAA path (reads
+        // unbound t10/t11/t12 → all 0). Always bind a zeroed default.
+        ID3D11Buffer* cbs[1] = { sZeroCB };
+        ctx->PSSetConstantBuffers(2, 1, cbs);
+        ctx->PSSetConstantBuffers(3, 1, cbs);
+        ctx->PSSetConstantBuffers(4, 1, cbs);
+        // Textures + samplers at s8/s9/s13. Plugins (SSAO, ShadowsRT) may
+        // overwrite in their PreExecute. Defaults: white at aoMap, black at
+        // aoParams, white at dustShadowMask.
+        ctx->PSSetShaderResources(8,  1, &sWhiteSRV);
+        ctx->PSSetShaderResources(9,  1, &sBlackSRV);
+        ctx->PSSetShaderResources(13, 1, &sWhiteSRV);
+        ctx->PSSetSamplers(8,  1, &sPointSamp);
+        ctx->PSSetSamplers(9,  1, &sPointSamp);
+        ctx->PSSetSamplers(13, 1, &sPointSamp);
+
+        static bool sFirstBind = true;
+        if (sFirstBind)
+        {
+            DustLog("DustDeferredDefaults: bound zero CB at b2/b3/b4, white at s8/s13, black at s9");
+            sFirstBind = false;
+        }
+    }
+
+    static void Shutdown()
+    {
+        if (sZeroCB)     { sZeroCB->Release();     sZeroCB = nullptr; }
+        if (sWhiteSRV)   { sWhiteSRV->Release();   sWhiteSRV = nullptr; }
+        if (sWhiteTex)   { sWhiteTex->Release();   sWhiteTex = nullptr; }
+        if (sBlackSRV)   { sBlackSRV->Release();   sBlackSRV = nullptr; }
+        if (sBlackTex)   { sBlackTex->Release();   sBlackTex = nullptr; }
+        if (sPointSamp)  { sPointSamp->Release();  sPointSamp = nullptr; }
+    }
+}
+
+// Build a NULL-terminated array of macro names from a D3D_SHADER_MACRO list.
+// Returned vector keeps the names alive; the array of pointers references
+// the strings inside it. Pass through nullptr/empty as a single-element
+// {nullptr} array.
+static std::vector<const char*> CollectDefineNames(const D3D_SHADER_MACRO* pDefines)
+{
+    std::vector<const char*> names;
+    if (pDefines)
+        for (const D3D_SHADER_MACRO* m = pDefines; m && m->Name; ++m)
+            names.push_back(m->Name);
+    names.push_back(nullptr); // terminator
+    return names;
+}
+
 static HRESULT WINAPI HookedD3DCompile(
     LPCVOID pSrcData, SIZE_T SrcDataSize, LPCSTR pSourceName,
     const D3D_SHADER_MACRO* pDefines, ID3DInclude* pInclude,
@@ -675,9 +895,33 @@ static HRESULT WINAPI HookedD3DCompile(
     UINT Flags1, UINT Flags2,
     ID3DBlob** ppCode, ID3DBlob** ppErrorMsgs)
 {
+    // Diagnostic: skip deferred shader patches entirely if Dust.ini has
+    //   [Dust] DisableDeferredPatch=1
+    // Lets us bisect "is the bug in the patch?" without rebuilding.
+    static int sDisableDeferredPatchInit = 0;
+    static int sDisableDeferredPatch = 0;
+    if (!sDisableDeferredPatchInit)
+    {
+        char modPath[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, modPath, MAX_PATH); // best-effort; we just need any nearby ini
+        // Try Dust.ini next to the host module
+        HMODULE hSelf = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)&HookedD3DCompile, &hSelf);
+        char selfPath[MAX_PATH] = {};
+        if (hSelf) GetModuleFileNameA(hSelf, selfPath, MAX_PATH);
+        char* slash = strrchr(selfPath, '\\');
+        if (slash) { *(slash + 1) = '\0'; strcat_s(selfPath, "Dust.ini"); }
+        sDisableDeferredPatch = GetPrivateProfileIntA("Dust", "DisableDeferredPatch", 0, selfPath);
+        sDisableDeferredPatchInit = 1;
+        if (sDisableDeferredPatch)
+            DustLog("ShaderPatch: deferred patch DISABLED via Dust.ini DisableDeferredPatch=1");
+    }
+
     // Detect the deferred lighting pixel shader: entry point is "main_fs"
     // and source contains deferred-specific identifiers.
-    if (pEntrypoint && pSrcData && SrcDataSize > 0 &&
+    if (!sDisableDeferredPatch && pEntrypoint && pSrcData && SrcDataSize > 0 &&
         strcmp(pEntrypoint, "main_fs") == 0)
     {
         std::string src((const char*)pSrcData, SrcDataSize);
@@ -698,9 +942,12 @@ static HRESULT WINAPI HookedD3DCompile(
                 {
                     Log("ShaderPatch: compiled deferred as %s", msaaTarget);
                     if (ppCode && *ppCode)
+                    {
+                        auto defineNames = CollectDefineNames(pDefines);
                         SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
-                            pEntrypoint, pTarget, pSourceName,
+                            pEntrypoint, pTarget, pSourceName, defineNames.data(),
                             (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+                    }
                     return hr;
                 }
 
@@ -736,9 +983,12 @@ static HRESULT WINAPI HookedD3DCompile(
                 if (SUCCEEDED(hr))
                 {
                     if (ppCode && *ppCode)
+                    {
+                        auto defineNames = CollectDefineNames(pDefines);
                         SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
-                            pEntrypoint, pTarget, pSourceName,
+                            pEntrypoint, pTarget, pSourceName, defineNames.data(),
                             (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+                    }
                     return hr;
                 }
 
@@ -760,9 +1010,22 @@ static HRESULT WINAPI HookedD3DCompile(
     // Record shader source for survey (always, for all shaders)
     if (SUCCEEDED(hr) && ppCode && *ppCode && pSrcData && SrcDataSize > 0)
     {
+        auto defineNames = CollectDefineNames(pDefines);
         SurveyRecorder::OnShaderCompiled(pSrcData, SrcDataSize,
-            pEntrypoint, pTarget, pSourceName,
+            pEntrypoint, pTarget, pSourceName, defineNames.data(),
             (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+
+        // Phase 1.C: cross-validate the source-level catalog against the
+        // bytecode reflection. Logs once per compile with a name+def summary.
+        if (pSourceName && pEntrypoint)
+        {
+            std::vector<std::string> defs;
+            for (const char* const* p = defineNames.data(); *p; ++p)
+                defs.emplace_back(*p);
+            ShaderSourceCatalog::ValidateAgainstBytecode(
+                pSourceName, pEntrypoint, defs,
+                (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+        }
     }
 
     return hr;
@@ -1286,6 +1549,9 @@ static void STDMETHODCALLTYPE HookedDraw(
                 sInMSAAResolve = false;
                 DeferredMSAA::BindForLighting(pThis);
             }
+            // Framework defaults for the patched deferred CBs/SRVs. Must run
+            // before plugin PreExecute so plugins can overwrite where active.
+            DustDeferredDefaults::BindBeforeDeferred(pThis, gDevice);
         }
 
         DustFrameContext fctx = {};
@@ -1786,6 +2052,7 @@ bool Install()
 void SignalShutdown()
 {
     gShutdownSignaled = true;
+    DustDeferredDefaults::Shutdown();
 }
 
 } // namespace D3D11Hook

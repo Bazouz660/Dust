@@ -72,7 +72,7 @@
 extern "C" {
 #endif
 
-#define DUST_API_VERSION 4
+#define DUST_API_VERSION 5
 
 // Injection points in the rendering pipeline
 typedef enum DustInjectionPoint {
@@ -276,6 +276,48 @@ typedef struct DustHostAPI {
     // When enabled, GBuffer draws render to MSAA targets and resolve automatically.
     void (*SetMSAA)(uint32_t sampleCount);
     uint32_t (*GetMSAASampleCount)(void);
+
+    // === API v5 additions: ShaderSourceCatalog queries ===
+    //
+    // The catalog is built at startup by parsing every HLSL file under
+    // <kenshiInstallDir>/data/materials/. Queries identify a shader variant by
+    // source basename + entry point + a list of preprocessor defines that
+    // were active at compile time.
+    //
+    //   sourceBasename : the .hlsl file's basename without extension
+    //                    (matches DustGeometryDraw::vsSourceName / psSourceName).
+    //   entryName      : the function entry point name, e.g. "main_vs".
+    //   defines/cnt    : array of macro names that were #defined when the game
+    //                    compiled this variant. Pass NULL/0 to resolve only the
+    //                    unconditional declarations.
+    //
+    // Names are matched case-sensitively. The OGRE `$`-prefix that D3DCompile
+    // adds to lowered samplers is NOT part of catalog names — query with the
+    // source-level name (e.g. "depthMap", not "$depthMap").
+
+    // Returns 1 if (sourceBasename, entryName) is known to the catalog, 0 otherwise.
+    int (*ShaderCatalogHasEntry)(const char* sourceBasename, const char* entryName);
+
+    // Returns 1 if the resolved variant declares a uniform with the given name.
+    int (*ShaderCatalogHasUniform)(const char* sourceBasename, const char* entryName,
+                                   const char* const* defines, uint32_t defineCount,
+                                   const char* uniformName);
+
+    // Array size for an array uniform (e.g. 60 for `worldMatrix3x4Array[BONES]`
+    // with `#define BONES 60`). Returns 0 for scalar uniforms, -1 if the
+    // uniform is not present in the variant.
+    int32_t (*ShaderCatalogGetUniformArraySize)(const char* sourceBasename, const char* entryName,
+                                                const char* const* defines, uint32_t defineCount,
+                                                const char* uniformName);
+
+    // Register slot of a resource (texture/sampler) in the variant.
+    // Returns >= 0 for an explicit `register(sN)`/`register(tN)` annotation.
+    // Returns -1 if the resource is not declared in the variant.
+    // Returns -2 if declared but with no register annotation (OGRE-fx parameter
+    // samplers, top-level SamplerState blocks).
+    int32_t (*ShaderCatalogGetResourceSlot)(const char* sourceBasename, const char* entryName,
+                                            const char* const* defines, uint32_t defineCount,
+                                            const char* resourceName);
 } DustHostAPI;
 
 // Setting types for the GUI settings descriptor (API v2+)

@@ -661,7 +661,9 @@ void Shutdown()
 
 void OnShaderCompiled(const void* pSrcData, SIZE_T srcSize,
                       const char* entryPoint, const char* target,
-                      const char* sourceName, const void* bytecode, SIZE_T bytecodeSize)
+                      const char* sourceName,
+                      const char* const* defineNames,
+                      const void* bytecode, SIZE_T bytecodeSize)
 {
     if (!bytecode || bytecodeSize == 0)
         return;
@@ -674,6 +676,9 @@ void OnShaderCompiled(const void* pSrcData, SIZE_T srcSize,
     info.entryPoint = entryPoint ? entryPoint : "";
     info.target     = target ? target : "";
     info.sourceName = sourceName ? sourceName : "";
+    if (defineNames)
+        for (const char* const* p = defineNames; *p; ++p)
+            info.defines.emplace_back(*p);
 
     sBytecodeToSource[hash] = std::move(info);
 }

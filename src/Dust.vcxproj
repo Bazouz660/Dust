@@ -99,6 +99,7 @@
     <ClCompile Include="SurveyRecorder.cpp" />
     <ClCompile Include="ShaderMetadata.cpp" />
     <ClCompile Include="ShaderDatabase.cpp" />
+    <ClCompile Include="ShaderSourceCatalog.cpp" />
     <ClCompile Include="GeometryCapture.cpp" />
     <ClCompile Include="GeometryReplay.cpp" />
     <ClCompile Include="MSAARedirect.cpp" />
@@ -126,6 +127,7 @@
     <ClInclude Include="SurveyRecorder.h" />
     <ClInclude Include="ShaderMetadata.h" />
     <ClInclude Include="ShaderDatabase.h" />
+    <ClInclude Include="ShaderSourceCatalog.h" />
     <ClInclude Include="GeometryCapture.h" />
     <ClInclude Include="GeometryReplay.h" />
     <ClInclude Include="MSAARedirect.h" />

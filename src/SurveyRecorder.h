@@ -109,10 +109,11 @@ struct SurveyFrameData
 
 struct ShaderSourceInfo
 {
-    std::string source;
-    std::string entryPoint;
-    std::string target;
-    std::string sourceName;
+    std::string              source;
+    std::string              entryPoint;
+    std::string              target;
+    std::string              sourceName;
+    std::vector<std::string> defines;     // macro names that were #defined at compile time
 };
 
 // ==================== Recorder API ====================
@@ -135,10 +136,14 @@ namespace SurveyRecorder
     void Reset();
     void Shutdown();
 
-    // Shader source capture — called from D3DCompile and CreateShader hooks
+    // Shader source capture — called from D3DCompile and CreateShader hooks.
+    // 'defineNames' is a NULL-terminated array of macro names; pass NULL if
+    // the compile had no defines.
     void OnShaderCompiled(const void* pSrcData, SIZE_T srcSize,
                           const char* entryPoint, const char* target,
-                          const char* sourceName, const void* bytecode, SIZE_T bytecodeSize);
+                          const char* sourceName,
+                          const char* const* defineNames,
+                          const void* bytecode, SIZE_T bytecodeSize);
     void OnPixelShaderCreated(const void* bytecode, SIZE_T bytecodeSize,
                               ID3D11PixelShader* shader);
     void OnVertexShaderCreated(const void* bytecode, SIZE_T bytecodeSize,

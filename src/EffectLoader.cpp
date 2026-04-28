@@ -4,6 +4,7 @@
 #include "GeometryCapture.h"
 #include "GeometryReplay.h"
 #include "ShaderDatabase.h"
+#include "ShaderSourceCatalog.h"
 #include "MSAARedirect.h"
 #include "DustLog.h"
 #include <d3dcompiler.h>
@@ -11,6 +12,8 @@
 #include <cstdlib>
 #include <unordered_map>
 #include <algorithm>
+#include <string>
+#include <vector>
 
 EffectLoader gEffectLoader;
 
@@ -553,6 +556,73 @@ static uint32_t HostGetMSAASampleCount()
     return MSAARedirect::GetSampleCount();
 }
 
+// ==================== v5: ShaderSourceCatalog queries ====================
+
+static std::vector<std::string> ToDefineVector(const char* const* defines, uint32_t cnt)
+{
+    std::vector<std::string> out;
+    if (!defines || cnt == 0) return out;
+    out.reserve(cnt);
+    for (uint32_t i = 0; i < cnt; ++i)
+        if (defines[i]) out.emplace_back(defines[i]);
+    return out;
+}
+
+static int HostShaderCatalogHasEntry(const char* sourceBasename, const char* entryName)
+{
+    if (!sourceBasename || !entryName) return 0;
+    const ShaderSourceCatalog::ShaderFile* f =
+        ShaderSourceCatalog::GetFileByBasename(sourceBasename);
+    if (!f) return 0;
+    return ShaderSourceCatalog::FindEntryPoint(f, entryName) ? 1 : 0;
+}
+
+static int HostShaderCatalogHasUniform(const char* sourceBasename, const char* entryName,
+                                       const char* const* defines, uint32_t defineCount,
+                                       const char* uniformName)
+{
+    if (!sourceBasename || !entryName || !uniformName) return 0;
+    const ShaderSourceCatalog::ShaderFile* f =
+        ShaderSourceCatalog::GetFileByBasename(sourceBasename);
+    if (!f) return 0;
+    auto rv = ShaderSourceCatalog::ResolveVariant(f, entryName, ToDefineVector(defines, defineCount));
+    if (!rv.valid) return 0;
+    for (auto* u : rv.activeUniforms)
+        if (u->name == uniformName) return 1;
+    return 0;
+}
+
+static int32_t HostShaderCatalogGetUniformArraySize(const char* sourceBasename, const char* entryName,
+                                                    const char* const* defines, uint32_t defineCount,
+                                                    const char* uniformName)
+{
+    if (!sourceBasename || !entryName || !uniformName) return -1;
+    const ShaderSourceCatalog::ShaderFile* f =
+        ShaderSourceCatalog::GetFileByBasename(sourceBasename);
+    if (!f) return -1;
+    auto rv = ShaderSourceCatalog::ResolveVariant(f, entryName, ToDefineVector(defines, defineCount));
+    if (!rv.valid) return -1;
+    for (auto* u : rv.activeUniforms)
+        if (u->name == uniformName) return (int32_t)u->arraySize;
+    return -1;
+}
+
+static int32_t HostShaderCatalogGetResourceSlot(const char* sourceBasename, const char* entryName,
+                                                const char* const* defines, uint32_t defineCount,
+                                                const char* resourceName)
+{
+    if (!sourceBasename || !entryName || !resourceName) return -1;
+    const ShaderSourceCatalog::ShaderFile* f =
+        ShaderSourceCatalog::GetFileByBasename(sourceBasename);
+    if (!f) return -1;
+    auto rv = ShaderSourceCatalog::ResolveVariant(f, entryName, ToDefineVector(defines, defineCount));
+    if (!rv.valid) return -1;
+    for (auto* r : rv.activeResources)
+        if (r->name == resourceName)
+            return (r->registerSlot >= 0) ? (int32_t)r->registerSlot : -2;
+    return -1;
+}
+
 // ==================== EffectLoader ====================
 
 void EffectLoader::BuildHostAPI()
@@ -591,6 +661,12 @@ void EffectLoader::BuildHostAPI()
     hostAPI_.GetGeometryCaptureFlags  = HostGetGeometryCaptureFlags;
     hostAPI_.SetMSAA                  = HostSetMSAA;
     hostAPI_.GetMSAASampleCount       = HostGetMSAASampleCount;
+
+    // v5 additions — ShaderSourceCatalog queries
+    hostAPI_.ShaderCatalogHasEntry            = HostShaderCatalogHasEntry;
+    hostAPI_.ShaderCatalogHasUniform          = HostShaderCatalogHasUniform;
+    hostAPI_.ShaderCatalogGetUniformArraySize = HostShaderCatalogGetUniformArraySize;
+    hostAPI_.ShaderCatalogGetResourceSlot     = HostShaderCatalogGetResourceSlot;
 }
 
 // ==================== v3: Config I/O ====================

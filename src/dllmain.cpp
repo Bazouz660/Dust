@@ -14,6 +14,7 @@
 #include "EffectLoader.h"
 #include "ShaderMetadata.h"
 #include "ShaderDatabase.h"
+#include "ShaderSourceCatalog.h"
 #include "GeometryCapture.h"
 #include "GeometryReplay.h"
 #include "MSAARedirect.h"
@@ -237,6 +238,49 @@ __declspec(dllexport) void startPlugin()
     std::string modDir = GetModuleDir(gDllModule);
     ManageShaderCache(gameDir, modDir);
 
+    // Build the source-level shader catalog by parsing the game's HLSL files
+    // in-place at <kenshiInstallDir>/data/materials/. Reading from the game
+    // directory avoids deploying duplicate .hlsl files into the mod folder,
+    // which OGRE's resource manager auto-scans and would treat as duplicates.
+    //
+    // GetGameDir() above derives from the DLL location and assumes a mods/Dust
+    // layout — that's wrong for Workshop-deployed mods (workshop/content/<id>/),
+    // so resolve the install dir from the running executable instead.
+    {
+        // Resolve the install dir from the running .exe. RE_Kenshi launches
+        // its own wrapper from <kenshiInstallDir>/RE_Kenshi/Kenshi_x64.exe,
+        // so the exe's parent isn't always the install root — try both.
+        char exePath[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+        std::string exeDir(exePath);
+        auto sep = exeDir.find_last_of("\\/");
+        if (sep != std::string::npos) exeDir.resize(sep + 1);
+
+        std::string materialsDir = exeDir + "data\\materials";
+        if (GetFileAttributesA(materialsDir.c_str()) == INVALID_FILE_ATTRIBUTES)
+        {
+            // Fall back to one directory up (RE_Kenshi launcher case).
+            std::string parent = exeDir;
+            if (!parent.empty() && (parent.back() == '\\' || parent.back() == '/'))
+                parent.pop_back();
+            auto sep2 = parent.find_last_of("\\/");
+            if (sep2 != std::string::npos) parent.resize(sep2 + 1);
+            materialsDir = parent + "data\\materials";
+        }
+
+        size_t parsed = ShaderSourceCatalog::Init(materialsDir);
+        if (parsed == 0)
+            Log("ShaderSourceCatalog: no files parsed (expected at %s)", materialsDir.c_str());
+
+        // Phase 1.C cross-validation runs D3DReflect on every D3DCompile.
+        // Off by default — opt in via [Dust] ValidateCatalog=1.
+        std::string ini = modDir + "Dust.ini";
+        bool enable = GetPrivateProfileIntA("Dust", "ValidateCatalog", 0, ini.c_str()) != 0;
+        ShaderSourceCatalog::SetValidationEnabled(enable);
+        if (enable)
+            Log("ShaderSourceCatalog: cross-validation ENABLED (per-compile D3DReflect)");
+    }
+
     // Load effect plugins from effects/ directory next to the DLL
     {
         std::string effectsDir = modDir + "effects";
@@ -302,6 +346,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
         GeometryCapture::Shutdown();
         ShaderDatabase::Shutdown();
         ShaderMetadata::Shutdown();
+        ShaderSourceCatalog::Shutdown();
         break;
     }
     return TRUE;

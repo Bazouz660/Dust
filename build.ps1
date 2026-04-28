@@ -62,6 +62,10 @@ Copy-Item "$Root\src\build\Release\Dust.dll"  "$ModDir\"
 Copy-Item "$Root\mod\RE_Kenshi.json"          "$ModDir\"
 Copy-Item "$Root\mod\Dust.mod"                "$ModDir\"
 
+# Note: ShaderSourceCatalog reads HLSL from <gameDir>\data\materials at runtime,
+# so we don't deploy vanilla_shaders/ here — that would conflict with OGRE's
+# resource manager which auto-scans the mod folder.
+
 foreach ($effect in $Effects) {
     $dll = Get-ChildItem "$Root\effects\$effect\build\Release\Dust*.dll" | Select-Object -First 1
     Copy-Item $dll.FullName "$ModDir\effects\"
