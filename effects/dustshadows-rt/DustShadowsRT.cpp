@@ -42,27 +42,33 @@ static std::string GetPluginDir()
 }
 
 // PRE: runs before the game's deferred draw.
-// Extracts sun direction and binds the shadow mask into the deferred PS so it can
-// sample it during the draw. Also disables the RT override if the mask isn't ready yet.
+// Always binds b4 (dustRTShadowEnabled) so the patched deferred shader never
+// reads stale data from a previous draw — leaving b4 unbound let dustRTShadowEnabled
+// take garbage values, occasionally tripping the RT branch and replacing the
+// shadow with an unbound s13 sample (=0), which made the scene look wet/metallic
+// (no diffuse from sun, only env spec). Heavy work (sun extraction, mask sampling)
+// only runs when actually applying.
 static void RTShadowsPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
 {
     auto& cfg = DPMRenderer::GetConfig();
-    if (!cfg.enabled) return;
 
-    // Extract sun direction while the deferred CB is still bound
-    DPMRenderer::ExtractSunDirection(ctx->context);
-
-    // Determine if we should override the deferred shadow this frame
-    bool shouldApply = cfg.applyToScene
+    bool shouldApply = cfg.enabled
+                    && cfg.applyToScene
                     && DPMRenderer::IsShadowMaskReady()
                     && DPMRenderer::HasValidSunDirection();
 
+    // Always bind b4 to a known value
     RTShadowCBData cbData = { shouldApply ? 1.0f : 0.0f, { 0.0f, 0.0f, 0.0f } };
     if (gRTShadowCB)
     {
         host->UpdateConstantBuffer(ctx->context, gRTShadowCB, &cbData, sizeof(cbData));
         ctx->context->PSSetConstantBuffers(4, 1, &gRTShadowCB);
     }
+
+    if (!cfg.enabled) return;
+
+    // Extract sun direction while the deferred CB is still bound
+    DPMRenderer::ExtractSunDirection(ctx->context);
 
     if (shouldApply)
     {
@@ -166,7 +172,9 @@ static void RTShadowsOnResolutionChanged(ID3D11Device* device, uint32_t w, uint3
     DPMRenderer::OnResolutionChanged(device, w, h);
 }
 
-static int RTShadowsIsEnabled() { return DPMRenderer::GetConfig().enabled ? 1 : 0; }
+// Always return 1 so PreExecute fires and binds b4 even when RT shadows are off.
+// PreExecute returns early after the binding when the user has disabled the effect.
+static int RTShadowsIsEnabled() { return 1; }
 
 static const char* kDebugLabels[] = { "Off", "Triangle Count Heatmap", "Shadow Mask", nullptr };
 

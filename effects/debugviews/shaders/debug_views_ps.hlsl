@@ -49,10 +49,11 @@ float3 ModeViewNormals(float2 uv)
 
 float3 ModeDepth(float2 uv)
 {
+    // GBuffer2 stores length(worldPos - cameraPos) / farClip, already in [0,1].
+    // Invert so near=white, far=black (matches typical depth visualisations).
     float d = depthTex.SampleLevel(pointSamp, uv, 0);
     float t = saturate((d - depthMin) / max(depthMax - depthMin, 0.001));
-    t = pow(t, 0.4); // expand near-depth for more contrast
-    return float3(t, t, t);
+    return (1.0 - t).xxx;
 }
 
 float3 ModeLuma(float2 uv)
