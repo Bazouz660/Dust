@@ -21,8 +21,10 @@ struct CapturedDraw
     UINT instanceCount         = 1;
     UINT startInstanceLocation = 0;
 
-    // Input Assembler — slot 0 is geometry, slot 1 is instance data (if instanced)
-    static const UINT           MAX_VB_SLOTS  = 2;
+    // Input Assembler — bumped to 8 to cover any OGRE shader variant that splits
+    // streams further (vertex morph targets, multiple UV channels, etc.). The cost
+    // is just 6 extra COM AddRef per draw, negligible.
+    static const UINT           MAX_VB_SLOTS  = 8;
     ID3D11Buffer*               vertexBuffers[MAX_VB_SLOTS] = {};
     UINT                        vbStrides[MAX_VB_SLOTS]     = {};
     UINT                        vbOffsets[MAX_VB_SLOTS]     = {};

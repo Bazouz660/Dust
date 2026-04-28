@@ -179,6 +179,10 @@ typedef void(STDMETHODCALLTYPE* PFN_DrawIndexedInstanced)(
     ID3D11DeviceContext* pThis, UINT IndexCountPerInstance, UINT InstanceCount,
     UINT StartIndexLocation, INT BaseVertexLocation, UINT StartInstanceLocation);
 
+typedef void(STDMETHODCALLTYPE* PFN_DrawInstanced)(
+    ID3D11DeviceContext* pThis, UINT VertexCountPerInstance, UINT InstanceCount,
+    UINT StartVertexLocation, UINT StartInstanceLocation);
+
 typedef void(STDMETHODCALLTYPE* PFN_OMSetRenderTargets)(
     ID3D11DeviceContext* pThis, UINT NumViews,
     ID3D11RenderTargetView* const* ppRenderTargetViews,
@@ -204,6 +208,7 @@ static PFN_CreatePixelShader        oCreatePixelShader = nullptr;
 static PFN_Draw                     oDraw = nullptr;
 static PFN_DrawIndexed              oDrawIndexed = nullptr;
 static PFN_DrawIndexedInstanced     oDrawIndexedInstanced = nullptr;
+static PFN_DrawInstanced            oDrawInstanced = nullptr;
 static PFN_OMSetRenderTargets       oOMSetRenderTargets = nullptr;
 static PFN_OMSetRenderTargetsAndUAVs oOMSetRenderTargetsAndUAVs = nullptr;
 static PFN_Present                  oPresent = nullptr;
@@ -1134,6 +1139,19 @@ static void STDMETHODCALLTYPE HookedDraw(
     if (Survey::IsActive())
         SurveyRecorder::OnDraw(pThis, VertexCount, StartVertexLocation);
 
+    // DIAGNOSTIC: log if a non-indexed Draw call ever occurs inside the GBuffer pass.
+    // We currently don't capture these — they'd be silently missed in wireframe replay.
+    if (GeometryCapture::IsInGBufferPass())
+    {
+        static bool sLoggedNonIndexedInGBuffer = false;
+        if (!sLoggedNonIndexedInGBuffer)
+        {
+            sLoggedNonIndexedInGBuffer = true;
+            DustLog("D3D11Hook: NON-INDEXED Draw inside GBuffer pass — verts=%u start=%u (NOT captured for wireframe)",
+                    VertexCount, StartVertexLocation);
+        }
+    }
+
     if (VertexCount != 3 && VertexCount != 4)
     {
         oDraw(pThis, VertexCount, StartVertexLocation);
@@ -1297,6 +1315,12 @@ static void STDMETHODCALLTYPE HookedDraw(
             }
         }
 
+        // Snapshot pre-fog HDR right after the lighting draw completes.
+        // Captured here so POST_FOG / POST_TONEMAP effects (e.g. Debug Views) can
+        // still read the lit scene before fog/atmosphere were composited.
+        if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
+            gEffectLoader.CapturePreFogHDR(pThis);
+
         // POST: effects that operate after the draw
         fctx.timing = DUST_TIMING_POST;
         gEffectLoader.DispatchPost(dip, &fctx);
@@ -1315,12 +1339,48 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     if (Survey::IsActive())
         SurveyRecorder::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 
+    // DIAG: if any DrawIndexed comes from a non-immediate context, deferred contexts
+    // are in use and our sInGBufferPass tracking won't work correctly across them.
+    if (gContext && pThis != gContext)
+    {
+        static bool sLoggedDeferred = false;
+        if (!sLoggedDeferred)
+        {
+            sLoggedDeferred = true;
+            DustLog("D3D11Hook: DrawIndexed on DEFERRED context %p (immediate=%p) — captures may be incomplete",
+                    pThis, gContext);
+        }
+    }
+
     GeometryCapture::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 
     if (MSAARedirect::IsActive())
         MSAARedirect::OnDraw();
 
     oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
+}
+
+static void STDMETHODCALLTYPE HookedDrawInstanced(
+    ID3D11DeviceContext* pThis, UINT VertexCountPerInstance, UINT InstanceCount,
+    UINT StartVertexLocation, UINT StartInstanceLocation)
+{
+    if (gShutdownSignaled) {
+        oDrawInstanced(pThis, VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
+        return;
+    }
+
+    if (GeometryCapture::IsInGBufferPass())
+    {
+        static bool sLogged = false;
+        if (!sLogged)
+        {
+            sLogged = true;
+            DustLog("D3D11Hook: DrawInstanced inside GBuffer pass — verts=%u inst=%u (NOT captured for wireframe)",
+                    VertexCountPerInstance, InstanceCount);
+        }
+    }
+
+    oDrawInstanced(pThis, VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
 }
 
 static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
@@ -1537,6 +1597,7 @@ static const int VTIDX_DEVICE_CreatePixelShader     = 15;
 static const int VTIDX_CTX_DrawIndexed              = 12;
 static const int VTIDX_CTX_Draw                     = 13;
 static const int VTIDX_CTX_DrawIndexedInstanced     = 20;
+static const int VTIDX_CTX_DrawInstanced            = 21;
 static const int VTIDX_CTX_OMSetRenderTargets       = 33;
 static const int VTIDX_CTX_OMSetRenderTargetsAndUAVs = 34;
 // VTIDX_SC_* constants moved to top of file (needed by deferred hook code)
@@ -1590,6 +1651,7 @@ bool Install()
     void* addrCreateVS     = devVtable[VTIDX_DEVICE_CreateVertexShader];
     void* addrCreatePS     = devVtable[VTIDX_DEVICE_CreatePixelShader];
     void* addrDraw         = ctxVtable[VTIDX_CTX_Draw];
+    void* addrDrawInst     = ctxVtable[VTIDX_CTX_DrawInstanced];
     void* addrDrawIndexed  = ctxVtable[VTIDX_CTX_DrawIndexed];
     void* addrDrawIdxInst  = ctxVtable[VTIDX_CTX_DrawIndexedInstanced];
     void* addrOMSetRT      = ctxVtable[VTIDX_CTX_OMSetRenderTargets];
@@ -1692,6 +1754,10 @@ bool Install()
     if (KenshiLib::AddHook(addrDrawIdxInst, (void*)HookedDrawIndexedInstanced,
                            (void**)&oDrawIndexedInstanced) != KenshiLib::SUCCESS)
     { Log("ERROR: Failed to hook DrawIndexedInstanced"); ok = false; }
+
+    if (KenshiLib::AddHook(addrDrawInst, (void*)HookedDrawInstanced,
+                           (void**)&oDrawInstanced) != KenshiLib::SUCCESS)
+    { Log("WARNING: Failed to hook DrawInstanced (diagnostic only)"); }
 
     if (KenshiLib::AddHook(addrOMSetRT, (void*)HookedOMSetRenderTargets,
                            (void**)&oOMSetRenderTargets) != KenshiLib::SUCCESS)

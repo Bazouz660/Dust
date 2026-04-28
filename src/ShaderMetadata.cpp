@@ -31,6 +31,11 @@ static const ClipMatrixName CLIP_MATRIX_NAMES[] = {
     { "worldViewProjMatrix",  VSTransformType::STATIC  },
     { "worldViewProj",        VSTransformType::STATIC  },
     { "viewProjectionMatrix", VSTransformType::SKINNED },
+    // farm_vs (foliage.hlsl), farm_shadow_vs (foliage.hlsl), birds_vs (birds.hlsl):
+    // VS does its own world-space composition then projects with a camera-only
+    // VP matrix. Treat as SKINNED for replay (clipMatrix == camera VP, no world
+    // composition needed in passthrough mode).
+    { "viewProjMatrix",       VSTransformType::SKINNED },
 };
 static const int CLIP_MATRIX_NAME_COUNT = sizeof(CLIP_MATRIX_NAMES) / sizeof(CLIP_MATRIX_NAMES[0]);
 

@@ -224,7 +224,9 @@ typedef struct DustHostAPI {
     // view-projection matrix. Best called at POST_LIGHTING (e.g. for shadow mapping).
     // Caller must set before calling: RT/DSV, PS (or NULL for depth-only), viewport,
     // rasterizer/blend/depth-stencil state. IA and VS state is saved/restored internally.
-    // replacementVP: row-major float4x4 (16 floats).
+    // replacementVP: row-major float4x4 (16 floats), or NULL for passthrough mode
+    // (replay each draw with its original captured CB — used for camera-aligned
+    // visualisations like wireframe overlays).
     // Returns the number of draws replayed.
     uint32_t (*ReplayGeometry)(ID3D11DeviceContext* ctx, ID3D11Device* device,
                                const float* replacementVP);

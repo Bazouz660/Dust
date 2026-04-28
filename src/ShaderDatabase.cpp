@@ -22,10 +22,13 @@ static DustShaderCategory ClassifySourceName(const char* name)
         return DUST_SHADER_UNKNOWN;
 
     if (strstr(name, "skin"))          return DUST_SHADER_SKIN;
+    if (strstr(name, "character"))     return DUST_SHADER_SKIN;     // severed_limb_vs etc.
+    if (strstr(name, "birds"))         return DUST_SHADER_FOLIAGE;  // viewProj-only, world built in VS
     if (strstr(name, "foliage"))       return DUST_SHADER_FOLIAGE;
     if (strstr(name, "terrain"))       return DUST_SHADER_TERRAIN;
     if (strstr(name, "triplanar"))     return DUST_SHADER_TRIPLANAR;
     if (strstr(name, "distant_town"))  return DUST_SHADER_DISTANT_TOWN;
+    if (strstr(name, "mapfeature"))    return DUST_SHADER_OBJECTS;  // static world objects
     if (strstr(name, "objects"))       return DUST_SHADER_OBJECTS;
     if (strstr(name, "object"))        return DUST_SHADER_OBJECTS;
 

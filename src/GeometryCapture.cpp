@@ -1,7 +1,11 @@
 #include "GeometryCapture.h"
 #include "DustAPI.h"
 #include "DustLog.h"
+#include "ShaderDatabase.h"
+#include <d3d11_1.h>
 #include <vector>
+#include <unordered_map>
+#include <string>
 
 namespace GeometryCapture
 {
@@ -99,9 +103,56 @@ static ID3D11RenderTargetView* sCachedGBufferRTVs[3] = {};
 static ID3D11DepthStencilView* sCachedGBufferDSV = nullptr;
 static bool sCacheValid = false;
 
-static bool IsGBufferConfig(UINT numViews,
-                            ID3D11RenderTargetView* const* ppRTVs,
-                            ID3D11DepthStencilView* pDSV)
+static void LogUniqueRTVConfig(UINT numViews,
+                               ID3D11RenderTargetView* const* ppRTVs,
+                               ID3D11DepthStencilView* pDSV,
+                               bool isGBuffer)
+{
+    static std::unordered_map<uint64_t, bool> sSeenConfigs;
+    uint64_t hash = ((uint64_t)numViews << 56);
+    UINT formats[8] = {}, widths[8] = {}, heights[8] = {};
+    for (UINT i = 0; i < numViews && i < 8; i++)
+    {
+        if (ppRTVs && ppRTVs[i])
+        {
+            ID3D11Resource* res = nullptr;
+            ppRTVs[i]->GetResource(&res);
+            if (res)
+            {
+                ID3D11Texture2D* tex = nullptr;
+                if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex)) && tex)
+                {
+                    D3D11_TEXTURE2D_DESC td;
+                    tex->GetDesc(&td);
+                    formats[i] = td.Format; widths[i] = td.Width; heights[i] = td.Height;
+                    tex->Release();
+                }
+                res->Release();
+            }
+        }
+        hash ^= ((uint64_t)formats[i] << (i*8)) ^ ((uint64_t)widths[i] << (i*4)) ^ ((uint64_t)heights[i] << (i*4));
+    }
+    if (sSeenConfigs.find(hash) == sSeenConfigs.end())
+    {
+        sSeenConfigs[hash] = true;
+        char buf[512] = {};
+        int off = _snprintf_s(buf, sizeof(buf), _TRUNCATE,
+                              "GeometryCapture: RTV config — numViews=%u%s [",
+                              numViews, isGBuffer ? " GBUFFER" : "");
+        for (UINT i = 0; i < numViews && i < 8; i++)
+        {
+            int n = _snprintf_s(buf + off, sizeof(buf) - off, _TRUNCATE,
+                                "%s(fmt=%u %ux%u)", (i ? " " : ""),
+                                formats[i], widths[i], heights[i]);
+            if (n > 0) off += n;
+        }
+        Log("%s] dsv=%p", buf, (void*)pDSV);
+    }
+}
+
+static bool IsGBufferConfigImpl(UINT numViews,
+                                ID3D11RenderTargetView* const* ppRTVs,
+                                ID3D11DepthStencilView* pDSV)
 {
     if (numViews != 3 || !ppRTVs || !pDSV)
         return false;
@@ -164,6 +215,15 @@ static bool IsGBufferConfig(UINT numViews,
     return true;
 }
 
+static bool IsGBufferConfig(UINT numViews,
+                            ID3D11RenderTargetView* const* ppRTVs,
+                            ID3D11DepthStencilView* pDSV)
+{
+    bool result = IsGBufferConfigImpl(numViews, ppRTVs, pDSV);
+    LogUniqueRTVConfig(numViews, ppRTVs, pDSV, result);
+    return result;
+}
+
 void OnOMSetRenderTargets(ID3D11DeviceContext* ctx, UINT numViews,
                           ID3D11RenderTargetView* const* ppRTVs,
                           ID3D11DepthStencilView* pDSV)
@@ -172,6 +232,12 @@ void OnOMSetRenderTargets(ID3D11DeviceContext* ctx, UINT numViews,
     OnOMSetRenderTargetsWithResult(isGBuffer);
 }
 
+// Per-frame counters
+static uint32_t sFrameDrawsTotal      = 0;  // every DrawIndexed seen this frame
+static uint32_t sFrameDrawsCaptured   = 0;  // captured (inside GBuffer pass)
+static uint32_t sFrameDrawsSkipped    = 0;  // dropped (not in GBuffer pass)
+static uint32_t sFrameGBufferToggles  = 0;  // OFF→ON transitions this frame
+
 void OnOMSetRenderTargetsWithResult(bool isGBuffer)
 {
     bool wasInGBuffer = sInGBufferPass;
@@ -179,6 +245,7 @@ void OnOMSetRenderTargetsWithResult(bool isGBuffer)
 
     if (!wasInGBuffer && sInGBufferPass)
     {
+        sFrameGBufferToggles++;
         if (sFramesCaptured < 3)
             Log("GeometryCapture: GBuffer pass detected (%ux%u)", sExpectedWidth, sExpectedHeight);
     }
@@ -189,6 +256,11 @@ void OnOMSetRenderTargetsWithResult(bool isGBuffer)
                 (uint32_t)sCaptures.size());
     }
 }
+
+// Diagnostic: cumulative set of (sourceName, vbSlotBits, instanced) combos seen.
+// Logged the FIRST time each unique combo appears so we can spot e.g. an "objects"
+// variant binding VB slot 2 that would have been silently dropped pre-fix.
+static std::unordered_map<uint64_t, bool> sLoggedSlotCombos;
 
 static void CaptureDrawState(ID3D11DeviceContext* ctx, CapturedDraw& draw)
 {
@@ -205,6 +277,28 @@ static void CaptureDrawState(ID3D11DeviceContext* ctx, CapturedDraw& draw)
 
     // PS pointer (always — cheap, enables shader identification)
     ctx->PSGetShader(&draw.ps, nullptr, nullptr);
+
+    // Diagnostic — log first occurrence of each unique (vs, vbSlotBits, instanced) combo.
+    // Unique combos are bounded by (#VSes × 16 × 2) so this can't spam unboundedly.
+    if (draw.vs)
+    {
+        uint32_t slotBits = 0;
+        for (UINT i = 0; i < CapturedDraw::MAX_VB_SLOTS; i++)
+            if (draw.vertexBuffers[i]) slotBits |= (1u << i);
+        bool instanced = (draw.instanceCount > 1);
+        uint64_t key = ((uint64_t)(uintptr_t)draw.vs) ^
+                       ((uint64_t)slotBits << 1) ^
+                       ((uint64_t)instanced << 33);
+        if (sLoggedSlotCombos.find(key) == sLoggedSlotCombos.end())
+        {
+            sLoggedSlotCombos[key] = true;
+            const char* nm = ShaderDatabase::GetSourceName((uint64_t)draw.vs);
+            Log("GeometryCapture: VS '%s' (%p) — slotBits=0x%X instanced=%d strides=[%u,%u,%u,%u,%u,%u,%u,%u]",
+                nm ? nm : "<unclassified>", draw.vs, slotBits, (int)instanced,
+                draw.vbStrides[0], draw.vbStrides[1], draw.vbStrides[2], draw.vbStrides[3],
+                draw.vbStrides[4], draw.vbStrides[5], draw.vbStrides[6], draw.vbStrides[7]);
+        }
+    }
 
     // PS resources (opt-in — adds ~0.4ms/frame for 200 draws)
     if (sCaptureFlags & DUST_CAPTURE_PS_RESOURCES)
@@ -225,7 +319,55 @@ static void CaptureDrawState(ID3D11DeviceContext* ctx, CapturedDraw& draw)
         uint32_t slot = draw.vsMetadata->cbSlot;
         if (slot < CapturedDraw::MAX_VS_CBS && draw.vsCBs[slot])
         {
-            uint32_t cbSize = draw.vsMetadata->cbTotalSize;
+            // Diagnostic: log unique (first,num) combos from VSGetConstantBuffers1
+            // for the matrix CB slot. If `first` varies across draws, Kenshi is using
+            // a shared CB with per-draw offsets and our replay is reading the wrong
+            // chunk of memory.
+            {
+                ID3D11DeviceContext1* ctx1 = nullptr;
+                if (SUCCEEDED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), (void**)&ctx1)))
+                {
+                    ID3D11Buffer* cbs[1] = {};
+                    UINT firstCB[1] = {};
+                    UINT numCB[1] = {};
+                    ctx1->VSGetConstantBuffers1(slot, 1, cbs, firstCB, numCB);
+                    static std::unordered_map<uint64_t, bool> sOffsetCombos;
+                    uint64_t key = ((uint64_t)slot << 56) ^ ((uint64_t)firstCB[0] << 24) ^ (uint64_t)numCB[0];
+                    if (sOffsetCombos.find(key) == sOffsetCombos.end())
+                    {
+                        sOffsetCombos[key] = true;
+                        Log("GeometryCapture: VSGetConstantBuffers1 slot %u — first=%u num=%u (vs %p)",
+                            slot, firstCB[0], numCB[0], draw.vs);
+                    }
+                    if (cbs[0]) cbs[0]->Release();
+                    ctx1->Release();
+                }
+            }
+
+            // Use the SOURCE CB's actual ByteWidth, not cbTotalSize from reflection.
+            // CopyResource silently fails if source and dest sizes differ — and OGRE
+            // can pad the CB resource above the reflected cbuffer size.
+            D3D11_BUFFER_DESC srcDesc = {};
+            draw.vsCBs[slot]->GetDesc(&srcDesc);
+            uint32_t cbSize = srcDesc.ByteWidth;
+
+            // Diagnostic: log mismatches between reflection-reported size and actual
+            // resource size. If we see these, our pre-fix stage copies were silently
+            // failing for these draws.
+            static std::unordered_map<uint64_t, bool> sLoggedSizeMismatch;
+            uint32_t reflectedSize = draw.vsMetadata->cbTotalSize;
+            if (cbSize != reflectedSize && draw.vs)
+            {
+                uint64_t key = (uint64_t)(uintptr_t)draw.vs;
+                if (sLoggedSizeMismatch.find(key) == sLoggedSizeMismatch.end())
+                {
+                    sLoggedSizeMismatch[key] = true;
+                    const char* nm = ShaderDatabase::GetSourceName((uint64_t)draw.vs);
+                    Log("GeometryCapture: VS '%s' (%p) CB size MISMATCH — reflection=%u actual=%u",
+                        nm ? nm : "<unclassified>", draw.vs, reflectedSize, cbSize);
+                }
+            }
+
             ID3D11Buffer* staging = AcquireStagingBuffer(sCachedDevice, cbSize);
             if (staging)
             {
@@ -241,8 +383,13 @@ static void CaptureDraw(ID3D11DeviceContext* ctx, UINT indexCount,
                         UINT startIndex, INT baseVertex,
                         UINT instanceCount, UINT startInstance)
 {
+    sFrameDrawsTotal++;
     if (!sInGBufferPass)
+    {
+        sFrameDrawsSkipped++;
         return;
+    }
+    sFrameDrawsCaptured++;
 
     CapturedDraw draw;
     draw.indexCount            = indexCount;
@@ -271,6 +418,22 @@ void OnDrawIndexedInstanced(ID3D11DeviceContext* ctx, UINT indexCountPerInstance
 
 void ResetFrame()
 {
+    // Per-frame coverage diagnostic — log when skip rate or toggle count changes,
+    // so we can see if the GBuffer-pass detection is missing draws (which would
+    // explain camera-dependent missing buildings if the game briefly leaves the
+    // 3-RT GBuffer config to do something else, then returns).
+    static uint32_t sLastSkipped = ~0u;
+    static uint32_t sLastToggles = ~0u;
+    if (sFrameDrawsSkipped != sLastSkipped || sFrameGBufferToggles != sLastToggles)
+    {
+        Log("GeometryCapture: frame coverage — total=%u captured=%u skipped=%u toggles=%u",
+            sFrameDrawsTotal, sFrameDrawsCaptured, sFrameDrawsSkipped, sFrameGBufferToggles);
+        sLastSkipped = sFrameDrawsSkipped;
+        sLastToggles = sFrameGBufferToggles;
+    }
+    sFrameDrawsTotal = sFrameDrawsCaptured = sFrameDrawsSkipped = 0;
+    sFrameGBufferToggles = 0;
+
     if (!sCaptures.empty())
     {
         if (sFramesCaptured == 0)
@@ -284,6 +447,9 @@ void ResetFrame()
                 sCaptures.size() > 0 ? classified * 100.0f / sCaptures.size() : 0.0f);
             if (sCaptureFlags & DUST_CAPTURE_PS_RESOURCES)
                 Log("GeometryCapture: PS resource capture enabled");
+
+            // (Per-source histogram now logged cumulatively from CaptureDrawState as
+            // unique (source, slotBits, instanced) combos appear.)
         }
         sFramesCaptured++;
     }

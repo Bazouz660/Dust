@@ -113,6 +113,18 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
     uint32_t replayed = 0;
     static std::vector<uint8_t> cbDataBuf;
 
+    // Passthrough mode: when replacementVP is null, replay each draw with its
+    // original captured matrices intact. Used by the wireframe debug view, which
+    // wants the same camera as the GBuffer pass — many of Kenshi's GBuffer VSes
+    // don't expose a separate worldMatrix in their CB, so the world*VP composition
+    // path silently falls through and projects raw object-space positions.
+    //
+    // Even in passthrough we must materialise the staging copy into a scratch CB,
+    // because Kenshi reuses the same CB pointer across many draws (updating its
+    // contents per-draw). By replay time the live CB holds whatever the LAST draw
+    // wrote — not the per-draw value we captured.
+    const bool passthrough = (replacementVP == nullptr);
+
     for (const auto& draw : captures)
     {
         if (!draw.vsMetadata || draw.vsMetadata->transformType == VSTransformType::UNKNOWN)
@@ -135,28 +147,31 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
         if (meta.clipMatrixOffset + 64 > draw.cbStagingSize)
             continue;
 
-        float* clipDst = reinterpret_cast<float*>(cbDataBuf.data() + meta.clipMatrixOffset);
-
-        bool useWorldFromCB = (meta.transformType == VSTransformType::STATIC &&
-                               draw.instanceCount <= 1);
-
-        if (useWorldFromCB)
+        if (!passthrough)
         {
-            if (meta.worldMatrixOffset + 64 <= draw.cbStagingSize &&
-                meta.worldMatrixSize >= 64)
+            float* clipDst = reinterpret_cast<float*>(cbDataBuf.data() + meta.clipMatrixOffset);
+
+            bool useWorldFromCB = (meta.transformType == VSTransformType::STATIC &&
+                                   draw.instanceCount <= 1);
+
+            if (useWorldFromCB)
             {
-                const float* world = reinterpret_cast<const float*>(
-                    cbDataBuf.data() + meta.worldMatrixOffset);
-                MatMul4x4(clipDst, world, replacementVP);
+                if (meta.worldMatrixOffset + 64 <= draw.cbStagingSize &&
+                    meta.worldMatrixSize >= 64)
+                {
+                    const float* world = reinterpret_cast<const float*>(
+                        cbDataBuf.data() + meta.worldMatrixOffset);
+                    MatMul4x4(clipDst, world, replacementVP);
+                }
+                else
+                {
+                    memcpy(clipDst, replacementVP, 64);
+                }
             }
             else
             {
                 memcpy(clipDst, replacementVP, 64);
             }
-        }
-        else
-        {
-            memcpy(clipDst, replacementVP, 64);
         }
 
         ID3D11Buffer* scratchCB = GetScratchCB(device, draw.cbStagingSize);
@@ -164,6 +179,7 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
             continue;
 
         ctx->UpdateSubresource(scratchCB, 0, nullptr, cbDataBuf.data(), 0, 0);
+        ID3D11Buffer* vsCBSlot = scratchCB;
 
         // Set IA state (both VB slots — slot 1 has instance data for instanced draws)
         ctx->IASetInputLayout(draw.inputLayout);
@@ -177,7 +193,7 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
         for (UINT i = 0; i < CapturedDraw::MAX_VS_CBS; i++)
         {
             if (i == meta.cbSlot)
-                ctx->VSSetConstantBuffers(i, 1, &scratchCB);
+                ctx->VSSetConstantBuffers(i, 1, &vsCBSlot);
             else if (draw.vsCBs[i])
                 ctx->VSSetConstantBuffers(i, 1, &draw.vsCBs[i]);
         }
@@ -226,6 +242,7 @@ uint32_t ReplayEx(ID3D11DeviceContext* ctx, ID3D11Device* device,
     uint32_t replayed        = 0;
     uint32_t priorTriangles  = 0;
     static std::vector<uint8_t> cbDataBufEx;
+    const bool passthrough = (replacementVP == nullptr);
 
     for (uint32_t i = 0; i < (uint32_t)captures.size(); i++)
     {
@@ -251,27 +268,30 @@ uint32_t ReplayEx(ID3D11DeviceContext* ctx, ID3D11Device* device,
         if (meta.clipMatrixOffset + 64 > draw.cbStagingSize)
             continue;
 
-        float* clipDst = reinterpret_cast<float*>(cbDataBufEx.data() + meta.clipMatrixOffset);
-
-        bool useWorldFromCB = (meta.transformType == VSTransformType::STATIC &&
-                               draw.instanceCount <= 1);
-        if (useWorldFromCB)
+        if (!passthrough)
         {
-            if (meta.worldMatrixOffset + 64 <= draw.cbStagingSize &&
-                meta.worldMatrixSize >= 64)
+            float* clipDst = reinterpret_cast<float*>(cbDataBufEx.data() + meta.clipMatrixOffset);
+
+            bool useWorldFromCB = (meta.transformType == VSTransformType::STATIC &&
+                                   draw.instanceCount <= 1);
+            if (useWorldFromCB)
             {
-                const float* world = reinterpret_cast<const float*>(
-                    cbDataBufEx.data() + meta.worldMatrixOffset);
-                MatMul4x4(clipDst, world, replacementVP);
+                if (meta.worldMatrixOffset + 64 <= draw.cbStagingSize &&
+                    meta.worldMatrixSize >= 64)
+                {
+                    const float* world = reinterpret_cast<const float*>(
+                        cbDataBufEx.data() + meta.worldMatrixOffset);
+                    MatMul4x4(clipDst, world, replacementVP);
+                }
+                else
+                {
+                    memcpy(clipDst, replacementVP, 64);
+                }
             }
             else
             {
                 memcpy(clipDst, replacementVP, 64);
             }
-        }
-        else
-        {
-            memcpy(clipDst, replacementVP, 64);
         }
 
         ID3D11Buffer* scratchCB = GetScratchCB(device, draw.cbStagingSize);

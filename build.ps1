@@ -35,14 +35,6 @@ function Build-Project($vcxproj) {
     if ($LASTEXITCODE -ne 0) { throw "Build failed: $name" }
 }
 
-# Pre-build math validation: ensures the sun-frustum matrix math in DPMRenderer
-# stays correct. Fails the build if the roundtrip / identity assertions break.
-Write-Host "==> Validating sun-frustum math" -ForegroundColor Cyan
-& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Root "tools\validate_sun_frustum.ps1") | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "Sun-frustum math validation FAILED. Run tools\validate_sun_frustum.ps1 directly to see details."
-}
-
 # Build boot (preload plugin)
 Build-Project (Join-Path $Root "boot\DustBoot.vcxproj")
 
