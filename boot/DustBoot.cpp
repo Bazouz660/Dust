@@ -414,6 +414,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hModule);
         gDllModule = hModule;
+        // Pin the DLL so FreeLibrary can never unmap it while KenshiLib trampoline
+        // hooks are still pointing into our code. The hooks can't be removed, so
+        // any unload would leave dangling jumps in DXGI and crash on the next
+        // CreateSwapChain* call.
+        {
+            char selfPath[MAX_PATH];
+            GetModuleFileNameA(hModule, selfPath, MAX_PATH);
+            LoadLibraryA(selfPath);
+        }
         break;
     }
     return TRUE;
