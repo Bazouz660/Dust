@@ -188,11 +188,12 @@ The host provides a `DustHostAPI` struct with functions for logging, resource ac
 Press **F11** (remappable) to toggle the ImGui overlay. When the overlay is open, game input is blocked (both Windows messages and DirectInput8) and an ImGui cursor is shown.
 
 **Left pane** (resizable):
-- **Framework settings**: Mod version display, remappable toggle key, logging toggle, startup notification toggle
+- **Framework settings**: Mod version display, remappable overlay-toggle key, optional remappable hotkey to flip all effects on/off without opening the overlay, theme selector (Kenshi/Dark), logging toggle, startup notification toggle
 - **Preset system**: Quick-switch between presets (Low, Medium, High, Ultra, or custom). Selected preset is remembered across game restarts
 - **Performance**: FPS, frame time graph, per-effect GPU cost (color-coded), total GPU budget percentage
 
 **Right pane** (collapsible per-effect):
+- **Search box** to filter effects by name
 - Auto-generated settings from each plugin's `DustSettingDesc` array
 - **Double-click** any slider for precise numeric input
 - Per-parameter **Reset** button (yellow "R" when value differs from saved)
@@ -263,7 +264,9 @@ Each effect has its own `.ini` file generated automatically in the `effects/` fo
 [Dust]
 Logging=0
 StartupMessage=1
-Theme=kenshi        # "kenshi" (warm parchment palette) or "dark" (ImGui default)
+Theme=kenshi          # "kenshi" (warm parchment palette) or "dark" (ImGui default)
+ToggleKey=122         # VK code for the overlay toggle (122 = VK_F11)
+ToggleEffectsKey=0    # VK code for the all-effects on/off hotkey (0 = unbound)
 
 [Shadows]
 ShadowResolution=0   # 0=default, or 2048/4096/8192/16384 (requires restart, RTWSM only)

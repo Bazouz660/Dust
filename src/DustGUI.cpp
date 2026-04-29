@@ -17,6 +17,7 @@
 #include <string>
 #include <cstring>
 #include <cstdio>
+#include <cctype>
 
 #define DIRECTINPUT_VERSION 0x0800
 #include <dinput.h>
@@ -57,6 +58,7 @@ struct FrameworkConfig {
     bool showSurvey = false;
     std::string lastPreset;        // name of last selected preset (empty = custom)
     int toggleKey = VK_F11;        // virtual key code for overlay toggle
+    int toggleEffectsKey = 0;      // 0 = unbound; else VK code that flips all effects on/off
     std::string theme = "kenshi";  // GUI theme: "kenshi" or "dark"
 };
 
@@ -80,6 +82,7 @@ static const char* VKKeyName(int vk)
 }
 
 static bool gWaitingForKey = false;
+static bool gWaitingForEffectsKey = false;
 
 // ==================== State ====================
 
@@ -234,6 +237,81 @@ static bool IsEffectEnabled(const LoadedEffect& le)
 {
     bool* p = FindEnabledPtr(le);
     return p ? *p : true; // default to true if no enabled setting found
+}
+
+// Flip every effect on or off, remembering the per-effect enabled state across
+// a disable/enable cycle. Used by the "Toggle Effects" checkbox and hotkey.
+static void SetAllEffectsEnabled(bool on)
+{
+    if (on == gAllEffectsOn) return;
+    gAllEffectsOn = on;
+
+    size_t count = gEffectLoader.Count();
+    if (!on)
+    {
+        gEffectWasEnabled.assign(count, false);
+        for (size_t i = 0; i < count; i++)
+        {
+            const LoadedEffect& le = gEffectLoader.GetEffect(i);
+            if (!le.initialized) continue;
+            bool* p = FindEnabledPtr(le);
+            gEffectWasEnabled[i] = p ? *p : false;
+            if (p) *p = false;
+            if (le.desc.OnSettingChanged) le.desc.OnSettingChanged();
+        }
+    }
+    else
+    {
+        for (size_t i = 0; i < count && i < gEffectWasEnabled.size(); i++)
+        {
+            const LoadedEffect& le = gEffectLoader.GetEffect(i);
+            if (!le.initialized) continue;
+            if (!gEffectWasEnabled[i]) continue;
+            bool* p = FindEnabledPtr(le);
+            if (p) *p = true;
+            if (le.desc.OnSettingChanged) le.desc.OnSettingChanged();
+        }
+    }
+}
+
+// Re-derive the master "all effects on" state from the actual effect Enabled
+// flags. Call this after a preset load: presets rewrite each effect's Enabled,
+// so the master switch and the remembered pre-disable snapshot would otherwise
+// drift out of sync with what's actually rendering.
+static void SyncAllEffectsOnState()
+{
+    size_t count = gEffectLoader.Count();
+    bool anyOn = false;
+    for (size_t i = 0; i < count; i++)
+    {
+        const LoadedEffect& le = gEffectLoader.GetEffect(i);
+        if (!le.initialized) continue;
+        if (IsEffectEnabled(le)) { anyOn = true; break; }
+    }
+    gAllEffectsOn = anyOn;
+    gEffectWasEnabled.clear(); // snapshot belonged to the previous preset
+}
+
+// Case-insensitive substring match for the right-pane effect search filter.
+static bool EffectNameMatchesFilter(const char* name, const char* filter)
+{
+    if (!filter || !*filter) return true;
+    if (!name) return false;
+    size_t nlen = strlen(name);
+    size_t flen = strlen(filter);
+    if (flen > nlen) return false;
+    for (size_t i = 0; i + flen <= nlen; i++)
+    {
+        bool match = true;
+        for (size_t j = 0; j < flen; j++)
+        {
+            unsigned char a = (unsigned char)name[i + j];
+            unsigned char b = (unsigned char)filter[j];
+            if (tolower(a) != tolower(b)) { match = false; break; }
+        }
+        if (match) return true;
+    }
+    return false;
 }
 
 // ==================== Custom slider with double-click-to-input ====================
@@ -537,13 +615,18 @@ static void OnOverlayClose()
 
 static LRESULT CALLBACK DustWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-    // Capture key binding when waiting for a new toggle key
-    // WM_SYSKEYDOWN is required for F10 (Windows treats it as a menu-activation key)
-    if (gWaitingForKey && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN))
+    // Capture key binding when waiting for a new toggle key.
+    // WM_SYSKEYDOWN is required for F10 (Windows treats it as a menu-activation key).
+    // Escape cancels without rebinding.
+    if ((gWaitingForKey || gWaitingForEffectsKey) && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN))
     {
-        if (wParam != VK_ESCAPE) // Escape cancels
-            gFwConfig.toggleKey = (int)wParam;
+        if (wParam != VK_ESCAPE)
+        {
+            if (gWaitingForKey)        gFwConfig.toggleKey        = (int)wParam;
+            else if (gWaitingForEffectsKey) gFwConfig.toggleEffectsKey = (int)wParam;
+        }
         gWaitingForKey = false;
+        gWaitingForEffectsKey = false;
         return 0;
     }
 
@@ -556,6 +639,17 @@ static LRESULT CALLBACK DustWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             OnOverlayOpen(hWnd);
         else
             OnOverlayClose();
+        return 0;
+    }
+
+    // Toggle-all-effects hotkey (skip when unbound, i.e. toggleEffectsKey == 0).
+    bool isEffectsToggleMsg = (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) &&
+                               gFwConfig.toggleEffectsKey != 0 &&
+                               (int)wParam == gFwConfig.toggleEffectsKey &&
+                               !(lParam & 0x40000000);
+    if (isEffectsToggleMsg)
+    {
+        SetAllEffectsEnabled(!gAllEffectsOn);
         return 0;
     }
 
@@ -708,7 +802,8 @@ static void LoadFrameworkConfig()
     gFwConfig.showStartupMessage = GetPrivateProfileIntA("Dust", "ShowStartupMessage", 1, gDustIniPath.c_str()) != 0;
     gFwConfig.showSurvey = GetPrivateProfileIntA("Dust", "ShowSurvey", 0, gDustIniPath.c_str()) != 0;
 
-    gFwConfig.toggleKey = GetPrivateProfileIntA("Dust", "ToggleKey", VK_F11, gDustIniPath.c_str());
+    gFwConfig.toggleKey        = GetPrivateProfileIntA("Dust", "ToggleKey",        VK_F11, gDustIniPath.c_str());
+    gFwConfig.toggleEffectsKey = GetPrivateProfileIntA("Dust", "ToggleEffectsKey", 0,      gDustIniPath.c_str());
 
     char themeBuf[64] = {};
     GetPrivateProfileStringA("Dust", "Theme", "kenshi", themeBuf, sizeof(themeBuf), gDustIniPath.c_str());
@@ -752,6 +847,8 @@ static void SaveFrameworkConfig()
     char keyBuf[16];
     snprintf(keyBuf, sizeof(keyBuf), "%d", gFwConfig.toggleKey);
     WritePrivateProfileStringA("Dust", "ToggleKey", keyBuf, gDustIniPath.c_str());
+    snprintf(keyBuf, sizeof(keyBuf), "%d", gFwConfig.toggleEffectsKey);
+    WritePrivateProfileStringA("Dust", "ToggleEffectsKey", keyBuf, gDustIniPath.c_str());
     WritePrivateProfileStringA("Dust", "Theme", gFwConfig.theme.c_str(), gDustIniPath.c_str());
     WritePrivateProfileStringA("Dust", "LastPreset", gFwConfig.lastPreset.c_str(), gDustIniPath.c_str());
 
@@ -775,6 +872,7 @@ static bool IsFrameworkDirty()
            gFwConfig.showSurvey != gFwDiskConfig.showSurvey ||
            gFwConfig.lastPreset != gFwDiskConfig.lastPreset ||
            gFwConfig.toggleKey != gFwDiskConfig.toggleKey ||
+           gFwConfig.toggleEffectsKey != gFwDiskConfig.toggleEffectsKey ||
            gFwConfig.theme != gFwDiskConfig.theme;
 }
 
@@ -788,7 +886,7 @@ static void DrawFrameworkSection()
     ImGui::Separator();
     ImGui::Spacing();
 
-    // Toggle key binding
+    // Toggle key binding (overlay GUI)
     if (gWaitingForKey)
     {
         ImGui::Button("Press a key...", ImVec2(ImGui::GetContentRegionAvail().x, 0));
@@ -798,9 +896,33 @@ static void DrawFrameworkSection()
         char label[128];
         snprintf(label, sizeof(label), "Toggle: %s", VKKeyName(gFwConfig.toggleKey));
         if (ImGui::Button(label, ImVec2(ImGui::GetContentRegionAvail().x, 0)))
+        {
             gWaitingForKey = true;
+            gWaitingForEffectsKey = false;
+        }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Click to rebind the overlay toggle key");
+    }
+
+    // Toggle-all-effects key binding (works whether the overlay is open or closed)
+    if (gWaitingForEffectsKey)
+    {
+        ImGui::Button("Press a key...##fx", ImVec2(ImGui::GetContentRegionAvail().x, 0));
+    }
+    else
+    {
+        char label[128];
+        if (gFwConfig.toggleEffectsKey == 0)
+            snprintf(label, sizeof(label), "Toggle Effects: (unbound)");
+        else
+            snprintf(label, sizeof(label), "Toggle Effects: %s", VKKeyName(gFwConfig.toggleEffectsKey));
+        if (ImGui::Button(label, ImVec2(ImGui::GetContentRegionAvail().x, 0)))
+        {
+            gWaitingForEffectsKey = true;
+            gWaitingForKey = false;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Click to rebind the hotkey that flips all effects on/off. Works whether the overlay is open or closed. Set ToggleEffectsKey=0 in Dust.ini to unbind.");
     }
 
     ImGui::Spacing();
@@ -962,6 +1084,7 @@ static void PollFilePicker()
         if (idx >= 0)
         {
             gEffectLoader.LoadPreset(idx);
+            SyncAllEffectsOnState();
             const auto& presets = gEffectLoader.GetPresets();
             if (idx < (int)presets.size())
             {
@@ -1040,6 +1163,7 @@ static void DrawPresetSection()
             if (ImGui::Selectable(presets[p].name.c_str(), selected))
             {
                 gEffectLoader.LoadPreset(p);
+                SyncAllEffectsOnState();
                 gFwConfig.lastPreset = presets[p].name;
                 SaveFrameworkConfig();
                 SnapshotAllEffects();
@@ -1226,6 +1350,7 @@ static void DrawPresetSection()
             if (idx >= 0)
             {
                 gEffectLoader.LoadPreset(idx);
+                SyncAllEffectsOnState();
                 const auto& ps = gEffectLoader.GetPresets();
                 if (idx < (int)ps.size())
                 {
@@ -1785,6 +1910,7 @@ void Render()
             if (sPresetDisplaySet && sPendingIdx >= 0 && gEffectLoader.IsInitialized())
             {
                 gEffectLoader.LoadPreset(sPendingIdx);
+                SyncAllEffectsOnState();
                 Log("Loaded global preset '%s'", gFwConfig.lastPreset.c_str());
                 sPresetApplied = true;
             }
@@ -1899,34 +2025,9 @@ void Render()
             DrawPresetSection();
 
             {
-                if (ImGui::Checkbox("Toggle Effects", &gAllEffectsOn))
-                {
-                    if (!gAllEffectsOn)
-                    {
-                        gEffectWasEnabled.resize(count);
-                        for (size_t i = 0; i < count; i++)
-                        {
-                            const LoadedEffect& le = gEffectLoader.GetEffect(i);
-                            if (!le.initialized) { gEffectWasEnabled[i] = false; continue; }
-                            bool* p = FindEnabledPtr(le);
-                            gEffectWasEnabled[i] = p ? *p : false;
-                            if (p) *p = false;
-                            if (le.desc.OnSettingChanged) le.desc.OnSettingChanged();
-                        }
-                    }
-                    else
-                    {
-                        for (size_t i = 0; i < count && i < gEffectWasEnabled.size(); i++)
-                        {
-                            const LoadedEffect& le = gEffectLoader.GetEffect(i);
-                            if (!le.initialized) continue;
-                            if (!gEffectWasEnabled[i]) continue;
-                            bool* p = FindEnabledPtr(le);
-                            if (p) *p = true;
-                            if (le.desc.OnSettingChanged) le.desc.OnSettingChanged();
-                        }
-                    }
-                }
+                bool desired = gAllEffectsOn;
+                if (ImGui::Checkbox("Toggle Effects", &desired))
+                    SetAllEffectsEnabled(desired);
             }
 
             ImGui::SameLine();
@@ -1936,6 +2037,12 @@ void Render()
             if (ImGui::SmallButton("Collapse All"))
                 gForceCollapseState = -1;
 
+            // Search/filter box: case-insensitive substring match on effect name.
+            // Empty filter shows everything; this state is intentionally not persisted.
+            static char sFilterBuf[64] = {};
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+            ImGui::InputTextWithHint("##effectfilter", "Search effects...", sFilterBuf, sizeof(sFilterBuf));
+
             ImGui::Spacing();
             ImGui::Separator();
             ImGui::Spacing();
@@ -1943,21 +2050,28 @@ void Render()
             // Scrollable effects area
             ImGui::BeginChild("##effects", ImVec2(0, 0), false);
 
+            int shown = 0;
             for (size_t i = 0; i < count; i++)
             {
                 const LoadedEffect& le = gEffectLoader.GetEffect(i);
                 if (!le.initialized) continue;
 
-                ImGui::PushID((int)i);
-                DrawEffectSection(i);
-                ImGui::PopID();
+                if (sFilterBuf[0] && !EffectNameMatchesFilter(le.desc.name, sFilterBuf))
+                    continue;
 
-                if (i + 1 < count)
+                if (shown > 0)
                 {
                     ImGui::Spacing();
                     ImGui::Spacing();
                 }
+
+                ImGui::PushID((int)i);
+                DrawEffectSection(i);
+                ImGui::PopID();
+                ++shown;
             }
+            if (shown == 0 && sFilterBuf[0])
+                ImGui::TextDisabled("No effect matches \"%s\"", sFilterBuf);
             gForceCollapseState = 0;
 
             ImGui::EndChild(); // ##effects
