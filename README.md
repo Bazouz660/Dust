@@ -263,6 +263,7 @@ Each effect has its own `.ini` file generated automatically in the `effects/` fo
 [Dust]
 Logging=0
 StartupMessage=1
+Theme=kenshi        # "kenshi" (warm parchment palette) or "dark" (ImGui default)
 
 [Shadows]
 ShadowResolution=0   # 0=default, or 2048/4096/8192/16384 (requires restart, RTWSM only)

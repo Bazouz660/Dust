@@ -55,8 +55,9 @@ struct FrameworkConfig {
     bool logging = false;
     bool showStartupMessage = true;
     bool showSurvey = false;
-    std::string lastPreset;    // name of last selected preset (empty = custom)
-    int toggleKey = VK_F11;    // virtual key code for overlay toggle
+    std::string lastPreset;        // name of last selected preset (empty = custom)
+    int toggleKey = VK_F11;        // virtual key code for overlay toggle
+    std::string theme = "kenshi";  // GUI theme: "kenshi" or "dark"
 };
 
 
@@ -625,6 +626,79 @@ static bool CreateBackBufferRTV(IDXGISwapChain* swapChain)
     return SUCCEEDED(hr);
 }
 
+// ==================== Theme ====================
+
+// Two themes: "kenshi" (warm parchment / dusty amber, matches the game) and
+// "dark" (ImGui default). Applied at init and live-previewed on combo change.
+static void ApplyDustTheme(const std::string& name)
+{
+    ImGuiStyle& style = ImGui::GetStyle();
+    ImVec4* c = style.Colors;
+
+    if (name == "dark")
+    {
+        ImGui::StyleColorsDark();
+        style.WindowRounding = 6.0f;
+        style.FrameRounding  = 4.0f;
+    }
+    else
+    {
+        // Kenshi: near-black warm backgrounds, cream/parchment text, dusty
+        // amber accents on hovered/active widgets. Sharper corners than dark.
+        c[ImGuiCol_Text]                  = ImVec4(0.92f, 0.86f, 0.74f, 1.00f);
+        c[ImGuiCol_TextDisabled]          = ImVec4(0.55f, 0.50f, 0.42f, 1.00f);
+        c[ImGuiCol_WindowBg]              = ImVec4(0.05f, 0.04f, 0.03f, 0.94f);
+        c[ImGuiCol_ChildBg]               = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+        c[ImGuiCol_PopupBg]               = ImVec4(0.06f, 0.05f, 0.04f, 0.96f);
+        c[ImGuiCol_Border]                = ImVec4(0.30f, 0.24f, 0.16f, 0.50f);
+        c[ImGuiCol_BorderShadow]          = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+        c[ImGuiCol_FrameBg]               = ImVec4(0.10f, 0.08f, 0.06f, 0.85f);
+        c[ImGuiCol_FrameBgHovered]        = ImVec4(0.20f, 0.14f, 0.08f, 0.90f);
+        c[ImGuiCol_FrameBgActive]         = ImVec4(0.28f, 0.18f, 0.08f, 0.95f);
+        c[ImGuiCol_TitleBg]               = ImVec4(0.04f, 0.03f, 0.02f, 1.00f);
+        c[ImGuiCol_TitleBgActive]         = ImVec4(0.08f, 0.06f, 0.04f, 1.00f);
+        c[ImGuiCol_TitleBgCollapsed]      = ImVec4(0.04f, 0.03f, 0.02f, 0.75f);
+        c[ImGuiCol_MenuBarBg]             = ImVec4(0.08f, 0.06f, 0.04f, 1.00f);
+        c[ImGuiCol_ScrollbarBg]           = ImVec4(0.04f, 0.03f, 0.02f, 0.50f);
+        c[ImGuiCol_ScrollbarGrab]         = ImVec4(0.30f, 0.22f, 0.12f, 1.00f);
+        c[ImGuiCol_ScrollbarGrabHovered]  = ImVec4(0.45f, 0.32f, 0.16f, 1.00f);
+        c[ImGuiCol_ScrollbarGrabActive]   = ImVec4(0.60f, 0.42f, 0.20f, 1.00f);
+        c[ImGuiCol_CheckMark]             = ImVec4(0.85f, 0.62f, 0.30f, 1.00f);
+        c[ImGuiCol_SliderGrab]            = ImVec4(0.60f, 0.42f, 0.20f, 1.00f);
+        c[ImGuiCol_SliderGrabActive]      = ImVec4(0.85f, 0.62f, 0.30f, 1.00f);
+        c[ImGuiCol_Button]                = ImVec4(0.18f, 0.13f, 0.08f, 0.85f);
+        c[ImGuiCol_ButtonHovered]         = ImVec4(0.45f, 0.30f, 0.14f, 0.95f);
+        c[ImGuiCol_ButtonActive]          = ImVec4(0.65f, 0.42f, 0.18f, 1.00f);
+        c[ImGuiCol_Header]                = ImVec4(0.18f, 0.13f, 0.08f, 0.85f);
+        c[ImGuiCol_HeaderHovered]         = ImVec4(0.40f, 0.28f, 0.14f, 0.90f);
+        c[ImGuiCol_HeaderActive]          = ImVec4(0.55f, 0.36f, 0.16f, 1.00f);
+        c[ImGuiCol_Separator]             = ImVec4(0.30f, 0.22f, 0.12f, 0.50f);
+        c[ImGuiCol_SeparatorHovered]      = ImVec4(0.50f, 0.34f, 0.16f, 0.80f);
+        c[ImGuiCol_SeparatorActive]       = ImVec4(0.70f, 0.46f, 0.20f, 1.00f);
+        c[ImGuiCol_ResizeGrip]            = ImVec4(0.30f, 0.22f, 0.12f, 0.40f);
+        c[ImGuiCol_ResizeGripHovered]     = ImVec4(0.50f, 0.34f, 0.16f, 0.70f);
+        c[ImGuiCol_ResizeGripActive]      = ImVec4(0.70f, 0.46f, 0.20f, 1.00f);
+        c[ImGuiCol_Tab]                   = ImVec4(0.12f, 0.09f, 0.06f, 1.00f);
+        c[ImGuiCol_TabHovered]            = ImVec4(0.45f, 0.30f, 0.14f, 1.00f);
+        c[ImGuiCol_TabActive]             = ImVec4(0.30f, 0.20f, 0.10f, 1.00f);
+        c[ImGuiCol_TabUnfocused]          = ImVec4(0.08f, 0.06f, 0.04f, 1.00f);
+        c[ImGuiCol_TabUnfocusedActive]    = ImVec4(0.18f, 0.13f, 0.08f, 1.00f);
+        c[ImGuiCol_PlotLines]             = ImVec4(0.85f, 0.62f, 0.30f, 1.00f);
+        c[ImGuiCol_PlotLinesHovered]      = ImVec4(1.00f, 0.75f, 0.40f, 1.00f);
+        c[ImGuiCol_PlotHistogram]         = ImVec4(0.85f, 0.62f, 0.30f, 1.00f);
+        c[ImGuiCol_PlotHistogramHovered]  = ImVec4(1.00f, 0.75f, 0.40f, 1.00f);
+        c[ImGuiCol_TextSelectedBg]        = ImVec4(0.55f, 0.36f, 0.16f, 0.50f);
+
+        style.WindowRounding = 2.0f;
+        style.FrameRounding  = 1.0f;
+    }
+
+    style.GrabRounding  = style.FrameRounding;
+    style.Alpha         = 0.95f;
+    style.WindowPadding = ImVec2(10, 10);
+    style.ItemSpacing   = ImVec2(8, 5);
+}
+
 // ==================== Framework config ====================
 
 static void LoadFrameworkConfig()
@@ -636,6 +710,11 @@ static void LoadFrameworkConfig()
 
     gFwConfig.toggleKey = GetPrivateProfileIntA("Dust", "ToggleKey", VK_F11, gDustIniPath.c_str());
 
+    char themeBuf[64] = {};
+    GetPrivateProfileStringA("Dust", "Theme", "kenshi", themeBuf, sizeof(themeBuf), gDustIniPath.c_str());
+    gFwConfig.theme = themeBuf;
+    if (gFwConfig.theme != "kenshi" && gFwConfig.theme != "dark")
+        gFwConfig.theme = "kenshi";
 
     char buf[256] = {};
     GetPrivateProfileStringA("Dust", "LastPreset", "", buf, sizeof(buf), gDustIniPath.c_str());
@@ -673,6 +752,7 @@ static void SaveFrameworkConfig()
     char keyBuf[16];
     snprintf(keyBuf, sizeof(keyBuf), "%d", gFwConfig.toggleKey);
     WritePrivateProfileStringA("Dust", "ToggleKey", keyBuf, gDustIniPath.c_str());
+    WritePrivateProfileStringA("Dust", "Theme", gFwConfig.theme.c_str(), gDustIniPath.c_str());
     WritePrivateProfileStringA("Dust", "LastPreset", gFwConfig.lastPreset.c_str(), gDustIniPath.c_str());
 
     gFwDiskConfig = gFwConfig;
@@ -685,6 +765,7 @@ static void ResetFrameworkConfig()
 {
     gFwConfig = gFwDiskConfig;
     DustLogEnabled() = gFwConfig.logging;
+    ApplyDustTheme(gFwConfig.theme);
 }
 
 static bool IsFrameworkDirty()
@@ -693,7 +774,8 @@ static bool IsFrameworkDirty()
            gFwConfig.showStartupMessage != gFwDiskConfig.showStartupMessage ||
            gFwConfig.showSurvey != gFwDiskConfig.showSurvey ||
            gFwConfig.lastPreset != gFwDiskConfig.lastPreset ||
-           gFwConfig.toggleKey != gFwDiskConfig.toggleKey;
+           gFwConfig.toggleKey != gFwDiskConfig.toggleKey ||
+           gFwConfig.theme != gFwDiskConfig.theme;
 }
 
 // ==================== Drawing: Framework pane ====================
@@ -719,6 +801,21 @@ static void DrawFrameworkSection()
             gWaitingForKey = true;
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Click to rebind the overlay toggle key");
+    }
+
+    ImGui::Spacing();
+
+    {
+        const char* themeLabels[] = { "Kenshi", "Dark" };
+        const char* themeKeys[]   = { "kenshi", "dark"  };
+        int themeIdx = (gFwConfig.theme == "dark") ? 1 : 0;
+        if (ImGui::Combo("Theme", &themeIdx, themeLabels, IM_ARRAYSIZE(themeLabels)))
+        {
+            gFwConfig.theme = themeKeys[themeIdx];
+            ApplyDustTheme(gFwConfig.theme);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("UI theme. Kenshi: warm parchment palette matching the game. Dark: ImGui default.");
     }
 
     ImGui::Spacing();
@@ -1564,15 +1661,9 @@ bool Init(IDXGISwapChain* swapChain, ID3D11Device* device, ID3D11DeviceContext* 
     // "Activate" which can leave io.KeysDown[VK_SPACE] stuck when the
     // overlay closes, breaking the game's pause key.
 
-    // Style
-    ImGui::StyleColorsDark();
-    ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowRounding = 6.0f;
-    style.FrameRounding = 4.0f;
-    style.GrabRounding = 4.0f;
-    style.Alpha = 0.95f;
-    style.WindowPadding = ImVec2(10, 10);
-    style.ItemSpacing = ImVec2(8, 5);
+    // Style: apply default theme now; LoadFrameworkConfig below will reapply
+    // the user's saved choice once the ini has been read.
+    ApplyDustTheme("kenshi");
 
     if (!ImGui_ImplWin32_Init(gHWnd))
     { Log("GUI: ImGui_ImplWin32_Init failed"); ImGui::DestroyContext(); return false; }
@@ -1596,6 +1687,7 @@ bool Init(IDXGISwapChain* swapChain, ID3D11Device* device, ID3D11DeviceContext* 
     Log("GUI: DInput hooks installed");
 
     LoadFrameworkConfig();
+    ApplyDustTheme(gFwConfig.theme);
 
     gInitialized = true;
     Log("GUI: Initialized (%s to toggle)", VKKeyName(gFwConfig.toggleKey));
