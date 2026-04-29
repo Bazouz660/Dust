@@ -86,8 +86,6 @@ jobs:
           /p:Configuration=Release
           /p:Platform=x64
 
-      # SSS is disabled for now (not ready for release)
-
       - name: Build Clarity plugin (DustClarity.dll)
         run: >
           msbuild effects\clarity\DustClarity.vcxproj

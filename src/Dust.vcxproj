@@ -127,9 +127,6 @@
     <ClInclude Include="discord_logo.h" />
     <ClInclude Include="github_logo.h" />
   </ItemGroup>
-  <ItemGroup>
-    <None Include="shaders\fullscreen_vs.hlsl" />
-  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

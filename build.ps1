@@ -35,7 +35,6 @@ Build-Project (Join-Path $Root "boot\DustBoot.vcxproj")
 # Build host
 Build-Project (Join-Path $Root "src\Dust.vcxproj")
 
-# Build effect plugins (SSS excluded — not release-ready)
 $Effects = @("ssao", "lut", "bloom", "dof", "ssil", "clarity", "outline", "kuwahara", "rtgi", "shadows", "smaa", "chromaticaberration", "deband", "filmgrain", "letterbox", "vignette")
 foreach ($effect in $Effects) {
     $vcxproj = Get-ChildItem (Join-Path $Root "effects\$effect\*.vcxproj") | Select-Object -First 1
@@ -48,7 +47,6 @@ if (-not $Deploy) { exit 0 }
 
 Write-Host "==> Deploying to $ModDir" -ForegroundColor Cyan
 New-Item -ItemType Directory -Force -Path "$ModDir\effects\shaders" | Out-Null
-New-Item -ItemType Directory -Force -Path "$ModDir\shaders"         | Out-Null
 New-Item -ItemType Directory -Force -Path "$ModDir\presets"         | Out-Null
 
 Copy-Item "$Root\boot\build\Release\DustBoot.dll" "$ModDir\"
