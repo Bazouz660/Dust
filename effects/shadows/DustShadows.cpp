@@ -12,11 +12,15 @@
 DustLogFn gLogFn = nullptr;
 
 struct ShadowConfig {
-    bool  enabled      = true;
-    float filterRadius = 1.0f;
-    float lightSize    = 3.0f;
-    bool  pcssEnabled  = true;
-    float biasScale    = 1.0f;
+    bool  enabled           = true;
+    float filterRadius      = 1.0f;
+    float lightSize         = 3.0f;
+    bool  pcssEnabled       = true;
+    float biasScale         = 1.0f;
+    bool  cliffFix          = false;  // off by default: previous always-on caused
+                                      // close-range vertical shadows to disappear
+    float cliffFixDistance  = 0.10f;  // fraction of shadow range where the bias
+                                      // ramps in; smooth saturate curve, not a hard cutoff
 };
 
 static ShadowConfig gConfig;
@@ -28,7 +32,9 @@ struct alignas(16) ShadowCBData {
     float lightSize;
     float pcssEnabled;
     float biasScale;
-    float pad0, pad1, pad2;
+    float cliffFixEnabled;
+    float cliffFixDistance;
+    float pad0;
 };
 
 static int ShadowInit(ID3D11Device* device, uint32_t w, uint32_t h, const DustHostAPI* host)
@@ -57,11 +63,14 @@ static void ShadowPreExecute(const DustFrameContext* ctx, const DustHostAPI* hos
     if (!gCB) return;
 
     ShadowCBData data;
-    data.enabled      = gConfig.enabled ? 1.0f : 0.0f;
-    data.filterRadius = gConfig.filterRadius * 0.001f;
-    data.lightSize    = gConfig.lightSize * 0.001f;
-    data.pcssEnabled  = gConfig.pcssEnabled ? 1.0f : 0.0f;
-    data.biasScale    = gConfig.biasScale;
+    data.enabled          = gConfig.enabled ? 1.0f : 0.0f;
+    data.filterRadius     = gConfig.filterRadius * 0.001f;
+    data.lightSize        = gConfig.lightSize * 0.001f;
+    data.pcssEnabled      = gConfig.pcssEnabled ? 1.0f : 0.0f;
+    data.biasScale        = gConfig.biasScale;
+    data.cliffFixEnabled  = gConfig.cliffFix ? 1.0f : 0.0f;
+    data.cliffFixDistance = gConfig.cliffFixDistance;
+    data.pad0             = 0.0f;
 
     host->UpdateConstantBuffer(ctx->context, gCB, &data, sizeof(data));
     ctx->context->PSSetConstantBuffers(2, 1, &gCB);
@@ -76,11 +85,13 @@ static void ShadowPostExecute(const DustFrameContext* ctx, const DustHostAPI* ho
 static int ShadowIsEnabled() { return 1; }
 
 static DustSettingDesc gSettings[] = {
-    { "Enabled",       DUST_SETTING_BOOL,  &gConfig.enabled,      0.0f, 1.0f,  "Enabled",      nullptr, "Enable or disable shadow filtering" },
-    { "Filter Radius", DUST_SETTING_FLOAT, &gConfig.filterRadius, 0.1f, 5.0f,  "FilterRadius", nullptr, "Size of the shadow softening filter" },
-    { "Light Size",    DUST_SETTING_FLOAT, &gConfig.lightSize,    0.5f, 10.0f, "LightSize",    nullptr, "Simulated light source size for contact-hardening shadows" },
-    { "PCSS",          DUST_SETTING_BOOL,  &gConfig.pcssEnabled,  0.0f, 1.0f,  "PCSS",         nullptr, "Enable Percentage-Closer Soft Shadows for distance-based softness" },
-    { "Bias Scale",    DUST_SETTING_FLOAT, &gConfig.biasScale,    0.0f, 3.0f,  "BiasScale",    nullptr, "Shadow bias multiplier to reduce shadow acne artifacts" },
+    { "Enabled",             DUST_SETTING_BOOL,  &gConfig.enabled,          0.0f, 1.0f,  "Enabled",          nullptr, "Enable or disable shadow filtering" },
+    { "Filter Radius",       DUST_SETTING_FLOAT, &gConfig.filterRadius,     0.1f, 5.0f,  "FilterRadius",     nullptr, "Size of the shadow softening filter" },
+    { "Light Size",          DUST_SETTING_FLOAT, &gConfig.lightSize,        0.5f, 10.0f, "LightSize",        nullptr, "Simulated light source size for contact-hardening shadows" },
+    { "PCSS",                DUST_SETTING_BOOL,  &gConfig.pcssEnabled,      0.0f, 1.0f,  "PCSS",             nullptr, "Enable Percentage-Closer Soft Shadows for distance-based softness" },
+    { "Bias Scale",          DUST_SETTING_FLOAT, &gConfig.biasScale,        0.0f, 3.0f,  "BiasScale",        nullptr, "Shadow bias multiplier to reduce shadow acne artifacts" },
+    { "Cliff Shadow Fix",    DUST_SETTING_BOOL,  &gConfig.cliffFix,         0.0f, 1.0f,  "CliffFix",         nullptr, "Reduce shadow acne on steep cliffs and vertical faces (can make close-range vertical shadows fade out). Integration of Crunk Aint Dead's Cliff Face Shadow Fix mod." },
+    { "Cliff Fix Distance",  DUST_SETTING_FLOAT, &gConfig.cliffFixDistance, 0.0f, 1.0f,  "CliffFixDistance", nullptr, "Fraction of shadow range where the cliff fix smoothly ramps in (higher = preserves more close-range vertical shadows)" },
 };
 
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)

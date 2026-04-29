@@ -134,6 +134,7 @@ The host provides a `DustHostAPI` struct with functions for logging, resource ac
 - **Variable penumbra**: Light size parameter controls how much shadows soften with distance from the caster
 - **12-sample Poisson disk**: Jittered per-pixel rotation for smooth, low-noise shadow edges
 - **Configurable**: Filter radius, light size, PCSS toggle, bias scale
+- **Cliff Shadow Fix (optional)**: Adds a small steep-surface bias that suppresses shadow acne on cliffs and vertical faces. Off by default since enabling it can fade close-range vertical shadows; the start distance is a smooth ramp controlled by a slider
 - **Shadow map resolution override**: Configurable in the GUI (2048–16384), requires restart
 
 ### Kuwahara Filter (`POST_LIGHTING`, priority 40)
@@ -353,6 +354,8 @@ FilterRadius=1.0
 LightSize=3.0
 PCSS=1
 BiasScale=1.0
+CliffFix=0
+CliffFixDistance=0.10
 ```
 
 ### Clarity.ini

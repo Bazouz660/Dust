@@ -291,6 +291,8 @@ static std::string PatchDeferredShader(const std::string& src)
             "\tfloat dustLightSize;\n"
             "\tfloat dustPCSSEnabled;\n"
             "\tfloat dustBiasScale;\n"
+            "\tfloat dustCliffFixEnabled;\n"
+            "\tfloat dustCliffFixDistance;\n"
             "};\n\n"
             "// [Dust] Improved RTWSM shadow filtering (post-warp offsets)\n"
             "float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,\n"
@@ -303,6 +305,17 @@ static std::string PatchDeferredShader(const std::string& src)
             "\tfloat sd = saturate(sc.z);\n"
             "\n"
             + steepBlock +
+            // User-toggleable cliff shadow fix: adds a small bias on steep
+            // (near-vertical) faces past a smoothly-ramped distance to suppress
+            // shadow acne on cliffs. Off by default; enabling at low CliffFixDistance
+            // can fade out close-range vertical shadows.
+            "\tif (dustCliffFixEnabled > 0.5) {\n"
+            "\t\tfloat cf_ny = abs(normal.y);\n"
+            "\t\tfloat cf_steep = saturate((0.42 - cf_ny) * 4.25);\n"
+            "\t\tfloat cf_gate = saturate((dist - shadowRange * dustCliffFixDistance) * 0.0035);\n"
+            "\t\tb += (cf_steep * cf_steep) * cf_gate * 0.0032;\n"
+            "\t}\n"
+            "\n"
             "\tfloat noise = frac(52.9829189 * frac(dot(screenPos, float2(0.06711056, 0.00583715))));\n"
             "\tfloat ang = noise * 6.28318530718;\n"
             "\tfloat sa, ca;\n"
