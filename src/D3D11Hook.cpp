@@ -50,6 +50,7 @@ static bool  sSwapChainHooked    = false;
 static std::vector<SurveyFrameData> sSurveyFrames;
 
 static bool gDeviceRemovedThisFrame = false;
+static volatile bool gShutdownSignaled = false;
 
 void ResetFrameState()
 {
@@ -925,6 +926,8 @@ static HRESULT STDMETHODCALLTYPE HookedCreateVertexShader(
 static void STDMETHODCALLTYPE HookedDraw(
     ID3D11DeviceContext* pThis, UINT VertexCount, UINT StartVertexLocation)
 {
+    if (gShutdownSignaled) { oDraw(pThis, VertexCount, StartVertexLocation); return; }
+
     // Try to install swap chain hooks early — DustBoot may already have captured the
     // swap chain, and we don't need device capture for that path. Pass pThis so
     // runtime discovery can also work from any draw call (not just fullscreen ones).
@@ -1088,6 +1091,8 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     ID3D11DeviceContext* pThis, UINT IndexCount, UINT StartIndexLocation,
     INT BaseVertexLocation)
 {
+    if (gShutdownSignaled) { oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation); return; }
+
     if (Survey::IsActive())
         SurveyRecorder::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 
@@ -1098,6 +1103,8 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
     ID3D11DeviceContext* pThis, UINT IndexCountPerInstance, UINT InstanceCount,
     UINT StartIndexLocation, INT BaseVertexLocation, UINT StartInstanceLocation)
 {
+    if (gShutdownSignaled) { oDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation); return; }
+
     if (Survey::IsActive())
         SurveyRecorder::OnDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
                                                 StartIndexLocation, BaseVertexLocation,
@@ -1112,6 +1119,8 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
     ID3D11RenderTargetView* const* ppRenderTargetViews,
     ID3D11DepthStencilView* pDepthStencilView)
 {
+    if (gShutdownSignaled) { oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView); return; }
+
     oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView);
 }
 
@@ -1173,7 +1182,7 @@ static void TickGuiOnPresent(IDXGISwapChain* swapChain, const char* via)
 static HRESULT STDMETHODCALLTYPE HookedPresent(
     IDXGISwapChain* pThis, UINT SyncInterval, UINT Flags)
 {
-    TickGuiOnPresent(pThis, "Present");
+    if (!gShutdownSignaled) TickGuiOnPresent(pThis, "Present");
     return oPresent(pThis, SyncInterval, Flags);
 }
 
@@ -1181,7 +1190,7 @@ static HRESULT STDMETHODCALLTYPE HookedPresent1(
     IDXGISwapChain1* pThis, UINT SyncInterval, UINT PresentFlags,
     const DXGI_PRESENT_PARAMETERS* pPresentParameters)
 {
-    TickGuiOnPresent(pThis, "Present1");
+    if (!gShutdownSignaled) TickGuiOnPresent(pThis, "Present1");
     return oPresent1(pThis, SyncInterval, PresentFlags, pPresentParameters);
 }
 
@@ -1189,6 +1198,8 @@ static HRESULT STDMETHODCALLTYPE HookedResizeBuffers(
     IDXGISwapChain* pThis, UINT BufferCount, UINT Width, UINT Height,
     DXGI_FORMAT NewFormat, UINT SwapChainFlags)
 {
+    if (gShutdownSignaled) return oResizeBuffers(pThis, BufferCount, Width, Height, NewFormat, SwapChainFlags);
+
     // Block Render() while we tear down and recreate the back buffer
     DustGUI::SetResizeInProgress(true);
 
@@ -1384,6 +1395,11 @@ bool Install()
         Log("Device/Context hooks installed, swap chain hooks deferred to first Draw");
 
     return ok;
+}
+
+void SignalShutdown()
+{
+    gShutdownSignaled = true;
 }
 
 } // namespace D3D11Hook

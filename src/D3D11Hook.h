@@ -20,4 +20,9 @@ namespace D3D11Hook
     // Present hook diagnostics and recovery
     bool IsPresentHooked();     // true if Present hook has actually fired
     void TryRecoverPresent();   // re-attempt swap chain discovery + hook
+
+    // Signal all hooks to pass through to originals (game shutting down).
+    // KenshiLib trampolines can't be removed, so any in-flight call after
+    // we begin teardown must skip our logic to avoid touching freed state.
+    void SignalShutdown();
 }
