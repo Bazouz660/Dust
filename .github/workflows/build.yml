@@ -34,6 +34,9 @@ jobs:
         run: |
           git submodule sync --recursive
           git submodule update --init --recursive --depth=1
+          # --depth=1 omits tag refs, which `git describe` needs below to map
+          # the pinned commit back to a release tag. Pull just the tag refs.
+          git -C external/KenshiLib fetch origin --tags --depth=1
 
       - name: Resolve KenshiLib release tag
         id: kenshilib
@@ -42,7 +45,8 @@ jobs:
           set -eu
           tag=$(git -C external/KenshiLib describe --tags --exact-match HEAD 2>/dev/null || true)
           if [ -z "$tag" ]; then
-            echo "ERROR: KenshiLib submodule HEAD is not on a tagged release."
+            sha=$(git -C external/KenshiLib rev-parse HEAD)
+            echo "ERROR: KenshiLib submodule HEAD ($sha) is not on a tagged release."
             echo "       Pin it to a release tag (e.g. v0.2.1) so the .lib can be fetched"
             echo "       from KenshiReclaimer/KenshiLib's release assets."
             exit 1
