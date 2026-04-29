@@ -394,16 +394,16 @@ static int BloomIsEnabled()
 // ==================== GUI Settings ====================
 
 static DustSettingDesc gBloomSettingsArray[] = {
-    { "Enabled",     DUST_SETTING_BOOL,  &gConfig.enabled,    0.0f, 1.0f, "Enabled",   nullptr, "Enable or disable the bloom effect" },
-    { "Intensity",   DUST_SETTING_FLOAT, &gConfig.intensity,  0.0f, 2.0f, "Intensity",  nullptr, "Overall bloom brightness multiplier" },
-    { "Threshold",   DUST_SETTING_FLOAT, &gConfig.threshold,  0.0f, 5.0f, "Threshold",  nullptr, "Minimum brightness for a pixel to contribute to bloom" },
-    { "Soft Knee",   DUST_SETTING_FLOAT, &gConfig.softKnee,   0.0f, 1.0f, "SoftKnee",   nullptr, "Smoothness of the threshold cutoff (0 = hard, 1 = soft)" },
-    { "Radius",      DUST_SETTING_FLOAT, &gConfig.radius,     0.5f, 3.0f, "Radius",     nullptr, "Size of the bloom blur kernel" },
-    { "Curve",       DUST_SETTING_FLOAT, &gConfig.curve,      0.5f, 3.0f, "Curve",      nullptr, "Controls how bloom fades with distance from bright areas" },
-    { "Scatter",     DUST_SETTING_FLOAT, &gConfig.scatter,    0.1f, 1.0f, "Scatter",    nullptr, "How far bloom spreads across mip levels (higher = wider glow)" },
-    { "Glow Amount", DUST_SETTING_FLOAT, &gConfig.glowAmount, 0.0f, 1.0f, "GlowAmount", nullptr, "Extra scatter on deeper mips for visible halos around bright objects" },
-    { "Mip Levels",  DUST_SETTING_INT,   &gConfig.mipLevels,  3.0f, 8.0f, "MipLevels",  nullptr, "Number of blur passes (more = wider bloom, higher cost)" },
-    { "Debug View",  DUST_SETTING_BOOL,  &gConfig.debugView,  0.0f, 1.0f, "DebugView",  nullptr, "Show raw bloom contribution before compositing" },
+    { "Enabled",     DUST_SETTING_BOOL,  &gConfig.enabled,    0.0f, 1.0f, "Enabled",   nullptr, "Enable or disable the bloom effect",                                  DUST_PERF_LOW    },
+    { "Intensity",   DUST_SETTING_FLOAT, &gConfig.intensity,  0.0f, 2.0f, "Intensity",  nullptr, "Overall bloom brightness multiplier",                                 DUST_PERF_NONE   },
+    { "Threshold",   DUST_SETTING_FLOAT, &gConfig.threshold,  0.0f, 5.0f, "Threshold",  nullptr, "Minimum brightness for a pixel to contribute to bloom",               DUST_PERF_NONE   },
+    { "Soft Knee",   DUST_SETTING_FLOAT, &gConfig.softKnee,   0.0f, 1.0f, "SoftKnee",   nullptr, "Smoothness of the threshold cutoff (0 = hard, 1 = soft)",             DUST_PERF_NONE   },
+    { "Radius",      DUST_SETTING_FLOAT, &gConfig.radius,     0.5f, 3.0f, "Radius",     nullptr, "Size of the bloom blur kernel",                                       DUST_PERF_NONE   },
+    { "Curve",       DUST_SETTING_FLOAT, &gConfig.curve,      0.5f, 3.0f, "Curve",      nullptr, "Controls how bloom fades with distance from bright areas",            DUST_PERF_NONE   },
+    { "Scatter",     DUST_SETTING_FLOAT, &gConfig.scatter,    0.1f, 1.0f, "Scatter",    nullptr, "How far bloom spreads across mip levels (higher = wider glow)",       DUST_PERF_NONE   },
+    { "Glow Amount", DUST_SETTING_FLOAT, &gConfig.glowAmount, 0.0f, 1.0f, "GlowAmount", nullptr, "Extra scatter on deeper mips for visible halos around bright objects", DUST_PERF_NONE  },
+    { "Mip Levels",  DUST_SETTING_INT,   &gConfig.mipLevels,  3.0f, 8.0f, "MipLevels",  nullptr, "Number of blur passes (more = wider bloom, higher cost)",             DUST_PERF_MEDIUM },
+    { "Debug View",  DUST_SETTING_BOOL,  &gConfig.debugView,  0.0f, 1.0f, "DebugView",  nullptr, "Show raw bloom contribution before compositing",                      DUST_PERF_NONE   },
 };
 
 // ==================== Plugin entry ====================

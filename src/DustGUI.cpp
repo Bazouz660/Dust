@@ -1537,8 +1537,43 @@ static void DrawEffectSection(size_t idx)
             break;
         }
 
-        if (s.description && ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", s.description);
+        if (ImGui::IsItemHovered() && s.type != DUST_SETTING_SECTION)
+        {
+            ImGui::BeginTooltip();
+            if (s.description)
+                ImGui::TextUnformatted(s.description);
+
+            const char* perfLabel = nullptr;
+            ImVec4 perfColor;
+            switch (s.perfImpact)
+            {
+            case DUST_PERF_NONE:
+                perfLabel = "None";
+                perfColor = ImVec4(0.80f, 0.80f, 0.80f, 1.00f);
+                break;
+            case DUST_PERF_LOW:
+                perfLabel = "Low";
+                perfColor = ImVec4(0.85f, 0.80f, 0.55f, 1.00f);
+                break;
+            case DUST_PERF_MEDIUM:
+                perfLabel = "Medium";
+                perfColor = ImVec4(1.00f, 0.60f, 0.20f, 1.00f);
+                break;
+            case DUST_PERF_HIGH:
+                perfLabel = "High";
+                perfColor = ImVec4(1.00f, 0.30f, 0.25f, 1.00f);
+                break;
+            default:
+                break;
+            }
+            if (perfLabel)
+            {
+                ImGui::TextUnformatted("Performance impact: ");
+                ImGui::SameLine(0.0f, 0.0f);
+                ImGui::TextColored(perfColor, "%s", perfLabel);
+            }
+            ImGui::EndTooltip();
+        }
 
         // Reset button for this parameter
         DrawResetButton(idx, i);

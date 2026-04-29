@@ -161,13 +161,13 @@ static const char* const gAspectLabels[] = { "2.35:1 (Cinemascope)", "2.39:1 (An
 static float gAspectValues[] = { 2.35f, 2.39f, 2.76f, 2.333f };
 
 static DustSettingDesc gSettingsArray[] = {
-    { "Enabled",      DUST_SETTING_BOOL,  &gLetterboxConfig.enabled,    0.0f, 1.0f, "Enabled",    nullptr, "Enable or disable letterbox bars" },
-    { "Aspect Ratio", DUST_SETTING_FLOAT, &gLetterboxConfig.aspectRatio,1.5f, 3.0f, "AspectRatio",nullptr, "Target aspect ratio (bars appear when wider than your screen)" },
-    { "Opacity",      DUST_SETTING_FLOAT, &gLetterboxConfig.opacity,    0.0f, 1.0f, "Opacity",    nullptr, "Bar opacity (0 = transparent, 1 = solid)" },
-    { "Bar Red",      DUST_SETTING_FLOAT, &gLetterboxConfig.colorR,     0.0f, 1.0f, "BarColorR",  nullptr, "Red component of the bar color" },
-    { "Bar Green",    DUST_SETTING_FLOAT, &gLetterboxConfig.colorG,     0.0f, 1.0f, "BarColorG",  nullptr, "Green component of the bar color" },
-    { "Bar Blue",     DUST_SETTING_FLOAT, &gLetterboxConfig.colorB,     0.0f, 1.0f, "BarColorB",  nullptr, "Blue component of the bar color" },
-    { "Debug View",   DUST_SETTING_BOOL,  &gLetterboxConfig.debugView,  0.0f, 1.0f, "DebugView",  nullptr, "Highlight bar regions" },
+    { "Enabled",      DUST_SETTING_BOOL,  &gLetterboxConfig.enabled,    0.0f, 1.0f, "Enabled",    nullptr, "Enable or disable letterbox bars",                              DUST_PERF_NONE },
+    { "Aspect Ratio", DUST_SETTING_FLOAT, &gLetterboxConfig.aspectRatio,1.5f, 3.0f, "AspectRatio",nullptr, "Target aspect ratio (bars appear when wider than your screen)", DUST_PERF_NONE },
+    { "Opacity",      DUST_SETTING_FLOAT, &gLetterboxConfig.opacity,    0.0f, 1.0f, "Opacity",    nullptr, "Bar opacity (0 = transparent, 1 = solid)",                      DUST_PERF_NONE },
+    { "Bar Red",      DUST_SETTING_FLOAT, &gLetterboxConfig.colorR,     0.0f, 1.0f, "BarColorR",  nullptr, "Red component of the bar color",                                DUST_PERF_NONE },
+    { "Bar Green",    DUST_SETTING_FLOAT, &gLetterboxConfig.colorG,     0.0f, 1.0f, "BarColorG",  nullptr, "Green component of the bar color",                              DUST_PERF_NONE },
+    { "Bar Blue",     DUST_SETTING_FLOAT, &gLetterboxConfig.colorB,     0.0f, 1.0f, "BarColorB",  nullptr, "Blue component of the bar color",                               DUST_PERF_NONE },
+    { "Debug View",   DUST_SETTING_BOOL,  &gLetterboxConfig.debugView,  0.0f, 1.0f, "DebugView",  nullptr, "Highlight bar regions",                                         DUST_PERF_NONE },
 };
 
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)

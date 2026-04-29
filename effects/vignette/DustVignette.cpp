@@ -158,13 +158,13 @@ static int VignetteIsEnabled()
 static const char* const gShapeLabels[] = { "Circle", "Rectangle", "Diamond", nullptr };
 
 static DustSettingDesc gSettingsArray[] = {
-    { "Enabled",   DUST_SETTING_BOOL,  &gVignetteConfig.enabled,   0.0f, 1.0f, "Enabled",   nullptr,       "Enable or disable the vignette effect" },
-    { "Strength",  DUST_SETTING_FLOAT, &gVignetteConfig.strength,  0.0f, 1.0f, "Strength",  nullptr,       "How much the edges darken" },
-    { "Radius",    DUST_SETTING_FLOAT, &gVignetteConfig.radius,    0.1f, 2.0f, "Radius",    nullptr,       "Distance from center where darkening begins" },
-    { "Softness",  DUST_SETTING_FLOAT, &gVignetteConfig.softness,  0.01f,2.0f, "Softness",  nullptr,       "How gradual the transition from lit to dark" },
-    { "Shape",        DUST_SETTING_ENUM,  &gVignetteConfig.shape,       0.0f, 2.0f, "Shape",       gShapeLabels,  "Vignette shape" },
-    { "Aspect Ratio", DUST_SETTING_FLOAT, &gVignetteConfig.aspectRatio, 0.5f, 2.0f, "AspectRatio", nullptr,       "Stretch the vignette horizontally (>1) or vertically (<1)" },
-    { "Debug View",   DUST_SETTING_BOOL,  &gVignetteConfig.debugView,   0.0f, 1.0f, "DebugView",   nullptr,       "Show the vignette mask" },
+    { "Enabled",   DUST_SETTING_BOOL,  &gVignetteConfig.enabled,   0.0f, 1.0f, "Enabled",   nullptr,       "Enable or disable the vignette effect",                    DUST_PERF_NONE },
+    { "Strength",  DUST_SETTING_FLOAT, &gVignetteConfig.strength,  0.0f, 1.0f, "Strength",  nullptr,       "How much the edges darken",                                DUST_PERF_NONE },
+    { "Radius",    DUST_SETTING_FLOAT, &gVignetteConfig.radius,    0.1f, 2.0f, "Radius",    nullptr,       "Distance from center where darkening begins",              DUST_PERF_NONE },
+    { "Softness",  DUST_SETTING_FLOAT, &gVignetteConfig.softness,  0.01f,2.0f, "Softness",  nullptr,       "How gradual the transition from lit to dark",              DUST_PERF_NONE },
+    { "Shape",        DUST_SETTING_ENUM,  &gVignetteConfig.shape,       0.0f, 2.0f, "Shape",       gShapeLabels,  "Vignette shape",                                       DUST_PERF_NONE },
+    { "Aspect Ratio", DUST_SETTING_FLOAT, &gVignetteConfig.aspectRatio, 0.5f, 2.0f, "AspectRatio", nullptr,       "Stretch the vignette horizontally (>1) or vertically (<1)", DUST_PERF_NONE },
+    { "Debug View",   DUST_SETTING_BOOL,  &gVignetteConfig.debugView,   0.0f, 1.0f, "DebugView",   nullptr,       "Show the vignette mask",                                DUST_PERF_NONE },
 };
 
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)

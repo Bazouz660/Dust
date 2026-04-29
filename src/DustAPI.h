@@ -172,6 +172,16 @@ typedef struct DustHostAPI {
     ID3D11ShaderResourceView* (*GetPreFogHDR)(void);
 } DustHostAPI;
 
+// Performance impact hint for a single setting (API v3.2+).
+// Shown as a colored line in the setting's tooltip so users can spot
+// settings that tank framerate before they crank them up.
+typedef enum DustPerfImpact {
+    DUST_PERF_NONE   = 0,   // No measurable cost (default for zero-init / older plugins)
+    DUST_PERF_LOW    = 1,
+    DUST_PERF_MEDIUM = 2,
+    DUST_PERF_HIGH   = 3
+} DustPerfImpact;
+
 // Setting types for the GUI settings descriptor (API v2+)
 typedef enum DustSettingType {
     DUST_SETTING_BOOL  = 0,
@@ -198,6 +208,8 @@ typedef struct DustSettingDesc {
     // v3.1 additions — zero-initialized for older settings
     const char* const* enumLabels;  // NULL-terminated array of labels (DUST_SETTING_ENUM only)
     const char*     description;    // Tooltip text shown on hover (NULL = no tooltip)
+    // v3.2 addition — zero-initialized for older settings (= DUST_PERF_NONE)
+    int             perfImpact;     // DustPerfImpact: shown as colored line in the tooltip
 } DustSettingDesc;
 
 // Effect descriptor flags (API v3+)

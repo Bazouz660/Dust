@@ -154,11 +154,11 @@ static int FilmGrainIsEnabled()
 }
 
 static DustSettingDesc gSettingsArray[] = {
-    { "Enabled",    DUST_SETTING_BOOL,  &gFilmGrainConfig.enabled,   0.0f,  1.0f, "Enabled",   nullptr, "Enable or disable the film grain effect" },
-    { "Intensity",  DUST_SETTING_FLOAT, &gFilmGrainConfig.intensity, 0.0f,  0.3f, "Intensity", nullptr, "Strength of the grain noise" },
-    { "Size",       DUST_SETTING_FLOAT, &gFilmGrainConfig.size,      1.0f,  4.0f, "Size",      nullptr, "Grain particle size in pixels" },
-    { "Colored",    DUST_SETTING_BOOL,  &gFilmGrainConfig.colored,   0.0f,  1.0f, "Colored",   nullptr, "Use color noise instead of luminance-only" },
-    { "Debug View", DUST_SETTING_BOOL,  &gFilmGrainConfig.debugView, 0.0f,  1.0f, "DebugView", nullptr, "Show raw noise pattern" },
+    { "Enabled",    DUST_SETTING_BOOL,  &gFilmGrainConfig.enabled,   0.0f,  1.0f, "Enabled",   nullptr, "Enable or disable the film grain effect", DUST_PERF_NONE },
+    { "Intensity",  DUST_SETTING_FLOAT, &gFilmGrainConfig.intensity, 0.0f,  0.3f, "Intensity", nullptr, "Strength of the grain noise",             DUST_PERF_NONE },
+    { "Size",       DUST_SETTING_FLOAT, &gFilmGrainConfig.size,      1.0f,  4.0f, "Size",      nullptr, "Grain particle size in pixels",           DUST_PERF_NONE },
+    { "Colored",    DUST_SETTING_BOOL,  &gFilmGrainConfig.colored,   0.0f,  1.0f, "Colored",   nullptr, "Use color noise instead of luminance-only", DUST_PERF_NONE },
+    { "Debug View", DUST_SETTING_BOOL,  &gFilmGrainConfig.debugView, 0.0f,  1.0f, "DebugView", nullptr, "Show raw noise pattern",                  DUST_PERF_NONE },
 };
 
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
