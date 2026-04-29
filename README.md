@@ -11,7 +11,7 @@ Effects are loaded as separate DLL plugins from an `effects/` folder using a sta
 - **GPU performance monitoring**: Per-effect GPU timing via D3D11 timestamp queries (handled automatically by the framework)
 - **Hot-reloadable configs**: Edit `.ini` files while the game is running; framework reloads them automatically
 - **Pipeline detection**: Identifies render passes by GPU state (render target formats, SRV bindings) rather than fragile shader hashes
-- **Runtime shader patching**: Modifies the game's deferred lighting shader bytecode in memory at startup — no files replaced on disk
+- **Runtime shader patching**: Modifies the game's deferred lighting shader bytecode in memory at startup. No files replaced on disk
 - **State save/restore**: Full D3D11 state capture ensures effects don't interfere with the game's rendering
 
 ## Architecture
@@ -21,10 +21,11 @@ Dust works by hooking D3D11 at the vtable level and inspecting GPU state on ever
 ```
 Game Render Pipeline:
   GBuffer Fill -> Deferred Lighting -> Fog -> Post-Processing -> Tonemapping -> Present
-                        |               |                              |
-                  POST_LIGHTING      POST_FOG                    POST_TONEMAP
-              (SSAO, SSIL, Outline)                          (LUT, Clarity, Bloom,
-                                                                   DOF)
+                        |                                              |
+                  POST_LIGHTING                                  POST_TONEMAP
+        (Shadows, SSAO, SSIL, RTGI,                  (LUT, Clarity, DOF, Bloom, Deband,
+         Kuwahara, Outline)                       Chromatic Aberration, Vignette, Film
+                                                    Grain, Letterbox, SMAA)
 ```
 
 Effects register at specific injection points. When Dust detects a matching render pass, it dispatches registered effects (in priority order) with full access to the relevant GPU resources.
@@ -58,25 +59,25 @@ typedef struct DustEffectDesc {
     // v3 additions
     uint32_t            flags;           // DUST_FLAG_FRAMEWORK_CONFIG | DUST_FLAG_FRAMEWORK_TIMING
     const char*         configSection;   // INI section name (NULL = use effect name)
-    const char*         _effectDir;      // Set by framework after DustEffectCreate — DLL directory
+    const char*         _effectDir;      // Set by framework after DustEffectCreate (DLL directory)
     int32_t             priority;        // Dispatch order within same injection point (lower = earlier)
 } DustEffectDesc;
 ```
 
-With `DUST_FLAG_FRAMEWORK_CONFIG`, the framework automatically handles INI load/save/hot-reload from the `DustSettingDesc` array — no boilerplate needed. With `DUST_FLAG_FRAMEWORK_TIMING`, GPU timestamp queries are managed by the framework.
+With `DUST_FLAG_FRAMEWORK_CONFIG`, the framework automatically handles INI load/save/hot-reload from the `DustSettingDesc` array, with no boilerplate needed. With `DUST_FLAG_FRAMEWORK_TIMING`, GPU timestamp queries are managed by the framework.
 
 The host provides a `DustHostAPI` struct with functions for logging, resource access (`GetSRV`, `GetRTV`), GPU state management (`SaveState`, `RestoreState`), shader compilation (`CompileShader`, `CompileShaderFromFile`), scene copying (`GetSceneCopy`), pre-fog HDR snapshot (`GetPreFogHDR`), fullscreen drawing (`DrawFullscreenTriangle`), and constant buffer helpers (`CreateConstantBuffer`, `UpdateConstantBuffer`).
 
 ## Current Effects
 
-### SSAO (Screen-Space Ambient Occlusion) — `POST_LIGHTING`, priority 0
+### SSAO (Screen-Space Ambient Occlusion) (`POST_LIGHTING`, priority 0)
 
 - **GTAO algorithm**: 12 directions, 6 steps per pixel
 - **Ambient-only AO**: Applied inside the deferred lighting shader to indirect/environment lighting only, not direct sunlight. Consistent between day and night, immune to auto-exposure
 - **Depth-aware bilateral blur**: Horizontal and vertical passes preserve hard edges
 - **Debug visualization**: Overlay mode to inspect the raw AO buffer
 
-### SSIL (Screen-Space Indirect Lighting) — `POST_LIGHTING`, priority 10
+### SSIL (Screen-Space Indirect Lighting) (`POST_LIGHTING`, priority 10)
 
 - **Indirect light bounce**: Samples albedo and depth in 8 directions × 4 steps per pixel to approximate one bounce of indirect lighting from nearby surfaces
 - **Color bleeding**: Albedo-weighted accumulation produces colored indirect light (red walls cast a red glow, etc.)
@@ -84,9 +85,9 @@ The host provides a `DustHostAPI` struct with functions for logging, resource ac
 - **Depth-aware bilateral blur**: Horizontal and vertical passes; configurable sharpness
 - **Debug visualization**: Overlay mode to inspect the raw IL buffer
 
-### LUT (Color Grading + Tonemapping) — `POST_TONEMAP`, priority 0
+### LUT (Color Grading + Tonemapping) (`POST_TONEMAP`, priority 0)
 
-- **Full HDR pipeline**: Captures the R11G11B10_FLOAT scene in `preExecute` before the game's tonemapper runs, then completely replaces the LDR output in `postExecute` — only one 8-bit quantization step in the entire chain
+- **Full HDR pipeline**: Captures the R11G11B10_FLOAT scene in `preExecute` before the game's tonemapper runs, then completely replaces the LDR output in `postExecute`, with only one 8-bit quantization step in the entire chain
 - **Selectable tonemapper**: ACES (Narkowicz/Hill), Reinhard, Reinhard Extended, Uncharted 2 (Hable), AgX, Khronos PBR Neutral, or linear passthrough
 - **Parametric LUT**: 32×32×32 color grading LUT generated from configurable parameters (stored as R32G32B32A32_FLOAT to avoid LUT quantization)
 - **Lift/Gamma/Gain**: Shadow, midtone, and highlight adjustment
@@ -96,28 +97,28 @@ The host provides a `DustHostAPI` struct with functions for logging, resource ac
 - **Triangular dithering**: Applied at the final 8-bit write to break up gradient banding
 - **Ships with a cinematic desert preset** tuned for Kenshi's aesthetic
 
-### Clarity / Local Contrast — `POST_TONEMAP`, priority 50
+### Clarity / Local Contrast (`POST_TONEMAP`, priority 50)
 
 - **Midtone detail enhancement**: Extracts and amplifies local contrast by subtracting a large-radius Gaussian blur from the original scene
 - **Midtone protection**: Luminance-based mask focuses the effect on midtones, preventing clipping in shadows and highlights
 - **Variable blur radius**: Configurable Gaussian kernel radius controls the spatial scale of "local" contrast (small = fine detail, large = broad structure)
 - **Debug visualization**: Overlay mode shows the extracted detail layer (gray = neutral, bright = positive detail, dark = negative)
 
-### Bloom — `POST_TONEMAP`, priority 100
+### Bloom (`POST_TONEMAP`, priority 100)
 
 - **HDR bloom pipeline**: Captures HDR scene before tonemapping, extracts bright areas, builds gaussian bloom via progressive downsample/upsample chain, composites additively onto LDR
 - **Post-fog extraction**: Blooms from the post-fog HDR scene so distant fogged objects don't bleed through
-- **Soft threshold**: Smooth knee curve controls bloom onset — only genuinely bright features contribute
-- **Simplified controls**: Intensity, Threshold, and Radius — no redundant settings
+- **Soft threshold**: Smooth knee curve controls bloom onset, so only genuinely bright features contribute
+- **Simplified controls**: Intensity, Threshold, and Radius, with no redundant settings
 
-### Outline — `POST_LIGHTING`, priority 50
+### Outline (`POST_LIGHTING`, priority 50)
 
 - **Edge detection**: Detects edges from both depth discontinuities (Laplacian) and normal angle differences
 - **Configurable appearance**: Adjustable thickness, strength/opacity, and outline color (RGB)
 - **Depth-limited**: Max depth parameter prevents outlines on distant objects and sky
 - **Debug visualization**: Overlay mode to inspect edge detection output
 
-### RTGI (Ray-Traced Global Illumination) — `POST_LIGHTING`, priority 5
+### RTGI (Ray-Traced Global Illumination) (`POST_LIGHTING`, priority 20)
 
 - **Screen-space indirect lighting**: Casts rays per pixel against the depth buffer and samples lit scene radiance at hit points for physically-based indirect illumination
 - **Ambient occlusion**: Occlusion term computed from ray hits, applied alongside indirect light
@@ -127,7 +128,7 @@ The host provides a `DustHostAPI` struct with functions for logging, resource ac
 - **Configurable**: Ray count, step count, ray length, thickness, resolution mode (full/half/quarter), denoise iterations
 - **Debug visualization**: Overlay modes for indirect light, AO, and normals
 
-### Shadows (RTWSM Enhancement) — `POST_LIGHTING`, priority 30
+### Shadows (RTWSM Enhancement) (`POST_LIGHTING`, priority -10)
 
 - **Improved shadow filtering**: Replaces the game's basic shadow sampling with PCSS (Percentage-Closer Soft Shadows) via the RTWSM warp map
 - **Variable penumbra**: Light size parameter controls how much shadows soften with distance from the caster
@@ -135,19 +136,51 @@ The host provides a `DustHostAPI` struct with functions for logging, resource ac
 - **Configurable**: Filter radius, light size, PCSS toggle, bias scale
 - **Shadow map resolution override**: Configurable in the GUI (2048–16384), requires restart
 
-### Kuwahara Filter — `POST_TONEMAP`, priority 150
+### Kuwahara Filter (`POST_LIGHTING`, priority 40)
 
 - **Painterly effect**: Anisotropic Kuwahara filter that smooths flat regions while preserving edges, giving a hand-painted look
 - **Configurable radius**: Controls the size of the filter kernel
 - **Blend strength**: Smoothly blend between original and filtered result
 - **Sharpness**: Controls how aggressively the lowest-variance sector wins
 
-### Depth of Field — `POST_TONEMAP`, priority 200
+### Depth of Field (`POST_TONEMAP`, priority 75)
 
 - **Auto-focus**: Samples depth at screen center and smoothly tracks focus distance
 - **Near and far field blur**: Independent control over near-field and far-field blur strength and range
-- **Sky handling**: Sky pixels are clamped to max depth so they follow the natural far-field ramp — sharp when looking at the sky, soft at the horizon
+- **Sky handling**: Sky pixels are clamped to max depth so they follow the natural far-field ramp: sharp when looking at the sky, soft at the horizon
 - **Configurable blur**: Adjustable blur radius and downscale factor for performance
+
+### Deband (`POST_TONEMAP`, priority 180)
+
+- **Gradient banding removal**: Adds a small, depth/luminance-aware noise pattern to break up the 8-bit color quantization that produces visible bands in skies and soft gradients
+- **Sky-only mode**: Optionally limits debanding to background pixels using a configurable depth threshold
+- **Configurable**: Threshold, sample range, intensity
+
+### Chromatic Aberration (`POST_TONEMAP`, priority 190)
+
+- **Lens-style color fringing**: Per-channel UV offset that grows toward the screen edges, mimicking real-lens dispersion
+- **Single parameter**: Strength controls the magnitude of the offset
+
+### Vignette (`POST_TONEMAP`, priority 200)
+
+- **Edge darkening**: Smooth radial falloff with configurable radius, softness, and strength
+- **Shape modes**: Circular or rectangular falloff with adjustable aspect ratio
+
+### Film Grain (`POST_TONEMAP`, priority 210)
+
+- **Animated noise**: Per-frame grain pattern with adjustable size and intensity
+- **Color modes**: Monochrome luminance grain or full per-channel chromatic grain
+
+### Letterbox (`POST_TONEMAP`, priority 220)
+
+- **Cinematic bars**: Constrains the visible image to a target aspect ratio (default 2.35:1)
+- **Configurable**: Aspect ratio, bar color, opacity
+
+### SMAA (`POST_TONEMAP`, priority 250)
+
+- **Subpixel Morphological Anti-Aliasing**: 3-pass SMAA (edge detect → blend weights → resolve) cleans up jagged edges left by the game's forward-rendered geometry
+- **Edge detection modes**: Luma, depth, or combined
+- **Debug visualization**: Show edge map or blend weights for tuning
 
 ## In-Game GUI
 
@@ -185,8 +218,6 @@ A startup toast notification appears for 30 seconds indicating the mod version a
            ├── Dust.ini
            ├── Dust.mod
            ├── RE_Kenshi.json
-           ├── shaders/
-           │   └── fullscreen_vs.hlsl
            └── effects/
                ├── DustSSAO.dll
                ├── DustSSIL.dll
@@ -198,28 +229,28 @@ A startup toast notification appears for 30 seconds indicating the mod version a
                ├── DustDOF.dll
                ├── DustOutline.dll
                ├── DustKuwahara.dll
+               ├── DustSMAA.dll
+               ├── DustChromaticAberration.dll
+               ├── DustDeband.dll
+               ├── DustFilmGrain.dll
+               ├── DustLetterbox.dll
+               ├── DustVignette.dll
                ├── presets/
                │   ├── dust_low/
                │   ├── dust_medium/
                │   ├── dust_high/
-               │   └── dust_ultra/
+               │   ├── dust_ultra/
+               │   ├── dust_cinematic/
+               │   ├── stylized_medium/
+               │   └── stylized_high/
                └── shaders/
-                   ├── ssao_*.hlsl
-                   ├── ssil_*.hlsl
-                   ├── rtgi_*.hlsl
-                   ├── clarity_*.hlsl
-                   ├── lut_ps.hlsl
-                   ├── bloom_*.hlsl
-                   ├── dof_*.hlsl
-                   ├── outline_*.hlsl
-                   ├── kuwahara_*.hlsl
-                   └── fullscreen_vs.hlsl
+                   └── *.hlsl
    ```
 3. Launch the game. Dust patches the deferred lighting shader in memory at startup (no files are modified on disk), generates default `.ini` configs in the `effects/` folder, and begins rendering.
 
 ### Uninstallation
 
-Delete the `Dust` folder from `mods/`. The game's shader is only patched in memory — no disk files are modified, so there is nothing to restore.
+Delete the `Dust` folder from `mods/`. The game's shader is only patched in memory; no disk files are modified, so there is nothing to restore.
 
 ## Configuration
 
@@ -393,6 +424,77 @@ Sharpness=8.0
 DebugView=0
 ```
 
+### SMAA.ini
+
+```ini
+[SMAA]
+Enabled=1
+EdgeMode=0          # 0=luma, 1=depth, 2=combined
+LumaThreshold=0.1
+DepthThreshold=0.01
+ShowEdges=0
+ShowWeights=0
+```
+
+### ChromaticAberration.ini
+
+```ini
+[ChromaticAberration]
+Enabled=1
+Strength=0.003
+DebugView=0
+```
+
+### Deband.ini
+
+```ini
+[Deband]
+Enabled=1
+Threshold=0.02
+Range=16.0
+Intensity=1.0
+SkyOnly=0
+SkyDepthThreshold=0.99
+DebugView=0
+```
+
+### FilmGrain.ini
+
+```ini
+[FilmGrain]
+Enabled=1
+Intensity=0.05
+Size=1.6
+Colored=0
+DebugView=0
+```
+
+### Letterbox.ini
+
+```ini
+[Letterbox]
+Enabled=1
+AspectRatio=2.35
+ColorR=0.0
+ColorG=0.0
+ColorB=0.0
+Opacity=1.0
+DebugView=0
+```
+
+### Vignette.ini
+
+```ini
+[Vignette]
+Enabled=1
+Strength=0.3
+Radius=0.8
+Softness=0.5
+Shape=0             # 0=circular, 1=rectangular
+AspectRatio=1.0
+DebugView=0
+```
+
 ## Building from Source
 
 ### Prerequisites
@@ -433,7 +535,15 @@ msbuild effects\clarity\DustClarity.vcxproj /p:Configuration=Release /p:Platform
 msbuild effects\dof\DustDOF.vcxproj   /p:Configuration=Release /p:Platform=x64
 msbuild effects\outline\DustOutline.vcxproj /p:Configuration=Release /p:Platform=x64
 msbuild effects\kuwahara\DustKuwahara.vcxproj /p:Configuration=Release /p:Platform=x64
+msbuild effects\smaa\DustSMAA.vcxproj /p:Configuration=Release /p:Platform=x64
+msbuild effects\chromaticaberration\DustChromaticAberration.vcxproj /p:Configuration=Release /p:Platform=x64
+msbuild effects\deband\DustDeband.vcxproj /p:Configuration=Release /p:Platform=x64
+msbuild effects\filmgrain\DustFilmGrain.vcxproj /p:Configuration=Release /p:Platform=x64
+msbuild effects\letterbox\DustLetterbox.vcxproj /p:Configuration=Release /p:Platform=x64
+msbuild effects\vignette\DustVignette.vcxproj /p:Configuration=Release /p:Platform=x64
 ```
+
+The `build.ps1` script at the repo root builds all of the above in one go. Pass `-Deploy` to also copy the artifacts into `KENSHI_MOD_DIR` (set in `.env`).
 
 ### Deployment
 
@@ -445,7 +555,6 @@ Copy the following into `<Kenshi>/mods/Dust/`:
 | `mod/RE_Kenshi.json` | `RE_Kenshi.json` |
 | `mod/Dust.mod` | `Dust.mod` |
 | `mod/Dust.ini` | `Dust.ini` |
-| `src/shaders/fullscreen_vs.hlsl` | `shaders/fullscreen_vs.hlsl` |
 | `effects/ssao/build/Release/DustSSAO.dll` | `effects/DustSSAO.dll` |
 | `effects/ssil/build/Release/DustSSIL.dll` | `effects/DustSSIL.dll` |
 | `effects/rtgi/build/Release/DustRTGI.dll` | `effects/DustRTGI.dll` |
@@ -456,6 +565,12 @@ Copy the following into `<Kenshi>/mods/Dust/`:
 | `effects/dof/build/Release/DustDOF.dll` | `effects/DustDOF.dll` |
 | `effects/outline/build/Release/DustOutline.dll` | `effects/DustOutline.dll` |
 | `effects/kuwahara/build/Release/DustKuwahara.dll` | `effects/DustKuwahara.dll` |
+| `effects/smaa/build/Release/DustSMAA.dll` | `effects/DustSMAA.dll` |
+| `effects/chromaticaberration/build/Release/DustChromaticAberration.dll` | `effects/DustChromaticAberration.dll` |
+| `effects/deband/build/Release/DustDeband.dll` | `effects/DustDeband.dll` |
+| `effects/filmgrain/build/Release/DustFilmGrain.dll` | `effects/DustFilmGrain.dll` |
+| `effects/letterbox/build/Release/DustLetterbox.dll` | `effects/DustLetterbox.dll` |
+| `effects/vignette/build/Release/DustVignette.dll` | `effects/DustVignette.dll` |
 | `effects/presets/` | `effects/presets/` |
 | `effects/*/shaders/*.hlsl` | `effects/shaders/` |
 
@@ -463,7 +578,7 @@ Copy the following into `<Kenshi>/mods/Dust/`:
 
 1. Create a new directory under `effects/` (e.g., `effects/myeffect/`)
 2. Add a `shaders/` subdirectory with your HLSL pixel shaders
-3. Include `../../src/DustAPI.h` — this is the only header needed
+3. Include `../../src/DustAPI.h`. This is the only header needed
 4. Export a `DustEffectCreate` function that fills `DustEffectDesc`
 5. Set `flags = DUST_FLAG_FRAMEWORK_CONFIG | DUST_FLAG_FRAMEWORK_TIMING` to let the framework handle INI I/O and GPU timing automatically
 6. Use `host->CompileShaderFromFile()` to load shaders at runtime (no `d3dcompiler.lib` needed in the plugin)
@@ -489,18 +604,24 @@ With no effects enabled, the framework's cost is unmeasurable.
 
 GPU costs are measured via D3D11 timestamp queries and displayed in the in-game GUI (F11). Typical costs at 2560×1440:
 
-| Effect   | Passes | GPU Cost |
-|----------|--------|----------|
-| SSAO     | 3 (generate + blur H + blur V) | ~1–3 ms |
-| SSIL     | 3 (generate + blur H + blur V) | ~2–5 ms |
-| RTGI     | 5+ (ray trace + temporal + variance + denoise × N) | ~3–8 ms |
-| Shadows  | 0 (inlined in deferred shader) | ~0.5–1.5 ms |
-| Outline  | 1 (edge detect + composite) | ~0.2–0.5 ms |
-| Clarity  | 3 (blur H + blur V + composite) | ~0.3–1 ms |
-| LUT      | 1 (HDR → ACES → LUT → dither) | ~0.1–0.3 ms |
-| Bloom    | ~8 (extract + downsample × 3 + upsample × 3 + composite) | ~0.5–1.5 ms |
-| DOF      | 4 (CoC + downsample + blur H + blur V) | ~0.5–2 ms |
-| Kuwahara | 1 (anisotropic filter) | ~1–3 ms |
+| Effect                | Passes | GPU Cost |
+|-----------------------|--------|----------|
+| SSAO                  | 3 (generate + blur H + blur V) | ~1–3 ms |
+| SSIL                  | 3 (generate + blur H + blur V) | ~2–5 ms |
+| RTGI                  | 5+ (ray trace + temporal + variance + denoise × N) | ~3–8 ms |
+| Shadows               | 0 (inlined in deferred shader) | ~0.5–1.5 ms |
+| Outline               | 1 (edge detect + composite) | ~0.2–0.5 ms |
+| Clarity               | 3 (blur H + blur V + composite) | ~0.3–1 ms |
+| LUT                   | 1 (HDR → ACES → LUT → dither) | ~0.1–0.3 ms |
+| Bloom                 | ~8 (extract + downsample × 3 + upsample × 3 + composite) | ~0.5–1.5 ms |
+| DOF                   | 4 (CoC + downsample + blur H + blur V) | ~0.5–2 ms |
+| Kuwahara              | 1 (anisotropic filter) | ~1–3 ms |
+| SMAA                  | 3 (edge detect + blend weights + resolve) | ~0.3–0.8 ms |
+| Chromatic Aberration  | 1 (per-channel offset) | <0.1 ms |
+| Deband                | 1 (noise-pattern dither) | ~0.1–0.3 ms |
+| Film Grain            | 1 (animated noise) | <0.1 ms |
+| Letterbox             | 1 (composite over edges) | <0.1 ms |
+| Vignette              | 1 (radial falloff) | <0.1 ms |
 
 ## Credits
 
