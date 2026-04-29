@@ -94,7 +94,9 @@
     <ClCompile Include="PipelineDetector.cpp" />
     <ClCompile Include="ResourceRegistry.cpp" />
     <ClCompile Include="EffectLoader.cpp" />
+    <ClCompile Include="EffectLoaderPresets.cpp" />
     <ClCompile Include="DustGUI.cpp" />
+    <ClCompile Include="DustGUI_DInputHook.cpp" />
     <ClCompile Include="FilePicker.cpp" />
     <ClCompile Include="Survey.cpp" />
     <ClCompile Include="SurveyRecorder.cpp" />
@@ -107,6 +109,7 @@
     <ClCompile Include="DeferredMSAA.cpp" />
 
     <ClCompile Include="SurveyWriter.cpp" />
+    <ClCompile Include="ShaderPatch.cpp" />
     <ClCompile Include="imgui\imgui.cpp" />
     <ClCompile Include="imgui\imgui_draw.cpp" />
     <ClCompile Include="imgui\imgui_tables.cpp" />
@@ -118,6 +121,7 @@
     <ClInclude Include="DustAPI.h" />
     <ClInclude Include="DustLog.h" />
     <ClInclude Include="DustGUI.h" />
+    <ClInclude Include="DustGUI_DInputHook.h" />
     <ClInclude Include="InjectionPoint.h" />
     <ClInclude Include="PipelineDetector.h" />
     <ClInclude Include="ResourceRegistry.h" />
@@ -136,6 +140,7 @@
     <ClInclude Include="DeferredMSAA.h" />
 
     <ClInclude Include="SurveyWriter.h" />
+    <ClInclude Include="ShaderPatch.h" />
     <ClInclude Include="imgui\imgui.h" />
     <ClInclude Include="imgui\backends\imgui_impl_win32.h" />
     <ClInclude Include="imgui\backends\imgui_impl_dx11.h" />
