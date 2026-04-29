@@ -1,6 +1,7 @@
 #include "ShaderPatch.h"
 #include "DustLog.h"
 #include "SurveyRecorder.h"
+#include "D3D11Hook.h"
 
 #include <string>
 #include <cstring>
@@ -303,6 +304,11 @@ HRESULT WINAPI HookedD3DCompile(
     UINT Flags1, UINT Flags2,
     ID3DBlob** ppCode, ID3DBlob** ppErrorMsgs)
 {
+    if (D3D11Hook::IsShutdownSignaled())
+        return oD3DCompile(pSrcData, SrcDataSize, pSourceName,
+                            pDefines, pInclude, pEntrypoint, pTarget,
+                            Flags1, Flags2, ppCode, ppErrorMsgs);
+
     // Detect the deferred lighting pixel shader: entry point is "main_fs"
     // and source contains deferred-specific identifiers.
     if (pEntrypoint && pSrcData && SrcDataSize > 0 &&

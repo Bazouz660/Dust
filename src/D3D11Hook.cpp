@@ -492,6 +492,8 @@ static HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
     ID3D11Device* pThis, const D3D11_TEXTURE2D_DESC* pDesc,
     const D3D11_SUBRESOURCE_DATA* pInitialData, ID3D11Texture2D** ppTexture2D)
 {
+    if (gShutdownSignaled) return oCreateTexture2D(pThis, pDesc, pInitialData, ppTexture2D);
+
     if (pDesc && pDesc->Width == pDesc->Height &&
         IsPowerOf2(pDesc->Width) && pDesc->Width >= 256 && pDesc->Width <= 8192)
     {
@@ -515,6 +517,10 @@ static HRESULT STDMETHODCALLTYPE HookedCreatePixelShader(
     ID3D11Device* pThis, const void* pShaderBytecode, SIZE_T BytecodeLength,
     ID3D11ClassLinkage* pClassLinkage, ID3D11PixelShader** ppPixelShader)
 {
+    if (gShutdownSignaled)
+        return oCreatePixelShader(pThis, pShaderBytecode, BytecodeLength,
+                                   pClassLinkage, ppPixelShader);
+
     // NOTE: Do NOT capture device here.  OGRE (and other middleware) may create
     // temporary enumeration devices that are destroyed before rendering begins.
     // Device capture happens in HookedDraw from the actual rendering context.
@@ -538,6 +544,10 @@ static HRESULT STDMETHODCALLTYPE HookedCreateVertexShader(
     ID3D11Device* pThis, const void* pShaderBytecode, SIZE_T BytecodeLength,
     ID3D11ClassLinkage* pClassLinkage, ID3D11VertexShader** ppVertexShader)
 {
+    if (gShutdownSignaled)
+        return oCreateVertexShader(pThis, pShaderBytecode, BytecodeLength,
+                                    pClassLinkage, ppVertexShader);
+
     HRESULT hr = oCreateVertexShader(pThis, pShaderBytecode, BytecodeLength,
                                       pClassLinkage, ppVertexShader);
     if (SUCCEEDED(hr) && ppVertexShader && *ppVertexShader)
@@ -1022,6 +1032,11 @@ bool Install()
 void SignalShutdown()
 {
     gShutdownSignaled = true;
+}
+
+bool IsShutdownSignaled()
+{
+    return gShutdownSignaled;
 }
 
 } // namespace D3D11Hook

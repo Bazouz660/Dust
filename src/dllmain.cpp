@@ -110,6 +110,12 @@ void (*GameWorld__mainLoop_GPUSensitiveStuff_orig)(GameWorld* thisptr, float tim
 
 void GameWorld__mainLoop_GPUSensitiveStuff_hook(GameWorld* thisptr, float time)
 {
+    if (D3D11Hook::IsShutdownSignaled())
+    {
+        GameWorld__mainLoop_GPUSensitiveStuff_orig(thisptr, time);
+        return;
+    }
+
     // Diagnostic: confirm game loop is actually firing. Pairs with Present diagnostic
     // in D3D11Hook so we can tell apart "game frozen" vs "Present hook bypassed".
     static uint64_t sLoopCount = 0;

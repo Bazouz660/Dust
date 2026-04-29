@@ -1,5 +1,6 @@
 #include "DustGUI_DInputHook.h"
 #include "DustLog.h"
+#include "D3D11Hook.h"
 #include "imgui/imgui.h"
 
 #define DIRECTINPUT_VERSION 0x0800
@@ -44,6 +45,9 @@ static bool ShouldBlockDInput()
 
 static HRESULT WINAPI HookedKbGetDeviceState(IDirectInputDevice8W* self, DWORD cbData, LPVOID lpvData)
 {
+    if (D3D11Hook::IsShutdownSignaled())
+        return oKbGetDeviceState(self, cbData, lpvData);
+
     HRESULT hr = oKbGetDeviceState(self, cbData, lpvData);
     if (SUCCEEDED(hr) && lpvData && ShouldBlockDInput())
         memset(lpvData, 0, cbData);
@@ -52,6 +56,9 @@ static HRESULT WINAPI HookedKbGetDeviceState(IDirectInputDevice8W* self, DWORD c
 
 static HRESULT WINAPI HookedMouseGetDeviceState(IDirectInputDevice8W* self, DWORD cbData, LPVOID lpvData)
 {
+    if (D3D11Hook::IsShutdownSignaled())
+        return oMouseGetDeviceState(self, cbData, lpvData);
+
     HRESULT hr = oMouseGetDeviceState(self, cbData, lpvData);
     if (SUCCEEDED(hr) && lpvData && ShouldBlockDInput())
         memset(lpvData, 0, cbData);
@@ -61,6 +68,9 @@ static HRESULT WINAPI HookedMouseGetDeviceState(IDirectInputDevice8W* self, DWOR
 static HRESULT WINAPI HookedKbGetDeviceData(IDirectInputDevice8W* self, DWORD cbObjectData,
     LPDIDEVICEOBJECTDATA rgdod, LPDWORD pdwInOut, DWORD dwFlags)
 {
+    if (D3D11Hook::IsShutdownSignaled())
+        return oKbGetDeviceData(self, cbObjectData, rgdod, pdwInOut, dwFlags);
+
     DWORD capacity = (pdwInOut && rgdod) ? *pdwInOut : 0;
     HRESULT hr = oKbGetDeviceData(self, cbObjectData, rgdod, pdwInOut, dwFlags);
     if (!SUCCEEDED(hr) || !pdwInOut) return hr;
@@ -138,6 +148,9 @@ static HRESULT WINAPI HookedKbGetDeviceData(IDirectInputDevice8W* self, DWORD cb
 static HRESULT WINAPI HookedMouseGetDeviceData(IDirectInputDevice8W* self, DWORD cbObjectData,
     LPDIDEVICEOBJECTDATA rgdod, LPDWORD pdwInOut, DWORD dwFlags)
 {
+    if (D3D11Hook::IsShutdownSignaled())
+        return oMouseGetDeviceData(self, cbObjectData, rgdod, pdwInOut, dwFlags);
+
     HRESULT hr = oMouseGetDeviceData(self, cbObjectData, rgdod, pdwInOut, dwFlags);
     if (SUCCEEDED(hr) && pdwInOut && ShouldBlockDInput())
         *pdwInOut = 0;

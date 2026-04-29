@@ -25,4 +25,5 @@ namespace D3D11Hook
     // KenshiLib trampolines can't be removed, so any in-flight call after
     // we begin teardown must skip our logic to avoid touching freed state.
     void SignalShutdown();
+    bool IsShutdownSignaled();
 }
