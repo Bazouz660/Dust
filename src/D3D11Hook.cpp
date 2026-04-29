@@ -364,13 +364,14 @@ static std::string PatchDeferredShader(const std::string& src)
     size_t pos3 = result.find(anchor3);
     if (pos3 != std::string::npos)
     {
-        std::string steepBlock = workshopSteepBias ? "" :
-            "\t// Steep surface bias: reduce shadow acne on cliffs and vertical faces\n"
+        std::string steepBlock = workshopSteepBias ?
             "\tfloat ny = abs(normal.y);\n"
             "\tfloat steep = saturate((0.42 - ny) * 4.25);\n"
             "\tfloat farGate = saturate((dist - shadowRange * 0.10) * 0.0035);\n"
-            "\tb += (steep * steep) * farGate * 0.0032;\n"
-            "\n";
+            "\tb -= (steep * steep) * farGate * 0.0032;\n"
+            "\n"
+            :
+            "";
 
         std::string inject3 =
             "// [Dust] RT shadow mask — screen-space binary mask produced by DustShadowsRT.\n"
@@ -388,6 +389,8 @@ static std::string PatchDeferredShader(const std::string& src)
             "\tfloat dustLightSize;\n"
             "\tfloat dustPCSSEnabled;\n"
             "\tfloat dustBiasScale;\n"
+            "\tfloat dustCliffFixEnabled;\n"
+            "\tfloat dustCliffFixDistance;\n"
             "};\n\n"
             "#if 0  // DustRTWShadow disabled — see commit notes\n"
             "// [Dust] DustRTWShadow — currently a passthrough to vanilla RTWShadow.\n"
@@ -415,6 +418,17 @@ static std::string PatchDeferredShader(const std::string& src)
             "\tfloat sd = saturate(sc.z);\n"
             "\n"
             + steepBlock +
+            // User-toggleable cliff shadow fix: adds a small bias on steep
+            // (near-vertical) faces past a smoothly-ramped distance to suppress
+            // shadow acne on cliffs. Off by default; enabling at low CliffFixDistance
+            // can fade out close-range vertical shadows.
+            "\tif (dustCliffFixEnabled > 0.5) {\n"
+            "\t\tfloat cf_ny = abs(normal.y);\n"
+            "\t\tfloat cf_steep = saturate((0.42 - cf_ny) * 4.25);\n"
+            "\t\tfloat cf_gate = saturate((dist - shadowRange * dustCliffFixDistance) * 0.0035);\n"
+            "\t\tb += (cf_steep * cf_steep) * cf_gate * 0.0032;\n"
+            "\t}\n"
+            "\n"
             "\tfloat noise = frac(52.9829189 * frac(dot(screenPos, float2(0.06711056, 0.00583715))));\n"
             "\tfloat ang = noise * 6.28318530718;\n"
             "\tfloat sa, ca;\n"
@@ -438,7 +452,10 @@ static std::string PatchDeferredShader(const std::string& src)
             "\n"
             "\tfloat fr = dustFilterRadius;\n"
             "\tfloat ls = dustLightSize;\n"
-            "\tb += fr * dustBiasScale;\n"
+            "\tfloat3 ld = normalize(shadowMatrix[2].xyz);\n"
+            "\tfloat NdotL = abs(dot(normal, ld));\n"
+            "\tfloat b_center = b;\n"
+            "\tb += fr * dustBiasScale * (1.0 - NdotL);\n"
             "\n"
             "\tif (dustPCSSEnabled > 0.5) {\n"
             "\t\tfloat bSum = 0;\n"
@@ -461,12 +478,9 @@ static std::string PatchDeferredShader(const std::string& src)
             "\t\t}\n"
             "\t}\n"
             "\n"
-            "\t// Scale filter by NdotL: shadow texels stretch at grazing light angles,\n"
-            "\t// making the fixed UV-space filter appear wider on the surface.\n"
-            "\tfloat3 ld = normalize(shadowMatrix[2].xyz);\n"
-            "\tfloat NdotL = abs(dot(normal, ld));\n"
             "\tfr *= max(sqrt(NdotL), 0.15);\n"
             "\n"
+            "\tfloat centerS = ShadowMap(sMap, center, sd, b_center, 0);\n"
             "\tfloat shadow = 0;\n"
             "\t[unroll]\n"
             "\tfor (int i = 0; i < 12; i++) {\n"
@@ -476,7 +490,7 @@ static std::string PatchDeferredShader(const std::string& src)
             "\t\tshadow += ShadowMap(sMap, sampleUV, sd, b, 0);\n"
             "\t}\n"
             "\tshadow /= 12.0;\n"
-            "\treturn shadow;\n"
+            "\treturn min(shadow, centerS);\n"
             "}\n"
             "#endif\n"
             "\n";
@@ -1044,31 +1058,38 @@ static bool sTryCaptureFromBoot = false; // true if DustBoot provided the swap c
 
 static IDXGISwapChain* TryGetSwapChainFromBoot()
 {
+    // Called per-draw — throttle all failure messages to avoid log spam.
+    static int sFailLogCount = 0;
+
     HMODULE boot = GetModuleHandleA("DustBoot.dll");
     if (!boot)
     {
-        Log("DustBoot: not loaded (preload plugin not installed)");
+        if (sFailLogCount < 1)
+        { Log("DustBoot: not loaded (preload plugin not installed)"); ++sFailLogCount; }
         return nullptr;
     }
 
     auto isHooked = (PFN_DustBoot_IsHooked)GetProcAddress(boot, "DustBoot_IsHooked");
     if (!isHooked || !isHooked())
     {
-        Log("DustBoot: loaded but factory hooks not active");
+        if (sFailLogCount < 3)
+        { Log("DustBoot: loaded but factory hooks not active"); ++sFailLogCount; }
         return nullptr;
     }
 
     auto getSC = (PFN_DustBoot_GetSwapChain)GetProcAddress(boot, "DustBoot_GetSwapChain");
     if (!getSC)
     {
-        Log("DustBoot: export DustBoot_GetSwapChain not found");
+        if (sFailLogCount < 1)
+        { Log("DustBoot: export DustBoot_GetSwapChain not found"); ++sFailLogCount; }
         return nullptr;
     }
 
     IDXGISwapChain* sc = getSC();
     if (!sc)
     {
-        Log("DustBoot: hooked but swap chain not captured yet");
+        if (sFailLogCount < 3)
+        { Log("DustBoot: hooked but swap chain not captured yet"); ++sFailLogCount; }
         return nullptr;
     }
 
@@ -1088,45 +1109,36 @@ static HRESULT STDMETHODCALLTYPE HookedResizeBuffers(IDXGISwapChain* pThis, UINT
 // Try to find the game's real swap chain by walking DXGI from the current
 // render target. If the RT is the swap chain's back buffer, IDXGISurface::GetParent
 // returns the swap chain. Falls back gracefully if the RT is an intermediate buffer.
-static bool TryDiscoverSwapChain(IDXGISwapChain** ppSwapChain)
+// If ctx is null, falls back to gContext.
+static bool TryDiscoverSwapChain(IDXGISwapChain** ppSwapChain, ID3D11DeviceContext* ctx = nullptr)
 {
     *ppSwapChain = nullptr;
 
+    if (!ctx) ctx = gContext;
+    if (!ctx) return false;
+
     ID3D11RenderTargetView* rtv = nullptr;
-    gContext->OMGetRenderTargets(1, &rtv, nullptr);
+    ctx->OMGetRenderTargets(1, &rtv, nullptr);
     if (!rtv)
-    {
-        Log("SwapChain discovery: no render target bound");
         return false;
-    }
 
     ID3D11Resource* res = nullptr;
     rtv->GetResource(&res);
     rtv->Release();
     if (!res)
-    {
-        Log("SwapChain discovery: RT has no resource");
         return false;
-    }
 
     IDXGISurface* surface = nullptr;
     HRESULT hr = res->QueryInterface(__uuidof(IDXGISurface), (void**)&surface);
     res->Release();
     if (FAILED(hr) || !surface)
-    {
-        Log("SwapChain discovery: RT resource is not a DXGI surface (hr=0x%08X)", (unsigned)hr);
         return false;
-    }
 
     hr = surface->GetParent(__uuidof(IDXGISwapChain), (void**)ppSwapChain);
     surface->Release();
 
     if (FAILED(hr) || !*ppSwapChain)
-    {
-        Log("SwapChain discovery: surface parent is not a swap chain (hr=0x%08X) — RT is likely an intermediate buffer",
-            (unsigned)hr);
         return false;
-    }
 
     Log("SwapChain discovery: found real swap chain at %p", *ppSwapChain);
     return true;
@@ -1150,7 +1162,7 @@ static bool VTableHook(void* pObject, int vtableIndex, void* detour, void** orig
 // The swap chain pointer we vtable-hooked — needed for recovery verification
 static IDXGISwapChain* gHookedSwapChain = nullptr;
 
-static void TryInstallSwapChainHooks()
+static void TryInstallSwapChainHooks(ID3D11DeviceContext* drawCtx = nullptr)
 {
     if (sSwapChainHooked)
         return;
@@ -1164,12 +1176,13 @@ static void TryInstallSwapChainHooks()
     }
     else
     {
-        // Layer 2: Fall back to runtime discovery from current render target
-        if (!TryDiscoverSwapChain(&realSwapChain) || !realSwapChain)
-        {
-            Log("SwapChain discovery failed — cannot install Present hooks (will retry)");
+        // Layer 2: Fall back to runtime discovery from current render target.
+        // Uses drawCtx if provided (any draw call), otherwise needs gContext from device capture.
+        ID3D11DeviceContext* ctx = drawCtx ? drawCtx : gContext;
+        if (!ctx)
             return;
-        }
+        if (!TryDiscoverSwapChain(&realSwapChain, ctx) || !realSwapChain)
+            return;
         Log("Using swap chain from runtime discovery (fallback)");
     }
 
@@ -1221,12 +1234,6 @@ void TryRecoverPresent()
 {
     if (gPresentHookCallCount > 0)
         return; // Already working
-
-    if (!gDeviceCaptured || !gDevice || !gContext)
-    {
-        Log("RECOVER: Cannot recover — device not captured yet");
-        return;
-    }
 
     Log("RECOVER: Attempting swap chain capture (DustBoot → discovery → vtable re-patch)...");
     sSwapChainHooked = false;
@@ -1398,6 +1405,13 @@ static void STDMETHODCALLTYPE HookedDraw(
     ID3D11DeviceContext* pThis, UINT VertexCount, UINT StartVertexLocation)
 {
     if (gShutdownSignaled) { oDraw(pThis, VertexCount, StartVertexLocation); return; }
+
+    // Try to install swap chain hooks early. DustBoot may already have captured the
+    // swap chain, and we don't need device capture for that path. Pass pThis so
+    // runtime discovery can also work from any draw call (not just fullscreen ones).
+    if (!sSwapChainHooked)
+        TryInstallSwapChainHooks(pThis);
+
     // Survey: record ALL draws (before fullscreen filter)
     if (Survey::IsActive())
         SurveyRecorder::OnDraw(pThis, VertexCount, StartVertexLocation);
@@ -1602,6 +1616,7 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     INT BaseVertexLocation)
 {
     if (gShutdownSignaled) { oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation); return; }
+
     if (Survey::IsActive())
         SurveyRecorder::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 
@@ -1654,6 +1669,7 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
     UINT StartIndexLocation, INT BaseVertexLocation, UINT StartInstanceLocation)
 {
     if (gShutdownSignaled) { oDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation); return; }
+
     if (Survey::IsActive())
         SurveyRecorder::OnDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
                                                 StartIndexLocation, BaseVertexLocation,
@@ -1800,7 +1816,7 @@ static void TickGuiOnPresent(IDXGISwapChain* swapChain, const char* via)
         }
     }
 
-    if (!gGuiInitDone && gDeviceCaptured)
+    if (!gGuiInitDone)
     {
         if (DustGUI::Init(swapChain, gDevice, gContext))
         {
@@ -1839,6 +1855,7 @@ static HRESULT STDMETHODCALLTYPE HookedResizeBuffers(
     DXGI_FORMAT NewFormat, UINT SwapChainFlags)
 {
     if (gShutdownSignaled) return oResizeBuffers(pThis, BufferCount, Width, Height, NewFormat, SwapChainFlags);
+
     // Block Render() while we tear down and recreate the back buffer
     DustGUI::SetResizeInProgress(true);
 
@@ -1848,7 +1865,7 @@ static HRESULT STDMETHODCALLTYPE HookedResizeBuffers(
     HRESULT hr = oResizeBuffers(pThis, BufferCount, Width, Height, NewFormat, SwapChainFlags);
 
     // Recreate back buffer RTV with the new swapchain dimensions
-    if (SUCCEEDED(hr) && gDeviceCaptured)
+    if (SUCCEEDED(hr) && gGuiInitDone)
         DustGUI::RecreateBackBuffer(pThis);
 
     DustGUI::SetResizeInProgress(false);

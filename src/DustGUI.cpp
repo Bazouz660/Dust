@@ -8,6 +8,7 @@
 
 #include "ShaderMetadata.h"
 #include "ShaderDatabase.h"
+#include "FilePicker.h"
 #include "Survey.h"
 #include "SurveyRecorder.h"
 #include "imgui/imgui.h"
@@ -23,6 +24,7 @@
 #include <string>
 #include <cstring>
 #include <cstdio>
+#include <cctype>
 
 #define DIRECTINPUT_VERSION 0x0800
 #include <dinput.h>
@@ -61,10 +63,11 @@ struct FrameworkConfig {
     bool logging = false;
     bool showStartupMessage = true;
     bool showSurvey = false;
-    std::string lastPreset;    // name of last selected preset (empty = custom)
-    int toggleKey = VK_F11;    // virtual key code for overlay toggle
-    int msaaSampleCount = 0;   // 0=off, 2/4/8
-
+    std::string lastPreset;        // name of last selected preset (empty = custom)
+    int toggleKey = VK_F11;        // virtual key code for overlay toggle
+    int toggleEffectsKey = 0;      // 0 = unbound; else VK code that flips all effects on/off
+    int msaaSampleCount = 0;       // 0=off, 2/4/8
+    std::string theme = "kenshi";  // GUI theme: "kenshi" or "dark"
 };
 
 
@@ -87,6 +90,7 @@ static const char* VKKeyName(int vk)
 }
 
 static bool gWaitingForKey = false;
+static bool gWaitingForEffectsKey = false;
 
 // ==================== State ====================
 
@@ -132,6 +136,24 @@ static int gForceCollapseState = 0; // 0=none, 1=expand all, -1=collapse all (co
 
 // Preset system GUI state
 static char gNewPresetName[64] = {};
+
+// Async picker tracking. The picker runs on a worker thread; we set one of
+// these to indicate what the next polled result should be used for.
+enum class PickerPurpose { None, Import, Export };
+static PickerPurpose gPickerPurpose = PickerPurpose::None;
+static int  gPickerExportPresetIdx = -1; // valid only for PickerPurpose::Export
+static std::string gPickerError;          // last error message (cleared when popup closes)
+static std::string gPickerInfo;           // last info message (e.g. "Imported 'X'")
+static int  gPickerInfoFrames = 0;        // countdown for transient info display
+
+// Edit Info popup state
+static char gEditInfoAuthor[128] = {};
+static char gEditInfoDesc[512]   = {};
+static int  gEditInfoPresetIdx   = -1;
+
+// Overwrite-on-import confirmation state
+static std::string gPendingImportSrc;     // source folder waiting for user to OK overwrite
+static std::string gPendingImportName;    // colliding name
 
 // Double-click to input mode
 static ImGuiID gInputModeID = 0;
@@ -223,6 +245,81 @@ static bool IsEffectEnabled(const LoadedEffect& le)
 {
     bool* p = FindEnabledPtr(le);
     return p ? *p : true; // default to true if no enabled setting found
+}
+
+// Flip every effect on or off, remembering the per-effect enabled state across
+// a disable/enable cycle. Used by the "Toggle Effects" checkbox and hotkey.
+static void SetAllEffectsEnabled(bool on)
+{
+    if (on == gAllEffectsOn) return;
+    gAllEffectsOn = on;
+
+    size_t count = gEffectLoader.Count();
+    if (!on)
+    {
+        gEffectWasEnabled.assign(count, false);
+        for (size_t i = 0; i < count; i++)
+        {
+            const LoadedEffect& le = gEffectLoader.GetEffect(i);
+            if (!le.initialized) continue;
+            bool* p = FindEnabledPtr(le);
+            gEffectWasEnabled[i] = p ? *p : false;
+            if (p) *p = false;
+            if (le.desc.OnSettingChanged) le.desc.OnSettingChanged();
+        }
+    }
+    else
+    {
+        for (size_t i = 0; i < count && i < gEffectWasEnabled.size(); i++)
+        {
+            const LoadedEffect& le = gEffectLoader.GetEffect(i);
+            if (!le.initialized) continue;
+            if (!gEffectWasEnabled[i]) continue;
+            bool* p = FindEnabledPtr(le);
+            if (p) *p = true;
+            if (le.desc.OnSettingChanged) le.desc.OnSettingChanged();
+        }
+    }
+}
+
+// Re-derive the master "all effects on" state from the actual effect Enabled
+// flags. Call this after a preset load: presets rewrite each effect's Enabled,
+// so the master switch and the remembered pre-disable snapshot would otherwise
+// drift out of sync with what's actually rendering.
+static void SyncAllEffectsOnState()
+{
+    size_t count = gEffectLoader.Count();
+    bool anyOn = false;
+    for (size_t i = 0; i < count; i++)
+    {
+        const LoadedEffect& le = gEffectLoader.GetEffect(i);
+        if (!le.initialized) continue;
+        if (IsEffectEnabled(le)) { anyOn = true; break; }
+    }
+    gAllEffectsOn = anyOn;
+    gEffectWasEnabled.clear(); // snapshot belonged to the previous preset
+}
+
+// Case-insensitive substring match for the right-pane effect search filter.
+static bool EffectNameMatchesFilter(const char* name, const char* filter)
+{
+    if (!filter || !*filter) return true;
+    if (!name) return false;
+    size_t nlen = strlen(name);
+    size_t flen = strlen(filter);
+    if (flen > nlen) return false;
+    for (size_t i = 0; i + flen <= nlen; i++)
+    {
+        bool match = true;
+        for (size_t j = 0; j < flen; j++)
+        {
+            unsigned char a = (unsigned char)name[i + j];
+            unsigned char b = (unsigned char)filter[j];
+            if (tolower(a) != tolower(b)) { match = false; break; }
+        }
+        if (match) return true;
+    }
+    return false;
 }
 
 // ==================== Custom slider with double-click-to-input ====================
@@ -529,13 +626,18 @@ static LRESULT CALLBACK DustWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     if (msg == WM_DESTROY || msg == WM_CLOSE)
         D3D11Hook::SignalShutdown();
 
-    // Capture key binding when waiting for a new toggle key
-    // WM_SYSKEYDOWN is required for F10 (Windows treats it as a menu-activation key)
-    if (gWaitingForKey && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN))
+    // Capture key binding when waiting for a new toggle key.
+    // WM_SYSKEYDOWN is required for F10 (Windows treats it as a menu-activation key).
+    // Escape cancels without rebinding.
+    if ((gWaitingForKey || gWaitingForEffectsKey) && (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN))
     {
-        if (wParam != VK_ESCAPE) // Escape cancels
-            gFwConfig.toggleKey = (int)wParam;
+        if (wParam != VK_ESCAPE)
+        {
+            if (gWaitingForKey)        gFwConfig.toggleKey        = (int)wParam;
+            else if (gWaitingForEffectsKey) gFwConfig.toggleEffectsKey = (int)wParam;
+        }
         gWaitingForKey = false;
+        gWaitingForEffectsKey = false;
         return 0;
     }
 
@@ -548,6 +650,17 @@ static LRESULT CALLBACK DustWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
             OnOverlayOpen(hWnd);
         else
             OnOverlayClose();
+        return 0;
+    }
+
+    // Toggle-all-effects hotkey (skip when unbound, i.e. toggleEffectsKey == 0).
+    bool isEffectsToggleMsg = (msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) &&
+                               gFwConfig.toggleEffectsKey != 0 &&
+                               (int)wParam == gFwConfig.toggleEffectsKey &&
+                               !(lParam & 0x40000000);
+    if (isEffectsToggleMsg)
+    {
+        SetAllEffectsEnabled(!gAllEffectsOn);
         return 0;
     }
 
@@ -618,6 +731,79 @@ static bool CreateBackBufferRTV(IDXGISwapChain* swapChain)
     return SUCCEEDED(hr);
 }
 
+// ==================== Theme ====================
+
+// Two themes: "kenshi" (warm parchment / dusty amber, matches the game) and
+// "dark" (ImGui default). Applied at init and live-previewed on combo change.
+static void ApplyDustTheme(const std::string& name)
+{
+    ImGuiStyle& style = ImGui::GetStyle();
+    ImVec4* c = style.Colors;
+
+    if (name == "dark")
+    {
+        ImGui::StyleColorsDark();
+        style.WindowRounding = 6.0f;
+        style.FrameRounding  = 4.0f;
+    }
+    else
+    {
+        // Kenshi: near-black warm backgrounds, cream/parchment text, dusty
+        // amber accents on hovered/active widgets. Sharper corners than dark.
+        c[ImGuiCol_Text]                  = ImVec4(0.92f, 0.86f, 0.74f, 1.00f);
+        c[ImGuiCol_TextDisabled]          = ImVec4(0.55f, 0.50f, 0.42f, 1.00f);
+        c[ImGuiCol_WindowBg]              = ImVec4(0.05f, 0.04f, 0.03f, 0.94f);
+        c[ImGuiCol_ChildBg]               = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+        c[ImGuiCol_PopupBg]               = ImVec4(0.06f, 0.05f, 0.04f, 0.96f);
+        c[ImGuiCol_Border]                = ImVec4(0.30f, 0.24f, 0.16f, 0.50f);
+        c[ImGuiCol_BorderShadow]          = ImVec4(0.00f, 0.00f, 0.00f, 0.00f);
+        c[ImGuiCol_FrameBg]               = ImVec4(0.10f, 0.08f, 0.06f, 0.85f);
+        c[ImGuiCol_FrameBgHovered]        = ImVec4(0.20f, 0.14f, 0.08f, 0.90f);
+        c[ImGuiCol_FrameBgActive]         = ImVec4(0.28f, 0.18f, 0.08f, 0.95f);
+        c[ImGuiCol_TitleBg]               = ImVec4(0.04f, 0.03f, 0.02f, 1.00f);
+        c[ImGuiCol_TitleBgActive]         = ImVec4(0.08f, 0.06f, 0.04f, 1.00f);
+        c[ImGuiCol_TitleBgCollapsed]      = ImVec4(0.04f, 0.03f, 0.02f, 0.75f);
+        c[ImGuiCol_MenuBarBg]             = ImVec4(0.08f, 0.06f, 0.04f, 1.00f);
+        c[ImGuiCol_ScrollbarBg]           = ImVec4(0.04f, 0.03f, 0.02f, 0.50f);
+        c[ImGuiCol_ScrollbarGrab]         = ImVec4(0.30f, 0.22f, 0.12f, 1.00f);
+        c[ImGuiCol_ScrollbarGrabHovered]  = ImVec4(0.45f, 0.32f, 0.16f, 1.00f);
+        c[ImGuiCol_ScrollbarGrabActive]   = ImVec4(0.60f, 0.42f, 0.20f, 1.00f);
+        c[ImGuiCol_CheckMark]             = ImVec4(0.85f, 0.62f, 0.30f, 1.00f);
+        c[ImGuiCol_SliderGrab]            = ImVec4(0.60f, 0.42f, 0.20f, 1.00f);
+        c[ImGuiCol_SliderGrabActive]      = ImVec4(0.85f, 0.62f, 0.30f, 1.00f);
+        c[ImGuiCol_Button]                = ImVec4(0.18f, 0.13f, 0.08f, 0.85f);
+        c[ImGuiCol_ButtonHovered]         = ImVec4(0.45f, 0.30f, 0.14f, 0.95f);
+        c[ImGuiCol_ButtonActive]          = ImVec4(0.65f, 0.42f, 0.18f, 1.00f);
+        c[ImGuiCol_Header]                = ImVec4(0.18f, 0.13f, 0.08f, 0.85f);
+        c[ImGuiCol_HeaderHovered]         = ImVec4(0.40f, 0.28f, 0.14f, 0.90f);
+        c[ImGuiCol_HeaderActive]          = ImVec4(0.55f, 0.36f, 0.16f, 1.00f);
+        c[ImGuiCol_Separator]             = ImVec4(0.30f, 0.22f, 0.12f, 0.50f);
+        c[ImGuiCol_SeparatorHovered]      = ImVec4(0.50f, 0.34f, 0.16f, 0.80f);
+        c[ImGuiCol_SeparatorActive]       = ImVec4(0.70f, 0.46f, 0.20f, 1.00f);
+        c[ImGuiCol_ResizeGrip]            = ImVec4(0.30f, 0.22f, 0.12f, 0.40f);
+        c[ImGuiCol_ResizeGripHovered]     = ImVec4(0.50f, 0.34f, 0.16f, 0.70f);
+        c[ImGuiCol_ResizeGripActive]      = ImVec4(0.70f, 0.46f, 0.20f, 1.00f);
+        c[ImGuiCol_Tab]                   = ImVec4(0.12f, 0.09f, 0.06f, 1.00f);
+        c[ImGuiCol_TabHovered]            = ImVec4(0.45f, 0.30f, 0.14f, 1.00f);
+        c[ImGuiCol_TabActive]             = ImVec4(0.30f, 0.20f, 0.10f, 1.00f);
+        c[ImGuiCol_TabUnfocused]          = ImVec4(0.08f, 0.06f, 0.04f, 1.00f);
+        c[ImGuiCol_TabUnfocusedActive]    = ImVec4(0.18f, 0.13f, 0.08f, 1.00f);
+        c[ImGuiCol_PlotLines]             = ImVec4(0.85f, 0.62f, 0.30f, 1.00f);
+        c[ImGuiCol_PlotLinesHovered]      = ImVec4(1.00f, 0.75f, 0.40f, 1.00f);
+        c[ImGuiCol_PlotHistogram]         = ImVec4(0.85f, 0.62f, 0.30f, 1.00f);
+        c[ImGuiCol_PlotHistogramHovered]  = ImVec4(1.00f, 0.75f, 0.40f, 1.00f);
+        c[ImGuiCol_TextSelectedBg]        = ImVec4(0.55f, 0.36f, 0.16f, 0.50f);
+
+        style.WindowRounding = 2.0f;
+        style.FrameRounding  = 1.0f;
+    }
+
+    style.GrabRounding  = style.FrameRounding;
+    style.Alpha         = 0.95f;
+    style.WindowPadding = ImVec2(10, 10);
+    style.ItemSpacing   = ImVec2(8, 5);
+}
+
 // ==================== Framework config ====================
 
 static void LoadFrameworkConfig()
@@ -627,8 +813,15 @@ static void LoadFrameworkConfig()
     gFwConfig.showStartupMessage = GetPrivateProfileIntA("Dust", "ShowStartupMessage", 1, gDustIniPath.c_str()) != 0;
     gFwConfig.showSurvey = GetPrivateProfileIntA("Dust", "ShowSurvey", 0, gDustIniPath.c_str()) != 0;
 
-    gFwConfig.toggleKey = GetPrivateProfileIntA("Dust", "ToggleKey", VK_F11, gDustIniPath.c_str());
-    gFwConfig.msaaSampleCount = GetPrivateProfileIntA("Dust", "MSAASamples", 0, gDustIniPath.c_str());
+    gFwConfig.toggleKey        = GetPrivateProfileIntA("Dust", "ToggleKey",        VK_F11, gDustIniPath.c_str());
+    gFwConfig.toggleEffectsKey = GetPrivateProfileIntA("Dust", "ToggleEffectsKey", 0,      gDustIniPath.c_str());
+    gFwConfig.msaaSampleCount  = GetPrivateProfileIntA("Dust", "MSAASamples",      0,      gDustIniPath.c_str());
+
+    char themeBuf[64] = {};
+    GetPrivateProfileStringA("Dust", "Theme", "kenshi", themeBuf, sizeof(themeBuf), gDustIniPath.c_str());
+    gFwConfig.theme = themeBuf;
+    if (gFwConfig.theme != "kenshi" && gFwConfig.theme != "dark")
+        gFwConfig.theme = "kenshi";
 
     char buf[256] = {};
     GetPrivateProfileStringA("Dust", "LastPreset", "", buf, sizeof(buf), gDustIniPath.c_str());
@@ -638,18 +831,8 @@ static void LoadFrameworkConfig()
     if (gFwConfig.lastPreset.empty())
         gFwConfig.lastPreset = "dust_high";
 
-    // Auto-load last preset
-    {
-        const auto& presets = gEffectLoader.GetPresets();
-        for (int i = 0; i < (int)presets.size(); i++)
-        {
-            if (presets[i].name == gFwConfig.lastPreset)
-            {
-                gEffectLoader.LoadPreset(i);
-                break;
-            }
-        }
-    }
+    // Preset auto-load is deferred to Render() — effects may not be initialized yet
+    // when the GUI starts (e.g. GUI inits from DustBoot swap chain before device capture).
 
     // Detect version change (Steam Workshop overwrites DLL but not Dust.ini)
     char lastVersion[128] = {};
@@ -679,6 +862,9 @@ static void SaveFrameworkConfig()
     char keyBuf[16];
     snprintf(keyBuf, sizeof(keyBuf), "%d", gFwConfig.toggleKey);
     WritePrivateProfileStringA("Dust", "ToggleKey", keyBuf, gDustIniPath.c_str());
+    snprintf(keyBuf, sizeof(keyBuf), "%d", gFwConfig.toggleEffectsKey);
+    WritePrivateProfileStringA("Dust", "ToggleEffectsKey", keyBuf, gDustIniPath.c_str());
+    WritePrivateProfileStringA("Dust", "Theme", gFwConfig.theme.c_str(), gDustIniPath.c_str());
     WritePrivateProfileStringA("Dust", "LastPreset", gFwConfig.lastPreset.c_str(), gDustIniPath.c_str());
     char msaaBuf[16];
     snprintf(msaaBuf, sizeof(msaaBuf), "%d", gFwConfig.msaaSampleCount);
@@ -696,6 +882,7 @@ static void ResetFrameworkConfig()
 {
     gFwConfig = gFwDiskConfig;
     DustLogEnabled() = gFwConfig.logging;
+    ApplyDustTheme(gFwConfig.theme);
 }
 
 static bool IsFrameworkDirty()
@@ -705,7 +892,9 @@ static bool IsFrameworkDirty()
            gFwConfig.showSurvey != gFwDiskConfig.showSurvey ||
            gFwConfig.lastPreset != gFwDiskConfig.lastPreset ||
            gFwConfig.toggleKey != gFwDiskConfig.toggleKey ||
-           gFwConfig.msaaSampleCount != gFwDiskConfig.msaaSampleCount;
+           gFwConfig.toggleEffectsKey != gFwDiskConfig.toggleEffectsKey ||
+           gFwConfig.msaaSampleCount != gFwDiskConfig.msaaSampleCount ||
+           gFwConfig.theme != gFwDiskConfig.theme;
 }
 
 // ==================== Drawing: Framework pane ====================
@@ -718,7 +907,7 @@ static void DrawFrameworkSection()
     ImGui::Separator();
     ImGui::Spacing();
 
-    // Toggle key binding
+    // Toggle key binding (overlay GUI)
     if (gWaitingForKey)
     {
         ImGui::Button("Press a key...", ImVec2(ImGui::GetContentRegionAvail().x, 0));
@@ -728,9 +917,48 @@ static void DrawFrameworkSection()
         char label[128];
         snprintf(label, sizeof(label), "Toggle: %s", VKKeyName(gFwConfig.toggleKey));
         if (ImGui::Button(label, ImVec2(ImGui::GetContentRegionAvail().x, 0)))
+        {
             gWaitingForKey = true;
+            gWaitingForEffectsKey = false;
+        }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Click to rebind the overlay toggle key");
+    }
+
+    // Toggle-all-effects key binding (works whether the overlay is open or closed)
+    if (gWaitingForEffectsKey)
+    {
+        ImGui::Button("Press a key...##fx", ImVec2(ImGui::GetContentRegionAvail().x, 0));
+    }
+    else
+    {
+        char label[128];
+        if (gFwConfig.toggleEffectsKey == 0)
+            snprintf(label, sizeof(label), "Toggle Effects: (unbound)");
+        else
+            snprintf(label, sizeof(label), "Toggle Effects: %s", VKKeyName(gFwConfig.toggleEffectsKey));
+        if (ImGui::Button(label, ImVec2(ImGui::GetContentRegionAvail().x, 0)))
+        {
+            gWaitingForEffectsKey = true;
+            gWaitingForKey = false;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Click to rebind the hotkey that flips all effects on/off. Works whether the overlay is open or closed. Set ToggleEffectsKey=0 in Dust.ini to unbind.");
+    }
+
+    ImGui::Spacing();
+
+    {
+        const char* themeLabels[] = { "Kenshi", "Dark" };
+        const char* themeKeys[]   = { "kenshi", "dark"  };
+        int themeIdx = (gFwConfig.theme == "dark") ? 1 : 0;
+        if (ImGui::Combo("Theme", &themeIdx, themeLabels, IM_ARRAYSIZE(themeLabels)))
+        {
+            gFwConfig.theme = themeKeys[themeIdx];
+            ApplyDustTheme(gFwConfig.theme);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("UI theme. Kenshi: warm parchment palette matching the game. Dark: ImGui default.");
     }
 
     ImGui::Spacing();
@@ -850,8 +1078,117 @@ static void SnapshotAllEffects()
     }
 }
 
+// Tooltip showing preset metadata (author, description, etc.)
+static void DrawPresetMetaTooltip(const PresetInfo& p)
+{
+    ImGui::BeginTooltip();
+    ImGui::TextUnformatted(p.name.c_str());
+    if (p.hasMetadata)
+    {
+        if (!p.metaAuthor.empty())
+            ImGui::Text("Author: %s", p.metaAuthor.c_str());
+        if (!p.metaDescription.empty())
+        {
+            ImGui::Separator();
+            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
+            ImGui::TextUnformatted(p.metaDescription.c_str());
+            ImGui::PopTextWrapPos();
+        }
+        if (p.metaApiVersion > 0)
+            ImGui::TextDisabled("API v%d, preset v%d", p.metaApiVersion, p.metaVersion);
+    }
+    else
+    {
+        ImGui::TextDisabled("(no metadata)");
+    }
+    ImGui::EndTooltip();
+}
+
+// Lightweight visual-only "disable": grey the button out by pushing alpha.
+// This ImGui version doesn't have BeginDisabled/EndDisabled (1.85+) so we
+// pair this with manual click gating (`if (clicked && !disabled)`).
+static void PushVisualDisabled(bool disabled)
+{
+    if (disabled)
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.5f);
+}
+static void PopVisualDisabled(bool disabled)
+{
+    if (disabled)
+        ImGui::PopStyleVar();
+}
+
+// Try to consume an async picker result. Called once per frame.
+static void PollFilePicker()
+{
+    std::string path;
+    if (!FilePicker::Poll(path)) return;
+
+    PickerPurpose purpose = gPickerPurpose;
+    gPickerPurpose = PickerPurpose::None;
+
+    if (path.empty()) return; // user cancelled
+
+    if (purpose == PickerPurpose::Import)
+    {
+        std::string err;
+        int idx = gEffectLoader.ImportPresetFromFolder(path.c_str(), false, &err);
+        if (idx >= 0)
+        {
+            gEffectLoader.LoadPreset(idx);
+            SyncAllEffectsOnState();
+            const auto& presets = gEffectLoader.GetPresets();
+            if (idx < (int)presets.size())
+            {
+                gFwConfig.lastPreset = presets[idx].name;
+                SaveFrameworkConfig();
+            }
+            SnapshotAllEffects();
+            gPickerInfo = "Imported '" + presets[idx].name + "'";
+            gPickerInfoFrames = 240; // ~4 seconds at 60fps
+            gPickerError.clear();
+        }
+        else if (err.find("already exists") != std::string::npos)
+        {
+            // Defer overwrite confirmation to a popup
+            gPendingImportSrc = path;
+            // Extract name for display from error message ("preset named 'X' ...")
+            size_t a = err.find('\'');
+            size_t b = (a != std::string::npos) ? err.find('\'', a + 1) : std::string::npos;
+            if (a != std::string::npos && b != std::string::npos)
+                gPendingImportName = err.substr(a + 1, b - a - 1);
+            else
+                gPendingImportName = "<unknown>";
+            gPickerError.clear();
+        }
+        else
+        {
+            gPickerError = err.empty() ? "Import failed" : err;
+        }
+    }
+    else if (purpose == PickerPurpose::Export)
+    {
+        std::string err;
+        if (gEffectLoader.ExportPreset(gPickerExportPresetIdx, path.c_str(), &err))
+        {
+            const auto& presets = gEffectLoader.GetPresets();
+            const char* name = (gPickerExportPresetIdx >= 0 && gPickerExportPresetIdx < (int)presets.size())
+                ? presets[gPickerExportPresetIdx].name.c_str() : "preset";
+            gPickerInfo = std::string("Exported '") + name + "' to " + path;
+            gPickerInfoFrames = 240;
+            gPickerError.clear();
+        }
+        else
+        {
+            gPickerError = err.empty() ? "Export failed" : err;
+        }
+    }
+}
+
 static void DrawPresetSection()
 {
+    PollFilePicker();
+
     const auto& presets = gEffectLoader.GetPresets();
     int currentPreset = gEffectLoader.GetCurrentPreset();
 
@@ -878,13 +1215,18 @@ static void DrawPresetSection()
             if (ImGui::Selectable(presets[p].name.c_str(), selected))
             {
                 gEffectLoader.LoadPreset(p);
+                SyncAllEffectsOnState();
                 gFwConfig.lastPreset = presets[p].name;
                 SaveFrameworkConfig();
                 SnapshotAllEffects();
             }
+            if (ImGui::IsItemHovered())
+                DrawPresetMetaTooltip(presets[p]);
         }
         ImGui::EndCombo();
     }
+    if (currentPreset >= 0 && currentPreset < (int)presets.size() && ImGui::IsItemHovered())
+        DrawPresetMetaTooltip(presets[currentPreset]);
 
     // Show warnings for outdated presets
     if (currentPreset >= 0 && !presets[currentPreset].warnings.empty())
@@ -894,9 +1236,43 @@ static void DrawPresetSection()
             ImGui::SetTooltip("%s", presets[currentPreset].warnings.c_str());
     }
 
-    // Save As
+    // Picker-busy banner (so the user knows the dialog is open somewhere)
+    if (FilePicker::IsBusy())
+        ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "Waiting for folder picker...");
+
+    // Transient info / error
+    if (gPickerInfoFrames > 0 && !gPickerInfo.empty())
+    {
+        ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "%s", gPickerInfo.c_str());
+        gPickerInfoFrames--;
+    }
+    if (!gPickerError.empty())
+    {
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.4f, 1.0f), "%s", gPickerError.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Dismiss##PickerErr")) gPickerError.clear();
+    }
+
+    // ---- Row 1: Save As / Import ----
+    bool pickerBusy = FilePicker::IsBusy();
+
     if (ImGui::Button("Save As...", ImVec2(0, 0)))
         ImGui::OpenPopup("##GlobalSavePresetAs");
+
+    ImGui::SameLine();
+    PushVisualDisabled(pickerBusy);
+    if (ImGui::Button("Import...") && !pickerBusy)
+    {
+        gPickerPurpose = PickerPurpose::Import;
+        gPickerError.clear();
+        if (!FilePicker::StartFolderPicker("Choose a Dust preset folder to import"))
+            gPickerPurpose = PickerPurpose::None;
+    }
+    PopVisualDisabled(pickerBusy);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s",
+            pickerBusy ? "A folder picker is already open"
+                       : "Import a preset from a folder on disk");
 
     if (ImGui::BeginPopup("##GlobalSavePresetAs"))
     {
@@ -918,10 +1294,9 @@ static void DrawPresetSection()
         ImGui::EndPopup();
     }
 
-    // Overwrite / Delete for active preset
+    // ---- Row 2: Save / Export / Edit Info / Delete (only when a preset is selected) ----
     if (currentPreset >= 0)
     {
-        ImGui::SameLine();
         if (ImGui::Button("Save", ImVec2(0, 0)))
         {
             gEffectLoader.SavePreset(currentPreset);
@@ -929,6 +1304,41 @@ static void DrawPresetSection()
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Save current settings into '%s'", presets[currentPreset].name.c_str());
+
+        ImGui::SameLine();
+        PushVisualDisabled(pickerBusy);
+        if (ImGui::Button("Export...") && !pickerBusy)
+        {
+            gPickerPurpose = PickerPurpose::Export;
+            gPickerExportPresetIdx = currentPreset;
+            gPickerError.clear();
+            if (!FilePicker::StartFolderPicker("Choose a destination folder to export the preset"))
+                gPickerPurpose = PickerPurpose::None;
+        }
+        PopVisualDisabled(pickerBusy);
+        if (ImGui::IsItemHovered())
+        {
+            if (pickerBusy)
+                ImGui::SetTooltip("A folder picker is already open");
+            else
+                ImGui::SetTooltip("Copy '%s' into another folder for sharing",
+                                  presets[currentPreset].name.c_str());
+        }
+
+        ImGui::SameLine();
+        if (ImGui::Button("Edit Info..."))
+        {
+            gEditInfoPresetIdx = currentPreset;
+            const PresetInfo& p = presets[currentPreset];
+            // Pre-fill from existing metadata
+            strncpy_s(gEditInfoAuthor, sizeof(gEditInfoAuthor),
+                      p.metaAuthor.c_str(), _TRUNCATE);
+            strncpy_s(gEditInfoDesc, sizeof(gEditInfoDesc),
+                      p.metaDescription.c_str(), _TRUNCATE);
+            ImGui::OpenPopup("##EditPresetInfo");
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Edit author / description metadata");
 
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.15f, 0.15f, 1.0f));
@@ -949,6 +1359,76 @@ static void DrawPresetSection()
                 ImGui::CloseCurrentPopup();
             ImGui::EndPopup();
         }
+    }
+
+    // ---- Edit Info popup ----
+    if (ImGui::BeginPopup("##EditPresetInfo"))
+    {
+        ImGui::Text("Preset metadata");
+        ImGui::Separator();
+        ImGui::SetNextItemWidth(280);
+        ImGui::InputText("Author##editinfoauthor", gEditInfoAuthor, sizeof(gEditInfoAuthor));
+        ImGui::SetNextItemWidth(280);
+        ImGui::InputTextMultiline("Description##editinfodesc",
+                                  gEditInfoDesc, sizeof(gEditInfoDesc),
+                                  ImVec2(280, 80));
+        ImGui::Spacing();
+        if (ImGui::Button("Save##editinfo", ImVec2(80, 0)))
+        {
+            if (gEditInfoPresetIdx >= 0 && gEditInfoPresetIdx < (int)presets.size())
+                gEffectLoader.UpdatePresetMetadata(gEditInfoPresetIdx,
+                                                  gEditInfoAuthor, gEditInfoDesc);
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel##editinfo", ImVec2(80, 0)))
+            ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    // ---- Overwrite-on-import confirmation ----
+    if (!gPendingImportSrc.empty())
+        ImGui::OpenPopup("##ConfirmImportOverwrite");
+    if (ImGui::BeginPopupModal("##ConfirmImportOverwrite", nullptr,
+                               ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        ImGui::Text("A preset named '%s' already exists.", gPendingImportName.c_str());
+        ImGui::Text("Overwrite it?");
+        ImGui::Spacing();
+        if (ImGui::Button("Overwrite", ImVec2(100, 0)))
+        {
+            std::string err;
+            int idx = gEffectLoader.ImportPresetFromFolder(gPendingImportSrc.c_str(), true, &err);
+            if (idx >= 0)
+            {
+                gEffectLoader.LoadPreset(idx);
+                SyncAllEffectsOnState();
+                const auto& ps = gEffectLoader.GetPresets();
+                if (idx < (int)ps.size())
+                {
+                    gFwConfig.lastPreset = ps[idx].name;
+                    SaveFrameworkConfig();
+                }
+                SnapshotAllEffects();
+                gPickerInfo = "Imported '" + gPendingImportName + "' (overwrote existing)";
+                gPickerInfoFrames = 240;
+            }
+            else
+            {
+                gPickerError = err.empty() ? "Import failed" : err;
+            }
+            gPendingImportSrc.clear();
+            gPendingImportName.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(100, 0)))
+        {
+            gPendingImportSrc.clear();
+            gPendingImportName.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
     }
 
     ImGui::Spacing();
@@ -1109,8 +1589,43 @@ static void DrawEffectSection(size_t idx)
             break;
         }
 
-        if (s.description && ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", s.description);
+        if (ImGui::IsItemHovered() && s.type != DUST_SETTING_SECTION)
+        {
+            ImGui::BeginTooltip();
+            if (s.description)
+                ImGui::TextUnformatted(s.description);
+
+            const char* perfLabel = nullptr;
+            ImVec4 perfColor;
+            switch (s.perfImpact)
+            {
+            case DUST_PERF_NONE:
+                perfLabel = "None";
+                perfColor = ImVec4(0.80f, 0.80f, 0.80f, 1.00f);
+                break;
+            case DUST_PERF_LOW:
+                perfLabel = "Low";
+                perfColor = ImVec4(0.85f, 0.80f, 0.55f, 1.00f);
+                break;
+            case DUST_PERF_MEDIUM:
+                perfLabel = "Medium";
+                perfColor = ImVec4(1.00f, 0.60f, 0.20f, 1.00f);
+                break;
+            case DUST_PERF_HIGH:
+                perfLabel = "High";
+                perfColor = ImVec4(1.00f, 0.30f, 0.25f, 1.00f);
+                break;
+            default:
+                break;
+            }
+            if (perfLabel)
+            {
+                ImGui::TextUnformatted("Performance impact: ");
+                ImGui::SameLine(0.0f, 0.0f);
+                ImGui::TextColored(perfColor, "%s", perfLabel);
+            }
+            ImGui::EndTooltip();
+        }
 
         // Reset button for this parameter
         DrawResetButton(idx, i);
@@ -1339,24 +1854,25 @@ bool Init(IDXGISwapChain* swapChain, ID3D11Device* device, ID3D11DeviceContext* 
 
     Log("GUI: Init starting (swap=%p, dev=%p, ctx=%p)", swapChain, device, context);
 
-    if (!swapChain || !device || !context)
-    { Log("GUI: Init aborted — null swap/device/context"); return false; }
+    if (!swapChain)
+    { Log("GUI: Init aborted — null swap chain"); return false; }
 
-    gDevice = device;
-    gContext = context;
-
-    // Sanity: the swap chain must belong to the same device we'll render with,
-    // otherwise CreateRenderTargetView on its back buffer fails with E_INVALIDARG.
-    // This happens when Kenshi creates extra swap chains on a different device.
+    // Always use the swap chain's own device — it's the only one that can create
+    // views on the swap chain's back buffer. On multi-device systems (e.g. iGPU +
+    // discrete GPU) this may differ from the effects pipeline's captured device.
     {
         ID3D11Device* scDevice = nullptr;
         HRESULT hr = swapChain->GetDevice(__uuidof(ID3D11Device), (void**)&scDevice);
         if (FAILED(hr) || !scDevice)
-        { Log("GUI: swapChain->GetDevice failed hr=0x%08X", (unsigned)hr); if (scDevice) scDevice->Release(); return false; }
-        bool match = (scDevice == gDevice);
+        { Log("GUI: swapChain->GetDevice failed hr=0x%08X", (unsigned)hr); return false; }
+
+        if (device && scDevice != device)
+            Log("GUI: note: swapChain device (%p) != captured device (%p)", scDevice, device);
+
+        gDevice = scDevice;
+        gDevice->GetImmediateContext(&gContext);
+        gContext->Release();
         scDevice->Release();
-        if (!match)
-        { Log("GUI: swapChain device (%p) != captured device (%p) — skipping this swap chain", scDevice, gDevice); return false; }
     }
 
     DXGI_SWAP_CHAIN_DESC desc = {};
@@ -1380,15 +1896,9 @@ bool Init(IDXGISwapChain* swapChain, ID3D11Device* device, ID3D11DeviceContext* 
     // "Activate" which can leave io.KeysDown[VK_SPACE] stuck when the
     // overlay closes, breaking the game's pause key.
 
-    // Style
-    ImGui::StyleColorsDark();
-    ImGuiStyle& style = ImGui::GetStyle();
-    style.WindowRounding = 6.0f;
-    style.FrameRounding = 4.0f;
-    style.GrabRounding = 4.0f;
-    style.Alpha = 0.95f;
-    style.WindowPadding = ImVec2(10, 10);
-    style.ItemSpacing = ImVec2(8, 5);
+    // Style: apply default theme now; LoadFrameworkConfig below will reapply
+    // the user's saved choice once the ini has been read.
+    ApplyDustTheme("kenshi");
 
     if (!ImGui_ImplWin32_Init(gHWnd))
     { Log("GUI: ImGui_ImplWin32_Init failed"); ImGui::DestroyContext(); return false; }
@@ -1412,6 +1922,7 @@ bool Init(IDXGISwapChain* swapChain, ID3D11Device* device, ID3D11DeviceContext* 
     Log("GUI: DInput hooks installed");
 
     LoadFrameworkConfig();
+    ApplyDustTheme(gFwConfig.theme);
 
     gInitialized = true;
     Log("GUI: Initialized (%s to toggle)", VKKeyName(gFwConfig.toggleKey));
@@ -1440,6 +1951,8 @@ void Shutdown()
     if (gBackBufferRTV)  { gBackBufferRTV->Release();  gBackBufferRTV = nullptr; }
     if (gDiscordLogoSRV) { gDiscordLogoSRV->Release(); gDiscordLogoSRV = nullptr; }
     if (gGithubLogoSRV)  { gGithubLogoSRV->Release();  gGithubLogoSRV = nullptr; }
+
+    FilePicker::Shutdown();
 
     gEffectStates.clear();
     gInitialized = false;
@@ -1477,6 +1990,42 @@ void Render()
 {
     if (!gInitialized || gResizeInProgress) return;
     if (!gDevice || !gContext || !gBackBufferRTV) return;
+
+    // Deferred preset auto-load: GUI can start before effects are initialized
+    // (DustBoot provides the swap chain before device capture / effect init).
+    // Phase 1: set display name early (presets scanned in LoadAll).
+    // Phase 2: apply values once effects are initialized.
+    {
+        static bool sPresetDisplaySet = false;
+        static bool sPresetApplied = false;
+        static int  sPendingIdx = -1;
+
+        if (!sPresetApplied && !gFwConfig.lastPreset.empty())
+        {
+            if (!sPresetDisplaySet)
+            {
+                const auto& presets = gEffectLoader.GetPresets();
+                for (int i = 0; i < (int)presets.size(); i++)
+                {
+                    if (presets[i].name == gFwConfig.lastPreset)
+                    {
+                        gEffectLoader.SetCurrentPreset(i);
+                        sPendingIdx = i;
+                        sPresetDisplaySet = true;
+                        break;
+                    }
+                }
+            }
+
+            if (sPresetDisplaySet && sPendingIdx >= 0 && gEffectLoader.IsInitialized())
+            {
+                gEffectLoader.LoadPreset(sPendingIdx);
+                SyncAllEffectsOnState();
+                Log("Loaded global preset '%s'", gFwConfig.lastPreset.c_str());
+                sPresetApplied = true;
+            }
+        }
+    }
 
     // Skip rendering if device has been removed (alt-tab, resolution change, etc.)
     HRESULT removeReason = gDevice->GetDeviceRemovedReason();
@@ -1586,34 +2135,9 @@ void Render()
             DrawPresetSection();
 
             {
-                if (ImGui::Checkbox("Toggle Effects", &gAllEffectsOn))
-                {
-                    if (!gAllEffectsOn)
-                    {
-                        gEffectWasEnabled.resize(count);
-                        for (size_t i = 0; i < count; i++)
-                        {
-                            const LoadedEffect& le = gEffectLoader.GetEffect(i);
-                            if (!le.initialized) { gEffectWasEnabled[i] = false; continue; }
-                            bool* p = FindEnabledPtr(le);
-                            gEffectWasEnabled[i] = p ? *p : false;
-                            if (p) *p = false;
-                            if (le.desc.OnSettingChanged) le.desc.OnSettingChanged();
-                        }
-                    }
-                    else
-                    {
-                        for (size_t i = 0; i < count && i < gEffectWasEnabled.size(); i++)
-                        {
-                            const LoadedEffect& le = gEffectLoader.GetEffect(i);
-                            if (!le.initialized) continue;
-                            if (!gEffectWasEnabled[i]) continue;
-                            bool* p = FindEnabledPtr(le);
-                            if (p) *p = true;
-                            if (le.desc.OnSettingChanged) le.desc.OnSettingChanged();
-                        }
-                    }
-                }
+                bool desired = gAllEffectsOn;
+                if (ImGui::Checkbox("Toggle Effects", &desired))
+                    SetAllEffectsEnabled(desired);
             }
 
             ImGui::SameLine();
@@ -1623,6 +2147,12 @@ void Render()
             if (ImGui::SmallButton("Collapse All"))
                 gForceCollapseState = -1;
 
+            // Search/filter box: case-insensitive substring match on effect name.
+            // Empty filter shows everything; this state is intentionally not persisted.
+            static char sFilterBuf[64] = {};
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+            ImGui::InputTextWithHint("##effectfilter", "Search effects...", sFilterBuf, sizeof(sFilterBuf));
+
             ImGui::Spacing();
             ImGui::Separator();
             ImGui::Spacing();
@@ -1630,21 +2160,28 @@ void Render()
             // Scrollable effects area
             ImGui::BeginChild("##effects", ImVec2(0, 0), false);
 
+            int shown = 0;
             for (size_t i = 0; i < count; i++)
             {
                 const LoadedEffect& le = gEffectLoader.GetEffect(i);
                 if (!le.initialized) continue;
 
-                ImGui::PushID((int)i);
-                DrawEffectSection(i);
-                ImGui::PopID();
+                if (sFilterBuf[0] && !EffectNameMatchesFilter(le.desc.name, sFilterBuf))
+                    continue;
 
-                if (i + 1 < count)
+                if (shown > 0)
                 {
                     ImGui::Spacing();
                     ImGui::Spacing();
                 }
+
+                ImGui::PushID((int)i);
+                DrawEffectSection(i);
+                ImGui::PopID();
+                ++shown;
             }
+            if (shown == 0 && sFilterBuf[0])
+                ImGui::TextDisabled("No effect matches \"%s\"", sFilterBuf);
             gForceCollapseState = 0;
 
             ImGui::EndChild(); // ##effects

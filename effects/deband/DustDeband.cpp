@@ -163,13 +163,13 @@ static int DebandIsEnabled()
 }
 
 static DustSettingDesc gSettingsArray[] = {
-    { "Enabled",        DUST_SETTING_BOOL,  &gDebandConfig.enabled,          0.0f,  1.0f,  "Enabled",          nullptr, "Enable or disable debanding" },
-    { "Threshold",      DUST_SETTING_FLOAT, &gDebandConfig.threshold,        0.001f,0.1f,  "Threshold",        nullptr, "Maximum color difference to treat as banding" },
-    { "Range",          DUST_SETTING_FLOAT, &gDebandConfig.range,            4.0f,  64.0f, "Range",            nullptr, "Search radius in pixels for averaging" },
-    { "Intensity",      DUST_SETTING_FLOAT, &gDebandConfig.intensity,        0.0f,  1.0f,  "Intensity",        nullptr, "Blend strength of the debanded result" },
-    { "Sky Only",       DUST_SETTING_BOOL,  &gDebandConfig.skyOnly,          0.0f,  1.0f,  "SkyOnly",          nullptr, "Only apply debanding to sky pixels" },
-    { "Sky Threshold",  DUST_SETTING_FLOAT, &gDebandConfig.skyDepthThreshold,0.9f,  1.0f,  "SkyDepthThreshold",nullptr, "Depth value above which pixels are treated as sky" },
-    { "Debug View",     DUST_SETTING_BOOL,  &gDebandConfig.debugView,        0.0f,  1.0f,  "DebugView",        nullptr, "Highlight regions affected by debanding" },
+    { "Enabled",        DUST_SETTING_BOOL,  &gDebandConfig.enabled,          0.0f,  1.0f,  "Enabled",          nullptr, "Enable or disable debanding",                       DUST_PERF_LOW  },
+    { "Threshold",      DUST_SETTING_FLOAT, &gDebandConfig.threshold,        0.001f,0.1f,  "Threshold",        nullptr, "Maximum color difference to treat as banding",      DUST_PERF_NONE },
+    { "Range",          DUST_SETTING_FLOAT, &gDebandConfig.range,            4.0f,  64.0f, "Range",            nullptr, "Search radius in pixels for averaging",             DUST_PERF_NONE },
+    { "Intensity",      DUST_SETTING_FLOAT, &gDebandConfig.intensity,        0.0f,  1.0f,  "Intensity",        nullptr, "Blend strength of the debanded result",             DUST_PERF_NONE },
+    { "Sky Only",       DUST_SETTING_BOOL,  &gDebandConfig.skyOnly,          0.0f,  1.0f,  "SkyOnly",          nullptr, "Only apply debanding to sky pixels",                DUST_PERF_NONE },
+    { "Sky Threshold",  DUST_SETTING_FLOAT, &gDebandConfig.skyDepthThreshold,0.9f,  1.0f,  "SkyDepthThreshold",nullptr, "Depth value above which pixels are treated as sky", DUST_PERF_NONE },
+    { "Debug View",     DUST_SETTING_BOOL,  &gDebandConfig.debugView,        0.0f,  1.0f,  "DebugView",        nullptr, "Highlight regions affected by debanding",           DUST_PERF_NONE },
 };
 
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)

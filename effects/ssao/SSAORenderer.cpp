@@ -2,6 +2,7 @@
 #include "SSAOConfig.h"
 #include "DustLog.h"
 #include <cstring>
+#include <cmath>
 #include <string>
 
 namespace SSAORenderer
@@ -48,6 +49,11 @@ static ID3D11DepthStencilState* gNoDepthDSS = nullptr;
 static ID3D11RasterizerState*   gNoCullRS = nullptr;
 static ID3D11SamplerState*      gPointClampSampler = nullptr;
 static ID3D11SamplerState*      gLinearClampSampler = nullptr;
+
+// Blue noise texture for AO sample jitter
+static ID3D11Texture2D*          gBlueNoiseTex = nullptr;
+static ID3D11ShaderResourceView* gBlueNoiseSRV = nullptr;
+static ID3D11SamplerState*       gPointWrapSampler = nullptr;
 
 struct SSAOCBData
 {
@@ -229,6 +235,52 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
         if (FAILED(hr)) return false;
     }
 
+    // Point-wrap sampler (for blue noise tiling)
+    {
+        D3D11_SAMPLER_DESC desc = {};
+        desc.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+        desc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
+        desc.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
+        desc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+        hr = device->CreateSamplerState(&desc, &gPointWrapSampler);
+        if (FAILED(hr)) return false;
+    }
+
+    // Blue noise texture (64x64 R8, R2 low-discrepancy sequence)
+    {
+        const int BN_SIZE = 64;
+        uint8_t data[BN_SIZE * BN_SIZE];
+        const float a1 = 0.7548776662466927f; // 1 / plastic constant
+        const float a2 = 0.5698402909980532f; // 1 / plastic constant^2
+        for (int y = 0; y < BN_SIZE; y++)
+            for (int x = 0; x < BN_SIZE; x++)
+            {
+                float v = a1 * (float)x + a2 * (float)y + 0.5f;
+                v = v - (float)(int)v;
+                data[y * BN_SIZE + x] = (uint8_t)(v * 255.0f);
+            }
+
+        D3D11_TEXTURE2D_DESC texDesc = {};
+        texDesc.Width = BN_SIZE;
+        texDesc.Height = BN_SIZE;
+        texDesc.MipLevels = 1;
+        texDesc.ArraySize = 1;
+        texDesc.Format = DXGI_FORMAT_R8_UNORM;
+        texDesc.SampleDesc.Count = 1;
+        texDesc.Usage = D3D11_USAGE_IMMUTABLE;
+        texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        D3D11_SUBRESOURCE_DATA initData = {};
+        initData.pSysMem = data;
+        initData.SysMemPitch = BN_SIZE;
+
+        hr = device->CreateTexture2D(&texDesc, &initData, &gBlueNoiseTex);
+        if (FAILED(hr)) { Log("Failed to create blue noise texture: 0x%08X", hr); return false; }
+
+        hr = device->CreateShaderResourceView(gBlueNoiseTex, nullptr, &gBlueNoiseSRV);
+        if (FAILED(hr)) { Log("Failed to create blue noise SRV: 0x%08X", hr); return false; }
+    }
+
     // Constant buffer
     gSSAOCB = host->CreateConstantBuffer(device, sizeof(SSAOCBData));
     if (!gSSAOCB) return false;
@@ -251,6 +303,7 @@ void Shutdown()
     SAFE_RELEASE(gNoBlend);
     SAFE_RELEASE(gNoDepthDSS);   SAFE_RELEASE(gNoCullRS);
     SAFE_RELEASE(gPointClampSampler); SAFE_RELEASE(gLinearClampSampler); SAFE_RELEASE(gSSAOCB);
+    SAFE_RELEASE(gBlueNoiseTex); SAFE_RELEASE(gBlueNoiseSRV); SAFE_RELEASE(gPointWrapSampler);
 #undef SAFE_RELEASE
     gInitialized = false;
     gFrameIndex = 0;
@@ -408,10 +461,13 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
     {
         ctx->OMSetRenderTargets(1, &gAoRTV, nullptr);
         ctx->PSSetShader(gSSAOGenPS, nullptr, 0);
-        ID3D11ShaderResourceView* srvs[2] = { depthSRV, normalsSRV };
-        ctx->PSSetShaderResources(0, 2, srvs);
+        ID3D11ShaderResourceView* srvs[3] = { depthSRV, normalsSRV, gBlueNoiseSRV };
+        ctx->PSSetShaderResources(0, 3, srvs);
+        ID3D11SamplerState* samplers[2] = { gPointClampSampler, gPointWrapSampler };
+        ctx->PSSetSamplers(0, 2, samplers);
         ctx->Draw(3, 0);
-        ctx->PSSetShaderResources(0, 2, nullSRVs);
+        ID3D11ShaderResourceView* null3[3] = {};
+        ctx->PSSetShaderResources(0, 3, null3);
     }
 
     // Pass 2: Horizontal blur

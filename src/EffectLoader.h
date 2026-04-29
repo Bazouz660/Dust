@@ -28,10 +28,20 @@ struct LoadedEffect {
 };
 
 // Global preset system — each preset is a folder with per-effect INI files
+// plus an optional dust_preset.ini metadata file.
 struct PresetInfo {
-    std::string name;   // display name (folder name)
-    std::string path;   // full path to the preset folder
-    std::string warnings; // non-empty if preset has outdated INI files (missing/unknown fields)
+    std::string name;        // display name (folder name)
+    std::string path;        // full path to the preset folder
+    std::string warnings;    // non-empty if preset has outdated INI files (missing/unknown fields)
+
+    // Metadata from dust_preset.ini (empty if file is absent — backwards
+    // compatible with pre-metadata presets).
+    bool        hasMetadata    = false;
+    std::string metaName;        // [Preset] Name (display name; falls back to folder name)
+    std::string metaAuthor;      // [Preset] Author
+    std::string metaDescription; // [Preset] Description
+    int         metaVersion     = 0;  // [Preset] Version (user-defined)
+    int         metaApiVersion  = 0;  // [Preset] ApiVersion (DUST_API_VERSION at save time)
 };
 
 class EffectLoader {
@@ -56,6 +66,7 @@ public:
 
     size_t Count() const { return effects_.size(); }
     const LoadedEffect& GetEffect(size_t index) const { return effects_[index]; }
+    bool IsInitialized() const { return initialized_; }
 
     // v3: Framework config helpers (called by DustGUI)
     void SaveEffectConfig(size_t index);
@@ -68,6 +79,22 @@ public:
     void SavePreset(int presetIdx);                // save all effect configs to preset folder
     int  SavePresetAs(const char* name);           // create new preset from current settings, returns index
     void DeletePreset(int presetIdx);
+
+    // Import a preset from an arbitrary folder. Validates source contains
+    // INI files (lenient — dust_preset.ini is preferred but not required),
+    // copies into <presetsDir>/<name>/, and returns the new index. If a
+    // preset with the same name already exists and overwrite is true, it is
+    // overwritten; otherwise -1 is returned. errorOut (if non-null) gets a
+    // human-readable error message on failure.
+    int  ImportPresetFromFolder(const char* srcDir, bool overwrite, std::string* errorOut);
+
+    // Copy <presetsDir>/<presetName>/ into <destParentDir>/<presetName>/.
+    // Returns true on success.
+    bool ExportPreset(int presetIdx, const char* destParentDir, std::string* errorOut);
+
+    // Update the preset's author/description and rewrite dust_preset.ini.
+    void UpdatePresetMetadata(int presetIdx, const char* author, const char* description);
+
     const std::vector<PresetInfo>& GetPresets() const { return presets_; }
     int  GetCurrentPreset() const { return currentPreset_; }
     void SetCurrentPreset(int idx) { currentPreset_ = idx; }
@@ -78,6 +105,8 @@ public:
 private:
     std::vector<LoadedEffect> effects_;
     DustHostAPI hostAPI_ = {};
+
+    bool initialized_ = false;
 
     // Preset state
     std::string presetsDir_;            // <effectsDir>/presets/
@@ -95,6 +124,10 @@ private:
     // Preset I/O helpers
     static void EffectConfigLoadFrom(LoadedEffect& le, const std::string& presetDir);
     static void EffectConfigSaveTo(LoadedEffect& le, const std::string& presetDir);
+
+    // Metadata helpers
+    static void ReadPresetMetadata(PresetInfo& info);
+    static void WritePresetMetadata(const PresetInfo& info);
 
     // v3: GPU timing helpers (phase: 0=pre, 1=post)
     void CollectTiming(LoadedEffect& le, ID3D11DeviceContext* ctx, int phase);

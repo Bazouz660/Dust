@@ -148,9 +148,9 @@ static int CAIsEnabled()
 }
 
 static DustSettingDesc gSettingsArray[] = {
-    { "Enabled",    DUST_SETTING_BOOL,  &gCAConfig.enabled,   0.0f,  1.0f,  "Enabled",   nullptr, "Enable or disable chromatic aberration" },
-    { "Strength",   DUST_SETTING_FLOAT, &gCAConfig.strength,  0.0f,  0.02f, "Strength",  nullptr, "Intensity of the RGB fringe at screen edges" },
-    { "Debug View", DUST_SETTING_BOOL,  &gCAConfig.debugView, 0.0f,  1.0f,  "DebugView", nullptr, "Visualize the offset magnitude as a heatmap" },
+    { "Enabled",    DUST_SETTING_BOOL,  &gCAConfig.enabled,   0.0f,  1.0f,  "Enabled",   nullptr, "Enable or disable chromatic aberration",      DUST_PERF_NONE },
+    { "Strength",   DUST_SETTING_FLOAT, &gCAConfig.strength,  0.0f,  0.02f, "Strength",  nullptr, "Intensity of the RGB fringe at screen edges", DUST_PERF_NONE },
+    { "Debug View", DUST_SETTING_BOOL,  &gCAConfig.debugView, 0.0f,  1.0f,  "DebugView", nullptr, "Visualize the offset magnitude as a heatmap", DUST_PERF_NONE },
 };
 
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)

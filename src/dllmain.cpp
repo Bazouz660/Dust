@@ -198,7 +198,7 @@ void GameWorld__mainLoop_GPUSensitiveStuff_hook(GameWorld* thisptr, float time)
     // Watchdog: if Present hasn't fired, periodically retry swap chain discovery.
     // Layer 3 fallback — covers cases where both DustBoot and initial discovery missed.
     // Retries at frame 120, 300, 600, 1200 (then stops — if it hasn't worked by ~20s, give up).
-    if (D3D11Hook::gDeviceCaptured && !D3D11Hook::IsPresentHooked() &&
+    if (!D3D11Hook::IsPresentHooked() &&
         (sLoopCount == 120 || sLoopCount == 300 || sLoopCount == 600 || sLoopCount == 1200))
     {
         Log("WARNING: Present hook has not fired after %llu game loops — attempting recovery",
@@ -326,8 +326,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hModule);
         gDllModule = hModule;
-        // Pin the DLL so FreeLibrary never unmaps it while hooks are active.
-        // KenshiLib trampoline hooks can't be removed, so we must stay loaded.
+        // Pin the DLL so FreeLibrary can never unmap it while KenshiLib trampoline
+        // hooks are still pointing into our code. The hooks can't be removed, so
+        // any unload would leave dangling jumps and crash on the next call.
         {
             char selfPath[MAX_PATH];
             GetModuleFileNameA(hModule, selfPath, MAX_PATH);
@@ -335,8 +336,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
         }
         break;
     case DLL_PROCESS_DETACH:
+        // Tell hook trampolines to pass through to originals; any in-flight call
+        // from another thread (or DXGI) must skip our logic now that teardown
+        // has begun.
         D3D11Hook::SignalShutdown();
-        if (lpReserved) break; // process terminating — OS reclaims everything
+        // lpReserved != nullptr means the process is terminating; the OS reclaims
+        // everything, and running our cleanup after rekenshi has begun unwinding
+        // is what was crashing on exit.
+        if (lpReserved) break;
         DustGUI::Shutdown();
         gEffectLoader.ShutdownAll();
 

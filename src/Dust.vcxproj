@@ -95,6 +95,7 @@
     <ClCompile Include="ResourceRegistry.cpp" />
     <ClCompile Include="EffectLoader.cpp" />
     <ClCompile Include="DustGUI.cpp" />
+    <ClCompile Include="FilePicker.cpp" />
     <ClCompile Include="Survey.cpp" />
     <ClCompile Include="SurveyRecorder.cpp" />
     <ClCompile Include="ShaderMetadata.cpp" />
@@ -121,6 +122,7 @@
     <ClInclude Include="PipelineDetector.h" />
     <ClInclude Include="ResourceRegistry.h" />
     <ClInclude Include="EffectLoader.h" />
+    <ClInclude Include="FilePicker.h" />
     <ClInclude Include="D3D11Hook.h" />
     <ClInclude Include="D3D11StateBlock.h" />
     <ClInclude Include="Survey.h" />
@@ -140,9 +142,6 @@
     <ClInclude Include="stb_image.h" />
     <ClInclude Include="discord_logo.h" />
     <ClInclude Include="github_logo.h" />
-  </ItemGroup>
-  <ItemGroup>
-    <None Include="shaders\fullscreen_vs.hlsl" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

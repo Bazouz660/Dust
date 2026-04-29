@@ -22,6 +22,9 @@ Screen-space ray-traced indirect lighting. Rays are cast per pixel against the d
 [h2]Ambient Occlusion (SSAO)[/h2]
 Adds realistic contact shadows in corners, crevices, and where objects meet the ground. Works directly with the game's lighting, so it looks natural even under different weather and time of day. Automatically adjusts for night scenes.
 
+[h2]Indirect Lighting (SSIL)[/h2]
+Adds a single bounce of indirect light from nearby surfaces. Albedo-weighted accumulation produces colored bleed (red walls cast a red glow, etc.) for richer scene lighting. Cheaper than RTGI and complements SSAO at the same injection point.
+
 [h2]Improved Shadows[/h2]
 Replaces the game's shadow sampling and filter with PCSS (Percentage-Closer Soft Shadows). Shadows get softer the further they are from the casting object, just like real life. Configurable light size, filter radius, and bias. Shadow map resolution can be increased up to 16384 in the settings (requires restart, RTWSM shadows only).
 
@@ -43,10 +46,28 @@ Edge detection from depth and normal discontinuities. Configurable thickness, st
 [h2]Kuwahara Filter[/h2]
 Anisotropic painterly filter that smooths flat regions while preserving edges for a hand-painted look.
 
+[h2]SMAA[/h2]
+Subpixel morphological anti-aliasing to clean up jagged edges left by the game's forward-rendered geometry. Three modes: luma, depth, or combined edge detection.
+
+[h2]Deband[/h2]
+Removes the visible color banding in skies and soft gradients caused by 8-bit quantization. Optional sky-only mode keeps the noise off detailed surfaces.
+
+[h2]Chromatic Aberration[/h2]
+Subtle lens-style color fringing that grows toward the screen edges. A single Strength slider controls the magnitude.
+
+[h2]Vignette[/h2]
+Smooth darkening around the edges of the frame, with circular or rectangular falloff and adjustable radius, softness, and strength.
+
+[h2]Film Grain[/h2]
+Animated noise on top of the final image. Adjustable intensity and grain size, with optional per-channel chromatic mode.
+
+[h2]Letterbox[/h2]
+Cinematic black bars to constrain the visible image to a target aspect ratio (default 2.35:1). Bar color and opacity are configurable.
+
 [h1]Features[/h1]
 [list]
 [*] [b]In-game settings (F11)[/b]: Tweak every effect in real-time with sliders, save your settings, reset anytime
-[*] [b]Preset system[/b]: Quick-switch between Low, Medium, High, and Ultra presets, share custom presets within the community
+[*] [b]Preset system[/b]: Quick-switch between Low, Medium, High, and Ultra presets (plus cinematic and stylized variants), share custom presets within the community
 [*] [b]Performance overlay[/b]: See exactly how much GPU time each effect costs
 [*] [b]Hot-reloadable configs[/b]: Edit .ini files while the game is running
 [*] [b]Plugin system[/b]: Effects are separate DLLs, anyone can create and share new ones

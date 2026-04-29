@@ -177,8 +177,7 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 }
 )";
 
-// Bilateral blur — horizontal.
-// Blur step scales with resolution (reference: 1080p).
+// Guided filter blur — pass 1 (positive gather offsets).
 static const char* g_SSAOBlurHPS = R"(
 Texture2D<float> aoTex     : register(t0);
 Texture2D<float> depthTex  : register(t1);
@@ -204,37 +203,42 @@ cbuffer SSAOParams : register(b0)
     float  blurSharpness;
 };
 
-static const int BLUR_RADIUS = 6;
-static const float REFERENCE_HEIGHT = 1080.0;
-static const float weights[13] = {
-    0.0044, 0.0115, 0.0257, 0.0488, 0.0799, 0.1122, 0.1350,
-    0.1122, 0.0799, 0.0488, 0.0257, 0.0115, 0.0044
-};
-
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 {
     float centerDepth = depthTex.Sample(samPoint, uv);
-    float depthThresh = centerDepth * blurSharpness + 0.00001;
-    float totalAO = 0.0, totalWeight = 0.0;
+    float4 mv = 0;
+    float4 ao, depth;
 
-    float stepScale = viewportSize.y / REFERENCE_HEIGHT;
+    ao    = aoTex.Gather(samPoint, uv + float2(-0.5, -0.5) * invViewportSize);
+    depth = depthTex.Gather(samPoint, uv + float2(-0.5, -0.5) * invViewportSize);
+    mv   += float4(dot(depth, 1), dot(depth, depth), dot(ao, 1), dot(ao, depth));
 
-    [unroll]
-    for (int i = -BLUR_RADIUS; i <= BLUR_RADIUS; i++)
-    {
-        float2 sampleUV = uv + float2(float(i) * stepScale * invViewportSize.x, 0.0);
-        float ao = aoTex.Sample(samPoint, sampleUV);
-        float d = depthTex.Sample(samPoint, sampleUV);
-        float w = weights[i + BLUR_RADIUS] * ((abs(d - centerDepth) < depthThresh) ? 1.0 : 0.0);
-        totalAO += ao * w;
-        totalWeight += w;
-    }
+    ao    = aoTex.Gather(samPoint, uv + float2(1.5, -0.5) * invViewportSize);
+    depth = depthTex.Gather(samPoint, uv + float2(1.5, -0.5) * invViewportSize);
+    mv   += float4(dot(depth, 1), dot(depth, depth), dot(ao, 1), dot(ao, depth));
 
-    return float4(totalAO / max(totalWeight, 0.0001), 0, 0, 1);
+    ao    = aoTex.Gather(samPoint, uv + float2(-0.5, 1.5) * invViewportSize);
+    depth = depthTex.Gather(samPoint, uv + float2(-0.5, 1.5) * invViewportSize);
+    mv   += float4(dot(depth, 1), dot(depth, depth), dot(ao, 1), dot(ao, depth));
+
+    ao    = aoTex.Gather(samPoint, uv + float2(1.5, 1.5) * invViewportSize);
+    depth = depthTex.Gather(samPoint, uv + float2(1.5, 1.5) * invViewportSize);
+    mv   += float4(dot(depth, 1), dot(depth, depth), dot(ao, 1), dot(ao, depth));
+
+    mv /= 16.0;
+
+    float depth_var  = mv.y - mv.x * mv.x;
+    float covariance = mv.w - mv.x * mv.z;
+    float relVar = depth_var / max(centerDepth * centerDepth, 1e-10);
+    float epsilon = exp2(relVar > 0.01 ? -12.0 : -30.0);
+
+    float b = covariance / max(depth_var, epsilon);
+    float a = mv.z - b * mv.x;
+    return float4(saturate(a + b * centerDepth), 0, 0, 1);
 }
 )";
 
-// Bilateral blur — vertical.
+// Guided filter blur — pass 2 (negative gather offsets).
 static const char* g_SSAOBlurVPS = R"(
 Texture2D<float> aoTex     : register(t0);
 Texture2D<float> depthTex  : register(t1);
@@ -260,33 +264,38 @@ cbuffer SSAOParams : register(b0)
     float  blurSharpness;
 };
 
-static const int BLUR_RADIUS = 6;
-static const float REFERENCE_HEIGHT = 1080.0;
-static const float weights[13] = {
-    0.0044, 0.0115, 0.0257, 0.0488, 0.0799, 0.1122, 0.1350,
-    0.1122, 0.0799, 0.0488, 0.0257, 0.0115, 0.0044
-};
-
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 {
     float centerDepth = depthTex.Sample(samPoint, uv);
-    float depthThresh = centerDepth * blurSharpness + 0.00001;
-    float totalAO = 0.0, totalWeight = 0.0;
+    float4 mv = 0;
+    float4 ao, depth;
 
-    float stepScale = viewportSize.y / REFERENCE_HEIGHT;
+    ao    = aoTex.Gather(samPoint, uv + float2(0.5, 0.5) * invViewportSize);
+    depth = depthTex.Gather(samPoint, uv + float2(0.5, 0.5) * invViewportSize);
+    mv   += float4(dot(depth, 1), dot(depth, depth), dot(ao, 1), dot(ao, depth));
 
-    [unroll]
-    for (int i = -BLUR_RADIUS; i <= BLUR_RADIUS; i++)
-    {
-        float2 sampleUV = uv + float2(0.0, float(i) * stepScale * invViewportSize.y);
-        float ao = aoTex.Sample(samPoint, sampleUV);
-        float d = depthTex.Sample(samPoint, sampleUV);
-        float w = weights[i + BLUR_RADIUS] * ((abs(d - centerDepth) < depthThresh) ? 1.0 : 0.0);
-        totalAO += ao * w;
-        totalWeight += w;
-    }
+    ao    = aoTex.Gather(samPoint, uv + float2(-1.5, 0.5) * invViewportSize);
+    depth = depthTex.Gather(samPoint, uv + float2(-1.5, 0.5) * invViewportSize);
+    mv   += float4(dot(depth, 1), dot(depth, depth), dot(ao, 1), dot(ao, depth));
 
-    return float4(totalAO / max(totalWeight, 0.0001), 0, 0, 1);
+    ao    = aoTex.Gather(samPoint, uv + float2(0.5, -1.5) * invViewportSize);
+    depth = depthTex.Gather(samPoint, uv + float2(0.5, -1.5) * invViewportSize);
+    mv   += float4(dot(depth, 1), dot(depth, depth), dot(ao, 1), dot(ao, depth));
+
+    ao    = aoTex.Gather(samPoint, uv + float2(-1.5, -1.5) * invViewportSize);
+    depth = depthTex.Gather(samPoint, uv + float2(-1.5, -1.5) * invViewportSize);
+    mv   += float4(dot(depth, 1), dot(depth, depth), dot(ao, 1), dot(ao, depth));
+
+    mv /= 16.0;
+
+    float depth_var  = mv.y - mv.x * mv.x;
+    float covariance = mv.w - mv.x * mv.z;
+    float relVar = depth_var / max(centerDepth * centerDepth, 1e-10);
+    float epsilon = exp2(relVar > 0.01 ? -12.0 : -30.0);
+
+    float b = covariance / max(depth_var, epsilon);
+    float a = mv.z - b * mv.x;
+    return float4(saturate(a + b * centerDepth), 0, 0, 1);
 }
 )";
 

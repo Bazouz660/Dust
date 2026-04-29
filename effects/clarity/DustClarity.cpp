@@ -87,11 +87,11 @@ static int ClarityIsEnabled()
 // ==================== GUI Settings ====================
 
 static DustSettingDesc gSettingsArray[] = {
-    { "Enabled",          DUST_SETTING_BOOL,  &gClarityConfig.enabled,        0.0f, 1.0f,  "Enabled",        nullptr, "Enable or disable the clarity effect" },
-    { "Strength",         DUST_SETTING_FLOAT, &gClarityConfig.strength,       0.0f, 2.0f,  "Strength",       nullptr, "Intensity of local contrast enhancement" },
-    { "Midtone Protect",  DUST_SETTING_FLOAT, &gClarityConfig.midtoneProtect, 0.0f, 1.0f,  "MidtoneProtect", nullptr, "Protect midtones from over-sharpening (0 = no protection)" },
-    { "Blur Radius",      DUST_SETTING_FLOAT, &gClarityConfig.blurRadius,     1.0f, 32.0f, "BlurRadius",     nullptr, "Size of the detail extraction blur" },
-    { "Debug View",       DUST_SETTING_BOOL,  &gClarityConfig.debugView,      0.0f, 1.0f,  "DebugView",      nullptr, "Show the extracted detail layer" },
+    { "Enabled",          DUST_SETTING_BOOL,  &gClarityConfig.enabled,        0.0f, 1.0f,  "Enabled",        nullptr, "Enable or disable the clarity effect",                    DUST_PERF_LOW    },
+    { "Strength",         DUST_SETTING_FLOAT, &gClarityConfig.strength,       0.0f, 2.0f,  "Strength",       nullptr, "Intensity of local contrast enhancement",                 DUST_PERF_NONE   },
+    { "Midtone Protect",  DUST_SETTING_FLOAT, &gClarityConfig.midtoneProtect, 0.0f, 1.0f,  "MidtoneProtect", nullptr, "Protect midtones from over-sharpening (0 = no protection)", DUST_PERF_NONE },
+    { "Blur Radius",      DUST_SETTING_FLOAT, &gClarityConfig.blurRadius,     1.0f, 32.0f, "BlurRadius",     nullptr, "Size of the detail extraction blur",                      DUST_PERF_HIGH   },
+    { "Debug View",       DUST_SETTING_BOOL,  &gClarityConfig.debugView,      0.0f, 1.0f,  "DebugView",      nullptr, "Show the extracted detail layer",                         DUST_PERF_NONE   },
 };
 
 // Plugin entry point

@@ -72,11 +72,11 @@ static int KuwaharaIsEnabled()
 }
 
 static DustSettingDesc gSettingsArray[] = {
-    { "Enabled",    DUST_SETTING_BOOL,  &gKuwaharaConfig.enabled,    0.0f,  1.0f,  "Enabled",   nullptr, "Enable or disable the Kuwahara filter" },
-    { "Radius",     DUST_SETTING_INT,   &gKuwaharaConfig.radius,     2.0f,  8.0f,  "Radius",    nullptr, "Filter kernel radius (larger = more stylized)" },
-    { "Strength",   DUST_SETTING_FLOAT, &gKuwaharaConfig.strength,   0.0f,  1.0f,  "Strength",  nullptr, "Blend factor between original and filtered image" },
-    { "Sharpness",  DUST_SETTING_FLOAT, &gKuwaharaConfig.sharpness,  1.0f,  16.0f, "Sharpness", nullptr, "Edge preservation sharpness (higher = crisper boundaries)" },
-    { "Debug View", DUST_SETTING_BOOL,  &gKuwaharaConfig.debugView,  0.0f,  1.0f,  "DebugView", nullptr, "Show the filtered result without blending" },
+    { "Enabled",    DUST_SETTING_BOOL,  &gKuwaharaConfig.enabled,    0.0f,  1.0f,  "Enabled",   nullptr, "Enable or disable the Kuwahara filter",                     DUST_PERF_MEDIUM },
+    { "Radius",     DUST_SETTING_INT,   &gKuwaharaConfig.radius,     2.0f,  8.0f,  "Radius",    nullptr, "Filter kernel radius (larger = more stylized)",             DUST_PERF_HIGH },
+    { "Strength",   DUST_SETTING_FLOAT, &gKuwaharaConfig.strength,   0.0f,  1.0f,  "Strength",  nullptr, "Blend factor between original and filtered image",          DUST_PERF_NONE },
+    { "Sharpness",  DUST_SETTING_FLOAT, &gKuwaharaConfig.sharpness,  1.0f,  16.0f, "Sharpness", nullptr, "Edge preservation sharpness (higher = crisper boundaries)", DUST_PERF_NONE },
+    { "Debug View", DUST_SETTING_BOOL,  &gKuwaharaConfig.debugView,  0.0f,  1.0f,  "DebugView", nullptr, "Show the filtered result without blending",                 DUST_PERF_NONE },
 };
 
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)

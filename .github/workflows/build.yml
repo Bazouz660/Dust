@@ -18,8 +18,82 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          submodules: true
-          lfs: true
+          submodules: false
+          lfs: false
+
+      # Init submodules WITHOUT smudging LFS. KenshiLib_Examples_deps stores
+      # KenshiLib.lib + Ogre/MyGUI .libs + boost.zip in upstream LFS, but that
+      # account's budget is exhausted intermittently. Dust only actually links
+      # against KenshiLib.lib (Ogre/MyGUI .libs are unused) and only needs Boost
+      # at the header level, so we skip LFS entirely and fetch what we need
+      # from public mirrors below.
+      - name: Init submodules without LFS smudge
+        shell: bash
+        env:
+          GIT_LFS_SKIP_SMUDGE: '1'
+        run: |
+          git submodule sync --recursive
+          git submodule update --init --recursive --depth=1
+          # --depth=1 omits tag refs, which `git describe` needs below to map
+          # the pinned commit back to a release tag. Pull just the tag refs.
+          git -C external/KenshiLib fetch origin --tags --depth=1
+
+      - name: Resolve KenshiLib release tag
+        id: kenshilib
+        shell: bash
+        run: |
+          set -eu
+          tag=$(git -C external/KenshiLib describe --tags --exact-match HEAD 2>/dev/null || true)
+          if [ -z "$tag" ]; then
+            sha=$(git -C external/KenshiLib rev-parse HEAD)
+            echo "ERROR: KenshiLib submodule HEAD ($sha) is not on a tagged release."
+            echo "       Pin it to a release tag (e.g. v0.2.1) so the .lib can be fetched"
+            echo "       from KenshiReclaimer/KenshiLib's release assets."
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "KenshiLib release tag: $tag"
+
+      - name: Cache KenshiLib.lib
+        id: kenshilib_cache
+        uses: actions/cache@v4
+        with:
+          path: external/KenshiLib_Examples_deps/KenshiLib/Libraries/KenshiLib.lib
+          key: kenshilib-${{ steps.kenshilib.outputs.tag }}-v1
+
+      - name: Fetch KenshiLib.lib from release assets
+        if: steps.kenshilib_cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -eu
+          tag="${{ steps.kenshilib.outputs.tag }}"
+          url="https://github.com/KenshiReclaimer/KenshiLib/releases/download/${tag}/KenshiLib_${tag}.zip"
+          dest="external/KenshiLib_Examples_deps/KenshiLib/Libraries"
+          mkdir -p "$dest"
+          curl -fL --ssl-no-revoke -o /tmp/KenshiLib_${tag}.zip "$url"
+          unzip -j -o /tmp/KenshiLib_${tag}.zip "KenshiLib.lib" -d "$dest"
+          ls -l "$dest/KenshiLib.lib"
+
+      - name: Cache Boost 1.60 headers
+        id: boost_cache
+        uses: actions/cache@v4
+        with:
+          path: external/KenshiLib_Examples_deps/boost_1_60_0/boost
+          key: boost-1.60.0-headers-v1
+
+      - name: Fetch Boost 1.60 headers
+        if: steps.boost_cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -eu
+          curl -fL --ssl-no-revoke -o /tmp/boost.tar.bz2 \
+            "https://archives.boost.io/release/1.60.0/source/boost_1_60_0.tar.bz2"
+          mkdir -p /tmp/boost-extract
+          tar -xjf /tmp/boost.tar.bz2 -C /tmp/boost-extract boost_1_60_0/boost
+          mkdir -p external/KenshiLib_Examples_deps/boost_1_60_0
+          # Replace any existing boost/ dir with the freshly extracted one.
+          rm -rf external/KenshiLib_Examples_deps/boost_1_60_0/boost
+          mv /tmp/boost-extract/boost_1_60_0/boost external/KenshiLib_Examples_deps/boost_1_60_0/boost
 
       - name: Resolve version
         id: version
@@ -34,11 +108,6 @@ jobs:
             echo "value=0.0.0-dev.$SHORT_SHA" >> "$GITHUB_OUTPUT"
             echo "label=dev-$SHORT_SHA" >> "$GITHUB_OUTPUT"
           fi
-
-      - name: Extract Boost headers
-        run: |
-          cd external\KenshiLib_Examples_deps\boost_1_60_0
-          tar -xf boost.zip
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v3
@@ -85,8 +154,6 @@ jobs:
           msbuild effects\ssil\DustSSIL.vcxproj
           /p:Configuration=Release
           /p:Platform=x64
-
-      # SSS is disabled for now (not ready for release)
 
       - name: Build Clarity plugin (DustClarity.dll)
         run: >
