@@ -523,6 +523,22 @@ DebugView=0
 
 All build dependencies ([KenshiLib](https://github.com/KenshiReclaimer/KenshiLib), [KenshiLib_Examples_deps](https://github.com/BFrizzleFoShizzle/KenshiLib_Examples_deps)) are included as git submodules in the `external/` directory.
 
+#### Side-stepping the deps repo's LFS
+
+`KenshiLib_Examples_deps` stores `KenshiLib.lib` and a Boost archive in Git LFS. Dust only links `KenshiLib.lib` and only needs Boost as headers, so we skip LFS on submodule checkout and fetch what we need from public mirrors:
+
+- `KenshiLib.lib` is downloaded from the matching `KenshiReclaimer/KenshiLib` GitHub release (regular release asset, no LFS).
+- Boost 1.60 headers come from `archives.boost.io`.
+
+CI handles this automatically (cached by KenshiLib release tag and Boost version). For a local setup:
+
+```bash
+GIT_LFS_SKIP_SMUDGE=1 git submodule update --init --recursive
+powershell.exe -ExecutionPolicy Bypass -File ./tools/fetch_external_libs.ps1
+```
+
+The script is idempotent; pass `-Force` to redownload. The KenshiLib submodule must be on a tagged release commit (e.g. `v0.2.1`) for the `.lib` URL to resolve.
+
 ### Build
 
 **Framework (Dust.dll):**
