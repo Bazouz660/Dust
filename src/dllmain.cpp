@@ -13,6 +13,23 @@
 
 static HMODULE gDllModule = nullptr;
 
+// ==================== Shutdown exception filter ====================
+// Once our DllMain DETACH has run (gShutdownSignaled), any further unhandled
+// exception is post-cleanup noise — typically RE_Kenshi/Kenshi shutdown bugs
+// that surface now that our hook trampolines pass through cleanly instead of
+// crashing first. Swallow these to avoid the OS error dialog. Real bugs
+// during gameplay still go through to the previous filter (RE_Kenshi's).
+
+static LPTOP_LEVEL_EXCEPTION_FILTER gPreviousExceptionFilter = nullptr;
+
+static LONG WINAPI DustShutdownExceptionFilter(EXCEPTION_POINTERS* ep)
+{
+    if (D3D11Hook::IsShutdownSignaled())
+        TerminateProcess(GetCurrentProcess(), 0);
+    return gPreviousExceptionFilter ? gPreviousExceptionFilter(ep)
+                                    : EXCEPTION_CONTINUE_SEARCH;
+}
+
 // ==================== Utility ====================
 
 static std::string GetModuleDir(HMODULE hModule)
@@ -147,6 +164,11 @@ void GameWorld__mainLoop_GPUSensitiveStuff_hook(GameWorld* thisptr, float time)
 // Do NOT use extern "C" here.
 __declspec(dllexport) void startPlugin()
 {
+    // Install our shutdown exception filter as early as possible. Chains to
+    // RE_Kenshi's filter (installed earlier) so legitimate gameplay crashes
+    // still surface their dialog.
+    gPreviousExceptionFilter = SetUnhandledExceptionFilter(DustShutdownExceptionFilter);
+
     // Init logging (reads Logging=1/0 from Dust.ini next to the DLL)
     DustLogInit(gDllModule);
 

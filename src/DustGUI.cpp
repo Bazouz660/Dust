@@ -559,9 +559,9 @@ static void ApplyDustTheme(const std::string& name)
         c[ImGuiCol_CheckMark]             = ImVec4(0.78f, 0.66f, 0.36f, 1.00f);
         c[ImGuiCol_SliderGrab]            = ImVec4(0.58f, 0.48f, 0.30f, 1.00f);
         c[ImGuiCol_SliderGrabActive]      = ImVec4(0.78f, 0.66f, 0.36f, 1.00f);
-        c[ImGuiCol_Button]                = ImVec4(0.24f, 0.22f, 0.18f, 0.90f);
-        c[ImGuiCol_ButtonHovered]         = ImVec4(0.40f, 0.34f, 0.24f, 0.95f);
-        c[ImGuiCol_ButtonActive]          = ImVec4(0.56f, 0.46f, 0.28f, 1.00f);
+        c[ImGuiCol_Button]                = ImVec4(0.34f, 0.29f, 0.20f, 0.95f);
+        c[ImGuiCol_ButtonHovered]         = ImVec4(0.52f, 0.43f, 0.26f, 1.00f);
+        c[ImGuiCol_ButtonActive]          = ImVec4(0.70f, 0.56f, 0.32f, 1.00f);
         c[ImGuiCol_Header]                = ImVec4(0.24f, 0.22f, 0.18f, 0.85f);
         c[ImGuiCol_HeaderHovered]         = ImVec4(0.38f, 0.32f, 0.22f, 0.90f);
         c[ImGuiCol_HeaderActive]          = ImVec4(0.50f, 0.42f, 0.26f, 1.00f);

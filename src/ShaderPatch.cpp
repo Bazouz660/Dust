@@ -138,10 +138,7 @@ static std::string PatchDeferredShader(const std::string& src)
             "\n"
             "\tfloat fr = dustFilterRadius;\n"
             "\tfloat ls = dustLightSize;\n"
-            "\tfloat3 ld = normalize(shadowMatrix[2].xyz);\n"
-            "\tfloat NdotL = abs(dot(normal, ld));\n"
-            "\tfloat b_center = b;\n"
-            "\tb += fr * dustBiasScale * (1.0 - NdotL);\n"
+            "\tb += fr * dustBiasScale;\n"
             "\n"
             "\tif (dustPCSSEnabled > 0.5) {\n"
             "\t\tfloat bSum = 0;\n"
@@ -163,9 +160,10 @@ static std::string PatchDeferredShader(const std::string& src)
             "\t\t}\n"
             "\t}\n"
             "\n"
+            "\tfloat3 ld = normalize(shadowMatrix[2].xyz);\n"
+            "\tfloat NdotL = abs(dot(normal, ld));\n"
             "\tfr *= max(sqrt(NdotL), 0.15);\n"
             "\n"
-            "\tfloat centerS = ShadowMap(sMap, center, sd, b_center, 0);\n"
             "\tfloat shadow = 0;\n"
             "\t[unroll]\n"
             "\tfor (int i = 0; i < 12; i++) {\n"
@@ -174,7 +172,7 @@ static std::string PatchDeferredShader(const std::string& src)
             "\t\tshadow += ShadowMap(sMap, suv, sd, b, 0);\n"
             "\t}\n"
             "\tshadow /= 12.0;\n"
-            "\treturn min(shadow, centerS);\n"
+            "\treturn shadow;\n"
             "}\n\n";
         result.insert(pos3, inject3);
         Log("ShaderPatch: injected DustShadowParams cbuffer + DustRTWShadow function");
