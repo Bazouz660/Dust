@@ -1,6 +1,7 @@
 #include "EffectLoader.h"
 #include "ResourceRegistry.h"
 #include "D3D11StateBlock.h"
+#include "D3D11Hook.h"
 #include "DustLog.h"
 #include <d3dcompiler.h>
 #include <cstring>
@@ -397,6 +398,7 @@ void EffectLoader::BuildHostAPI()
     hostAPI_.CreateConstantBuffer   = HostCreateConstantBuffer;
     hostAPI_.UpdateConstantBuffer   = HostUpdateConstantBuffer;
     hostAPI_.GetPreFogHDR           = HostGetPreFogHDR;
+    hostAPI_.SetShadowAtlasResolution = D3D11Hook::SetShadowAtlasResolution;
 }
 
 // ==================== v3: Config I/O ====================

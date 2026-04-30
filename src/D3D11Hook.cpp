@@ -53,8 +53,38 @@ static std::vector<SurveyFrameData> sSurveyFrames;
 static bool gDeviceRemovedThisFrame = false;
 static volatile bool gShutdownSignaled = false;
 
+// True once the game has progressed past loader/splash. Set by SignalGameAlive
+// from either TitleScreen::show(true) (main menu reached) or GameWorld::mainLoop
+// (in-game reached). Anything Presenting before this is loader/splash code
+// (Havok loader window, etc.) — initializing ImGui against a window that's
+// about to be destroyed is what crashes some users on startup.
+static volatile bool gGameAlive = false;
+
+// Latched on the first Present we accept after gGameAlive flips. VTable
+// hooks fire on every swap chain that shares the vtable; we only want to act
+// on the game's main one.
+static IDXGISwapChain* gCanonicalSwapChain = nullptr;
+
+// Plugin-supplied override for the shadow atlas dimension (square). 0 = no
+// override; HookedCreateTexture2D rewrites the desc when this is non-zero
+// and the descriptor matches the shadow atlas / depth signature.
+static UINT gShadowAtlasOverride = 0;
+
+void SetShadowAtlasResolution(UINT size) { gShadowAtlasOverride = size; }
+UINT GetShadowAtlasResolution()          { return gShadowAtlasOverride; }
+
+void SignalGameAlive(const char* via)
+{
+    if (!gGameAlive)
+    {
+        gGameAlive = true;
+        Log("Game alive (via %s) — splash/loader phase complete", via ? via : "?");
+    }
+}
+
 void ResetFrameState()
 {
+    SignalGameAlive("GameWorld::mainLoop");
     gPipelineDetector.ResetFrame();
     gResourceRegistry.ResetFrame();
     gDispatchedThisFrame = false;
@@ -488,6 +518,31 @@ static const char* FormatName(DXGI_FORMAT f)
     }
 }
 
+// Detects the shadow atlas pair: R32_FLOAT color (RTV+SRV) and
+// D32_FLOAT/R32_TYPELESS depth (DSV, optionally SRV). The game's "shadow
+// resolution" setting actually picks 1024/2048/4096 — we accept any square
+// power-of-two in that range. The 512^2 RTW intermediate is excluded by
+// the 1024 floor; no other pipeline output is square R32_FLOAT/D32 in this
+// size range (see docs/pipeline/00_overview.md).
+static bool IsShadowAtlasDesc(const D3D11_TEXTURE2D_DESC* d)
+{
+    if (!d) return false;
+    if (d->Width != d->Height) return false;
+    if (!IsPowerOf2(d->Width)) return false;
+    if (d->Width < 1024 || d->Width > 16384) return false;
+    if (d->ArraySize != 1) return false;
+    if (d->MipLevels != 1) return false;
+
+    bool hasSRV = (d->BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0;
+    bool hasRTV = (d->BindFlags & D3D11_BIND_RENDER_TARGET) != 0;
+    bool hasDSV = (d->BindFlags & D3D11_BIND_DEPTH_STENCIL) != 0;
+
+    if (d->Format == DXGI_FORMAT_R32_FLOAT && hasRTV && hasSRV) return true;
+    if ((d->Format == DXGI_FORMAT_D32_FLOAT ||
+         d->Format == DXGI_FORMAT_R32_TYPELESS) && hasDSV) return true;
+    return false;
+}
+
 static HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
     ID3D11Device* pThis, const D3D11_TEXTURE2D_DESC* pDesc,
     const D3D11_SUBRESOURCE_DATA* pInitialData, ID3D11Texture2D** ppTexture2D)
@@ -508,6 +563,19 @@ static HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
                 hasSRV ? "SRV " : "", hasRTV ? "RTV " : "", hasDSV ? "DSV " : "");
 
         }
+    }
+
+    UINT override = gShadowAtlasOverride;
+    if (override != 0 && IsShadowAtlasDesc(pDesc) && pDesc->Width != override)
+    {
+        D3D11_TEXTURE2D_DESC modDesc = *pDesc;
+        modDesc.Width  = override;
+        modDesc.Height = override;
+        Log("Shadow atlas override: %ux%u %s -> %ux%u",
+            pDesc->Width, pDesc->Height,
+            FormatName(pDesc->Format) ? FormatName(pDesc->Format) : "?",
+            override, override);
+        return oCreateTexture2D(pThis, &modDesc, pInitialData, ppTexture2D);
     }
 
     return oCreateTexture2D(pThis, pDesc, pInitialData, ppTexture2D);
@@ -766,12 +834,53 @@ static void TickGuiOnPresent(IDXGISwapChain* swapChain, const char* via)
     if (gPresentHookCallCount <= 5 ||
         (gPresentHookCallCount <= 600 && (gPresentHookCallCount % 60) == 0))
     {
-        Log("Present #%llu via %s: captured=%d guiDone=%d boot=%d draws=%llu",
-            (unsigned long long)gPresentHookCallCount, via,
+        Log("Present #%llu via %s: sc=%p captured=%d guiDone=%d boot=%d draws=%llu",
+            (unsigned long long)gPresentHookCallCount, via, swapChain,
             (int)gDeviceCaptured,
             (int)gGuiInitDone,
             (int)sTryCaptureFromBoot,
             (unsigned long long)gDrawHookCallCount);
+    }
+
+    // Splash/loader filter. Slow-startup machines (e.g. Iblis: Havok loader
+    // takes seconds) Present a transient splash swap chain before the main
+    // game one — initializing ImGui against a window that's about to be
+    // destroyed crashes when the loader exits.
+    //
+    // Two-stage gate by Kenshi-side lifecycle events, not pointer heuristics:
+    //   1. Skip everything until SignalGameAlive() fires (either the title
+    //      screen has become visible, or the in-game loop has started). By
+    //      definition, anything Presenting before that is pre-game.
+    //   2. After the game is alive, latch the first Present we see. VTable
+    //      hooks fire on every swap chain sharing the vtable, so we filter
+    //      later Presents to that single swap chain.
+    if (!gGameAlive)
+    {
+        static int sLogCount = 0;
+        if (sLogCount < 3)
+        {
+            Log("Skipping pre-game Present on swap chain %p (loader/splash phase)",
+                swapChain);
+            ++sLogCount;
+        }
+        return;
+    }
+
+    if (!gCanonicalSwapChain)
+    {
+        gCanonicalSwapChain = swapChain;
+        Log("Canonical game swap chain latched: %p (after game loop alive)", swapChain);
+    }
+    else if (swapChain != gCanonicalSwapChain)
+    {
+        static int sLogCount = 0;
+        if (sLogCount < 3)
+        {
+            Log("Ignoring Present on non-canonical swap chain %p (canonical=%p)",
+                swapChain, gCanonicalSwapChain);
+            ++sLogCount;
+        }
+        return;
     }
 
     // Survey: finalize frame at Present boundary

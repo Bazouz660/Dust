@@ -170,6 +170,12 @@ typedef struct DustHostAPI {
     // before fog/atmosphere was drawn. Available from POST_FOG and POST_TONEMAP.
     // Returns NULL if POST_LIGHTING hasn't fired yet this frame.
     ID3D11ShaderResourceView* (*GetPreFogHDR)(void);
+
+    // Override the game's shadow atlas resolution. Pass 0 to disable override
+    // (game's default 4096 is used). Takes effect at the next CreateTexture2D
+    // for the shadow atlas — since the atlas is created once at world load,
+    // changes after that point require a game restart.
+    void (*SetShadowAtlasResolution)(uint32_t size);
 } DustHostAPI;
 
 // Performance impact hint for a single setting (API v3.2+).

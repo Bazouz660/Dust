@@ -93,12 +93,36 @@ static std::string PatchDeferredShader(const std::string& src)
             "\tfloat dustCliffFixEnabled;\n"
             "\tfloat dustCliffFixDistance;\n"
             "};\n\n"
+            // The warp map is 513x2 R32_FLOAT, sampled by vanilla GetOffsetLocationS
+            // with tex2Dlod. The warp sampler is point-filtered, so adjacent screen
+            // pixels can fall into different warp-map texels and snap to discretely
+            // different shadow-map lookups — visible as "squares" whose screen size
+            // grows with the warp gradient. Manually bilerp the warp value to remove
+            // that quantization (4 taps total, vs vanilla's 2; warp map is tiny, all
+            // taps stay in cache).
+            "// [Dust] Bilinear warp lookup (replacement for point-sampled GetOffsetLocationS)\n"
+            "float DustWarp1D(sampler2D wMap, float u, float row) {\n"
+            "\tconst float kWarpW = 513.0;\n"
+            "\tfloat p = u * kWarpW - 0.5;\n"
+            "\tfloat pf = clamp(floor(p), 0.0, kWarpW - 2.0);\n"
+            "\tfloat t = saturate(p - pf);\n"
+            "\tfloat u0 = (pf + 0.5) / kWarpW;\n"
+            "\tfloat u1 = (pf + 1.5) / kWarpW;\n"
+            "\tfloat v0 = tex2Dlod(wMap, float4(u0, row, 0, 0)).x;\n"
+            "\tfloat v1 = tex2Dlod(wMap, float4(u1, row, 0, 0)).x;\n"
+            "\treturn lerp(v0, v1, t);\n"
+            "}\n"
+            "float2 DustGetOffsetLocationS(sampler2D wMap, float2 ts) {\n"
+            "\tts.x += DustWarp1D(wMap, ts.x, 0.25);\n"
+            "\tts.y += DustWarp1D(wMap, ts.y, 0.75);\n"
+            "\treturn ts;\n"
+            "}\n\n"
             "// [Dust] Improved RTWSM shadow filtering (post-warp offsets)\n"
             "float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,\n"
             "                     float3 worldPos, float b, float edgeBias, float2 screenPos,\n"
             "                     float3 normal, float dist, float shadowRange) {\n"
             "\tfloat4 sc = mul(shadowMatrix, float4(worldPos, 1));\n"
-            "\tfloat2 center = GetOffsetLocationS(wMap, sc.xy);\n"
+            "\tfloat2 center = DustGetOffsetLocationS(wMap, sc.xy);\n"
             "\tfloat2 edge = saturate(abs(center - 0.5) * 20 - 9);\n"
             "\tb += edgeBias * (edge.x + edge.y);\n"
             "\tfloat sd = saturate(sc.z);\n"

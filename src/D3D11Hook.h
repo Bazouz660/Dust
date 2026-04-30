@@ -26,4 +26,17 @@ namespace D3D11Hook
     // we begin teardown must skip our logic to avoid touching freed state.
     void SignalShutdown();
     bool IsShutdownSignaled();
+
+    // Signal that the game has progressed past the loader/splash phase.
+    // Either the title screen has become visible (TitleScreen::show(true))
+    // or the in-game loop has started — both mean it is safe to attach ImGui
+    // to whatever swap chain is presenting. Until one of these fires, every
+    // Present is treated as splash/loader and ignored.
+    void SignalGameAlive(const char* via);
+
+    // Plugin-driven override for the shadow atlas resolution. 0 disables the
+    // override (game default 4096 used). Read by HookedCreateTexture2D when
+    // the game creates the 4096^2 shadow atlas / depth pair.
+    void SetShadowAtlasResolution(UINT size);
+    UINT GetShadowAtlasResolution();
 }

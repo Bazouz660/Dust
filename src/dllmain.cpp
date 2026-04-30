@@ -3,6 +3,7 @@
 
 // KenshiLib headers
 #include <kenshi/GameWorld.h>
+#include <kenshi/gui/TitleScreen.h>
 #include <core/Functions.h>
 
 // Dust framework
@@ -12,23 +13,6 @@
 #include "EffectLoader.h"
 
 static HMODULE gDllModule = nullptr;
-
-// ==================== Shutdown exception filter ====================
-// Once our DllMain DETACH has run (gShutdownSignaled), any further unhandled
-// exception is post-cleanup noise — typically RE_Kenshi/Kenshi shutdown bugs
-// that surface now that our hook trampolines pass through cleanly instead of
-// crashing first. Swallow these to avoid the OS error dialog. Real bugs
-// during gameplay still go through to the previous filter (RE_Kenshi's).
-
-static LPTOP_LEVEL_EXCEPTION_FILTER gPreviousExceptionFilter = nullptr;
-
-static LONG WINAPI DustShutdownExceptionFilter(EXCEPTION_POINTERS* ep)
-{
-    if (D3D11Hook::IsShutdownSignaled())
-        TerminateProcess(GetCurrentProcess(), 0);
-    return gPreviousExceptionFilter ? gPreviousExceptionFilter(ep)
-                                    : EXCEPTION_CONTINUE_SEARCH;
-}
 
 // ==================== Utility ====================
 
@@ -158,17 +142,25 @@ void GameWorld__mainLoop_GPUSensitiveStuff_hook(GameWorld* thisptr, float time)
     GameWorld__mainLoop_GPUSensitiveStuff_orig(thisptr, time);
 }
 
+// ==================== Title screen hook ====================
+// Earliest reliable signal that the game is past the splash/loader phase.
+// Fires when Kenshi's main menu becomes visible — well before any save loads.
+
+void (*TitleScreen__show_orig)(TitleScreen* thisptr, bool on) = nullptr;
+
+void TitleScreen__show_hook(TitleScreen* thisptr, bool on)
+{
+    if (on)
+        D3D11Hook::SignalGameAlive("TitleScreen::show");
+    TitleScreen__show_orig(thisptr, on);
+}
+
 // ==================== Plugin entry point ====================
 
 // RE_Kenshi calls GetProcAddress(plugin, "?startPlugin@@YAXXZ") — C++ mangled name.
 // Do NOT use extern "C" here.
 __declspec(dllexport) void startPlugin()
 {
-    // Install our shutdown exception filter as early as possible. Chains to
-    // RE_Kenshi's filter (installed earlier) so legitimate gameplay crashes
-    // still surface their dialog.
-    gPreviousExceptionFilter = SetUnhandledExceptionFilter(DustShutdownExceptionFilter);
-
     // Init logging (reads Logging=1/0 from Dust.ini next to the DLL)
     DustLogInit(gDllModule);
 
@@ -206,6 +198,19 @@ __declspec(dllexport) void startPlugin()
     }
 
     Log("Game loop hook installed");
+
+    // Hook TitleScreen::show — earliest reliable "game is past splash" signal,
+    // so the GUI can attach during the main menu rather than waiting for a
+    // save to load. Non-fatal if it fails — game-loop hook is the fallback.
+    KenshiLib::HookStatus titleStatus = KenshiLib::AddHook(
+        KenshiLib::GetRealAddress(&TitleScreen::_NV_show),
+        &TitleScreen__show_hook,
+        &TitleScreen__show_orig);
+
+    if (titleStatus != KenshiLib::SUCCESS)
+        Log("WARNING: Failed to hook TitleScreen::show — GUI will only attach once a save loads");
+    else
+        Log("Title screen hook installed");
 
     // Install D3D11 hooks — creates a temporary device to discover function
     // addresses, then hooks them via KenshiLib::AddHook. The real device/context
