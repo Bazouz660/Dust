@@ -3,8 +3,11 @@
 #include "SurveyRecorder.h"
 #include "D3D11Hook.h"
 
+#include <d3d11shader.h>
+#include <d3dcompiler.h>
 #include <string>
 #include <cstring>
+#include <cstdio>
 
 namespace ShaderPatch
 {
@@ -83,8 +86,14 @@ static std::string PatchDeferredShader(const std::string& src)
             "";
 
         std::string inject3 =
-            "// [Dust] Shadow filtering parameters (bound by Shadows plugin at b2)\n"
-            "cbuffer DustShadowParams : register(b2) {\n"
+            // Use b7 not b2: CSM's auto-allocated $Globals cbuffer can land
+            // on b2 due to its larger uniform array footprint (csmParams,
+            // csmScale, csmTrans, csmUvBounds = 4 * SHADOW_MAP_COUNT vec4s).
+            // Our plugin's PSSetConstantBuffers(7, ...) then doesn't clobber
+            // game data. RTW happened to work at b2 because its uniform set
+            // is much smaller and stays in b0.
+            "// [Dust] Shadow filtering parameters (bound by Shadows plugin at b7)\n"
+            "cbuffer DustShadowParams : register(b7) {\n"
             "\tfloat dustShadowEnabled;\n"
             "\tfloat dustFilterRadius;\n"
             "\tfloat dustLightSize;\n"
@@ -199,7 +208,7 @@ static std::string PatchDeferredShader(const std::string& src)
             "\treturn shadow;\n"
             "}\n\n";
         result.insert(pos3, inject3);
-        Log("ShaderPatch: injected DustShadowParams cbuffer + DustRTWShadow function");
+        Log("ShaderPatch: injected DustShadowParams cbuffer + DustRTWShadow");
     }
     else
     {
@@ -319,6 +328,53 @@ static std::string PatchObjectsShader(const std::string& src)
     return result;
 }
 
+// Diagnostic: dump patched HLSL source to disk + log the compiled shader's
+// resource binding layout (cbuffer slots, sampler slots, texture slots).
+// This is ground truth for which registers are actually used — no guessing
+// about whether a slot is free vs. occupied.
+static void DumpPatchedShader(const std::string& source, const void* bytecode, SIZE_T bytecodeSize)
+{
+    static int sCounter = 0;
+    int idx = sCounter++;
+
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%sDust_shader_%03d.hlsl", DustLogDir().c_str(), idx);
+    FILE* f = fopen(path, "wb");
+    if (f) { fwrite(source.c_str(), 1, source.size(), f); fclose(f); }
+
+    if (!bytecode || bytecodeSize == 0) return;
+
+    ID3D11ShaderReflection* reflector = nullptr;
+    if (FAILED(D3DReflect(bytecode, bytecodeSize, IID_ID3D11ShaderReflection, (void**)&reflector)) ||
+        !reflector)
+        return;
+
+    D3D11_SHADER_DESC desc = {};
+    reflector->GetDesc(&desc);
+    Log("Patched shader %d: %u cbuffers, %u bound resources, %u instructions",
+        idx, desc.ConstantBuffers, desc.BoundResources, desc.InstructionCount);
+
+    for (UINT i = 0; i < desc.BoundResources; i++)
+    {
+        D3D11_SHADER_INPUT_BIND_DESC bd = {};
+        if (FAILED(reflector->GetResourceBindingDesc(i, &bd))) continue;
+
+        const char* typeStr = "?";
+        switch (bd.Type)
+        {
+            case D3D_SIT_CBUFFER:   typeStr = "cbuffer";   break;
+            case D3D_SIT_TBUFFER:   typeStr = "tbuffer";   break;
+            case D3D_SIT_TEXTURE:   typeStr = "texture";   break;
+            case D3D_SIT_SAMPLER:   typeStr = "sampler";   break;
+            default: break;
+        }
+        Log("  [%2u] %-16s slot=%2u count=%u  %s",
+            i, typeStr, bd.BindPoint, bd.BindCount, bd.Name ? bd.Name : "?");
+    }
+
+    reflector->Release();
+}
+
 HRESULT WINAPI HookedD3DCompile(
     LPCVOID pSrcData, SIZE_T SrcDataSize, LPCSTR pSourceName,
     const D3D_SHADER_MACRO* pDefines, ID3DInclude* pInclude,
@@ -352,9 +408,13 @@ HRESULT WINAPI HookedD3DCompile(
                 {
                     // Record shader source for survey (use patched source)
                     if (ppCode && *ppCode)
+                    {
                         SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
                             pEntrypoint, pTarget, pSourceName,
                             (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+                        DumpPatchedShader(patched, (*ppCode)->GetBufferPointer(),
+                            (*ppCode)->GetBufferSize());
+                    }
                     return hr;
                 }
 

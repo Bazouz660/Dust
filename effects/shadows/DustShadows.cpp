@@ -303,13 +303,15 @@ static void ShadowPreExecute(const DustFrameContext* ctx, const DustHostAPI* hos
     data.pad0             = 0.0f;
 
     host->UpdateConstantBuffer(ctx->context, gCB, &data, sizeof(data));
-    ctx->context->PSSetConstantBuffers(2, 1, &gCB);
+    // Bind to b7: b2 collides with CSM's auto-allocated $Globals cbuffer
+    // (which holds csmParams arrays). See ShaderPatch.cpp for details.
+    ctx->context->PSSetConstantBuffers(7, 1, &gCB);
 }
 
 static void ShadowPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
 {
     ID3D11Buffer* nullCB = nullptr;
-    ctx->context->PSSetConstantBuffers(2, 1, &nullCB);
+    ctx->context->PSSetConstantBuffers(7, 1, &nullCB);
 }
 
 static int ShadowIsEnabled() { return 1; }
