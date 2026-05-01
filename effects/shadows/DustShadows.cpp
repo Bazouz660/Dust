@@ -249,7 +249,7 @@ struct alignas(16) ShadowCBData {
     float biasScale;
     float cliffFixEnabled;
     float cliffFixDistance;
-    float pad0;
+    float csmFilterScale;
 };
 
 static int ShadowInit(ID3D11Device* device, uint32_t w, uint32_t h, const DustHostAPI* host)
@@ -300,7 +300,10 @@ static void ShadowPreExecute(const DustFrameContext* ctx, const DustHostAPI* hos
     data.biasScale        = gConfig.biasScale;
     data.cliffFixEnabled  = gConfig.cliffFix ? 1.0f : 0.0f;
     data.cliffFixDistance = gConfig.cliffFixDistance;
-    data.pad0             = 0.0f;
+    // CSM uses gConfig.filterRadius as a raw multiplier on csmParams[i][1]
+    // (vanilla per-cascade PCF radius). RTW uses the same slider value but
+    // multiplied by 0.001 above for UV-space. Same slider, two interpretations.
+    data.csmFilterScale   = gConfig.filterRadius;
 
     host->UpdateConstantBuffer(ctx->context, gCB, &data, sizeof(data));
     // Bind to b7: b2 collides with CSM's auto-allocated $Globals cbuffer

@@ -101,6 +101,7 @@ static std::string PatchDeferredShader(const std::string& src)
             "\tfloat dustBiasScale;\n"
             "\tfloat dustCliffFixEnabled;\n"
             "\tfloat dustCliffFixDistance;\n"
+            "\tfloat dustCsmFilterScale;\n"
             "};\n\n"
             // The warp map is 513x2 R32_FLOAT, sampled by vanilla GetOffsetLocationS
             // with tex2Dlod. The warp sampler is point-filtered, so adjacent screen
@@ -206,9 +207,41 @@ static std::string PatchDeferredShader(const std::string& src)
             "\t}\n"
             "\tshadow /= 12.0;\n"
             "\treturn shadow;\n"
+            "}\n\n"
+            // CSM filter wrapper: scales the per-cascade PCF filter radius
+            // (csmParams[i][1] = kCsmPcfFilterRadius) by user-controllable
+            // dustCsmFilterScale before forwarding to vanilla. Cascade
+            // selection, sampleProj basis, and PCF kernel are vanilla — only
+            // the radius changes. Disabled flag falls back to scale = 1.0.
+            "float DustCascadeShadow(\n"
+            "\tfloat4 shadowParams,\n"
+            "\tfloat4x4 shadowViewMat,\n"
+            "\tfloat4 csmScale[SHADOW_MAP_COUNT],\n"
+            "\tfloat4 csmTrans[SHADOW_MAP_COUNT],\n"
+            "\tfloat4 csmParams[SHADOW_MAP_COUNT],\n"
+            "\tfloat4 csmUvBounds[SHADOW_MAP_COUNT],\n"
+            "\tsampler2D shadowDepthMap,\n"
+            "\tsampler2D shadowJitterMap,\n"
+            "\tfloat4 posWs,\n"
+            "\tfloat4 posSs,\n"
+            "\tfloat3 normalWs,\n"
+            "\tout float3 debugColorMask)\n"
+            "{\n"
+            "\tfloat radiusScale = (dustShadowEnabled > 0.5) ? dustCsmFilterScale : 1.0;\n"
+            "\tfloat4 modCsmParams[SHADOW_MAP_COUNT];\n"
+            "\t[unroll]\n"
+            "\tfor (int i = 0; i < SHADOW_MAP_COUNT; i++) {\n"
+            "\t\tmodCsmParams[i] = csmParams[i];\n"
+            "\t\tmodCsmParams[i][1] *= radiusScale;\n"
+            "\t}\n"
+            "\treturn computeShadowMultiplier(\n"
+            "\t\tshadowParams, shadowViewMat,\n"
+            "\t\tcsmScale, csmTrans, modCsmParams, csmUvBounds,\n"
+            "\t\tshadowDepthMap, shadowJitterMap,\n"
+            "\t\tposWs, posSs, normalWs, debugColorMask);\n"
             "}\n\n";
         result.insert(pos3, inject3);
-        Log("ShaderPatch: injected DustShadowParams cbuffer + DustRTWShadow");
+        Log("ShaderPatch: injected DustShadowParams cbuffer + DustRTWShadow + DustCascadeShadow passthrough");
     }
     else
     {
@@ -250,6 +283,22 @@ static std::string PatchDeferredShader(const std::string& src)
     else
     {
         Log("ShaderPatch: '= RTWShadow(' not found, shadow redirect skipped");
+    }
+
+    // CSM passthrough redirect: replace `shadow = computeShadowMultiplier(`
+    // with `shadow = DustCascadeShadow(`. The argument list is identical, so
+    // this is a pure name swap; no ternary, no out-param-in-ternary issues.
+    const char* csmCallAnchor = "shadow = computeShadowMultiplier(";
+    size_t csmAnchorPos = result.find(csmCallAnchor);
+    if (csmAnchorPos != std::string::npos)
+    {
+        const char* csmReplacement = "shadow = DustCascadeShadow(";
+        result.replace(csmAnchorPos, strlen(csmCallAnchor), csmReplacement);
+        Log("ShaderPatch: redirected computeShadowMultiplier -> DustCascadeShadow (passthrough)");
+    }
+    else
+    {
+        Log("ShaderPatch: '= computeShadowMultiplier(' not found, CSM redirect skipped");
     }
 
     return result;
@@ -370,6 +419,30 @@ static void DumpPatchedShader(const std::string& source, const void* bytecode, S
         }
         Log("  [%2u] %-16s slot=%2u count=%u  %s",
             i, typeStr, bd.BindPoint, bd.BindCount, bd.Name ? bd.Name : "?");
+    }
+
+    // Walk cbuffer variables to show array element counts. Tells us things
+    // like the actual SHADOW_MAP_COUNT (= csmParams[].Elements) without
+    // having to guess from the source.
+    for (UINT i = 0; i < desc.ConstantBuffers; i++)
+    {
+        ID3D11ShaderReflectionConstantBuffer* cb = reflector->GetConstantBufferByIndex(i);
+        if (!cb) continue;
+        D3D11_SHADER_BUFFER_DESC cbDesc = {};
+        if (FAILED(cb->GetDesc(&cbDesc))) continue;
+        Log("  cbuffer '%s': %u vars, %u bytes", cbDesc.Name, cbDesc.Variables, cbDesc.Size);
+        for (UINT j = 0; j < cbDesc.Variables; j++)
+        {
+            ID3D11ShaderReflectionVariable* var = cb->GetVariableByIndex(j);
+            if (!var) continue;
+            D3D11_SHADER_VARIABLE_DESC vDesc = {};
+            if (FAILED(var->GetDesc(&vDesc))) continue;
+            ID3D11ShaderReflectionType* type = var->GetType();
+            D3D11_SHADER_TYPE_DESC tDesc = {};
+            if (type) type->GetDesc(&tDesc);
+            Log("    %-24s offset=%4u size=%4u elements=%u",
+                vDesc.Name ? vDesc.Name : "?", vDesc.StartOffset, vDesc.Size, tDesc.Elements);
+        }
     }
 
     reflector->Release();

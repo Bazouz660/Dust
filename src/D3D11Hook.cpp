@@ -16,6 +16,10 @@
 #include <string>
 #include <cstring>
 #include <vector>
+#include <unordered_set>
+#include <unordered_map>
+#include <mutex>
+#include <atomic>
 
 namespace D3D11Hook
 {
@@ -957,15 +961,190 @@ static HRESULT STDMETHODCALLTYPE HookedResizeBuffers(
     return hr;
 }
 
+// ==================== CSM cascade matrix interception ====================
+// Phase 1: instrumentation only — track CSM-mode deferred $Params cbuffers
+// (608 bytes per D3DReflect) and log their cascade matrix contents. This is
+// the source-of-truth dump we need before deciding how to rewrite values.
+//
+// Cbuffer layout (from logged D3DReflect output, $Params for CSM main_fs):
+//   csmParams   @ 208, 4x float4   (per-cascade: split, filter radius, fixed bias, depth radius)
+//   csmScale    @ 272, 4x float4   (per-cascade: world->atlas-uv scale)
+//   csmTrans    @ 336, 4x float4   (per-cascade: world->atlas-uv translate)
+//   csmUvBounds @ 400, 4x float4   (per-cascade: atlas tile UV bounds)
+
+namespace CSMIntercept
+{
+    static const UINT kCbSize           = 608;
+    static const UINT kCsmParamsOffset  = 208;
+    static const UINT kCsmScaleOffset   = 272;
+    static const UINT kCsmTransOffset   = 336;
+    static const UINT kCsmUvBoundsOffset = 400;
+    static const UINT kCsmCount         = 4;
+
+    static std::unordered_set<ID3D11Buffer*>           sTracked;
+    static std::unordered_map<ID3D11Buffer*, void*>    sMapped;  // resource -> mapped pointer
+    static std::mutex                                  sMutex;
+    static std::atomic<int>                            sUpdateCounter{0};
+    static std::atomic<int>                            sUnmapCounter{0};
+
+    static void DumpCascades(const void* pSrcData)
+    {
+        const float* params = (const float*)((const char*)pSrcData + kCsmParamsOffset);
+        const float* scale  = (const float*)((const char*)pSrcData + kCsmScaleOffset);
+        const float* trans  = (const float*)((const char*)pSrcData + kCsmTransOffset);
+        const float* bounds = (const float*)((const char*)pSrcData + kCsmUvBoundsOffset);
+        for (UINT i = 0; i < kCsmCount; i++)
+        {
+            const float* p = params + i*4;
+            const float* s = scale  + i*4;
+            const float* t = trans  + i*4;
+            const float* b = bounds + i*4;
+            Log("CSM[%u]: params=(%.3f, %.4f, %.5f, %.4f)", i, p[0], p[1], p[2], p[3]);
+            Log("       scale=(%.5f, %.5f, %.5f) trans=(%.5f, %.5f, %.5f)",
+                s[0], s[1], s[2], t[0], t[1], t[2]);
+            Log("       uvBounds=(%.3f, %.3f, %.3f, %.3f)", b[0], b[1], b[2], b[3]);
+        }
+    }
+}
+
+typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateBuffer)(
+    ID3D11Device*, const D3D11_BUFFER_DESC*, const D3D11_SUBRESOURCE_DATA*, ID3D11Buffer**);
+typedef void (STDMETHODCALLTYPE* PFN_UpdateSubresource)(
+    ID3D11DeviceContext*, ID3D11Resource*, UINT, const D3D11_BOX*,
+    const void*, UINT, UINT);
+typedef HRESULT (STDMETHODCALLTYPE* PFN_Map)(
+    ID3D11DeviceContext*, ID3D11Resource*, UINT,
+    D3D11_MAP, UINT, D3D11_MAPPED_SUBRESOURCE*);
+typedef void (STDMETHODCALLTYPE* PFN_Unmap)(
+    ID3D11DeviceContext*, ID3D11Resource*, UINT);
+
+static PFN_CreateBuffer       oCreateBuffer       = nullptr;
+static PFN_UpdateSubresource  oUpdateSubresource  = nullptr;
+static PFN_Map                oMap                = nullptr;
+static PFN_Unmap              oUnmap              = nullptr;
+
+static HRESULT STDMETHODCALLTYPE HookedCreateBuffer(
+    ID3D11Device* pThis, const D3D11_BUFFER_DESC* pDesc,
+    const D3D11_SUBRESOURCE_DATA* pInitialData, ID3D11Buffer** ppBuffer)
+{
+    if (gShutdownSignaled) return oCreateBuffer(pThis, pDesc, pInitialData, ppBuffer);
+
+    HRESULT hr = oCreateBuffer(pThis, pDesc, pInitialData, ppBuffer);
+    if (SUCCEEDED(hr) && pDesc && ppBuffer && *ppBuffer &&
+        (pDesc->BindFlags & D3D11_BIND_CONSTANT_BUFFER) &&
+        pDesc->ByteWidth == CSMIntercept::kCbSize)
+    {
+        std::lock_guard<std::mutex> lock(CSMIntercept::sMutex);
+        CSMIntercept::sTracked.insert(*ppBuffer);
+        Log("CSMIntercept: tracked cbuffer %p (size=%u)", *ppBuffer, pDesc->ByteWidth);
+    }
+    return hr;
+}
+
+static void STDMETHODCALLTYPE HookedUpdateSubresource(
+    ID3D11DeviceContext* pThis, ID3D11Resource* pDstResource, UINT DstSubresource,
+    const D3D11_BOX* pDstBox, const void* pSrcData, UINT SrcRowPitch, UINT SrcDepthPitch)
+{
+    if (gShutdownSignaled)
+    {
+        oUpdateSubresource(pThis, pDstResource, DstSubresource, pDstBox,
+                           pSrcData, SrcRowPitch, SrcDepthPitch);
+        return;
+    }
+
+    bool tracked = false;
+    if (pDstResource && pSrcData)
+    {
+        // Cheap pointer-only check — UpdateSubresource is hot. Avoid QueryInterface
+        // by reinterpreting (cbuffers and other ID3D11Buffer share vtable layout
+        // with ID3D11Resource so the pointer compares directly).
+        std::lock_guard<std::mutex> lock(CSMIntercept::sMutex);
+        if (CSMIntercept::sTracked.count((ID3D11Buffer*)pDstResource))
+            tracked = true;
+    }
+
+    if (tracked)
+    {
+        // Throttle: log first 3 calls, then once every ~600 calls (~10s @ 60fps)
+        int n = CSMIntercept::sUpdateCounter.fetch_add(1);
+        if (n < 3 || (n % 600) == 0)
+        {
+            Log("CSMIntercept: UpdateSubresource on %p (call #%d)", pDstResource, n);
+            CSMIntercept::DumpCascades(pSrcData);
+        }
+    }
+
+    oUpdateSubresource(pThis, pDstResource, DstSubresource, pDstBox,
+                       pSrcData, SrcRowPitch, SrcDepthPitch);
+}
+
+static HRESULT STDMETHODCALLTYPE HookedMap(
+    ID3D11DeviceContext* pThis, ID3D11Resource* pResource, UINT Subresource,
+    D3D11_MAP MapType, UINT MapFlags, D3D11_MAPPED_SUBRESOURCE* pMappedResource)
+{
+    if (gShutdownSignaled)
+        return oMap(pThis, pResource, Subresource, MapType, MapFlags, pMappedResource);
+
+    HRESULT hr = oMap(pThis, pResource, Subresource, MapType, MapFlags, pMappedResource);
+
+    // Stash the mapped pointer so HookedUnmap can read/modify the data right
+    // before commit. Only track if the resource is in our cbuffer set.
+    if (SUCCEEDED(hr) && pResource && pMappedResource && pMappedResource->pData)
+    {
+        std::lock_guard<std::mutex> lock(CSMIntercept::sMutex);
+        ID3D11Buffer* buf = (ID3D11Buffer*)pResource;
+        if (CSMIntercept::sTracked.count(buf))
+            CSMIntercept::sMapped[buf] = pMappedResource->pData;
+    }
+    return hr;
+}
+
+static void STDMETHODCALLTYPE HookedUnmap(
+    ID3D11DeviceContext* pThis, ID3D11Resource* pResource, UINT Subresource)
+{
+    if (gShutdownSignaled) { oUnmap(pThis, pResource, Subresource); return; }
+
+    void* mappedData = nullptr;
+    if (pResource)
+    {
+        std::lock_guard<std::mutex> lock(CSMIntercept::sMutex);
+        ID3D11Buffer* buf = (ID3D11Buffer*)pResource;
+        auto it = CSMIntercept::sMapped.find(buf);
+        if (it != CSMIntercept::sMapped.end())
+        {
+            mappedData = it->second;
+            CSMIntercept::sMapped.erase(it);
+        }
+    }
+
+    if (mappedData)
+    {
+        // Phase 1: log only. Mapped buffer holds the cascade data the GPU is
+        // about to receive — read it before the original Unmap commits.
+        int n = CSMIntercept::sUnmapCounter.fetch_add(1);
+        if (n < 3 || (n % 600) == 0)
+        {
+            Log("CSMIntercept: Unmap on %p (call #%d)", pResource, n);
+            CSMIntercept::DumpCascades(mappedData);
+        }
+    }
+
+    oUnmap(pThis, pResource, Subresource);
+}
+
 // ==================== Install ====================
 
+static const int VTIDX_DEVICE_CreateBuffer          = 3;
 static const int VTIDX_DEVICE_CreateTexture2D       = 5;
 static const int VTIDX_DEVICE_CreateVertexShader    = 12;
 static const int VTIDX_DEVICE_CreatePixelShader     = 15;
 static const int VTIDX_CTX_DrawIndexed              = 12;
 static const int VTIDX_CTX_Draw                     = 13;
+static const int VTIDX_CTX_Map                      = 14;
+static const int VTIDX_CTX_Unmap                    = 15;
 static const int VTIDX_CTX_DrawIndexedInstanced     = 20;
 static const int VTIDX_CTX_OMSetRenderTargets       = 33;
+static const int VTIDX_CTX_UpdateSubresource        = 48;
 // VTIDX_SC_* constants moved to top of file (needed by deferred hook code)
 
 bool Install()
@@ -1013,6 +1192,7 @@ bool Install()
     void** ctxVtable = *reinterpret_cast<void***>(tmpContext);
     void** scVtable  = *reinterpret_cast<void***>(tmpSwapChain);
 
+    void* addrCreateBuffer = devVtable[VTIDX_DEVICE_CreateBuffer];
     void* addrCreateTex2D  = devVtable[VTIDX_DEVICE_CreateTexture2D];
     void* addrCreateVS     = devVtable[VTIDX_DEVICE_CreateVertexShader];
     void* addrCreatePS     = devVtable[VTIDX_DEVICE_CreatePixelShader];
@@ -1020,6 +1200,9 @@ bool Install()
     void* addrDrawIndexed  = ctxVtable[VTIDX_CTX_DrawIndexed];
     void* addrDrawIdxInst  = ctxVtable[VTIDX_CTX_DrawIndexedInstanced];
     void* addrOMSetRT      = ctxVtable[VTIDX_CTX_OMSetRenderTargets];
+    void* addrUpdateSubres = ctxVtable[VTIDX_CTX_UpdateSubresource];
+    void* addrMap          = ctxVtable[VTIDX_CTX_Map];
+    void* addrUnmap        = ctxVtable[VTIDX_CTX_Unmap];
     void* addrPresent      = scVtable[VTIDX_SC_Present];
     void* addrResizeBuf    = scVtable[VTIDX_SC_ResizeBuffers];
 
@@ -1093,6 +1276,22 @@ bool Install()
         std::string ini = DustLogDir() + "Dust.ini";
         Survey::InitFromINI(ini.c_str());
     }
+
+    if (KenshiLib::AddHook(addrCreateBuffer, (void*)HookedCreateBuffer,
+                           (void**)&oCreateBuffer) != KenshiLib::SUCCESS)
+    { Log("WARNING: Failed to hook CreateBuffer (CSM cbuffer tracking disabled)"); }
+
+    if (KenshiLib::AddHook(addrUpdateSubres, (void*)HookedUpdateSubresource,
+                           (void**)&oUpdateSubresource) != KenshiLib::SUCCESS)
+    { Log("WARNING: Failed to hook UpdateSubresource (CSM cbuffer tracking disabled)"); }
+
+    if (KenshiLib::AddHook(addrMap, (void*)HookedMap,
+                           (void**)&oMap) != KenshiLib::SUCCESS)
+    { Log("WARNING: Failed to hook Map (CSM cbuffer tracking disabled)"); }
+
+    if (KenshiLib::AddHook(addrUnmap, (void*)HookedUnmap,
+                           (void**)&oUnmap) != KenshiLib::SUCCESS)
+    { Log("WARNING: Failed to hook Unmap (CSM cbuffer tracking disabled)"); }
 
     if (KenshiLib::AddHook(addrCreateTex2D, (void*)HookedCreateTexture2D,
                            (void**)&oCreateTexture2D) != KenshiLib::SUCCESS)
