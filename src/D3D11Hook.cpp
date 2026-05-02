@@ -1117,17 +1117,9 @@ static void STDMETHODCALLTYPE HookedUnmap(
         }
     }
 
-    if (mappedData)
-    {
-        // Phase 1: log only. Mapped buffer holds the cascade data the GPU is
-        // about to receive — read it before the original Unmap commits.
-        int n = CSMIntercept::sUnmapCounter.fetch_add(1);
-        if (n < 3 || (n % 600) == 0)
-        {
-            Log("CSMIntercept: Unmap on %p (call #%d)", pResource, n);
-            CSMIntercept::DumpCascades(mappedData);
-        }
-    }
+    // (mappedData is a hook point for future cbuffer modification — read/write
+    // before the original Unmap commits the data to the GPU. Currently a no-op.)
+    (void)mappedData;
 
     oUnmap(pThis, pResource, Subresource);
 }
