@@ -25,9 +25,40 @@ static std::string GetModuleDir(HMODULE hModule)
     return (pos != std::string::npos) ? s.substr(0, pos + 1) : s;
 }
 
+// True if `dir` looks like a Kenshi install root (has a `data/` subfolder —
+// vanilla data is always present regardless of the install method).
+static bool IsKenshiRoot(const std::string& dir)
+{
+    std::string probe = dir + "\\data";
+    DWORD attr = GetFileAttributesA(probe.c_str());
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
 static std::string GetGameDir(HMODULE hModule)
 {
-    // DLL is at <game>/mods/Dust/Dust.dll -- go up 2 dirs
+    // Start from the running executable's directory and walk up looking for
+    // a Kenshi root marker. Handles three cases:
+    //   - exe is Kenshi.exe in the game root (zero-level climb)
+    //   - exe is RE_Kenshi.exe in <game>/RE_Kenshi/ (one-level climb)
+    //   - other launcher arrangements (a couple of levels up)
+    char exePath[MAX_PATH] = {};
+    if (GetModuleFileNameA(NULL, exePath, MAX_PATH) > 0)
+    {
+        std::string dir(exePath);
+        auto pos = dir.find_last_of("\\/");
+        if (pos != std::string::npos) dir = dir.substr(0, pos);
+
+        for (int i = 0; i < 4; i++)
+        {
+            if (IsKenshiRoot(dir)) return dir + "\\";
+            auto p = dir.find_last_of("\\/");
+            if (p == std::string::npos) break;
+            dir = dir.substr(0, p);
+        }
+    }
+
+    // Fallback: assume DLL is at <game>/mods/Dust/Dust.dll and go up 2 dirs.
+    // Hit only when neither GetModuleFileNameA nor the marker walk worked.
     std::string modDir = GetModuleDir(hModule);
     auto pos = modDir.find_last_of("\\/", modDir.size() - 2);
     if (pos != std::string::npos)
@@ -177,10 +208,11 @@ __declspec(dllexport) void startPlugin()
     std::string modDir = GetModuleDir(gDllModule);
     ManageShaderCache(gameDir, modDir);
 
-    // Load effect plugins from effects/ directory next to the DLL
+    // Load effect plugins from effects/ directory next to the DLL.
+    // gameDir lets the loader scan other mods + Steam Workshop for presets.
     {
         std::string effectsDir = modDir + "effects";
-        int loaded = gEffectLoader.LoadAll(effectsDir.c_str());
+        int loaded = gEffectLoader.LoadAll(effectsDir.c_str(), gameDir.c_str());
         Log("Loaded %d effect plugin(s) from %s", loaded, effectsDir.c_str());
     }
 

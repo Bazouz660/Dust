@@ -640,7 +640,7 @@ float EffectLoader::GetEffectGpuTime(size_t index) const
 
 // ==================== LoadAll ====================
 
-int EffectLoader::LoadAll(const char* effectsDir)
+int EffectLoader::LoadAll(const char* effectsDir, const char* gameDir)
 {
     BuildHostAPI();
 
@@ -656,6 +656,15 @@ int EffectLoader::LoadAll(const char* effectsDir)
             presetsDir_ = eDir.substr(0, pos) + "\\presets";
         else
             presetsDir_ = "presets";
+    }
+
+    // Game root — drives discovery of presets shipped by other mods and
+    // Steam Workshop items. Trailing separator is stripped for consistency.
+    if (gameDir && *gameDir)
+    {
+        gameDir_ = gameDir;
+        while (!gameDir_.empty() && (gameDir_.back() == '\\' || gameDir_.back() == '/'))
+            gameDir_.pop_back();
     }
 
     char searchPath[MAX_PATH];

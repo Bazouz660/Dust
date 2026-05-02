@@ -7,13 +7,40 @@
 #include <cstring>
 
 // ==================== Global Preset System ====================
-// Each preset is a folder under <modRoot>/presets/ containing per-effect INI
-// files plus an optional dust_preset.ini metadata file.
-// e.g. <modRoot>/presets/dust_high/DOF.ini, SSAO.ini, dust_preset.ini, ...
+// A preset is a folder containing dust_preset.ini at its root and effect INIs
+// inside an effects/ subfolder, e.g.
+//   <presetDir>/dust_preset.ini
+//   <presetDir>/effects/SSAO.ini, DOF.ini, ...
+//
+// Layouts by source:
+//   - Local:    <DustMod>/presets/<presetName>/...
+//   - External: <modRoot>/...                 (mod folder IS the preset)
+//
+// For backwards compatibility, EffectConfigLoadFrom also reads <presetDir>/<X>.ini
+// when the new path is absent — so flat-layout presets from older Dust versions
+// keep working until they're saved (which writes to the new path).
 
 // Metadata filename — sentinel that marks a folder as a Dust preset.
 static const char* kPresetMetaFile = "dust_preset.ini";
 static const char* kPresetMetaSection = "Preset";
+// Subfolder holding effect INIs in the canonical preset layout.
+static const char* kEffectsSubdir = "effects";
+
+// Path Dust uses to read effect settings. New canonical location is
+// <presetDir>/effects/<section>.ini; falls back to a flat <presetDir>/<section>.ini
+// for legacy presets that haven't been re-saved yet.
+static std::string EffectIniReadPath(const std::string& presetDir, const std::string& section)
+{
+    std::string newPath = presetDir + "\\" + kEffectsSubdir + "\\" + section + ".ini";
+    if (GetFileAttributesA(newPath.c_str()) != INVALID_FILE_ATTRIBUTES) return newPath;
+    return presetDir + "\\" + section + ".ini";
+}
+
+// Path Dust writes effect settings to. Always the canonical (new) location.
+static std::string EffectIniWritePath(const std::string& presetDir, const std::string& section)
+{
+    return presetDir + "\\" + kEffectsSubdir + "\\" + section + ".ini";
+}
 
 void EffectLoader::ReadPresetMetadata(PresetInfo& info)
 {
@@ -39,6 +66,7 @@ void EffectLoader::ReadPresetMetadata(PresetInfo& info)
     info.metaDescription = buf;
     info.metaVersion    = GetPrivateProfileIntA(kPresetMetaSection, "Version",    0, metaPath.c_str());
     info.metaApiVersion = GetPrivateProfileIntA(kPresetMetaSection, "ApiVersion", 0, metaPath.c_str());
+    info.metaIsDefault  = GetPrivateProfileIntA(kPresetMetaSection, "Default",    0, metaPath.c_str()) != 0;
 }
 
 void EffectLoader::WritePresetMetadata(const PresetInfo& info)
@@ -56,6 +84,12 @@ void EffectLoader::WritePresetMetadata(const PresetInfo& info)
 
     snprintf(buf, sizeof(buf), "%d", DUST_API_VERSION);
     WritePrivateProfileStringA(kPresetMetaSection, "ApiVersion", buf, metaPath.c_str());
+
+    // Preserve the Default flag — set by mod authors via manual INI editing,
+    // not surfaced in the GUI. Only written when set so we don't pollute
+    // user-created INIs with Default=0.
+    if (info.metaIsDefault)
+        WritePrivateProfileStringA(kPresetMetaSection, "Default", "1", metaPath.c_str());
 }
 
 void EffectLoader::EffectConfigLoadFrom(LoadedEffect& le, const std::string& presetDir)
@@ -63,7 +97,7 @@ void EffectLoader::EffectConfigLoadFrom(LoadedEffect& le, const std::string& pre
     const char* section = le.desc.configSection ? le.desc.configSection : le.desc.name;
     if (!section) return;
 
-    std::string iniPath = presetDir + "\\" + std::string(section) + ".ini";
+    std::string iniPath = EffectIniReadPath(presetDir, section);
 
     // If this effect has no INI in the preset, disable it
     DWORD attr = GetFileAttributesA(iniPath.c_str());
@@ -157,10 +191,21 @@ void EffectLoader::EffectConfigSaveTo(LoadedEffect& le, const std::string& prese
     const char* section = le.desc.configSection ? le.desc.configSection : le.desc.name;
     if (!section) return;
 
-    std::string iniPath = presetDir + "\\" + std::string(section) + ".ini";
+    // Ensure the canonical effects/ subfolder exists before writing.
+    std::string effectsDir = presetDir + "\\" + kEffectsSubdir;
+    CreateDirectoryA(effectsDir.c_str(), nullptr);
+
+    std::string iniPath = EffectIniWritePath(presetDir, section);
     char buf[64];
 
     WritePrivateProfileStringA(section, nullptr, nullptr, iniPath.c_str());
+
+    // Migrate away from legacy flat layout: if a same-named INI exists at the
+    // preset root from an older Dust version, drop it so it doesn't shadow
+    // the new file via the read fallback.
+    std::string legacyPath = presetDir + "\\" + std::string(section) + ".ini";
+    if (legacyPath != iniPath)
+        DeleteFileA(legacyPath.c_str());
 
     for (uint32_t i = 0; i < le.desc.settingCount; i++)
     {
@@ -199,6 +244,170 @@ void EffectLoader::EffectConfigSaveTo(LoadedEffect& le, const std::string& prese
     }
 }
 
+// Read <gameDir>/data/mods.cfg into a list of .mod filenames in load order.
+// Returns empty on missing/unreadable. Each line is one mod.
+static std::vector<std::string> ReadModsCfg(const std::string& gameDir)
+{
+    std::vector<std::string> order;
+    if (gameDir.empty()) return order;
+
+    std::string path = gameDir + "\\data\\mods.cfg";
+    FILE* f = fopen(path.c_str(), "r");
+    if (!f)
+    {
+        Log("ReadModsCfg: not found at '%s'", path.c_str());
+        return order;
+    }
+    char line[512];
+    while (fgets(line, sizeof(line), f))
+    {
+        std::string s(line);
+        while (!s.empty() && (s.back() == '\n' || s.back() == '\r' ||
+                              s.back() == ' '  || s.back() == '\t'))
+            s.pop_back();
+        size_t i = 0;
+        while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) i++;
+        if (i > 0) s.erase(0, i);
+        if (!s.empty()) order.push_back(std::move(s));
+    }
+    fclose(f);
+    return order;
+}
+
+// Index of `modFilename` in `loadOrder` (case-insensitive), or -1 if absent.
+// An empty loadOrder is treated as "no mods enabled" — everything returns -1.
+static int LoadOrderIndex(const std::vector<std::string>& loadOrder,
+                          const std::string& modFilename)
+{
+    if (modFilename.empty()) return -1;
+    for (int j = 0; j < (int)loadOrder.size(); j++)
+        if (_stricmp(loadOrder[j].c_str(), modFilename.c_str()) == 0) return j;
+    return -1;
+}
+
+// Enumerate immediate subdirectories of `dir`, calling cb(name, fullPath) for
+// each. Skips "."/"..". Returns the number of entries visited (0 if dir is
+// missing or empty).
+template <typename Fn>
+static int ForEachSubdir(const std::string& dir, Fn cb)
+{
+    char search[MAX_PATH];
+    snprintf(search, sizeof(search), "%s\\*", dir.c_str());
+
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(search, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+
+    int n = 0;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (fd.cFileName[0] == '.') continue;
+        cb(fd.cFileName, dir + "\\" + fd.cFileName);
+        n++;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return n;
+}
+
+// True if `parent\leaf` exists as a regular file.
+static bool FileExistsAt(const std::string& parent, const char* leaf)
+{
+    std::string p = parent + "\\" + leaf;
+    DWORD attr = GetFileAttributesA(p.c_str());
+    return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// Find the first *.mod file in `dir` and return its basename (e.g. "Foo.mod").
+// Empty if no .mod file is present.
+static std::string FindModFilename(const std::string& dir)
+{
+    std::string out;
+    char search[MAX_PATH];
+    snprintf(search, sizeof(search), "%s\\*.mod", dir.c_str());
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(search, &fd);
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY))
+            out = fd.cFileName;
+        FindClose(h);
+    }
+    return out;
+}
+
+static void EmitPreset(std::vector<PresetInfo>& out,
+                       const std::string& path,
+                       const std::string& name,
+                       PresetSource source,
+                       const std::string& sourceLabel,
+                       int loadOrderRank)
+{
+    PresetInfo info;
+    info.name = name;
+    info.path = path;
+    info.source = source;
+    info.sourceLabel = sourceLabel;
+    info.loadOrderRank = loadOrderRank;
+    EffectLoader::ReadPresetMetadata(info);
+    out.push_back(std::move(info));
+}
+
+// Scan the local presets dir — every immediate subfolder is treated as a
+// preset (back-compat with hand-rolled folders that lack dust_preset.ini).
+static void ScanLocalPresets(std::vector<PresetInfo>& out,
+                             const std::string& presetRoot)
+{
+    int n = ForEachSubdir(presetRoot, [&](const char* name, const std::string& path) {
+        EmitPreset(out, path, name, PresetSource::Local, "", -1);
+    });
+    if (n > 0) Log("ScanPresets:   '%s' -> %d preset(s)", presetRoot.c_str(), n);
+}
+
+// A mod folder IS the preset when dust_preset.ini sits at its root. The
+// preset's display name comes from sourceLabel (the mod folder name); its
+// effect INIs live in <modRoot>/effects/.
+static void ScanExternalMod(std::vector<PresetInfo>& out,
+                            const std::string& modRoot,
+                            PresetSource source,
+                            const std::string& sourceLabel,
+                            int loadOrderRank)
+{
+    if (!FileExistsAt(modRoot, kPresetMetaFile)) return;
+    EmitPreset(out, modRoot, sourceLabel, source, sourceLabel, loadOrderRank);
+    Log("ScanPresets:   '%s' -> 1 preset", modRoot.c_str());
+}
+
+// Walk every mod under `containerDir` (the game's mods/ folder or the
+// workshop content folder). Mods absent from loadOrder are skipped, as are
+// Dust's own installs — folders containing Dust.dll — so the framework's
+// bundled presets aren't re-listed when Dust is also subscribed via Workshop.
+static void ScanContainer(std::vector<PresetInfo>& out,
+                          const std::string& containerDir,
+                          PresetSource source,
+                          const std::vector<std::string>& loadOrder)
+{
+    Log("ScanPresets: scanning container '%s'", containerDir.c_str());
+
+    ForEachSubdir(containerDir, [&](const char* name, const std::string& entryDir) {
+        if (FileExistsAt(entryDir, "Dust.dll"))
+        {
+            Log("ScanPresets:   skipping '%s' (Dust install)", name);
+            return;
+        }
+
+        std::string modFilename = FindModFilename(entryDir);
+        int rank = LoadOrderIndex(loadOrder, modFilename);
+        if (rank < 0)
+        {
+            Log("ScanPresets:   skipping '%s' (mod '%s' not enabled in mods.cfg)",
+                name, modFilename.empty() ? "<no .mod file>" : modFilename.c_str());
+            return;
+        }
+
+        ScanExternalMod(out, entryDir, source, name, rank);
+    });
+}
+
 void EffectLoader::ScanPresets()
 {
     presets_.clear();
@@ -206,34 +415,81 @@ void EffectLoader::ScanPresets()
 
     if (presetsDir_.empty()) return;
 
-    // Ensure presets root directory exists
+    Log("ScanPresets: presetsDir='%s' gameDir='%s'",
+        presetsDir_.c_str(), gameDir_.c_str());
+
+    // mods.cfg drives both the disabled-mod filter and load-order ranking.
+    // If missing/empty, no external mods are considered enabled and the
+    // dropdown shows only Local presets.
+    auto loadOrder = ReadModsCfg(gameDir_);
+    Log("ScanPresets: %zu enabled mod(s) per mods.cfg", loadOrder.size());
+
     CreateDirectoryA(presetsDir_.c_str(), nullptr);
 
-    // Enumerate subdirectories
-    char searchPath[MAX_PATH];
-    snprintf(searchPath, sizeof(searchPath), "%s\\*", presetsDir_.c_str());
+    ScanLocalPresets(presets_, presetsDir_);
+    size_t localCount = presets_.size();
 
-    WIN32_FIND_DATAA fd;
-    HANDLE hFind = FindFirstFileA(searchPath, &fd);
-    if (hFind == INVALID_HANDLE_VALUE) return;
+    size_t modCount = 0, workshopCount = 0;
+    if (!gameDir_.empty())
+    {
+        ScanContainer(presets_, gameDir_ + "\\mods", PresetSource::Mod, loadOrder);
+        modCount = presets_.size() - localCount;
 
-    do {
-        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-        if (fd.cFileName[0] == '.') continue; // skip . and ..
+        // 233860 is Kenshi's Steam app id; silently skipped on non-Steam installs.
+        ScanContainer(presets_, gameDir_ + "\\..\\..\\workshop\\content\\233860",
+                      PresetSource::Workshop, loadOrder);
+        workshopCount = presets_.size() - localCount - modCount;
+    }
 
-        PresetInfo info;
-        info.name = fd.cFileName;
-        info.path = presetsDir_ + "\\" + fd.cFileName;
-        ReadPresetMetadata(info); // empty for pre-feature presets — that's OK
-        presets_.push_back(std::move(info));
-    } while (FindNextFileA(hFind, &fd));
-
-    FindClose(hFind);
-
+    // Sort by source first (Local → Mod → Workshop) so the user's own
+    // presets cluster at the top of the dropdown.
     std::sort(presets_.begin(), presets_.end(),
-        [](const PresetInfo& a, const PresetInfo& b) { return a.name < b.name; });
+        [](const PresetInfo& a, const PresetInfo& b) {
+            if (a.source != b.source) return (int)a.source < (int)b.source;
+            if (a.name   != b.name)   return a.name < b.name;
+            return a.sourceLabel < b.sourceLabel;
+        });
 
-    Log("Found %zu global presets in %s", presets_.size(), presetsDir_.c_str());
+    Log("Found %zu preset(s): %zu local, %zu mod, %zu workshop",
+        presets_.size(), localCount, modCount, workshopCount);
+}
+
+int EffectLoader::FindFirstLaunchDefaultIdx() const
+{
+    // External default with the highest load-order rank wins (Kenshi
+    // convention: later mods override earlier).
+    int bestIdx = -1, bestRank = -1;
+    for (int i = 0; i < (int)presets_.size(); i++)
+    {
+        const PresetInfo& p = presets_[i];
+        if (!p.metaIsDefault) continue;
+        if (p.source == PresetSource::Local) continue;
+        if (p.loadOrderRank > bestRank) { bestRank = p.loadOrderRank; bestIdx = i; }
+    }
+    if (bestIdx >= 0)
+    {
+        Log("FindDefault: external default '%s' from '%s' (load-order rank %d)",
+            presets_[bestIdx].name.c_str(),
+            presets_[bestIdx].sourceLabel.c_str(), bestRank);
+        return bestIdx;
+    }
+
+    for (int i = 0; i < (int)presets_.size(); i++)
+        if (presets_[i].metaIsDefault && presets_[i].source == PresetSource::Local)
+        {
+            Log("FindDefault: local default '%s'", presets_[i].name.c_str());
+            return i;
+        }
+
+    for (int i = 0; i < (int)presets_.size(); i++)
+        if (presets_[i].source == PresetSource::Local && presets_[i].name == "dust_high")
+        {
+            Log("FindDefault: falling back to dust_high");
+            return i;
+        }
+
+    Log("FindDefault: no default preset available");
+    return -1;
 }
 
 void EffectLoader::ValidatePreset(int presetIdx)
@@ -251,7 +507,7 @@ void EffectLoader::ValidatePreset(int presetIdx)
         const char* section = le.desc.configSection ? le.desc.configSection : le.desc.name;
         if (!section) continue;
 
-        std::string iniPath = preset.path + "\\" + std::string(section) + ".ini";
+        std::string iniPath = EffectIniReadPath(preset.path, section);
         DWORD attr = GetFileAttributesA(iniPath.c_str());
         if (attr == INVALID_FILE_ATTRIBUTES) continue; // missing INI = disabled, not outdated
 
@@ -343,6 +599,12 @@ void EffectLoader::SavePreset(int presetIdx)
     if (presetIdx < 0 || presetIdx >= (int)presets_.size()) return;
 
     PresetInfo& preset = presets_[presetIdx];
+    if (preset.isReadOnly())
+    {
+        Log("SavePreset: refusing to write to read-only preset '%s' (source=%s)",
+            preset.name.c_str(), preset.sourceLabel.c_str());
+        return;
+    }
     const std::string& presetDir = preset.path;
 
     for (auto& le : effects_)
@@ -391,11 +653,15 @@ int EffectLoader::SavePresetAs(const char* name)
     // Create the preset folder
     CreateDirectoryA(presetDir.c_str(), nullptr);
 
-    // Check if already in list
+    // Check if a *local* preset with this name already exists. We deliberately
+    // ignore Mod/Workshop entries — Save As always targets the local presets
+    // folder, so a name collision with a read-only preset is fine (both
+    // entries coexist, distinguished by source).
     int existingIdx = -1;
     for (int i = 0; i < (int)presets_.size(); i++)
     {
-        if (_stricmp(presets_[i].name.c_str(), safeName.c_str()) == 0)
+        if (presets_[i].source == PresetSource::Local &&
+            _stricmp(presets_[i].name.c_str(), safeName.c_str()) == 0)
         {
             existingIdx = i;
             break;
@@ -413,15 +679,21 @@ int EffectLoader::SavePresetAs(const char* name)
     PresetInfo info;
     info.name = safeName;
     info.path = presetDir;
+    info.source = PresetSource::Local;
     presets_.push_back(info);
 
     std::sort(presets_.begin(), presets_.end(),
-        [](const PresetInfo& a, const PresetInfo& b) { return a.name < b.name; });
+        [](const PresetInfo& a, const PresetInfo& b) {
+            if (a.source != b.source) return (int)a.source < (int)b.source;
+            if (a.name   != b.name)   return a.name < b.name;
+            return a.sourceLabel < b.sourceLabel;
+        });
 
     int newIdx = -1;
     for (int i = 0; i < (int)presets_.size(); i++)
     {
-        if (presets_[i].name == safeName) { newIdx = i; break; }
+        if (presets_[i].source == PresetSource::Local && presets_[i].name == safeName)
+        { newIdx = i; break; }
     }
 
     if (newIdx >= 0)
@@ -437,24 +709,33 @@ void EffectLoader::DeletePreset(int presetIdx)
 {
     if (presetIdx < 0 || presetIdx >= (int)presets_.size()) return;
 
-    const std::string& presetDir = presets_[presetIdx].path;
-
-    // Delete all INI files in the preset folder
-    char searchPath[MAX_PATH];
-    snprintf(searchPath, sizeof(searchPath), "%s\\*.ini", presetDir.c_str());
-
-    WIN32_FIND_DATAA fd;
-    HANDLE hFind = FindFirstFileA(searchPath, &fd);
-    if (hFind != INVALID_HANDLE_VALUE)
+    if (presets_[presetIdx].isReadOnly())
     {
-        do {
-            std::string filePath = presetDir + "\\" + fd.cFileName;
-            DeleteFileA(filePath.c_str());
-        } while (FindNextFileA(hFind, &fd));
-        FindClose(hFind);
+        Log("DeletePreset: refusing to delete read-only preset '%s' (source=%s)",
+            presets_[presetIdx].name.c_str(), presets_[presetIdx].sourceLabel.c_str());
+        return;
     }
 
-    // Remove the directory
+    const std::string& presetDir = presets_[presetIdx].path;
+    auto deleteIniFiles = [](const std::string& dir) {
+        char search[MAX_PATH];
+        snprintf(search, sizeof(search), "%s\\*.ini", dir.c_str());
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA(search, &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            DeleteFileA((dir + "\\" + fd.cFileName).c_str());
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    };
+
+    // Effect INIs live under effects/ in the canonical layout, but legacy
+    // flat-layout presets keep them at the root. Clean both.
+    std::string effectsDir = presetDir + "\\" + kEffectsSubdir;
+    deleteIniFiles(effectsDir);
+    RemoveDirectoryA(effectsDir.c_str());
+    deleteIniFiles(presetDir);
     RemoveDirectoryA(presetDir.c_str());
 
     Log("Deleted global preset '%s'", presets_[presetIdx].name.c_str());
@@ -472,6 +753,12 @@ void EffectLoader::UpdatePresetMetadata(int presetIdx, const char* author, const
     if (presetIdx < 0 || presetIdx >= (int)presets_.size()) return;
 
     PresetInfo& preset = presets_[presetIdx];
+    if (preset.isReadOnly())
+    {
+        Log("UpdatePresetMetadata: refusing to write to read-only preset '%s' (source=%s)",
+            preset.name.c_str(), preset.sourceLabel.c_str());
+        return;
+    }
     preset.metaAuthor      = author      ? author      : "";
     preset.metaDescription = description ? description : "";
     if (preset.metaName.empty()) preset.metaName = preset.name;
@@ -510,9 +797,10 @@ static std::string PathLeaf(const std::string& path)
     return leaf;
 }
 
-// Copy every regular file from srcDir into dstDir (non-recursive — presets are
-// flat). dstDir is created if missing. Returns number of files copied.
-static int CopyFlatDirectory(const std::string& srcDir, const std::string& dstDir)
+// Recursively copy every regular file from srcDir into dstDir, preserving
+// subfolder structure. dstDir (and any subfolders encountered) are created
+// if missing. Returns the total number of files copied.
+static int CopyDirectoryTree(const std::string& srcDir, const std::string& dstDir)
 {
     CreateDirectoryA(dstDir.c_str(), nullptr);
 
@@ -525,36 +813,50 @@ static int CopyFlatDirectory(const std::string& srcDir, const std::string& dstDi
 
     int copied = 0;
     do {
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (fd.cFileName[0] == '.') continue;
         std::string src = srcDir + "\\" + fd.cFileName;
         std::string dst = dstDir + "\\" + fd.cFileName;
-        if (CopyFileA(src.c_str(), dst.c_str(), FALSE))
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        {
+            copied += CopyDirectoryTree(src, dst);
+        }
+        else if (CopyFileA(src.c_str(), dst.c_str(), FALSE))
+        {
             copied++;
+        }
         else
-            Log("CopyFlatDirectory: failed to copy %s -> %s (err=%lu)",
+        {
+            Log("CopyDirectoryTree: failed to copy %s -> %s (err=%lu)",
                 src.c_str(), dst.c_str(), GetLastError());
+        }
     } while (FindNextFileA(hFind, &fd));
     FindClose(hFind);
     return copied;
 }
 
-// Count INI files in a folder (excluding dust_preset.ini).
+// Count effect INIs in a preset folder. Looks at <dir>/effects/*.ini (canonical
+// layout) and falls back to flat <dir>/*.ini (legacy) for folders that haven't
+// been migrated yet. Excludes dust_preset.ini.
 static int CountEffectInis(const std::string& dir)
 {
-    char searchPath[MAX_PATH];
-    snprintf(searchPath, sizeof(searchPath), "%s\\*.ini", dir.c_str());
+    auto countIniFiles = [](const std::string& d) {
+        char search[MAX_PATH];
+        snprintf(search, sizeof(search), "%s\\*.ini", d.c_str());
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA(search, &fd);
+        if (h == INVALID_HANDLE_VALUE) return 0;
+        int n = 0;
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            if (_stricmp(fd.cFileName, kPresetMetaFile) == 0) continue;
+            n++;
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+        return n;
+    };
 
-    WIN32_FIND_DATAA fd;
-    HANDLE hFind = FindFirstFileA(searchPath, &fd);
-    if (hFind == INVALID_HANDLE_VALUE) return 0;
-
-    int n = 0;
-    do {
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        if (_stricmp(fd.cFileName, kPresetMetaFile) == 0) continue;
-        n++;
-    } while (FindNextFileA(hFind, &fd));
-    FindClose(hFind);
+    int n = countIniFiles(dir + "\\" + kEffectsSubdir);
+    if (n == 0) n = countIniFiles(dir);
     return n;
 }
 
@@ -618,11 +920,13 @@ int EffectLoader::ImportPresetFromFolder(const char* srcDir, bool overwrite, std
 
     std::string destDir = presetsDir_ + "\\" + targetName;
 
-    // Collision handling
+    // Collision handling — only check Local entries; Mod/Workshop presets with
+    // the same name are unrelated read-only neighbors and don't conflict.
     int existingIdx = -1;
     for (int i = 0; i < (int)presets_.size(); i++)
     {
-        if (_stricmp(presets_[i].name.c_str(), targetName.c_str()) == 0)
+        if (presets_[i].source == PresetSource::Local &&
+            _stricmp(presets_[i].name.c_str(), targetName.c_str()) == 0)
         {
             existingIdx = i;
             break;
@@ -635,25 +939,28 @@ int EffectLoader::ImportPresetFromFolder(const char* srcDir, bool overwrite, std
         return -1;
     }
 
-    // If overwriting, wipe destination INIs first so stale entries don't persist.
+    // If overwriting, wipe destination INIs first so stale entries don't
+    // persist. Cleans both the canonical effects/ subfolder and any legacy
+    // root-level INIs from older Dust versions.
     if (existingIdx >= 0)
     {
-        char searchPath[MAX_PATH];
-        snprintf(searchPath, sizeof(searchPath), "%s\\*.ini", destDir.c_str());
-        WIN32_FIND_DATAA fd;
-        HANDLE hFind = FindFirstFileA(searchPath, &fd);
-        if (hFind != INVALID_HANDLE_VALUE)
-        {
+        auto wipeIniFiles = [](const std::string& d) {
+            char search[MAX_PATH];
+            snprintf(search, sizeof(search), "%s\\*.ini", d.c_str());
+            WIN32_FIND_DATAA fd;
+            HANDLE h = FindFirstFileA(search, &fd);
+            if (h == INVALID_HANDLE_VALUE) return;
             do {
                 if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-                std::string p = destDir + "\\" + fd.cFileName;
-                DeleteFileA(p.c_str());
-            } while (FindNextFileA(hFind, &fd));
-            FindClose(hFind);
-        }
+                DeleteFileA((d + "\\" + fd.cFileName).c_str());
+            } while (FindNextFileA(h, &fd));
+            FindClose(h);
+        };
+        wipeIniFiles(destDir + "\\" + kEffectsSubdir);
+        wipeIniFiles(destDir);
     }
 
-    int copied = CopyFlatDirectory(srcStr, destDir);
+    int copied = CopyDirectoryTree(srcStr, destDir);
     if (copied <= 0)
     {
         setErr("Failed to copy any files from source folder");
@@ -674,8 +981,14 @@ int EffectLoader::ImportPresetFromFolder(const char* srcDir, bool overwrite, std
 
     // Rebuild list (covers add + reorder)
     int prevCurrent = currentPreset_;
-    std::string prevCurrentName = (prevCurrent >= 0 && prevCurrent < (int)presets_.size())
-        ? presets_[prevCurrent].name : "";
+    std::string prevCurrentName, prevCurrentLabel;
+    PresetSource prevCurrentSource = PresetSource::Local;
+    if (prevCurrent >= 0 && prevCurrent < (int)presets_.size())
+    {
+        prevCurrentName   = presets_[prevCurrent].name;
+        prevCurrentLabel  = presets_[prevCurrent].sourceLabel;
+        prevCurrentSource = presets_[prevCurrent].source;
+    }
 
     ScanPresets();
 
@@ -683,13 +996,17 @@ int EffectLoader::ImportPresetFromFolder(const char* srcDir, bool overwrite, std
     if (!prevCurrentName.empty())
     {
         for (int i = 0; i < (int)presets_.size(); i++)
-            if (presets_[i].name == prevCurrentName) { currentPreset_ = i; break; }
+            if (presets_[i].name == prevCurrentName &&
+                presets_[i].source == prevCurrentSource &&
+                presets_[i].sourceLabel == prevCurrentLabel)
+            { currentPreset_ = i; break; }
     }
 
-    // Find new index and validate
+    // Find new index and validate (always Local — that's where we just imported)
     int newIdx = -1;
     for (int i = 0; i < (int)presets_.size(); i++)
-        if (presets_[i].name == targetName) { newIdx = i; break; }
+        if (presets_[i].source == PresetSource::Local && presets_[i].name == targetName)
+        { newIdx = i; break; }
     if (newIdx >= 0) ValidatePreset(newIdx);
 
     Log("Imported preset '%s' (%d file%s) from %s",
@@ -738,7 +1055,7 @@ bool EffectLoader::ExportPreset(int presetIdx, const char* destParentDir, std::s
         if (a == b) { setErr("Source and destination are the same folder"); return false; }
     }
 
-    int copied = CopyFlatDirectory(preset.path, destDir);
+    int copied = CopyDirectoryTree(preset.path, destDir);
     if (copied <= 0)
     {
         setErr("Failed to copy any files");

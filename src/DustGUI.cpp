@@ -57,10 +57,19 @@ struct FrameworkConfig {
     bool logging = false;
     bool showStartupMessage = true;
     bool showSurvey = false;
-    std::string lastPreset;        // name of last selected preset (empty = custom)
+    std::string lastPreset;        // name of last selected preset (empty = custom OR first launch)
+    // Source disambiguates presets that share a name across mod folders.
+    // Empty source => Local (back-compat with INIs that predate this field).
+    std::string lastPresetSource;  // "", "local", "mod", or "workshop"
+    std::string lastPresetLabel;   // mod folder name or workshop ID; empty for local
     int toggleKey = VK_F11;        // virtual key code for overlay toggle
     int toggleEffectsKey = 0;      // 0 = unbound; else VK code that flips all effects on/off
     std::string theme = "kenshi";  // GUI theme: "kenshi" or "dark"
+
+    // True when LastPreset key was absent from Dust.ini at load time, false
+    // when present (even with empty value — that means user picked Custom).
+    // In-memory only; never persisted. Drives first-launch default resolution.
+    bool firstLaunch = false;
 };
 
 
@@ -618,13 +627,27 @@ static void LoadFrameworkConfig()
     if (gFwConfig.theme != "kenshi" && gFwConfig.theme != "dark")
         gFwConfig.theme = "kenshi";
 
+    // Distinguishing "key missing" (first launch) from "key empty" (Custom)
+    // requires a sentinel — GetPrivateProfileStringA's default-string return
+    // collapses both cases otherwise.
+    static const char* kMissingSentinel = "\x01\x02DUST_MISSING";
     char buf[256] = {};
-    GetPrivateProfileStringA("Dust", "LastPreset", "", buf, sizeof(buf), gDustIniPath.c_str());
-    gFwConfig.lastPreset = buf;
-
-    // Default to dust_high if no preset has been saved yet
-    if (gFwConfig.lastPreset.empty())
-        gFwConfig.lastPreset = "dust_high";
+    GetPrivateProfileStringA("Dust", "LastPreset", kMissingSentinel,
+                             buf, sizeof(buf), gDustIniPath.c_str());
+    if (strcmp(buf, kMissingSentinel) == 0)
+    {
+        gFwConfig.lastPreset.clear();
+        gFwConfig.firstLaunch = true;
+    }
+    else
+    {
+        gFwConfig.lastPreset = buf;
+        gFwConfig.firstLaunch = false;
+    }
+    GetPrivateProfileStringA("Dust", "LastPresetSource", "", buf, sizeof(buf), gDustIniPath.c_str());
+    gFwConfig.lastPresetSource = buf;
+    GetPrivateProfileStringA("Dust", "LastPresetLabel", "", buf, sizeof(buf), gDustIniPath.c_str());
+    gFwConfig.lastPresetLabel = buf;
 
     // Preset auto-load is deferred to Render() — effects may not be initialized yet
     // when the GUI starts (e.g. GUI inits from DustBoot swap chain before device capture).
@@ -658,6 +681,8 @@ static void SaveFrameworkConfig()
     WritePrivateProfileStringA("Dust", "ToggleEffectsKey", keyBuf, gDustIniPath.c_str());
     WritePrivateProfileStringA("Dust", "Theme", gFwConfig.theme.c_str(), gDustIniPath.c_str());
     WritePrivateProfileStringA("Dust", "LastPreset", gFwConfig.lastPreset.c_str(), gDustIniPath.c_str());
+    WritePrivateProfileStringA("Dust", "LastPresetSource", gFwConfig.lastPresetSource.c_str(), gDustIniPath.c_str());
+    WritePrivateProfileStringA("Dust", "LastPresetLabel", gFwConfig.lastPresetLabel.c_str(), gDustIniPath.c_str());
 
     gFwDiskConfig = gFwConfig;
     // Apply logging change immediately
@@ -678,6 +703,8 @@ static bool IsFrameworkDirty()
            gFwConfig.showStartupMessage != gFwDiskConfig.showStartupMessage ||
            gFwConfig.showSurvey != gFwDiskConfig.showSurvey ||
            gFwConfig.lastPreset != gFwDiskConfig.lastPreset ||
+           gFwConfig.lastPresetSource != gFwDiskConfig.lastPresetSource ||
+           gFwConfig.lastPresetLabel != gFwDiskConfig.lastPresetLabel ||
            gFwConfig.toggleKey != gFwDiskConfig.toggleKey ||
            gFwConfig.toggleEffectsKey != gFwDiskConfig.toggleEffectsKey ||
            gFwConfig.theme != gFwDiskConfig.theme;
@@ -834,10 +861,48 @@ static void SnapshotAllEffects()
 }
 
 // Tooltip showing preset metadata (author, description, etc.)
+// String form of PresetSource for INI persistence and string comparisons.
+static const char* PresetSourceKey(PresetSource s)
+{
+    switch (s)
+    {
+    case PresetSource::Mod:      return "mod";
+    case PresetSource::Workshop: return "workshop";
+    case PresetSource::Local:    return "local";
+    }
+    return "local";
+}
+
+// Display label for a preset, including source tag for non-Local entries so
+// users can tell where each preset came from when names collide across mods.
+static std::string PresetDisplayLabel(const PresetInfo& p)
+{
+    switch (p.source)
+    {
+    case PresetSource::Mod:      return p.name + "  [mod: " + p.sourceLabel + "]";
+    case PresetSource::Workshop: return p.name + "  [workshop: " + p.sourceLabel + "]";
+    case PresetSource::Local:    break;
+    }
+    return p.name;
+}
+
 static void DrawPresetMetaTooltip(const PresetInfo& p)
 {
     ImGui::BeginTooltip();
     ImGui::TextUnformatted(p.name.c_str());
+    switch (p.source)
+    {
+    case PresetSource::Mod:
+        ImGui::TextDisabled("Source: mod \"%s\"", p.sourceLabel.c_str());
+        ImGui::TextDisabled("Read-only — use Save As to fork");
+        break;
+    case PresetSource::Workshop:
+        ImGui::TextDisabled("Source: workshop %s", p.sourceLabel.c_str());
+        ImGui::TextDisabled("Read-only — use Save As to fork");
+        break;
+    case PresetSource::Local:
+        break;
+    }
     if (p.hasMetadata)
     {
         if (!p.metaAuthor.empty())
@@ -895,7 +960,9 @@ static void PollFilePicker()
             const auto& presets = gEffectLoader.GetPresets();
             if (idx < (int)presets.size())
             {
-                gFwConfig.lastPreset = presets[idx].name;
+                gFwConfig.lastPreset       = presets[idx].name;
+                gFwConfig.lastPresetSource = PresetSourceKey(presets[idx].source);
+                gFwConfig.lastPresetLabel  = presets[idx].sourceLabel;
                 SaveFrameworkConfig();
             }
             SnapshotAllEffects();
@@ -951,32 +1018,67 @@ static void DrawPresetSection()
     ImGui::Separator();
     ImGui::Spacing();
 
-    const char* previewName = (currentPreset >= 0 && currentPreset < (int)presets.size())
-        ? presets[currentPreset].name.c_str() : "(Custom)";
+    std::string previewLabel = (currentPreset >= 0 && currentPreset < (int)presets.size())
+        ? PresetDisplayLabel(presets[currentPreset]) : "(Custom)";
+
+    // Detect whether section headers are needed (only when we have presets
+    // from more than one source, otherwise the headers are noise).
+    bool hasMultipleSources = false;
+    if (!presets.empty())
+    {
+        PresetSource first = presets[0].source;
+        for (const auto& p : presets)
+            if (p.source != first) { hasMultipleSources = true; break; }
+    }
 
     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
-    if (ImGui::BeginCombo("##Preset", previewName))
+    if (ImGui::BeginCombo("##Preset", previewLabel.c_str()))
     {
         if (ImGui::Selectable("(Custom)", currentPreset < 0))
         {
             gEffectLoader.SetCurrentPreset(-1);
             gFwConfig.lastPreset.clear();
+            gFwConfig.lastPresetSource.clear();
+            gFwConfig.lastPresetLabel.clear();
             SaveFrameworkConfig();
         }
 
+        PresetSource lastSource = PresetSource::Local;
+        bool firstItem = true;
         for (int p = 0; p < (int)presets.size(); p++)
         {
+            const PresetInfo& info = presets[p];
+
+            if (hasMultipleSources && (firstItem || info.source != lastSource))
+            {
+                if (!firstItem) ImGui::Separator();
+                const char* hdr = "Local";
+                if (info.source == PresetSource::Mod)      hdr = "From mods";
+                if (info.source == PresetSource::Workshop) hdr = "From workshop";
+                ImGui::TextDisabled("%s", hdr);
+                lastSource = info.source;
+            }
+            firstItem = false;
+
+            // ##id makes labels unique even if two presets share a display name.
+            std::string label = PresetDisplayLabel(info);
+            char idSuffix[32];
+            snprintf(idSuffix, sizeof(idSuffix), "##preset%d", p);
+            label += idSuffix;
+
             bool selected = (p == currentPreset);
-            if (ImGui::Selectable(presets[p].name.c_str(), selected))
+            if (ImGui::Selectable(label.c_str(), selected))
             {
                 gEffectLoader.LoadPreset(p);
                 SyncAllEffectsOnState();
-                gFwConfig.lastPreset = presets[p].name;
+                gFwConfig.lastPreset       = info.name;
+                gFwConfig.lastPresetSource = PresetSourceKey(info.source);
+                gFwConfig.lastPresetLabel  = info.sourceLabel;
                 SaveFrameworkConfig();
                 SnapshotAllEffects();
             }
             if (ImGui::IsItemHovered())
-                DrawPresetMetaTooltip(presets[p]);
+                DrawPresetMetaTooltip(info);
         }
         ImGui::EndCombo();
     }
@@ -1052,13 +1154,23 @@ static void DrawPresetSection()
     // ---- Row 2: Save / Export / Edit Info / Delete (only when a preset is selected) ----
     if (currentPreset >= 0)
     {
-        if (ImGui::Button("Save", ImVec2(0, 0)))
+        bool readOnly = presets[currentPreset].isReadOnly();
+
+        PushVisualDisabled(readOnly);
+        if (ImGui::Button("Save", ImVec2(0, 0)) && !readOnly)
         {
             gEffectLoader.SavePreset(currentPreset);
             SnapshotAllEffects();
         }
+        PopVisualDisabled(readOnly);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Save current settings into '%s'", presets[currentPreset].name.c_str());
+        {
+            if (readOnly)
+                ImGui::SetTooltip("'%s' is read-only — use Save As to fork it locally",
+                                  presets[currentPreset].name.c_str());
+            else
+                ImGui::SetTooltip("Save current settings into '%s'", presets[currentPreset].name.c_str());
+        }
 
         ImGui::SameLine();
         PushVisualDisabled(pickerBusy);
@@ -1081,7 +1193,8 @@ static void DrawPresetSection()
         }
 
         ImGui::SameLine();
-        if (ImGui::Button("Edit Info..."))
+        PushVisualDisabled(readOnly);
+        if (ImGui::Button("Edit Info...") && !readOnly)
         {
             gEditInfoPresetIdx = currentPreset;
             const PresetInfo& p = presets[currentPreset];
@@ -1092,14 +1205,21 @@ static void DrawPresetSection()
                       p.metaDescription.c_str(), _TRUNCATE);
             ImGui::OpenPopup("##EditPresetInfo");
         }
+        PopVisualDisabled(readOnly);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Edit author / description metadata");
+            ImGui::SetTooltip("%s", readOnly
+                ? "Read-only preset — metadata is owned by the source mod"
+                : "Edit author / description metadata");
 
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.15f, 0.15f, 1.0f));
-        if (ImGui::Button("Delete"))
+        PushVisualDisabled(readOnly);
+        if (ImGui::Button("Delete") && !readOnly)
             ImGui::OpenPopup("##ConfirmDeletePreset");
+        PopVisualDisabled(readOnly);
         ImGui::PopStyleColor();
+        if (readOnly && ImGui::IsItemHovered())
+            ImGui::SetTooltip("Read-only preset — cannot delete from another mod's folder");
 
         if (ImGui::BeginPopup("##ConfirmDeletePreset"))
         {
@@ -1161,7 +1281,9 @@ static void DrawPresetSection()
                 const auto& ps = gEffectLoader.GetPresets();
                 if (idx < (int)ps.size())
                 {
-                    gFwConfig.lastPreset = ps[idx].name;
+                    gFwConfig.lastPreset       = ps[idx].name;
+                    gFwConfig.lastPresetSource = PresetSourceKey(ps[idx].source);
+                    gFwConfig.lastPresetLabel  = ps[idx].sourceLabel;
                     SaveFrameworkConfig();
                 }
                 SnapshotAllEffects();
@@ -1723,29 +1845,54 @@ void Render()
     if (!gInitialized || gResizeInProgress) return;
     if (!gDevice || !gContext || !gBackBufferRTV) return;
 
-    // Deferred preset auto-load: GUI can start before effects are initialized
-    // (DustBoot provides the swap chain before device capture / effect init).
-    // Phase 1: set display name early (presets scanned in LoadAll).
-    // Phase 2: apply values once effects are initialized.
+    // Deferred preset auto-load: the GUI can start before effects are initialized
+    // (DustBoot provides the swap chain before device capture / effect init), so
+    // index resolution and value application happen in two passes.
     {
         static bool sPresetDisplaySet = false;
         static bool sPresetApplied = false;
         static int  sPendingIdx = -1;
 
-        if (!sPresetApplied && !gFwConfig.lastPreset.empty())
+        if (!sPresetApplied)
         {
             if (!sPresetDisplaySet)
             {
                 const auto& presets = gEffectLoader.GetPresets();
-                for (int i = 0; i < (int)presets.size(); i++)
+                int chosen = -1;
+
+                if (!gFwConfig.lastPreset.empty())
                 {
-                    if (presets[i].name == gFwConfig.lastPreset)
+                    // Fallback path keeps legacy INIs (no source fields) working.
+                    int exactIdx = -1, fallbackIdx = -1;
+                    for (int i = 0; i < (int)presets.size(); i++)
                     {
-                        gEffectLoader.SetCurrentPreset(i);
-                        sPendingIdx = i;
-                        sPresetDisplaySet = true;
-                        break;
+                        if (presets[i].name != gFwConfig.lastPreset) continue;
+                        if (fallbackIdx < 0) fallbackIdx = i;
+
+                        if (!gFwConfig.lastPresetSource.empty() &&
+                            gFwConfig.lastPresetSource == PresetSourceKey(presets[i].source) &&
+                            gFwConfig.lastPresetLabel  == presets[i].sourceLabel)
+                        { exactIdx = i; break; }
                     }
+                    chosen = (exactIdx >= 0) ? exactIdx : fallbackIdx;
+                }
+                else if (gFwConfig.firstLaunch)
+                {
+                    // No saved choice and key absent — let modders override.
+                    chosen = gEffectLoader.FindFirstLaunchDefaultIdx();
+                }
+                // else: lastPreset empty + key present => Custom, leave chosen = -1.
+
+                if (chosen >= 0)
+                {
+                    gEffectLoader.SetCurrentPreset(chosen);
+                    sPendingIdx = chosen;
+                    sPresetDisplaySet = true;
+                }
+                else
+                {
+                    // Nothing to load — don't keep retrying every frame.
+                    sPresetApplied = true;
                 }
             }
 
@@ -1753,7 +1900,9 @@ void Render()
             {
                 gEffectLoader.LoadPreset(sPendingIdx);
                 SyncAllEffectsOnState();
-                Log("Loaded global preset '%s'", gFwConfig.lastPreset.c_str());
+                const auto& presets = gEffectLoader.GetPresets();
+                if (sPendingIdx < (int)presets.size())
+                    Log("Loaded global preset '%s'", presets[sPendingIdx].name.c_str());
                 sPresetApplied = true;
             }
         }

@@ -27,12 +27,31 @@ struct LoadedEffect {
     FILETIME        configMtime;    // for hot-reload
 };
 
+// Where a preset came from. Local presets live under <modDir>/presets/ and are
+// fully writable. Mod/Workshop presets are discovered in other mods' folders
+// and treated as read-only — the user can load them but not save/delete in
+// place (Save As copies them to Local).
+enum class PresetSource {
+    Local,
+    Mod,
+    Workshop,
+};
+
 // Global preset system — each preset is a folder with per-effect INI files
 // plus an optional dust_preset.ini metadata file.
 struct PresetInfo {
     std::string name;        // display name (folder name)
     std::string path;        // full path to the preset folder
     std::string warnings;    // non-empty if preset has outdated INI files (missing/unknown fields)
+
+    // Discovery source — Mod/Workshop are read-only.
+    PresetSource source = PresetSource::Local;
+    std::string  sourceLabel; // mod folder name, workshop ID, or empty for Local
+
+    // Index in <game>/data/mods.cfg (0 = first / lowest priority, last = highest).
+    // -1 for Local presets and for external presets whose mod isn't in mods.cfg
+    // (those are filtered out of presets_ before reaching here).
+    int loadOrderRank = -1;
 
     // Metadata from dust_preset.ini (empty if file is absent — backwards
     // compatible with pre-metadata presets).
@@ -42,12 +61,17 @@ struct PresetInfo {
     std::string metaDescription; // [Preset] Description
     int         metaVersion     = 0;  // [Preset] Version (user-defined)
     int         metaApiVersion  = 0;  // [Preset] ApiVersion (DUST_API_VERSION at save time)
+    bool        metaIsDefault   = false; // [Preset] Default — modder claims this as the default
+
+    bool isReadOnly() const { return source != PresetSource::Local; }
 };
 
 class EffectLoader {
 public:
-    // Scan effects/ folder and load all plugin DLLs
-    int LoadAll(const char* effectsDir);
+    // Scan effects/ folder and load all plugin DLLs.
+    // gameDir is the Kenshi root (used to discover presets shipped by other
+    // mods and Steam Workshop items); pass nullptr to skip external discovery.
+    int LoadAll(const char* effectsDir, const char* gameDir = nullptr);
 
     // Initialize all loaded plugins (call after device capture)
     bool InitAll(ID3D11Device* device, uint32_t w, uint32_t h);
@@ -99,6 +123,14 @@ public:
     int  GetCurrentPreset() const { return currentPreset_; }
     void SetCurrentPreset(int idx) { currentPreset_ = idx; }
 
+    // Picks the preset to load on first launch, when the user has no saved
+    // choice. Resolution order: external Default=1 with highest mods.cfg
+    // load-order index → Local Default=1 → "dust_high" → -1.
+    int  FindFirstLaunchDefaultIdx() const;
+
+    // Public so discovery helpers can populate metadata on each found folder.
+    static void ReadPresetMetadata(PresetInfo& info);
+
     // v3: GPU timing access (for DustGUI)
     float GetEffectGpuTime(size_t index) const;
 
@@ -109,7 +141,8 @@ private:
     bool initialized_ = false;
 
     // Preset state
-    std::string presetsDir_;            // <effectsDir>/presets/
+    std::string presetsDir_;            // <modDir>/presets/  (writable, "Local")
+    std::string gameDir_;               // Kenshi root, for discovering external presets
     std::vector<PresetInfo> presets_;
     int currentPreset_ = -1;            // -1 = custom
 
@@ -125,8 +158,7 @@ private:
     static void EffectConfigLoadFrom(LoadedEffect& le, const std::string& presetDir);
     static void EffectConfigSaveTo(LoadedEffect& le, const std::string& presetDir);
 
-    // Metadata helpers
-    static void ReadPresetMetadata(PresetInfo& info);
+    // Metadata helpers (Read is public above)
     static void WritePresetMetadata(const PresetInfo& info);
 
     // v3: GPU timing helpers (phase: 0=pre, 1=post)
