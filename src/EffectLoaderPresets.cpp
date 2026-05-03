@@ -169,7 +169,7 @@ void EffectLoader::EffectConfigLoadFrom(LoadedEffect& le, const std::string& pre
         case DUST_SETTING_COLOR3:
         {
             float r = 0.0f, g = 0.0f, b = 0.0f;
-            if (sscanf(probe, "%f,%f,%f", &r, &g, &b) == 3)
+            if (sscanf_s(probe, "%f,%f,%f", &r, &g, &b) == 3)
             {
                 if (s.minVal < s.maxVal)
                 {
@@ -252,7 +252,8 @@ static std::vector<std::string> ReadModsCfg(const std::string& gameDir)
     if (gameDir.empty()) return order;
 
     std::string path = gameDir + "\\data\\mods.cfg";
-    FILE* f = fopen(path.c_str(), "r");
+    FILE* f = nullptr;
+    fopen_s(&f, path.c_str(), "r");
     if (!f)
     {
         Log("ReadModsCfg: not found at '%s'", path.c_str());

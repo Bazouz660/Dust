@@ -7,6 +7,7 @@
 #include "SurveyRecorder.h"
 #include "SurveyWriter.h"
 #include "ShaderPatch.h"
+#include "OgreSwapHook.h"
 #include "DustLog.h"
 #include <core/Functions.h>
 #include <d3d11.h>
@@ -360,6 +361,22 @@ static void TryInstallSwapChainHooks(ID3D11DeviceContext* drawCtx = nullptr)
 {
     if (sSwapChainHooked)
         return;
+
+    // Defer Present/ResizeBuffers vtable patching until the splash/loader
+    // phase is over. Some users have an overlay or driver shim with an inline
+    // hook on Present that crashes when called against a transient loader
+    // swap chain. By holding off the patch until gGameAlive flips
+    // (TitleScreen::show or first GameWorld::mainLoop), the splash Present
+    // runs on the un-patched DXGI path with zero Dust code in its chain.
+    if (!gGameAlive)
+        return;
+
+    // Preferred GUI tick site: OGRE's RenderWindow::swapBuffers. Lives in the
+    // game's own render path, never fires for the loader's transient swap
+    // chain. If this succeeds, the DXGI Present hook below still installs
+    // (we need ResizeBuffers anyway) but TickGuiOnPresent skips its render
+    // step to avoid double-rendering.
+    OgreSwapHook::TryInstall();
 
     // Layer 1: Try DustBoot (preload plugin that intercepted CreateSwapChain)
     IDXGISwapChain* realSwapChain = TryGetSwapChainFromBoot();
@@ -920,6 +937,12 @@ static void TickGuiOnPresent(IDXGISwapChain* swapChain, const char* via)
                 Log("GUI init failed, will retry (attempt %d)", ++sRetryCount);
         }
     }
+
+    // OGRE's swapBuffers hook (if installed) is what actually renders the GUI
+    // — see OgreSwapHook. Initialization stays here because this is the path
+    // we have the DXGI swap chain on. Render is skipped to avoid double-draw.
+    if (OgreSwapHook::IsInstalled())
+        return;
 
     DustGUI::Render();
 }

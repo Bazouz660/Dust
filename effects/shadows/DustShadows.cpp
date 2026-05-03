@@ -144,7 +144,8 @@ static int ResolveUserShadowRange(int fallback)
 
 static std::string ReadFileContents(const std::string& path)
 {
-    FILE* f = fopen(path.c_str(), "rb");
+    FILE* f = nullptr;
+    fopen_s(&f, path.c_str(), "rb");
     if (!f) return "";
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
@@ -218,7 +219,8 @@ static bool WriteSettingsCfgInt(const std::string& key, int value)
         content += key + "=" + valBuf + "\n";
     }
 
-    FILE* f = fopen(path.c_str(), "wb");
+    FILE* f = nullptr;
+    fopen_s(&f, path.c_str(), "wb");
     if (!f) return false;
     bool ok = fwrite(content.data(), 1, content.size(), f) == content.size();
     fclose(f);

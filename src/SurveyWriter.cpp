@@ -227,7 +227,8 @@ void WriteFrame(const SurveyFrameData& frame, const char* outputDir)
     snprintf(path, sizeof(path), "%sframe_%llu.json", outputDir,
              (unsigned long long)frame.frameIndex);
 
-    FILE* f = fopen(path, "w");
+    FILE* f = nullptr;
+    fopen_s(&f, path, "w");
     if (!f)
     {
         Log("SURVEY: Failed to open %s for writing", path);
@@ -434,7 +435,8 @@ void WriteShaders(const char* outputDir)
         snprintf(path, sizeof(path), "%sshaders\\%s_0x%llX.hlsl",
                  outputDir, prefix, (unsigned long long)pair.first);
 
-        FILE* f = fopen(path, "w");
+        FILE* f = nullptr;
+        fopen_s(&f, path, "w");
         if (!f) continue;
 
         fprintf(f, "// Shader pointer: 0x%llX\n", (unsigned long long)pair.first);
@@ -458,7 +460,8 @@ void WriteSummary(const SurveyFrameData* frames, int numFrames, const char* outp
     char path[MAX_PATH];
     snprintf(path, sizeof(path), "%ssurvey_summary.json", outputDir);
 
-    FILE* f = fopen(path, "w");
+    FILE* f = nullptr;
+    fopen_s(&f, path, "w");
     if (!f)
     {
         Log("SURVEY: Failed to write summary to %s", path);

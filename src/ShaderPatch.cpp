@@ -377,19 +377,14 @@ static std::string PatchObjectsShader(const std::string& src)
     return result;
 }
 
-// Diagnostic: dump patched HLSL source to disk + log the compiled shader's
-// resource binding layout (cbuffer slots, sampler slots, texture slots).
-// This is ground truth for which registers are actually used — no guessing
-// about whether a slot is free vs. occupied.
-static void DumpPatchedShader(const std::string& source, const void* bytecode, SIZE_T bytecodeSize)
+// Diagnostic: log the compiled shader's resource binding layout (cbuffer
+// slots, sampler slots, texture slots). This is ground truth for which
+// registers are actually used — no guessing about whether a slot is free
+// vs. occupied.
+static void LogPatchedShaderReflection(const void* bytecode, SIZE_T bytecodeSize)
 {
     static int sCounter = 0;
     int idx = sCounter++;
-
-    char path[MAX_PATH];
-    snprintf(path, sizeof(path), "%sDust_shader_%03d.hlsl", DustLogDir().c_str(), idx);
-    FILE* f = fopen(path, "wb");
-    if (f) { fwrite(source.c_str(), 1, source.size(), f); fclose(f); }
 
     if (!bytecode || bytecodeSize == 0) return;
 
@@ -485,7 +480,7 @@ HRESULT WINAPI HookedD3DCompile(
                         SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
                             pEntrypoint, pTarget, pSourceName,
                             (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
-                        DumpPatchedShader(patched, (*ppCode)->GetBufferPointer(),
+                        LogPatchedShaderReflection((*ppCode)->GetBufferPointer(),
                             (*ppCode)->GetBufferSize());
                     }
                     return hr;

@@ -480,7 +480,7 @@ void EffectLoader::EffectConfigLoad(LoadedEffect& le)
             if (!missing)
             {
                 float r = 0.0f, g = 0.0f, b = 0.0f;
-                if (sscanf(probe, "%f,%f,%f", &r, &g, &b) == 3)
+                if (sscanf_s(probe, "%f,%f,%f", &r, &g, &b) == 3)
                 {
                     if (s.minVal < s.maxVal)
                     {

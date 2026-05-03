@@ -49,7 +49,7 @@ static FILE* BootLogFile()
                  st.wHour, st.wMinute, st.wSecond);
 
         std::string path = logsDir + "\\" + filename;
-        f = fopen(path.c_str(), "w");
+        fopen_s(&f, path.c_str(), "w");
     }
     return f;
 }

@@ -97,7 +97,8 @@ static void ManageShaderCache(const std::string& gameDir, const std::string& mod
     // Read existing stamp
     std::string storedStamp;
     {
-        FILE* f = fopen(stampPath.c_str(), "r");
+        FILE* f = nullptr;
+        fopen_s(&f, stampPath.c_str(), "r");
         if (f)
         {
             char buf[256] = {};
@@ -128,7 +129,8 @@ static void ManageShaderCache(const std::string& gameDir, const std::string& mod
     std::string reDir = gameDir + "RE_Kenshi";
     CreateDirectoryA(reDir.c_str(), nullptr);
 
-    FILE* f = fopen(stampPath.c_str(), "w");
+    FILE* f = nullptr;
+    fopen_s(&f, stampPath.c_str(), "w");
     if (f)
     {
         fprintf(f, "%s\n", currentStamp.c_str());
