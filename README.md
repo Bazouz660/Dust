@@ -502,6 +502,54 @@ AspectRatio=1.0
 DebugView=0
 ```
 
+## Troubleshooting
+
+If you run into problems (crashes, missing effects, visual artifacts, mod not loading), work through these checks before reporting an issue.
+
+### Quick checklist
+
+1. **Check Dust version**: F11 -> framework settings shows the running version. Confirm it matches the latest release. The startup toast also displays the version for 30 seconds.
+2. **Check RE_Kenshi version**: 0.3.3 or later is recommended. Older versions may conflict with Dust's startup.
+3. **Disable all other mods except Dust + RE_Kenshi**: Open Kenshi's launcher mod list, uncheck everything else. Other mods that touch the render pipeline (ReShade, the ReShade REST addon) are the most common conflict source.
+4. **Disable third-party overlays**: Steam, Discord, MSI Afterburner / RivaTuner, GeForce Experience, Xbox Game Bar. Any of these hook D3D11 and can race with Dust's hook.
+5. **Try a different preset**: Preset selector is at the top of the left pane in the F11 GUI. If `dust_ultra` crashes but `dust_low` works, the issue is in a specific effect (most often RTGI on lower-end GPUs).
+6. **Reset to defaults**: Delete and re-download the mod. Delete `Dust.ini` to reset framework settings (toggle key, theme).
+7. **Try a different display mode**: Test exclusive fullscreen, borderless windowed, and windowed. Borderless is usually most reliable.
+8. **Try a different resolution**: A few effects (DOF, RTGI, SMAA) can behave differently at extreme resolutions or unusual aspect ratios. Test 1080p as a baseline.
+9.  **Clear the shader cache**: After updating Dust or RE_Kenshi, delete any cached shader files in your Kenshi data folder so shaders recompile against the new patch. A full game restart is also required for any change in `Shadow Resolution` to take effect.
+10. **Update GPU drivers**: D3D11 driver bugs can exist. Install the latest stable NVIDIA / AMD / Intel driver before assuming the bug is in Dust.
+
+### Diagnostic logging
+
+Enable logging in `<Kenshi>/mods/Dust/Dust.ini`:
+
+```ini
+[Dust]
+Logging=1
+```
+
+The log is written to `Dust.log` in the same folder. Include the relevant parts when reporting issues.
+
+### Common symptoms
+
+| Symptom | Likely cause | What to try |
+|---|---|---|
+| Game crashes at startup | Conflicting mod or overlay, outdated RE_Kenshi | Disable other mods and overlays, update RE_Kenshi. |
+| F11 doesn't open the GUI | Toggle key conflict, overlay intercepting input | Change `ToggleKey` in `Dust.ini`, disable Steam / Discord overlays. |
+| Effects don't apply (no visual change) | Effect disabled, conflicting render hook | F11 -> verify the effect is enabled, disable ReShade / ENB. |
+| Black screen or full-frame corruption | GPU driver issue, display-mode mismatch | Update drivers, switch between fullscreen and borderless. |
+| Severe artifacts (banding, rectangles, flicker) | Specific effect or known shadow limitation | Toggle effects off one by one to isolate. RTWSM artifacts near the camera are a known limitation. |
+| Stuttering or low FPS | Heavy effect on insufficient GPU | Switch to a lighter preset (`dust_medium` / `dust_low`), disable RTGI. |
+| DLLs missing after install | Antivirus quarantine | Add an exception for `<Kenshi>/mods/Dust/` in Windows Defender or your AV. |
+
+### Reporting issues
+
+If the checklist doesn't help:
+
+1. Capture `Dust.log` with `Logging=1`.
+2. Note GPU, driver version, RE_Kenshi version, Dust version, active preset, display mode.
+3. Open an issue at the [GitHub issue tracker](https://github.com/Bazouz660/Dust/issues) or post in the Discord server linked from the Workshop page.
+
 ## Building from Source
 
 ### Prerequisites

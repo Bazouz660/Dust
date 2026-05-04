@@ -86,6 +86,56 @@ The mod currently does not officialy support Proton/Wine for now. It seems to wo
 A startup notification appears for 30 seconds indicating the mod is active and which key toggles the GUI. This can
 be disabled in the framework settings.
 
+[h1]Troubleshooting[/h1]
+
+If something isn't working, work through these checks in order before asking for help.
+
+[h2]First steps[/h2]
+[list]
+[*] [b]Check Dust version[/b]: Press F11 and look at the framework settings panel for the running version. The startup notification also shows it for 30 seconds. Make sure it matches the latest release.
+[*] [b]Check RE_Kenshi version[/b]: 0.3.2 or newer is recommended. Older versions may conflict.
+[*] [b]Disable other mods[/b]: From Kenshi's launcher mod list, uncheck everything except Dust and RE_Kenshi. Other mods that change the rendering (ReShade, ReShade REST addon) are the most common cause of conflicts.
+[*] [b]Disable overlays[/b]: Steam overlay, Discord overlay, MSI Afterburner / RivaTuner, GeForce Experience, Xbox Game Bar. These hook the game's rendering and can fight with Dust.
+[*] [b]Update GPU drivers[/b]: Install the latest stable NVIDIA / AMD / Intel driver.
+[/list]
+
+[h2]If a specific effect or preset is broken[/h2]
+[list]
+[*] [b]Try a different preset[/b]: The preset selector is at the top of the F11 menu. If Ultra crashes but Low works, the issue is a specific heavy effect (most often RTGI on lower-end GPUs).
+[*] [b]Toggle effects off one by one[/b]: From the F11 menu, disable each effect's "Enabled" checkbox until the problem goes away to identify the culprit.
+[*] [b]Reset to defaults[/b]: Delete the .ini file for the effect that's misbehaving (in mods/Dust/effects/), it will regenerate on next launch.
+[/list]
+
+[h2]Display and performance issues[/h2]
+[list]
+[*] [b]Try a different display mode[/b]: Switch between fullscreen, borderless windowed, and windowed. Borderless is usually most reliable.
+[*] [b]Toggle VSync[/b]: VSync can interact poorly with the rendering hooks. Try toggling it in the Kenshi launcher or your driver control panel.
+[*] [b]Try a different resolution[/b]: A few effects (DOF, RTGI, SMAA) can behave differently at unusual resolutions. Test at 1080p as a baseline if you're on something exotic (ultrawide, 4K, etc.).
+[*] [b]Clear the shader cache[/b]: After updating Dust or RE_Kenshi, delete any cached shader files in your Kenshi data folder.
+[*] [b]Restart after enabling shadow resolution overrides[/b]: The shadow plugin's atlas resolution setting needs a full game restart, not just a settings reload.
+[/list]
+
+[h2]DLLs disappear after installing[/h2]
+
+Some antivirus tools (Windows Defender included) flag the DLLs as suspicious because Dust hooks the game process. Check your AV quarantine and add an exception for the [b]<Kenshi>/mods/Dust/[/b] folder.
+
+[h2]Diagnostic logging[/h2]
+
+To capture diagnostic info, open [b]mods/Dust/Dust.ini[/b] and change [b]Logging=0[/b] to [b]Logging=1[/b]. The log is written to [b]Dust.log[/b] in the same folder. Attach the log when asking for help.
+
+[h2]Reporting issues[/h2]
+
+If the checks above don't help, join the Discord server linked at the bottom of this page or open a GitHub issue. Include:
+[list]
+[*] Dust version
+[*] RE_Kenshi version
+[*] GPU and driver version
+[*] Which preset and effects are active
+[*] Display mode (fullscreen / borderless / windowed) and resolution
+[*] Dust.log with logging enabled
+[*] Ideally your load order (mods.cfg)
+[/list]
+
 [h1]How it works[/h1]
 
 Dust is not a ReShade preset or a post-process overlay. It hooks into Kenshi's D3D11 deferred rendering pipeline and injects effects at specific points in the render pass (after GBuffer, after lighting, after tonemapping, etc). This means effects have access to the actual depth buffer, HDR scene data, and lighting state before the game flattens everything to the final image.
