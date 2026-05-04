@@ -11,6 +11,7 @@
 #include "D3D11Hook.h"
 #include "DustGUI.h"
 #include "EffectLoader.h"
+#include "PssmDetour.h"
 
 static HMODULE gDllModule = nullptr;
 
@@ -232,6 +233,14 @@ __declspec(dllexport) void startPlugin()
     }
 
     Log("Game loop hook installed");
+
+    // Diagnostic detour on Ogre::PSSMShadowCameraSetup::calculateSplitPoints.
+    // Installs here (early in startPlugin) so it's in place before Kenshi's
+    // shadow node init, which is when this function is called. Late-stage
+    // installs (post-gGameAlive) miss the call.
+    PssmDetour::TryInstall();
+
+
 
     // Hook TitleScreen::show — earliest reliable "game is past splash" signal,
     // so the GUI can attach during the main menu rather than waiting for a

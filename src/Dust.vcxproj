@@ -103,6 +103,8 @@
     <ClCompile Include="SurveyWriter.cpp" />
     <ClCompile Include="ShaderPatch.cpp" />
     <ClCompile Include="OgreSwapHook.cpp" />
+    <ClCompile Include="ShadowProbe.cpp" />
+    <ClCompile Include="PssmDetour.cpp" />
     <ClCompile Include="imgui\imgui.cpp" />
     <ClCompile Include="imgui\imgui_draw.cpp" />
     <ClCompile Include="imgui\imgui_tables.cpp" />
@@ -127,6 +129,8 @@
     <ClInclude Include="SurveyWriter.h" />
     <ClInclude Include="ShaderPatch.h" />
     <ClInclude Include="OgreSwapHook.h" />
+    <ClInclude Include="ShadowProbe.h" />
+    <ClInclude Include="PssmDetour.h" />
     <ClInclude Include="imgui\imgui.h" />
     <ClInclude Include="imgui\backends\imgui_impl_win32.h" />
     <ClInclude Include="imgui\backends\imgui_impl_dx11.h" />

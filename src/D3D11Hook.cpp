@@ -8,6 +8,7 @@
 #include "SurveyWriter.h"
 #include "ShaderPatch.h"
 #include "OgreSwapHook.h"
+#include "ShadowProbe.h"
 #include "DustLog.h"
 #include <core/Functions.h>
 #include <d3d11.h>
@@ -851,6 +852,12 @@ static void TickGuiOnPresent(IDXGISwapChain* swapChain, const char* via)
 {
     ++gPresentHookCallCount;
 
+    // One-shot probe to discover Kenshi's shadow node name and lambda value.
+    // Cheap after the first success (early-returns on sProbed). Lives here
+    // rather than TryInstallSwapChainHooks so it can keep retrying until
+    // CompositorManager2 is alive — the swap-chain installer fires only once.
+    ShadowProbe::TryProbe();
+
     // Periodic diagnostic: confirm Present is firing and show init state
     if (gPresentHookCallCount <= 5 ||
         (gPresentHookCallCount <= 600 && (gPresentHookCallCount % 60) == 0))
@@ -1009,6 +1016,115 @@ namespace CSMIntercept
     static std::mutex                                  sMutex;
     static std::atomic<int>                            sUpdateCounter{0};
     static std::atomic<int>                            sUnmapCounter{0};
+    static std::atomic<bool>                           sLayoutLogged{false};
+    static std::atomic<bool>                           sStackLogged{false};
+
+    // One-shot caller-stack capture, fired the first time real CSM data is
+    // unmapped. Tells us which DLL/EXE writes the cbuffer (Kenshi_x64.exe,
+    // OgreMain_x64.dll, a plugin, etc.) and the per-frame RVAs, so we can
+    // pick a higher-level hook point now that OGRE's shadow path is
+    // confirmed unused.
+    static void LogCallerStack(const void* pSrcData, const char* tag)
+    {
+        if (sStackLogged.load()) return;
+
+        // Same liveness gate as ClassifyLayout — wait until the engine has
+        // populated real cascade data, not the zero-init pass.
+        const float* params = (const float*)((const char*)pSrcData + kCsmParamsOffset);
+        bool live = false;
+        for (UINT i = 0; i < kCsmCount; i++)
+            if (params[i*4] > 1e-4f || params[i*4] < -1e-4f) { live = true; break; }
+        if (!live) return;
+
+        if (sStackLogged.exchange(true)) return;
+
+        void* frames[24] = {0};
+        USHORT n = RtlCaptureStackBackTrace(0, 24, frames, nullptr);
+        Log("CSMIntercept: caller stack at %s (%u frames):", tag, (unsigned)n);
+
+        for (USHORT i = 0; i < n; i++)
+        {
+            HMODULE mod = nullptr;
+            if (GetModuleHandleExA(
+                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    (LPCSTR)frames[i], &mod) && mod)
+            {
+                char modPath[MAX_PATH];
+                GetModuleFileNameA(mod, modPath, MAX_PATH);
+                const char* base = strrchr(modPath, '\\');
+                base = base ? base + 1 : modPath;
+
+                uintptr_t rva = (uintptr_t)frames[i] - (uintptr_t)mod;
+                Log("  [%2u] %p  %s+0x%llx",
+                    (unsigned)i, frames[i], base, (unsigned long long)rva);
+            }
+            else
+            {
+                Log("  [%2u] %p  (unmapped)", (unsigned)i, frames[i]);
+            }
+        }
+    }
+
+    // One-shot classifier of the cascade texture layout. Verdict gates Step 4
+    // of docs/shadow_csm_improvement_plan.md — atlas-packed means lambda +
+    // global atlas resolution are the only levers; separate textures would
+    // additionally allow per-cascade width/height tuning.
+    //
+    // Discriminator: csmTrans is the world->atlas-UV translation for each
+    // cascade. In atlas-packed mode it bakes in the tile offset, so the four
+    // cascades' trans (X,Y) land in distinct atlas cells. In separate-texture
+    // mode (each cascade owns full UV) all four trans values cluster together.
+    // We bucket into half-unit cells: distinct cells -> atlas-packed.
+    //
+    // (The reflected csmUvBounds slot turned out to be unused by Kenshi's
+    // shader — always zero — so it cannot serve as the discriminator.)
+    static void ClassifyLayout(const void* pSrcData)
+    {
+        if (sLayoutLogged.load()) return;
+
+        const float* params = (const float*)((const char*)pSrcData + kCsmParamsOffset);
+        const float* trans  = (const float*)((const char*)pSrcData + kCsmTransOffset);
+        auto isClose = [](float a, float b) { float d = a - b; return d > -1e-4f && d < 1e-4f; };
+
+        // Wait until the engine has populated real cascade data — the first
+        // Unmap is sometimes a zero-init pass. Cascade split distance (params[0]
+        // of each entry) is the liveness signal.
+        bool live = false;
+        for (UINT i = 0; i < kCsmCount; i++)
+            if (!isClose(params[i*4], 0.0f)) { live = true; break; }
+        if (!live) return;
+
+        if (sLayoutLogged.exchange(true)) return;
+
+        int cellX[kCsmCount], cellY[kCsmCount];
+        for (UINT i = 0; i < kCsmCount; i++)
+        {
+            const float* t = trans + i*4;
+            cellX[i] = (int)(t[0] * 2.0f);
+            cellY[i] = (int)(t[1] * 2.0f);
+        }
+        bool atlasPacked = false;
+        for (UINT i = 1; i < kCsmCount; i++)
+            if (cellX[i] != cellX[0] || cellY[i] != cellY[0]) { atlasPacked = true; break; }
+
+        if (atlasPacked)
+        {
+            Log("CSM layout verdict: ATLAS-PACKED (cascades share one texture)");
+            Log("  -> only lambda + global atlas resolution are tuning levers");
+            for (UINT i = 0; i < kCsmCount; i++)
+            {
+                const float* t = trans + i*4;
+                Log("  cascade %u atlas-cell=(%d,%d) trans=(%.3f, %.3f)",
+                    i, cellX[i], cellY[i], t[0], t[1]);
+            }
+        }
+        else
+        {
+            Log("CSM layout verdict: SEPARATE TEXTURES (cascades cluster in same UV cell)");
+            Log("  -> per-cascade width/height is a tuning lever (Step 4 Path A bonus)");
+        }
+    }
 
     static void DumpCascades(const void* pSrcData)
     {
@@ -1088,6 +1204,8 @@ static void STDMETHODCALLTYPE HookedUpdateSubresource(
 
     if (tracked)
     {
+        CSMIntercept::ClassifyLayout(pSrcData);  // one-shot atlas-vs-separate verdict
+
         // Throttle: log first 3 calls, then once every ~600 calls (~10s @ 60fps)
         int n = CSMIntercept::sUpdateCounter.fetch_add(1);
         if (n < 3 || (n % 600) == 0)
@@ -1141,8 +1259,21 @@ static void STDMETHODCALLTYPE HookedUnmap(
     }
 
     // (mappedData is a hook point for future cbuffer modification — read/write
-    // before the original Unmap commits the data to the GPU. Currently a no-op.)
-    (void)mappedData;
+    // before the original Unmap commits the data to the GPU.)
+    if (mappedData)
+    {
+        CSMIntercept::ClassifyLayout(mappedData);  // one-shot atlas-vs-separate verdict
+        CSMIntercept::LogCallerStack(mappedData, "HookedUnmap"); // one-shot stack dump
+
+        // Throttled raw dump on the Unmap path — diagnostic for figuring out
+        // when (if ever) real cascade data lands. First 3 calls + every 600.
+        int n = CSMIntercept::sUnmapCounter.fetch_add(1);
+        if (n < 3 || (n % 600) == 0)
+        {
+            Log("CSMIntercept: Unmap on %p (call #%d)", pResource, n);
+            CSMIntercept::DumpCascades(mappedData);
+        }
+    }
 
     oUnmap(pThis, pResource, Subresource);
 }

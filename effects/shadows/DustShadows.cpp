@@ -28,6 +28,10 @@ struct ShadowConfig {
     int   resolutionIndex   = 2;      // index into kShadowResolutions (default = 4096)
     int   shadowRange       = 6000;   // overridden in DustEffectCreate from settings.cfg
                                       // if a value is already present there
+    float pssmLambda        = 0.95f;  // PSSM cascade split distribution. 0.0 =
+                                      // pure linear (close shadows extend
+                                      // far, but blockier); 1.0 = pure log
+                                      // (close shadows tiny+sharp, far blurry)
 };
 
 static ShadowConfig gConfig;
@@ -268,6 +272,8 @@ static int ShadowInit(ID3D11Device* device, uint32_t w, uint32_t h, const DustHo
     }
     if (host->SetShadowAtlasResolution)
         host->SetShadowAtlasResolution(GetSelectedShadowResolution());
+    if (host->SetCascadeLambda)
+        host->SetCascadeLambda(gConfig.pssmLambda);
     // NB: shadow range is written to settings.cfg from DustEffectCreate,
     // which runs early enough to beat Kenshi's startup read. A write here
     // would land too late and could clobber the early write with a stale
@@ -325,6 +331,8 @@ static void ShadowOnSettingChanged()
 {
     if (gHost && gHost->SetShadowAtlasResolution)
         gHost->SetShadowAtlasResolution(GetSelectedShadowResolution());
+    if (gHost && gHost->SetCascadeLambda)
+        gHost->SetCascadeLambda(gConfig.pssmLambda);
     PushShadowRangeToGame();
 }
 
@@ -338,6 +346,7 @@ static DustSettingDesc gSettings[] = {
     { "Cliff Fix Distance",  DUST_SETTING_FLOAT, &gConfig.cliffFixDistance, 0.0f, 1.0f,  "CliffFixDistance", nullptr, "Fraction of shadow range where the cliff fix smoothly ramps in (higher = preserves more close-range vertical shadows)",                                                     DUST_PERF_NONE },
     { "Shadow Resolution",   DUST_SETTING_ENUM,  &gConfig.resolutionIndex,  0.0f, 6.0f,  "Resolution",       kShadowResolutionLabels, "Override the shadow atlas resolution. Higher = sharper shadows, more VRAM (16384 ~= 1 GB). Restart the game to apply.",                                              DUST_PERF_LOW    },
     { "Shadow Range",        DUST_SETTING_INT,   &gConfig.shadowRange,      500.0f, 50000.0f, "Range",        nullptr, "Maximum distance shadows render. Bypasses the in-game UI's 9000 cap by writing settings.cfg directly. Restart to apply. Touching the in-game Shadow Range slider will overwrite this.", DUST_PERF_MEDIUM },
+    { "Cascade Lambda",      DUST_SETTING_FLOAT, &gConfig.pssmLambda,       0.0f, 1.0f,  "CascadeLambda",   nullptr, "PSSM cascade split distribution. 0.0 = pure linear (close shadows extend further but blockier); 1.0 = pure logarithmic (close shadows tiny+sharp, far cascades huge). Kenshi's native is ~0.95.", DUST_PERF_NONE },
 };
 
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)

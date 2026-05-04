@@ -2,6 +2,7 @@
 #include "ResourceRegistry.h"
 #include "D3D11StateBlock.h"
 #include "D3D11Hook.h"
+#include "PssmDetour.h"
 #include "DustLog.h"
 #include <d3dcompiler.h>
 #include <cstring>
@@ -399,6 +400,7 @@ void EffectLoader::BuildHostAPI()
     hostAPI_.UpdateConstantBuffer   = HostUpdateConstantBuffer;
     hostAPI_.GetPreFogHDR           = HostGetPreFogHDR;
     hostAPI_.SetShadowAtlasResolution = D3D11Hook::SetShadowAtlasResolution;
+    hostAPI_.SetCascadeLambda         = PssmDetour::SetLambda;
 }
 
 // ==================== v3: Config I/O ====================

@@ -176,6 +176,12 @@ typedef struct DustHostAPI {
     // for the shadow atlas — since the atlas is created once at world load,
     // changes after that point require a game restart.
     void (*SetShadowAtlasResolution)(uint32_t size);
+
+    // Set the PSSM lambda for cascade split distribution. 0.0 = pure linear
+    // (cascade 0 huge, far cascade tiny); 1.0 = pure logarithmic (cascade 0
+    // tiny, far cascade huge). Kenshi's native value is ~0.95. Effect is
+    // visible next frame; no restart needed. Pass any value — it's clamped.
+    void (*SetCascadeLambda)(float lambda);
 } DustHostAPI;
 
 // Performance impact hint for a single setting (API v3.2+).
