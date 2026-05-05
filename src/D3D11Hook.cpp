@@ -13,6 +13,7 @@
 #include "ShaderMetadata.h"
 #include "ShaderDatabase.h"
 #include "GeometryCapture.h"
+#include "POMState.h"
 #include "DustLog.h"
 #include <core/Functions.h>
 #include <d3d11.h>
@@ -474,6 +475,7 @@ static void TryCaptureDevice(ID3D11Device* device)
     gDevice = device;
     device->GetImmediateContext(&gContext);
     GeometryCapture::SetDevice(device);
+    POMState::SetDevice(device);
 
     Log("Captured real D3D11 device=%p, context=%p", gDevice, gContext);
 
@@ -864,10 +866,18 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
 {
     if (gShutdownSignaled) { oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView); return; }
 
-    bool isGBuffer = GeometryCapture::CheckGBufferConfig(NumViews, ppRenderTargetViews, pDepthStencilView);
+    bool wasInGBuffer = GeometryCapture::IsInGBufferPass();
+    bool isGBuffer    = GeometryCapture::CheckGBufferConfig(NumViews, ppRenderTargetViews, pDepthStencilView);
 
     oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView);
     GeometryCapture::OnOMSetRenderTargetsWithResult(isGBuffer);
+
+    // POM cbuffer follows GBuffer pass: bind on enter, unbind on leave. Bound at
+    // PS slot 8 — the patched objects.hlsl reads its parameters from there.
+    if (!wasInGBuffer && isGBuffer)
+        POMState::OnGBufferEnter(pThis);
+    else if (wasInGBuffer && !isGBuffer)
+        POMState::OnGBufferLeave(pThis);
 }
 
 // ==================== Swap chain hooks (ImGui) ====================

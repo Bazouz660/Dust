@@ -6,6 +6,7 @@
 #include "GeometryCapture.h"
 #include "GeometryReplay.h"
 #include "ShaderDatabase.h"
+#include "POMState.h"
 #include "DustLog.h"
 #include <d3dcompiler.h>
 #include <cstring>
@@ -537,6 +538,14 @@ static uint32_t HostGetGeometryCaptureFlags()
     return GeometryCapture::GetCaptureFlags();
 }
 
+// ==================== Host API wrappers (v5) ====================
+
+static void HostSetPOMEnabled(int enabled)         { POMState::SetEnabled(enabled != 0); }
+static void HostSetPOMHeightScale(float scale)     { POMState::SetHeightScale(scale); }
+static void HostSetPOMThreshold(float threshold)   { POMState::SetThreshold(threshold); }
+static void HostSetPOMThresholdWidth(float width)  { POMState::SetThresholdWidth(width); }
+static void HostSetPOMSamples(int minS, int maxS)  { POMState::SetMinSamples(minS); POMState::SetMaxSamples(maxS); }
+
 // ==================== EffectLoader ====================
 
 void EffectLoader::BuildHostAPI()
@@ -575,6 +584,13 @@ void EffectLoader::BuildHostAPI()
     hostAPI_.GetGeometryDrawBuffers   = HostGetGeometryDrawBuffers;
     hostAPI_.SetGeometryCaptureFlags  = HostSetGeometryCaptureFlags;
     hostAPI_.GetGeometryCaptureFlags  = HostGetGeometryCaptureFlags;
+
+    // v5 additions
+    hostAPI_.SetPOMEnabled        = HostSetPOMEnabled;
+    hostAPI_.SetPOMHeightScale    = HostSetPOMHeightScale;
+    hostAPI_.SetPOMThreshold      = HostSetPOMThreshold;
+    hostAPI_.SetPOMThresholdWidth = HostSetPOMThresholdWidth;
+    hostAPI_.SetPOMSamples        = HostSetPOMSamples;
 }
 
 // ==================== v3: Config I/O ====================

@@ -36,7 +36,7 @@ Build-Project (Join-Path $Root "boot\DustBoot.vcxproj")
 # Build host
 Build-Project (Join-Path $Root "src\Dust.vcxproj")
 
-$Effects = @("ssao", "lut", "bloom", "dof", "ssil", "clarity", "outline", "kuwahara", "rtgi", "shadows", "smaa", "chromaticaberration", "deband", "filmgrain", "letterbox", "vignette")
+$Effects = @("ssao", "lut", "bloom", "dof", "ssil", "clarity", "outline", "kuwahara", "rtgi", "shadows", "smaa", "chromaticaberration", "deband", "filmgrain", "letterbox", "vignette", "pom")
 foreach ($effect in $Effects) {
     $vcxproj = Get-ChildItem (Join-Path $Root "effects\$effect\*.vcxproj") | Select-Object -First 1
     Build-Project $vcxproj.FullName
@@ -50,6 +50,22 @@ Write-Host "==> Deploying to $ModDir" -ForegroundColor Cyan
 New-Item -ItemType Directory -Force -Path "$ModDir\effects\shaders" | Out-Null
 if (-not $SkipPresets) {
     New-Item -ItemType Directory -Force -Path "$ModDir\presets"     | Out-Null
+}
+
+# Prune stale Dust*.dll from previous deploys (sibling branches, removed
+# plugins). Plugins built against an older DustAPI version can crash the host
+# loader. Scoped to effects/ so the root Dust.dll is unaffected. .ini files
+# are left alone — they hold user settings and don't load on their own.
+$expectedDlls = @{}
+foreach ($effect in $Effects) {
+    $src = Get-ChildItem "$Root\effects\$effect\build\Release\Dust*.dll" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($src) { $expectedDlls[$src.Name] = $true }
+}
+Get-ChildItem "$ModDir\effects\Dust*.dll" -ErrorAction SilentlyContinue | ForEach-Object {
+    if (-not $expectedDlls.ContainsKey($_.Name)) {
+        Write-Host "==> Pruning stale plugin: $($_.Name)" -ForegroundColor Yellow
+        Remove-Item $_.FullName -Force
+    }
 }
 
 Copy-Item "$Root\boot\build\Release\DustBoot.dll" "$ModDir\"

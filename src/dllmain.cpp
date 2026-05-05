@@ -16,6 +16,7 @@
 #include "ShaderDatabase.h"
 #include "GeometryCapture.h"
 #include "GeometryReplay.h"
+#include "POMState.h"
 
 static HMODULE gDllModule = nullptr;
 
@@ -89,6 +90,9 @@ static std::string BuildCacheStamp(const std::string& modDir)
     std::string stamp = "dust|dev";
 #endif
 
+    // Bump this suffix when ShaderPatch HLSL injection changes, so RE_Kenshi
+    // discards cached bytecode that was compiled with an older injection.
+    stamp += "|patch=pom-r7-no-terrain";
     return stamp;
 }
 
@@ -301,6 +305,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
         if (lpReserved) break;
         DustGUI::Shutdown();
         gEffectLoader.ShutdownAll();
+        POMState::Shutdown();
         GeometryReplay::Shutdown();
         GeometryCapture::Shutdown();
         ShaderDatabase::Shutdown();

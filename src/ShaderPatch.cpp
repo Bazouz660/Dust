@@ -377,6 +377,169 @@ static std::string PatchObjectsShader(const std::string& src)
     return result;
 }
 
+// Patch vanilla objects.hlsl main_ps to add Parallax Occlusion Mapping.
+// Derives height from diffuse luminance (no authored height maps required):
+// bright = at-surface, dark = recessed. Skips foliage (#ifndef TRANSPARENCY).
+// MVP: hardcoded parameters, no depth correction, no LOD fade.
+static std::string PatchObjectsShaderForPOM(const std::string& src)
+{
+    std::string result = src;
+
+    // Helpers go before main_vs (file-scope, available to both VS and PS).
+    const char* helperAnchor = "void main_vs(";
+    size_t helperPos = result.find(helperAnchor);
+    if (helperPos == std::string::npos)
+    {
+        Log("ShaderPatch[POM]: anchor 'void main_vs(' not found, skipping");
+        return src;
+    }
+
+    std::string helpers =
+        // Parameters bound by POMState at PS slot 8 on GBuffer pass entry.
+        "// [Dust] POM parameter cbuffer (bound by host on GBuffer pass entry)\n"
+        "cbuffer DustPOMParams : register(b8) {\n"
+        "\tfloat4 dustPomCfg;     // x=enabled, y=heightScale, z=threshold, w=thresholdWidth\n"
+        "\tfloat4 dustPomSamples; // x=minSamples, y=maxSamples\n"
+        "};\n\n"
+        "// [Dust] POM derived height. Mip 2 smooths pixel-level luminance noise.\n"
+        "// 'bright = deep' convention: bright pixels get displaced (more parallax\n"
+        "// motion = perceived closer/raised) while dark pixels anchor.\n"
+        "float DustPOMHeight(Texture2D tex, SamplerState samp, float2 uv)\n"
+        "{\n"
+        "\tfloat lum = dot(tex.SampleLevel(samp, uv, 2).rgb, float3(0.299, 0.587, 0.114));\n"
+        "\treturn saturate((lum - dustPomCfg.z) / max(dustPomCfg.w, 1e-3));\n"
+        "}\n\n"
+        "// [Dust] POM ray march in tangent space.\n"
+        "// viewDirTS.z is clamped to avoid the grazing-angle offset blow-up\n"
+        "// (the textbook 'P = V.xy / V.z * scale' diverges as V.z -> 0).\n"
+        "float2 DustPOM(Texture2D tex, SamplerState samp, float2 uvIn,\n"
+        "               float3 viewDirTS, float heightScale,\n"
+        "               int minSamples, int maxSamples)\n"
+        "{\n"
+        "\tif (viewDirTS.z <= 0.001) return uvIn;\n"
+        "\t// Defense in depth: hard cap loop bound regardless of caller.\n"
+        "\tint   safeMax  = clamp(maxSamples, 4, 64);\n"
+        "\tint   safeMin  = clamp(minSamples, 2, safeMax);\n"
+        "\tfloat zClamped = max(viewDirTS.z, 0.3);\n"
+        "\tfloat numSteps = lerp((float)safeMax, (float)safeMin, abs(viewDirTS.z));\n"
+        "\tfloat stepSize = 1.0 / numSteps;\n"
+        "\tfloat2 deltaUV = viewDirTS.xy * heightScale / (zClamped * numSteps);\n"
+        "\tfloat2 currUV    = uvIn;\n"
+        "\tfloat  currLayer = 0.0;\n"
+        "\tfloat  currHeight = DustPOMHeight(tex, samp, currUV);\n"
+        "\t[loop]\n"
+        "\tfor (int i = 0; i < safeMax && currLayer < currHeight; i++)\n"
+        "\t{\n"
+        "\t\tcurrUV    -= deltaUV;\n"
+        "\t\tcurrHeight = DustPOMHeight(tex, samp, currUV);\n"
+        "\t\tcurrLayer += stepSize;\n"
+        "\t}\n"
+        "\t// Cap-exit: ran out of samples without crossing the heightfield. The\n"
+        "\t// ray stayed 'deep' the whole march (e.g. uniform bright region with\n"
+        "\t// bright=deep convention), so any computed offset is meaningless and\n"
+        "\t// causes dark smears where the displaced UV lands on far-away texels.\n"
+        "\tif (currLayer < currHeight) return uvIn;\n"
+        "\tfloat2 prevUV     = currUV + deltaUV;\n"
+        "\tfloat  prevLayer  = currLayer - stepSize;\n"
+        "\tfloat  prevHeight = DustPOMHeight(tex, samp, prevUV);\n"
+        "\tfloat  afterDepth  = currHeight - currLayer;\n"
+        "\tfloat  beforeDepth = prevHeight - prevLayer;\n"
+        "\tfloat  denom = afterDepth - beforeDepth;\n"
+        "\tfloat  weight = (abs(denom) > 1e-6) ? afterDepth / denom : 0.0;\n"
+        "\treturn lerp(currUV, prevUV, weight);\n"
+        "}\n\n";
+    result.insert(helperPos, helpers);
+    Log("ShaderPatch[POM]: injected DustPOM helpers");
+
+    // Inject POM offset before the "// Texture maps" sampling block.
+    // Anchor is on its own line so we can insert above it.
+    const char* sampleAnchor = "// Texture maps";
+    size_t samplePos = result.find(sampleAnchor);
+    if (samplePos == std::string::npos)
+    {
+        Log("ShaderPatch[POM]: anchor '// Texture maps' not found, skipping injection");
+        return src;
+    }
+
+    std::string pomBlock =
+        "// [Dust] POM offset UV (skipped on foliage variants and when disabled).\n"
+        "\t// Stricter gate (in [0.5, 1.5]) and value clamps protect against the\n"
+        "\t// brief startup window where the host cbuffer at b8 may not yet be\n"
+        "\t// bound, so reads return zeros / garbage / NaN.\n"
+        "\t// Gradients of the *original* texCoord are computed unconditionally so\n"
+        "\t// downstream samples can use SampleGrad. Without that, the per-pixel\n"
+        "\t// jump between adjacent fragments' pomTexCoord values trips the GPU's\n"
+        "\t// auto-mip-selector and produces regular dark smears.\n"
+        "\tfloat2 _pomDdx = ddx(texCoord);\n"
+        "\tfloat2 _pomDdy = ddy(texCoord);\n"
+        "\tfloat2 pomTexCoord = texCoord;\n"
+        "\t#ifndef TRANSPARENCY\n"
+        "\tif (dustPomCfg.x > 0.5 && dustPomCfg.x < 1.5)\n"
+        "\t{\n"
+        "\t\tfloat _pomScale = clamp(dustPomCfg.y, 0.0, 0.1);\n"
+        "\t\tint   _pomMin   = (int)clamp(dustPomSamples.x, 2.0, 64.0);\n"
+        "\t\tint   _pomMax   = (int)clamp(dustPomSamples.y, 4.0, 64.0);\n"
+        "\t\tif (_pomScale > 0.0)\n"
+        "\t\t{\n"
+        "\t\t\tfloat3 V_world = normalize(cameraPos - worldPos);\n"
+        "\t\t\tfloat3 N = normalize(normal);\n"
+        // Reconstruct tangent basis from screen-space derivatives of worldPos
+        // and texCoord. Robust against non-uniform world matrix scale.
+        "\t\t\tfloat3 dp1 = ddx(worldPos);\n"
+        "\t\t\tfloat3 dp2 = ddy(worldPos);\n"
+        "\t\t\tfloat2 duv1 = ddx(texCoord);\n"
+        "\t\t\tfloat2 duv2 = ddy(texCoord);\n"
+        "\t\t\tfloat3 dp2perp = cross(dp2, N);\n"
+        "\t\t\tfloat3 dp1perp = cross(N, dp1);\n"
+        "\t\t\tfloat3 T = dp2perp * duv1.x + dp1perp * duv2.x;\n"
+        "\t\t\tfloat3 B = dp2perp * duv1.y + dp1perp * duv2.y;\n"
+        "\t\t\tfloat invMax = rsqrt(max(dot(T,T), dot(B,B)));\n"
+        "\t\t\tT *= invMax; B *= invMax;\n"
+        "\t\t\tfloat3 viewDirTS = float3(dot(V_world, T), dot(V_world, B), dot(V_world, N));\n"
+        // Angle-based fade: POM is unreliable at grazing angles (basis becomes
+        // degenerate, ray march divergence amplifies). Smoothly ramp from 0 at
+        // viewDirTS.z=0.15 to full at viewDirTS.z=0.4 — kills most edge/corner
+        // warping where the surface tangent is near the view direction.
+        "\t\t\tfloat _pomFade = smoothstep(0.15, 0.4, viewDirTS.z);\n"
+        "\t\t\tif (_pomFade > 0.0)\n"
+        "\t\t\t{\n"
+        "\t\t\t\tpomTexCoord = DustPOM(base_map, sampleState, texCoord, viewDirTS,\n"
+        "\t\t\t\t                       _pomScale * _pomFade, _pomMin, _pomMax);\n"
+        // Hard cap on absolute offset magnitude. Even when DustPOM finds a
+        // 'real' intersection, displacing too far lands the diffuse sample on
+        // unrelated texels (the dark-smear residue). Caps the visible damage.
+        "\t\t\t\tfloat2 _pomDelta = pomTexCoord - texCoord;\n"
+        "\t\t\t\tfloat _pomLen = length(_pomDelta);\n"
+        "\t\t\t\tif (_pomLen > 0.04)\n"
+        "\t\t\t\t\tpomTexCoord = texCoord + _pomDelta * (0.04 / _pomLen);\n"
+        "\t\t\t}\n"
+        "\t\t}\n"
+        "\t}\n"
+        "\t#endif\n"
+        "\t";
+    result.insert(samplePos, pomBlock);
+
+    // Substitute Kenshi's '.Sample(sampleState, texCoord)' calls with
+    // '.SampleGrad(sampleState, pomTexCoord, _pomDdx, _pomDdy)'. SampleGrad with
+    // the original texCoord's gradients prevents the auto-mip-selector from
+    // aliasing on the displaced UV's per-pixel jumps. Construction grid
+    // ('texCoord * scaffoldTiling') and dust noise ('worldPos.xz') don't match
+    // and are left alone.
+    const std::string fromPattern = ".Sample(sampleState, texCoord)";
+    const std::string toPattern   = ".SampleGrad(sampleState, pomTexCoord, _pomDdx, _pomDdy)";
+    size_t scan = samplePos;
+    int subCount = 0;
+    while ((scan = result.find(fromPattern, scan)) != std::string::npos)
+    {
+        result.replace(scan, fromPattern.size(), toPattern);
+        scan += toPattern.size();
+        subCount++;
+    }
+    Log("ShaderPatch[POM]: injected POM block, substituted %d sample sites", subCount);
+
+    return result;
+}
+
 // Diagnostic: log the compiled shader's resource binding layout (cbuffer
 // slots, sampler slots, texture slots). This is ground truth for which
 // registers are actually used — no guessing about whether a slot is free
@@ -498,16 +661,29 @@ HRESULT WINAPI HookedD3DCompile(
         }
     }
 
-    // Detect objects shader for foliage alpha fix: entry point is "main_ps"
-    // and source contains the vanilla hard-cutoff alpha test.
+    // Detect objects shader: entry point is "main_ps" and source matches the
+    // file-level identifier. Apply foliage alpha fix and POM injection in turn —
+    // each sub-patch is gated by its own anchors and "already patched" check.
     if (pEntrypoint && pSrcData && SrcDataSize > 0 &&
         strcmp(pEntrypoint, "main_ps") == 0)
     {
         std::string src((const char*)pSrcData, SrcDataSize);
-        if (src.find("clip(normalTex.a - threshold)") != std::string::npos &&
-            src.find("DustStabilizeThreshold") == std::string::npos)
+        bool isObjects = src.find("// General objects deferred lighting shader") != std::string::npos;
+        if (isObjects)
         {
-            std::string patched = PatchObjectsShader(src);
+            std::string patched = src;
+
+            if (patched.find("clip(normalTex.a - threshold)") != std::string::npos &&
+                patched.find("DustStabilizeThreshold") == std::string::npos)
+            {
+                patched = PatchObjectsShader(patched);
+            }
+
+            if (patched.find("DustPOM") == std::string::npos)
+            {
+                patched = PatchObjectsShaderForPOM(patched);
+            }
+
             if (patched.size() != src.size())
             {
                 Log("ShaderPatch: patched objects main_ps (%zu -> %zu bytes)",

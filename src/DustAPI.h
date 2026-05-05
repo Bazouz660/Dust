@@ -72,7 +72,7 @@
 extern "C" {
 #endif
 
-#define DUST_API_VERSION 4
+#define DUST_API_VERSION 5
 
 // Injection points in the rendering pipeline
 typedef enum DustInjectionPoint {
@@ -274,6 +274,17 @@ typedef struct DustHostAPI {
     // DUST_CAPTURE_PS_RESOURCES = capture PS CBs, SRVs, samplers per draw.
     void (*SetGeometryCaptureFlags)(uint32_t flags);
     uint32_t (*GetGeometryCaptureFlags)(void);
+
+    // === API v5 additions ===
+
+    // Parallax Occlusion Mapping parameters. Push values from a plugin; the
+    // host owns the cbuffer at PS slot 8 and binds it on GBuffer pass entry.
+    // The patched objects.hlsl main_ps reads from this cbuffer.
+    void (*SetPOMEnabled)(int enabled);              // 0/1
+    void (*SetPOMHeightScale)(float scale);          // typical 0.0..0.05
+    void (*SetPOMThreshold)(float threshold);        // luminance below this -> no displacement
+    void (*SetPOMThresholdWidth)(float width);       // saturate((lum-threshold)/width)
+    void (*SetPOMSamples)(int minSamples, int maxSamples);
 } DustHostAPI;
 
 // Performance impact hint for a single setting (API v3.2+).
