@@ -72,7 +72,7 @@
 extern "C" {
 #endif
 
-#define DUST_API_VERSION 3
+#define DUST_API_VERSION 4
 
 // Injection points in the rendering pipeline
 typedef enum DustInjectionPoint {
@@ -121,6 +121,45 @@ typedef struct DustFrameContext {
 #define DUST_RESOURCE_NORMALS   "normals"
 #define DUST_RESOURCE_HDR_RT    "hdr_rt"
 #define DUST_RESOURCE_LDR_RT    "ldr_rt"
+
+// Shader categories for Kenshi's known GBuffer shaders (API v4+)
+typedef enum DustShaderCategory {
+    DUST_SHADER_UNKNOWN      = 0,
+    DUST_SHADER_OBJECTS      = 1,   // Static world objects (buildings, props, ruins)
+    DUST_SHADER_TERRAIN      = 2,   // Terrain surface
+    DUST_SHADER_FOLIAGE      = 3,   // Vegetation (trees, grass, bushes)
+    DUST_SHADER_SKIN         = 4,   // Skinned meshes (characters, creatures)
+    DUST_SHADER_TRIPLANAR    = 5,   // Triplanar-mapped surfaces
+    DUST_SHADER_DISTANT_TOWN = 6    // LOD distant town meshes
+} DustShaderCategory;
+
+// How the VS transforms vertices to clip space (API v4+)
+typedef enum DustTransformType {
+    DUST_TRANSFORM_UNKNOWN = 0,
+    DUST_TRANSFORM_STATIC  = 1,   // Combined WorldViewProj in VS constant buffer
+    DUST_TRANSFORM_SKINNED = 2    // ViewProj in CB, bone matrices handle world transform
+} DustTransformType;
+
+// Geometry capture flags — opt-in to expensive state capture (API v4+)
+// Default: only IA + VS + PS pointer captured (lean, ~0.2ms/frame for 200 draws).
+// Enable PS resources for material-aware replay (+~0.4ms/frame).
+#define DUST_CAPTURE_PS_RESOURCES  1
+
+// C-compatible view of a captured GBuffer draw (API v4+)
+typedef struct DustGeometryDraw {
+    uint32_t            indexCount;
+    uint32_t            instanceCount;
+    uint32_t            startIndexLocation;
+    int32_t             baseVertexLocation;
+    uint32_t            startInstanceLocation;
+    DustShaderCategory  vsCategory;
+    DustShaderCategory  psCategory;
+    const char*         vsSourceName;   // HLSL source name, e.g. "skin" (NULL if unknown)
+    const char*         psSourceName;   // HLSL source name (NULL if unknown)
+    DustTransformType   transformType;
+    uint32_t            clipMatrixOffset;   // byte offset of clip matrix in VS CB data
+    uint32_t            worldMatrixOffset;  // byte offset of world matrix (0 if none)
+} DustGeometryDraw;
 
 // Host API - function pointers provided by Dust to plugins
 typedef struct DustHostAPI {
@@ -188,6 +227,53 @@ typedef struct DustHostAPI {
     // vanilla, >1.0 = softer that cascade. Clamped to [0, 5]. Composes with
     // the global Filter Radius slider.
     void (*SetCascadeFilterScale)(int cascadeIdx, float scale);
+
+    // === API v4 additions ===
+
+    // Geometry capture — number of GBuffer draws captured this frame.
+    // Valid from POST_GBUFFER through PRE_PRESENT.
+    uint32_t (*GetGeometryDrawCount)(void);
+
+    // Geometry capture — retrieve info about a captured draw.
+    // Returns 0 on success, -1 if drawIndex is out of range or outInfo is NULL.
+    int (*GetGeometryDrawInfo)(uint32_t drawIndex, DustGeometryDraw* outInfo);
+
+    // Geometry replay — re-issues all classified GBuffer draws with a replacement
+    // view-projection matrix. Best called at POST_LIGHTING (e.g. for shadow mapping).
+    // Caller must set before calling: RT/DSV, PS (or NULL for depth-only), viewport,
+    // rasterizer/blend/depth-stencil state. IA and VS state is saved/restored internally.
+    // replacementVP: row-major float4x4 (16 floats).
+    // Returns the number of draws replayed.
+    uint32_t (*ReplayGeometry)(ID3D11DeviceContext* ctx, ID3D11Device* device,
+                               const float* replacementVP);
+
+    // Shader database — returns a human-readable description for a shader category.
+    const char* (*GetShaderCategoryName)(DustShaderCategory category);
+
+    // Per-draw geometry access — bind IA state and issue individual draws with custom shaders.
+    // Enables voxelization, SSS, material-specific rendering. Plugin sets its own VS/GS/PS.
+    // Use SaveState/RestoreState around custom rendering.
+    int (*BindGeometryDraw)(ID3D11DeviceContext* ctx, uint32_t drawIndex);
+    int (*IssueGeometryDraw)(ID3D11DeviceContext* ctx, uint32_t drawIndex);
+
+    // Read the VS constant buffer data for a classified draw (frozen at capture time).
+    // outData points to an internal buffer valid until the next call or ResetFrame.
+    // Returns -1 for unclassified draws or if no staging data is available.
+    int (*GetGeometryDrawConstants)(ID3D11DeviceContext* ctx, uint32_t drawIndex,
+                                    const void** outData, uint32_t* outSize);
+
+    // Get raw VB/IB handles for compute shader access (e.g. BVH building).
+    // Returned pointers are non-owning, valid until end of frame.
+    // Plugin must CopyResource to its own SRV-capable buffer for compute use.
+    int (*GetGeometryDrawBuffers)(uint32_t drawIndex,
+                                  ID3D11Buffer** outVB, uint32_t* outStride,
+                                  ID3D11Buffer** outIB, DXGI_FORMAT* outIndexFormat);
+
+    // Capture flags — opt-in to expensive per-draw state capture.
+    // Default 0 = lean capture (IA + VS + PS pointer only).
+    // DUST_CAPTURE_PS_RESOURCES = capture PS CBs, SRVs, samplers per draw.
+    void (*SetGeometryCaptureFlags)(uint32_t flags);
+    uint32_t (*GetGeometryCaptureFlags)(void);
 } DustHostAPI;
 
 // Performance impact hint for a single setting (API v3.2+).

@@ -101,6 +101,10 @@
     <ClCompile Include="Survey.cpp" />
     <ClCompile Include="SurveyRecorder.cpp" />
     <ClCompile Include="SurveyWriter.cpp" />
+    <ClCompile Include="ShaderMetadata.cpp" />
+    <ClCompile Include="ShaderDatabase.cpp" />
+    <ClCompile Include="GeometryCapture.cpp" />
+    <ClCompile Include="GeometryReplay.cpp" />
     <ClCompile Include="ShaderPatch.cpp" />
     <ClCompile Include="OgreSwapHook.cpp" />
     <ClCompile Include="ShadowProbe.cpp" />
@@ -127,6 +131,10 @@
     <ClInclude Include="Survey.h" />
     <ClInclude Include="SurveyRecorder.h" />
     <ClInclude Include="SurveyWriter.h" />
+    <ClInclude Include="ShaderMetadata.h" />
+    <ClInclude Include="ShaderDatabase.h" />
+    <ClInclude Include="GeometryCapture.h" />
+    <ClInclude Include="GeometryReplay.h" />
     <ClInclude Include="ShaderPatch.h" />
     <ClInclude Include="OgreSwapHook.h" />
     <ClInclude Include="ShadowProbe.h" />

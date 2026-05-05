@@ -3,12 +3,16 @@
 #include "D3D11StateBlock.h"
 #include "D3D11Hook.h"
 #include "PssmDetour.h"
+#include "GeometryCapture.h"
+#include "GeometryReplay.h"
+#include "ShaderDatabase.h"
 #include "DustLog.h"
 #include <d3dcompiler.h>
 #include <cstring>
 #include <cstdlib>
 #include <unordered_map>
 #include <algorithm>
+#include <vector>
 
 EffectLoader gEffectLoader;
 
@@ -376,6 +380,163 @@ static void HostUpdateConstantBuffer(ID3D11DeviceContext* ctx, ID3D11Buffer* cb,
     }
 }
 
+// ==================== Host API wrappers (v4) ====================
+
+static uint32_t HostGetGeometryDrawCount()
+{
+    return GeometryCapture::GetCaptureCount();
+}
+
+static int HostGetGeometryDrawInfo(uint32_t drawIndex, DustGeometryDraw* outInfo)
+{
+    if (!outInfo) return -1;
+    const auto& captures = GeometryCapture::GetCaptures();
+    if (drawIndex >= (uint32_t)captures.size()) return -1;
+
+    const CapturedDraw& draw = captures[drawIndex];
+    outInfo->indexCount            = draw.indexCount;
+    outInfo->instanceCount         = draw.instanceCount;
+    outInfo->startIndexLocation    = draw.startIndexLocation;
+    outInfo->baseVertexLocation    = draw.baseVertexLocation;
+    outInfo->startInstanceLocation = draw.startInstanceLocation;
+    outInfo->vsCategory    = ShaderDatabase::GetVertexShaderCategory(draw.vs);
+    outInfo->psCategory    = ShaderDatabase::GetPixelShaderCategory(draw.ps);
+    outInfo->vsSourceName  = ShaderDatabase::GetSourceName((uint64_t)draw.vs);
+    outInfo->psSourceName  = ShaderDatabase::GetSourceName((uint64_t)draw.ps);
+
+    if (draw.vsMetadata)
+    {
+        switch (draw.vsMetadata->transformType)
+        {
+        case VSTransformType::STATIC:  outInfo->transformType = DUST_TRANSFORM_STATIC; break;
+        case VSTransformType::SKINNED: outInfo->transformType = DUST_TRANSFORM_SKINNED; break;
+        default:                       outInfo->transformType = DUST_TRANSFORM_UNKNOWN; break;
+        }
+        outInfo->clipMatrixOffset  = draw.vsMetadata->clipMatrixOffset;
+        outInfo->worldMatrixOffset = draw.vsMetadata->worldMatrixOffset;
+    }
+    else
+    {
+        outInfo->transformType     = DUST_TRANSFORM_UNKNOWN;
+        outInfo->clipMatrixOffset  = 0;
+        outInfo->worldMatrixOffset = 0;
+    }
+
+    return 0;
+}
+
+static uint32_t HostReplayGeometry(ID3D11DeviceContext* ctx, ID3D11Device* device,
+                                    const float* replacementVP)
+{
+    return GeometryReplay::Replay(ctx, device, replacementVP);
+}
+
+static const char* HostGetShaderCategoryName(DustShaderCategory category)
+{
+    switch (category)
+    {
+    case DUST_SHADER_OBJECTS:       return "Static world objects (buildings, props, ruins)";
+    case DUST_SHADER_TERRAIN:       return "Terrain surface";
+    case DUST_SHADER_FOLIAGE:       return "Vegetation (trees, grass, bushes)";
+    case DUST_SHADER_SKIN:          return "Skinned meshes (characters, creatures)";
+    case DUST_SHADER_TRIPLANAR:     return "Triplanar-mapped surfaces";
+    case DUST_SHADER_DISTANT_TOWN:  return "LOD distant town meshes";
+    default:                        return "Unknown";
+    }
+}
+
+static int HostBindGeometryDraw(ID3D11DeviceContext* ctx, uint32_t drawIndex)
+{
+    if (!ctx) return -1;
+    const auto& captures = GeometryCapture::GetCaptures();
+    if (drawIndex >= (uint32_t)captures.size()) return -1;
+
+    const CapturedDraw& draw = captures[drawIndex];
+
+    ctx->IASetInputLayout(draw.inputLayout);
+    ctx->IASetPrimitiveTopology(draw.topology);
+    ctx->IASetVertexBuffers(0, CapturedDraw::MAX_VB_SLOTS, draw.vertexBuffers,
+                            draw.vbStrides, draw.vbOffsets);
+    ctx->IASetIndexBuffer(draw.indexBuffer, draw.indexFormat, draw.ibOffset);
+
+    return 0;
+}
+
+static int HostIssueGeometryDraw(ID3D11DeviceContext* ctx, uint32_t drawIndex)
+{
+    if (!ctx) return -1;
+    const auto& captures = GeometryCapture::GetCaptures();
+    if (drawIndex >= (uint32_t)captures.size()) return -1;
+
+    const CapturedDraw& draw = captures[drawIndex];
+
+    if (draw.instanceCount > 1)
+    {
+        ctx->DrawIndexedInstanced(draw.indexCount, draw.instanceCount,
+                                  draw.startIndexLocation, draw.baseVertexLocation,
+                                  draw.startInstanceLocation);
+    }
+    else
+    {
+        ctx->DrawIndexed(draw.indexCount, draw.startIndexLocation,
+                         draw.baseVertexLocation);
+    }
+
+    return 0;
+}
+
+static std::vector<uint8_t> sCBReadBuf;
+
+static int HostGetGeometryDrawConstants(ID3D11DeviceContext* ctx, uint32_t drawIndex,
+                                         const void** outData, uint32_t* outSize)
+{
+    if (!ctx || !outData || !outSize) return -1;
+    const auto& captures = GeometryCapture::GetCaptures();
+    if (drawIndex >= (uint32_t)captures.size()) return -1;
+
+    const CapturedDraw& draw = captures[drawIndex];
+    if (!draw.cbStagingCopy || draw.cbStagingSize == 0) return -1;
+
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT hr = ctx->Map(draw.cbStagingCopy, 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) return -1;
+
+    sCBReadBuf.resize(draw.cbStagingSize);
+    memcpy(sCBReadBuf.data(), mapped.pData, draw.cbStagingSize);
+    ctx->Unmap(draw.cbStagingCopy, 0);
+
+    *outData = sCBReadBuf.data();
+    *outSize = draw.cbStagingSize;
+    return 0;
+}
+
+static int HostGetGeometryDrawBuffers(uint32_t drawIndex,
+                                       ID3D11Buffer** outVB, uint32_t* outStride,
+                                       ID3D11Buffer** outIB, DXGI_FORMAT* outIndexFormat)
+{
+    const auto& captures = GeometryCapture::GetCaptures();
+    if (drawIndex >= (uint32_t)captures.size()) return -1;
+
+    const CapturedDraw& draw = captures[drawIndex];
+
+    if (outVB)     *outVB = draw.vertexBuffers[0];
+    if (outStride) *outStride = draw.vbStrides[0];
+    if (outIB)     *outIB = draw.indexBuffer;
+    if (outIndexFormat) *outIndexFormat = draw.indexFormat;
+
+    return 0;
+}
+
+static void HostSetGeometryCaptureFlags(uint32_t flags)
+{
+    GeometryCapture::SetCaptureFlags(flags);
+}
+
+static uint32_t HostGetGeometryCaptureFlags()
+{
+    return GeometryCapture::GetCaptureFlags();
+}
+
 // ==================== EffectLoader ====================
 
 void EffectLoader::BuildHostAPI()
@@ -402,6 +563,18 @@ void EffectLoader::BuildHostAPI()
     hostAPI_.SetShadowAtlasResolution = D3D11Hook::SetShadowAtlasResolution;
     hostAPI_.SetCascadeLambda         = PssmDetour::SetLambda;
     hostAPI_.SetCascadeFilterScale    = PssmDetour::SetCascadeFilterScale;
+
+    // v4 additions
+    hostAPI_.GetGeometryDrawCount     = HostGetGeometryDrawCount;
+    hostAPI_.GetGeometryDrawInfo      = HostGetGeometryDrawInfo;
+    hostAPI_.ReplayGeometry           = HostReplayGeometry;
+    hostAPI_.GetShaderCategoryName    = HostGetShaderCategoryName;
+    hostAPI_.BindGeometryDraw         = HostBindGeometryDraw;
+    hostAPI_.IssueGeometryDraw        = HostIssueGeometryDraw;
+    hostAPI_.GetGeometryDrawConstants = HostGetGeometryDrawConstants;
+    hostAPI_.GetGeometryDrawBuffers   = HostGetGeometryDrawBuffers;
+    hostAPI_.SetGeometryCaptureFlags  = HostSetGeometryCaptureFlags;
+    hostAPI_.GetGeometryCaptureFlags  = HostGetGeometryCaptureFlags;
 }
 
 // ==================== v3: Config I/O ====================

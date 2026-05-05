@@ -3,6 +3,8 @@
 #include "DustLog.h"
 #include "EffectLoader.h"
 #include "FilePicker.h"
+#include "GeometryCapture.h"
+#include "ShaderMetadata.h"
 #include "Survey.h"
 #include "SurveyRecorder.h"
 #include "imgui/imgui.h"
@@ -1615,9 +1617,32 @@ static void DrawPerformanceSection()
     ImGui::Spacing();
 
     // Resolution info
-    ImGui::TextDisabled("Resolution info from last frame context");
-    // We don't have direct access to resolution here, but we can show display size
     ImGui::Text("Display: %.0fx%.0f", io.DisplaySize.x, io.DisplaySize.y);
+
+    // Geometry capture stats
+    uint32_t captureCount = GeometryCapture::GetCaptureCount();
+    if (captureCount > 0)
+    {
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.4f, 1.0f), "Geometry Capture");
+        ImGui::Spacing();
+
+        ImGui::Text("  GBuffer Draws: %u", captureCount);
+
+        uint32_t classified = 0;
+        const auto& captures = GeometryCapture::GetCaptures();
+        for (const auto& draw : captures)
+            if (draw.vsMetadata && draw.vsMetadata->transformType != VSTransformType::UNKNOWN)
+                classified++;
+
+        ImGui::Text("  Classified:    %u (%.0f%%)", classified,
+                     captureCount > 0 ? classified * 100.0f / captureCount : 0.0f);
+        ImGui::Text("  Shaders:       %u tracked, %u classified",
+                     ShaderMetadata::GetTrackedCount(), ShaderMetadata::GetClassifiedCount());
+    }
 }
 
 // ==================== Startup toast ====================

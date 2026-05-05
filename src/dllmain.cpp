@@ -12,6 +12,10 @@
 #include "DustGUI.h"
 #include "EffectLoader.h"
 #include "PssmDetour.h"
+#include "ShaderMetadata.h"
+#include "ShaderDatabase.h"
+#include "GeometryCapture.h"
+#include "GeometryReplay.h"
 
 static HMODULE gDllModule = nullptr;
 
@@ -297,6 +301,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
         if (lpReserved) break;
         DustGUI::Shutdown();
         gEffectLoader.ShutdownAll();
+        GeometryReplay::Shutdown();
+        GeometryCapture::Shutdown();
+        ShaderDatabase::Shutdown();
+        ShaderMetadata::Shutdown();
         break;
     }
     return TRUE;

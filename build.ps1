@@ -1,5 +1,6 @@
 param(
-    [switch]$Deploy
+    [switch]$Deploy,
+    [switch]$SkipPresets
 )
 
 $ErrorActionPreference = "Stop"
@@ -47,7 +48,9 @@ if (-not $Deploy) { exit 0 }
 
 Write-Host "==> Deploying to $ModDir" -ForegroundColor Cyan
 New-Item -ItemType Directory -Force -Path "$ModDir\effects\shaders" | Out-Null
-New-Item -ItemType Directory -Force -Path "$ModDir\presets"         | Out-Null
+if (-not $SkipPresets) {
+    New-Item -ItemType Directory -Force -Path "$ModDir\presets"     | Out-Null
+}
 
 Copy-Item "$Root\boot\build\Release\DustBoot.dll" "$ModDir\"
 Copy-Item "$Root\src\build\Release\Dust.dll"  "$ModDir\"
@@ -61,7 +64,11 @@ foreach ($effect in $Effects) {
     if ($shaders) { Copy-Item $shaders.FullName "$ModDir\effects\shaders\" }
 }
 
-$presets = Get-ChildItem "$Root\effects\presets\*" -ErrorAction SilentlyContinue
-if ($presets) { Copy-Item "$Root\effects\presets\*" "$ModDir\presets\" -Recurse -Force }
+if ($SkipPresets) {
+    Write-Host "==> Skipping presets (per -SkipPresets)" -ForegroundColor Yellow
+} else {
+    $presets = Get-ChildItem "$Root\effects\presets\*" -ErrorAction SilentlyContinue
+    if ($presets) { Copy-Item "$Root\effects\presets\*" "$ModDir\presets\" -Recurse -Force }
+}
 
 Write-Host "==> Deploy complete" -ForegroundColor Green

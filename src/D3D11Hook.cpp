@@ -10,6 +10,9 @@
 #include "OgreSwapHook.h"
 #include "ShadowProbe.h"
 #include "PssmDetour.h"
+#include "ShaderMetadata.h"
+#include "ShaderDatabase.h"
+#include "GeometryCapture.h"
 #include "DustLog.h"
 #include <core/Functions.h>
 #include <d3d11.h>
@@ -92,6 +95,7 @@ void SignalGameAlive(const char* via)
 void ResetFrameState()
 {
     SignalGameAlive("GameWorld::mainLoop");
+    GeometryCapture::ResetFrame();
     gPipelineDetector.ResetFrame();
     gResourceRegistry.ResetFrame();
     gDispatchedThisFrame = false;
@@ -469,6 +473,7 @@ static void TryCaptureDevice(ID3D11Device* device)
 
     gDevice = device;
     device->GetImmediateContext(&gContext);
+    GeometryCapture::SetDevice(device);
 
     Log("Captured real D3D11 device=%p, context=%p", gDevice, gContext);
 
@@ -507,6 +512,7 @@ static void TryCaptureDevice(ID3D11Device* device)
     else
     {
         Log("Detected resolution: %ux%u", gWidth, gHeight);
+        GeometryCapture::SetResolution(gWidth, gHeight);
     }
 
     // Initialize all loaded effect plugins
@@ -619,7 +625,10 @@ static HRESULT STDMETHODCALLTYPE HookedCreatePixelShader(
     HRESULT hr = oCreatePixelShader(pThis, pShaderBytecode, BytecodeLength,
                                      pClassLinkage, ppPixelShader);
     if (SUCCEEDED(hr) && ppPixelShader && *ppPixelShader)
+    {
         SurveyRecorder::OnPixelShaderCreated(pShaderBytecode, BytecodeLength, *ppPixelShader);
+        ShaderDatabase::OnPixelShaderCreated(*ppPixelShader);
+    }
     return hr;
 }
 
@@ -642,7 +651,11 @@ static HRESULT STDMETHODCALLTYPE HookedCreateVertexShader(
     HRESULT hr = oCreateVertexShader(pThis, pShaderBytecode, BytecodeLength,
                                       pClassLinkage, ppVertexShader);
     if (SUCCEEDED(hr) && ppVertexShader && *ppVertexShader)
+    {
         SurveyRecorder::OnVertexShaderCreated(pShaderBytecode, BytecodeLength, *ppVertexShader);
+        ShaderMetadata::OnVertexShaderCreated(pShaderBytecode, BytecodeLength, *ppVertexShader);
+        ShaderDatabase::OnVertexShaderCreated(*ppVertexShader);
+    }
     return hr;
 }
 
@@ -751,6 +764,7 @@ static void STDMETHODCALLTYPE HookedDraw(
                             gWidth = desc.Width;
                             gHeight = desc.Height;
                             gEffectLoader.OnResolutionChanged(gDevice, gWidth, gHeight);
+                            GeometryCapture::SetResolution(gWidth, gHeight);
                         }
                         tex->Release();
                     }
@@ -819,6 +833,8 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     if (Survey::IsActive())
         SurveyRecorder::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 
+    GeometryCapture::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
+
     oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 }
 
@@ -833,6 +849,10 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
                                                 StartIndexLocation, BaseVertexLocation,
                                                 StartInstanceLocation);
 
+    GeometryCapture::OnDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
+                                            StartIndexLocation, BaseVertexLocation,
+                                            StartInstanceLocation);
+
     oDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
                           StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
 }
@@ -844,7 +864,10 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
 {
     if (gShutdownSignaled) { oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView); return; }
 
+    bool isGBuffer = GeometryCapture::CheckGBufferConfig(NumViews, ppRenderTargetViews, pDepthStencilView);
+
     oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView);
+    GeometryCapture::OnOMSetRenderTargetsWithResult(isGBuffer);
 }
 
 // ==================== Swap chain hooks (ImGui) ====================
