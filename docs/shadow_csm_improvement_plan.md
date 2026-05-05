@@ -1,6 +1,13 @@
 # Shadow Improvement Plan
 
-*Written: 2026-05-04*
+*Written: 2026-05-04 — Path B implemented 2026-05-05*
+
+## TL;DR
+
+Runtime PSSM lambda control is shipped. `Shadows → Cascade Lambda` slider in Dust's GUI controls cascade-split distribution live (0.0 = pure linear, 1.0 = pure logarithmic, Kenshi default ≈ 0.95). User reports lambda 0.8-0.9 looks visibly better than vanilla. See "§11 Path B implementation" below.
+
+---
+
 
 Plan covering both shadow paths in Kenshi:
 
@@ -39,22 +46,28 @@ split[i] = lambda * near * (far/near)^(i/N) + (1-lambda) * (near + (far-near) * 
 
 In-game observation: at shadow range 9000, the visible shadow envelope reads as 500-1000m. So **1 Kenshi unit ≈ 0.06-0.11 m**, call it ~0.08 m/unit. All meter values below assume 0.083 m/unit.
 
-### Splits at default lambda=0.95, far=9000, near=1
+### Live data captured 2026-05-04 (supersedes prior estimates)
 
-| Cascade | Range (units) | Width (m) |
-|---|---|---|
-| 0 | 1 → 122 | ~10 |
-| 1 | 122 → 315 | ~16 |
-| 2 | 315 → 1215 | ~75 |
-| 3 | 1215 → 9000 | **~645** |
+Cbuffer dump from `D3D11Hook.cpp` at runtime, slider Shadow Range = 9000:
 
-This matches the user's in-game observation directly: cascade 0 reads as "extremely small" (~10m) and cascade 3 lands in the user's 500-1000m bracket. Conclusion: **Kenshi is almost certainly running OGRE-default lambda=0.95**, not something exotic. No need to invoke lambda close to 1.0; the defaults already produce what we see.
+| Cascade | Split end (units) | Width (units) | Width (m) |
+|---|---|---|---|
+| 0 | 40.7  | ~40   | ~3.4  |
+| 1 | 110.8 | ~70   | ~5.8  |
+| 2 | 435.3 | ~325  | ~27   |
+| 3 | 5999  | ~5564 | **~462** |
 
-### The texel-density gap
+Engine-internal far = ~6000, **not** the Shadow Range UI slider. `settings.cfg` reports `Shadow Range=50000`, yet cascade 3 ends at 5999 in the dump — the slider is *not* the engine far distance, and the relationship is not a simple compression. The engine far appears to be set independently (possibly clamped or derived from view frustum/scene). Solving the PSSM formula against these splits with near≈0.1 yields **λ ≈ 0.97-0.99** (cascade 3 even lies *below* the pure-log split for λ=0.95). Kenshi is more logarithmic than OGRE default. The cascade-3-vs-cascade-0 width ratio is ~140×, worse than the ~64× the prior estimate gave.
 
-At far=9000, lambda=0.95, the cascade 3 / cascade 0 world-extent ratio is ~64×. Each cascade gets the same atlas slot, so texels in cascade 3 are ~64× wider than in cascade 0. With a 16384² atlas (8192² per cascade in 2x2 layout), cascade 3 covering 645m at 8192 texels = **~8 cm/texel**. That is exactly where the "huge rectangles" come from.
+Filter radius (`csmParams[1]`) is already per-cascade and scales 0.0061 / 0.0023 / 0.0006 / 0.0004 — Kenshi's shader pre-computes a per-cascade filter taper. (Out of scope for tuning here; just noting it for future filter work.)
 
-Doubling atlas resolution gives 2× texel density per cascade. The atlas knob alone is fully exhausted at 16384² for the user's hardware. The remaining lever is **redistribution (lambda)**.
+### The texel-density gap (using live data)
+
+With far=6000, λ≈0.97, cascade 3 width = ~462m. At 16384² atlas (8192² per cascade in 2x2 layout): 462m / 8192 texels = **~5.6 cm/texel**. Slightly less catastrophic than the 8 cm/texel earlier estimate, but still where the "huge rectangles" come from.
+
+Cascade 0 at the same atlas: 3.4m / 8192 = ~0.4 mm/texel. Massively overserved.
+
+Doubling atlas resolution gives 2× texel density per cascade. The atlas knob is exhausted at 16384² for the user's hardware. The remaining lever is **redistribution (lambda)**.
 
 ## 3. Engine details (confirmed)
 
@@ -68,9 +81,10 @@ Doubling atlas resolution gives 2× texel density per cascade. The atlas knob al
   csmParams   @ 208, 4x float4   (per-cascade: split, filter radius, fixed bias, depth radius)
   csmScale    @ 272, 4x float4   (per-cascade: world->atlas-uv scale)
   csmTrans    @ 336, 4x float4   (per-cascade: world->atlas-uv translate)
-  csmUvBounds @ 400, 4x float4   (per-cascade: atlas tile UV bounds)
+  csmUvBounds @ 400, 4x float4   (reflected but unused — always zero)
   ```
-  The presence of `csmUvBounds` strongly implies all 4 cascades pack into a single shared atlas texture (OGRE `isAtlas=true` mode), but this is not yet verified.
+  **Confirmed 2x2 atlas-packed** (one shared texture). Discriminator is the trans-clustering: cascades' `(transX, transY)` land in 4 distinct half-unit cells `(0,0)/(1,0)/(0,1)/(1,1)`, with the atlas tile offset baked directly into `csmTrans`. The `csmUvBounds` slot exists in shader reflection but is never written by Kenshi — leftover from OGRE's atlas plumbing that this shader doesn't consume.
+- The cbuffer is updated via `Map`/`Unmap` (D3D11_USAGE_DYNAMIC), not `UpdateSubresource`. Any future runtime mutation has to hook the Unmap path.
 
 ## 4. The relevant OGRE 2.0 type
 
@@ -92,52 +106,57 @@ Each per-cascade entry in the shadow node definition has its own `width`, `heigh
 
 ## 5. Plan
 
-### Step 1: confirm atlas mode (do this even before grabbing the script)
+### Step 1: confirm atlas mode — DONE 2026-05-04
 
-Add a one-shot dump of `csmUvBounds[i]` for all 4 cascades in `src/D3D11Hook.cpp` around the existing `DumpCascades` (line 1013-1030). If the bounds look like `(0, 0, 0.5, 0.5)`, `(0.5, 0, 1.0, 0.5)`, `(0, 0.5, 0.5, 1.0)`, `(0.5, 0.5, 1.0, 1.0)`, it is a 2x2 atlas. If they all read `(0, 0, 1, 1)` then each cascade has its own texture and per-cascade resolution is on the table.
+Implemented as `CSMIntercept::ClassifyLayout` in `src/D3D11Hook.cpp`, hooked into the Unmap path. Verdict: **2x2 atlas-packed**. `csmUvBounds` is unused by the shader; classification is via trans-clustering (each cascade's `(transX, transY)` falls in a distinct half-unit cell of the atlas).
 
-This is the only thing in this plan that does not require Kenshi to be installed; it just needs the dump output.
+Implication: per-cascade resolution is **not** a lever. Step 4 has only Path A (lambda + global resolution) — no Path A bonus.
 
-### Step 2: locate Kenshi's compositor script
+### Step 2: locate Kenshi's compositor script — DONE 2026-05-04
 
-On a machine with Kenshi installed (Steam: `<library>/steamapps/common/Kenshi/`), grep the data directory:
+**Result: there is no compositor script.** Searched `D:\SteamLibrary\steamapps\common\Kenshi\` recursively for `pssm_lambda|pssmLambda|compositor_node_shadow|technique pssm|num_splits` across `*.compositor` (10 files), `*.material` (164 files), `*.cfg`, `*.json`, `*.txt`, `*.xml`. **Zero hits anywhere.** The 10 `.compositor` files cover GBuffer/Lighting_HDR/Resolve_HDR/Water_Reflection/Debug, FXAA/HeatHaze post-process, and Caelum sky — none define a shadow node. `compositors.cfg` only lists post-process nodes (FXAA, HeatHaze).
 
-```powershell
-Get-ChildItem "<Kenshi>\data" -Recurse -Include *.compositor,*.material |
-    Select-String -Pattern "pssm_lambda|num_splits|shadow_map.*pssm|compositor_node_shadow"
+The `SHADOW_MAP_COUNT` cascade count is a `#define` in `data/materials/common/shadowFunctions.hlsl:3` and `shadow_csm.glsl:4` (default 4, ladder up to 9). The cbuffer values are populated by Kenshi's binary at runtime, not by a script.
+
+**Conclusion: Kenshi's shadow node is constructed in C++.** Either by Kenshi explicitly or by OGRE's auto-construction defaults invoked from Kenshi's compositor manager setup.
+
+### Step 3: ~~read current values~~ — N/A
+
+Subsumed into Step 1's runtime dump and the Step 2 finding above. Nominal values to record: λ ≈ 0.97-0.99 (back-solved), 4 cascades, atlas-packed 2x2, far ≈ 6000 (engine-internal, decoupled from slider).
+
+### Step 4: pick implementation path — Path A dead, Path B is the only option
+
+~~**Path A: edit the compositor script**~~ — **NOT VIABLE.** Step 2 confirmed there is no script to edit.
+
+**Path B: hook OGRE at runtime** — the only path forward. Survey 2026-05-04 found Path B is *much* more accessible than originally thought:
+
+- ✅ **Dust already links `OgreMain_x64.lib`** (`src/Dust.vcxproj:71,87`). The plan's "non-trivial linkage" obstacle was wrong.
+- ✅ **OGRE 2.0 Tindalos headers are in tree** at `external/KenshiLib/Include/ogre/`.
+- ✅ **Working OGRE C++ usage already exists** — `src/OgreSwapHook.cpp` already vtable-patches `Ogre::RenderTarget::swapBuffers` against the live instance reached via `Ogre::Root::getSingletonPtr()`.
+- ✅ **RE_Kenshi does not touch shadows** (wide grep returned zero hits). No conflict risk.
+- ✅ **`OgreMain_x64.dll` and `RenderSystem_Direct3D11_x64.dll` ship as separate DLLs** alongside `Kenshi_x64.exe`, so symbols are dynamically resolvable.
+- ⚠️ **Lambda lives on `ShadowTextureDefinition::pssmLambda`** (`OgreCompositorShadowNodeDef.h:73`) — a *public* `Real` field, default `0.95f`. Mutable directly.
+- ⚠️ **The vector holding those defs is `protected`** (`mShadowMapTexDefinitions`). Three workarounds: `#define protected public` before include (cursed but works), friend-class declaration (requires header edit), or offset hack (layout-dependent).
+- ⚠️ **Workspace rebuild is required after mutation.** OGRE comment: *"Modifying a NodeDef while it's being used by CompositorNode instances is undefined."* So sequence is: snapshot live workspaces → `removeAllWorkspaces` → mutate def → `addWorkspace` recreated.
+- ⚠️ **Shadow node name unknown.** Kenshi creates it programmatically with no script. We'll need to enumerate `CompositorManager2::getNodeDefinitions()` (or attempt `getShadowNodeDefinition`) to find the right node by inspection at runtime.
+
+**Concrete API path:**
+```cpp
+auto* root = Ogre::Root::getSingletonPtr();
+auto* cm   = root->getCompositorManager2();
+// Find the shadow node def (name discovered by enumeration / log-and-inspect)
+auto* def  = const_cast<Ogre::CompositorShadowNodeDef*>(cm->getShadowNodeDefinition("..."));
+// Snapshot live workspaces (sceneManager, finalRT, defaultCam, defName, enabled, position)
+// removeAllWorkspaces / removeWorkspace per snapshot
+// Mutate def->mShadowMapTexDefinitions[i].pssmLambda for i in [0..3]
+// addWorkspace per snapshot
 ```
 
-Likely candidate filenames: `Deferred.compositor`, `ShadowMaps.compositor`, anything in a `shaders/` subfolder. The relevant block is `compositor_node_shadow ... { technique pssm; ... }`.
+**Lower-level alternative (also viable):** detour `Ogre::PSSMShadowCameraSetup::calculateSplitPoints(splitCount, near, far, lambda)` — public non-virtual method, mangled symbol resolvable in `OgreMain_x64.dll`. Every camera setup created after the detour gets our lambda. Avoids the rebuild dance entirely. Slightly riskier (function detour vs. data mutation) but no header workaround needed.
 
-### Step 3: read current values
+**Dead-end alternative (do NOT pursue):** rewrite the cbuffer at `Map`/`Unmap`. The shader reads split distances from the cbuffer, but the *shadow map content* is rendered by the shadow camera using OGRE's split distances, not ours. Mismatching the two produces shadows sampled from the wrong region of the atlas — visibly broken.
 
-Record:
-
-- Current `pssm_lambda` (expected ~0.95)
-- Current `num_splits` (expected 4)
-- Current `pssm_split_padding` (expected ~1.0)
-- Each `shadow_map` line: dimensions, format, `atlas <name>` clause if present
-- Whether atlas mode is in use (matches step 1's dump)
-
-### Step 4: pick implementation path
-
-**Path A: edit the compositor script** (cheap, static)
-
-- Change `pssm_lambda` from ~0.95 to ~0.6 as the first test. If split 0 still looks fine, push down to 0.5. If split 0 starts looking bad, climb back to 0.7.
-- Leave `pssm_split_padding` alone unless a seam appears between splits.
-- If step 1 confirms separate per-cascade textures, optionally bump split 2 and 3's `width`/`height` while leaving split 0 alone.
-- Pros: no code, no DLL changes, immediate visual confirmation.
-- Cons: not live-tunable. Every Kenshi update may overwrite. Distribution requires shipping a modified compositor file, which is friction.
-
-**Path B: hook OGRE at runtime** (proper)
-
-- Walk `Ogre::Root::getSingleton().getCompositorManager2()` -> shadow node def -> `ShadowTextureDefinition` entries.
-- Mutate `pssmLambda` (and per-cascade `width`/`height` if per-cascade textures), then force a workspace rebuild.
-- Expose as Dust shadow plugin sliders alongside the existing filter radius and resolution controls.
-- Pros: live tuning, persists across updates, no game-file modification.
-- Cons: Dust currently is a pure D3D11 hook with no OGRE dependency. Adding OGRE linkage is non-trivial. Compositor rebuild may be intrusive (frame hitch or breakage).
-
-**Recommended order**: do Path A first to validate the lambda thesis with real visual feedback. If the result is good, productize as Path B. If Path A is already good enough and the user is happy editing one file once, skip B.
+**Recommended next step**: discovery probe — log all node definitions on first frame to find Kenshi's shadow node name. Then pick between the two viable paths above based on which the user prefers (data-mutation + rebuild vs. function detour).
 
 ## 6. Why max atlas + lambda compound
 
@@ -148,19 +167,19 @@ These solve different problems and combine multiplicatively:
 
 Currently, the user paid full VRAM cost for a max-size atlas, but ~80% of those extra texels land on cascade 0/1 which were already fine at 2048. Lambda redistributes that VRAM toward the cascades that need it.
 
-### Lambda budget at far=9000 (the realistic ceiling)
+### Lambda budget at engine far=6000, near=0.1 (the actual configuration)
 
-| Lambda | Cascade 0 (m) | Cascade 3 (m) | Cascade 3 density vs default |
+| Lambda | Cascade 0 (m) | Cascade 3 (m) | Cascade 3 density vs current |
 |---|---|---|---|
-| 0.95 (OGRE default) | ~10 | ~645 | 1.0× (baseline) |
-| 0.7 | ~50 | ~530 | 1.2× |
-| 0.5 | ~94 | ~428 | 1.5× |
-| 0.3 | ~131 | ~332 | 1.94× |
-| 0.0 (pure linear) | ~187 | ~187 | 3.45× |
+| 0.97 (current Kenshi value) | ~3.9 | ~456 | 1.0× (baseline) |
+| 0.7 | ~37 | ~364 | 1.25× |
+| 0.5 | ~62 | ~295 | 1.55× |
+| 0.3 | ~87 | ~227 | 2.01× |
+| 0.0 (pure linear) | ~125 | ~125 | 3.65× |
 
-Honest reading: **lambda alone roughly halves cascade 3's coverage** before pure linear (where all cascades become equally bad). Cascade 3 density improvement tops out at ~3.5× even at the extreme. That is real — combined with full 16384² atlas, lambda 0.5 brings cascade 3 from ~8 cm/texel to ~5 cm/texel, which is acceptable rather than "huge rectangles". But this is "less obviously broken", not "fixed".
+Honest reading: **lambda alone roughly cuts cascade 3's coverage by a third** (lambda 0.5) or by half (lambda 0.3) before pure linear. Cascade 3 density improvement tops out at ~3.6× even at the extreme. Combined with full 16384² atlas, lambda 0.5 brings cascade 3 from ~5.6 cm/texel to ~3.6 cm/texel — acceptable rather than "huge rectangles". This is "less obviously broken", not "fixed".
 
-The trade is cascade 0 growing from 10m to ~50-95m. Cascade 0 was massively overserved at 10m, so this is a free win up to a point — exactly the headroom the user noted ("split 0 already looked good at 2048"). The realistic recommendation is **lambda 0.5-0.7**, picking by visual taste.
+The trade is cascade 0 growing from ~4m to ~37-62m. Cascade 0 was massively overserved at 4m (sub-millimeter texels), so this is a free win up to a point — exactly the headroom the user noted ("split 0 already looked good at 2048"). The realistic recommendation is **lambda 0.5-0.7**, picking by visual taste.
 
 Bonus: with splits more uniform, the cascade 1->2 and 2->3 transitions also become less jarring because the resolution step between them is smaller.
 
@@ -182,13 +201,75 @@ At ranges far beyond 9000 (the user's slider goes to 50000), cascade 3 covers te
 - **More than 4 cascades**. `SHADOW_MAP_COUNT` is bound in the deferred shader cbuffer. Engine-side change, much larger scope.
 - **VSM / MSM / EVSM**. These are filtering-quality improvements, not texel-density fixes. Same reason as the custom filter rejection.
 
-## 9. Open questions to answer once Kenshi install is available
+## 9. Open questions
 
-1. Is the shadow node atlas-packed (one shared texture) or does each cascade have its own texture?
-2. What is the current `pssm_lambda` value?
-3. What is Kenshi's near plane and shadow far distance as the engine sees them (not the settings.cfg `Shadow Range` value, which is just a UI cap)?
-4. Does Kenshi load any compositor overrides from mods, or is the data file the single source of truth?
-5. Is RE_Kenshi already patching the compositor at runtime? If so, our edits may be stomped or already-stomped values may be what we are seeing.
+1. ~~Is the shadow node atlas-packed?~~ **Answered 2026-05-04: yes, 2x2 atlas-packed.**
+2. ~~What is the current `pssm_lambda` value?~~ **Answered 2026-05-04: λ ≈ 0.97-0.99 (back-solved from runtime splits).** Compositor script may state a different nominal value if RE_Kenshi or a mod overrides it; still worth reading once Kenshi install is available.
+3. ~~Engine near plane and shadow far distance?~~ **Partially answered: engine far ≈ 6000 (with `Shadow Range=50000` in settings.cfg). Near ≈ 0.1 (back-solved).** The slider does NOT correspond to the engine far distance — the engine far is set by something else (clamp? view frustum? scene size?). Unresolved.
+4. ~~Does Kenshi load any compositor overrides from mods?~~ **Moot — there is no shadow compositor script for mods to override.** Step 2 confirmed shadow node is C++-constructed. Modding the shadow node would require a binary patch.
+5. ~~Is RE_Kenshi already patching the compositor at runtime?~~ **Answered 2026-05-04: no.** Wide grep across `external/RE_Kenshi/` (full source: `OgreHooks.cpp`, `ShaderCache.cpp`, `MiscHooks.cpp`, etc.) for `shadow|cascade|csm|pssm|lambda|Compositor|Workspace` returned zero hits. RE_Kenshi only touches DDS texture loading, MyGUI, FS, heightmap, sound, and physics — not shadows. No conflict risk for Path B.
+
+6. ~~What is the name of Kenshi's shadow node definition?~~ **Moot 2026-05-05 — Kenshi doesn't use OGRE's `CompositorShadowNode` at all.** It uses regular `CompositorNode` with a custom render path. See §11.
+
+---
+
+## 11. Path B implementation (delivered 2026-05-05)
+
+The Path B "hook OGRE at runtime" plan turned out to need a different shape than originally drawn. Documenting the actual delivery here.
+
+### What's wired now
+
+- **`Shadows → Cascade Lambda` slider in Dust's GUI**, range `[0, 1]`, default `0.95` (matches Kenshi's native value). Lives in `effects/shadows/DustShadows.cpp` as a normal `DustSettingDesc`. Persists in `Dust.ini` under `[Shadows] CascadeLambda=`.
+- **Host API entry `SetCascadeLambda(float)`** added to `DustHostAPI` (`src/DustAPI.h:181`). Wired to `PssmDetour::SetLambda` in `src/EffectLoader.cpp`.
+- **`src/PssmDetour.cpp`** owns the actual splits override. Stores `sLambda` atomically; on slider change, recomputes splits via the standard PSSM formula and pushes them into both Kenshi's source array and OGRE's `GpuSharedParameters` buffer.
+
+### Why Path A and the original Path B sketch were wrong
+
+- **Path A (edit compositor script):** dead — no shadow node script exists in `data/`. Confirmed by full grep.
+- **Original Path B sketch (mutate `ShadowTextureDefinition::pssmLambda`):** dead — Kenshi never instantiates a `CompositorShadowNode`. We installed hooks on `ShadowCameraSetup::ctor`, `~ctor`, `CompositorShadowNode::ctor`, `_update`, `calculateSplitPoints`, `setSplitPoints`, and all four `getShadowCamera` virtuals (PSSM/Default/Focused/PlaneOptimal). **None ever fired.** Kenshi has its own custom render path.
+
+### How it actually works
+
+The cbuffer fields `csmParams[i].x` (split distances) are populated by Kenshi's own code in `Kenshi_x64.exe`. The data flow we discovered:
+
+1. Kenshi has a giant function (~10KB, starts ~`+0x8629a0` in `Kenshi_x64.exe`) that orchestrates the deferred-rendering frame, including shadow setup.
+2. Inside it, around `+0x862c34`, Kenshi calls `Ogre::GpuSharedParameters::getFloatPointer(this, 24)` to get a writable pointer into the `ShadowSharedParams` shared block (the slot for `csmParams`).
+3. Right after that call, Kenshi loops over its own pre-computed splits stored at `(orchestrator-this)->field_0x10`. Layout is `[near, split[1], split[2], split[3], far]` — 5 floats.
+4. For each cascade `i`, it writes `csmParams[i].x = splits[i+1] - near` into the shared block.
+5. OGRE pushes the shared block to the GPU cbuffer every frame — so the same values get re-uploaded forever, even though Kenshi only writes to the shared block once at scene init.
+
+### Discovery sequence
+
+1. Hooked `Ogre::GpuSharedParameters::getFloatPointer` (the raw-write fast path used by the orchestrator). Got call stack on first `pos==24` hit, which led to the orchestrator at `kenshi_x64.exe+0x862c34`.
+2. Disassembled the post-call code (capstone via `tmp/disasm_post_call.py`). Identified `(this)->field_0x10` as the source pointer for the splits.
+3. Used `RtlVirtualUnwind` from inside the OGRE hook to reconstruct the orchestrator's `RDI` (= `this`) — needed because MSVC's prologue clobbers our local `rdi` by the time C++ runs.
+4. Read 32 floats from `this->field_0x10` and saw `[1.0, 41.7, 111.81, 436.33, 6000.0]` — exact match for the cascade splits we'd already observed in the cbuffer (`csmParams[i].x = splits[i+1] - 1.0`).
+
+### What the slider actually does on each move
+
+In `PssmDetour::SetLambda`:
+
+1. Update `sLambda` atomic.
+2. Recompute `splits[1..3]` using the standard PSSM formula on the cached `near`/`far` values.
+3. Write them into Kenshi's `field_0x10` source array (so any subsequent shadow-camera setup uses the new splits).
+4. Call OGRE's exported `getFloatPointer(GpuSharedParameters, 24)` ourselves and write `csmParams[i].x = splits[i+1] - near` directly into the shared block — preserving `.yzw` (filter radius, biases).
+
+Step 4 is the critical one: Kenshi only writes to the shared block once at scene init, so without re-pushing ourselves on slider change, the cbuffer values would stay stale. With it, OGRE picks up our new values on the next frame's auto-push to GPU.
+
+### Caveats
+
+- We don't re-render the shadow MAP atlas. The atlas content was rendered with whichever cascade frusta Kenshi positioned originally. So the lambda slider re-distributes how the *shader samples* the atlas, but the atlas itself stays put. In practice this looks fine because Kenshi re-renders the shadow atlas every frame from the camera's current pose anyway — and if our `field_0x10` patch is read by that path (which it should be), both stay consistent. User reports the slider gives a visibly correct redistribution.
+- Hook-install address `+0x8629a0` is brittle (specific to RE_Kenshi-modified `Kenshi_x64.exe` 1.0.65 Steam). Future Kenshi/RE_Kenshi updates likely shift it. Probably OK for now since RE_Kenshi only supports 1.0.65 anyway.
+- The `getFloatPointer`-based capture relies on Kenshi calling it at scene init. If a future Kenshi patch caches differently, we'd miss the capture window. Mitigated by the fact that Dust loads early (preload via `dllStartPlugin`).
+
+### Files changed
+
+- `src/PssmDetour.cpp`, `src/PssmDetour.h` — the hook + state + `SetLambda`/`GetLambda` API
+- `src/DustAPI.h` — added `SetCascadeLambda` to `DustHostAPI`
+- `src/EffectLoader.cpp` — wired `hostAPI_.SetCascadeLambda`
+- `effects/shadows/DustShadows.cpp` — added `pssmLambda` config field, slider entry, `OnSettingChanged` push, `Init`-time push
+- `src/dllmain.cpp` — installs `PssmDetour::TryInstall()` early in `startPlugin`
+- `src/D3D11Hook.cpp` — `HookedUnmap` invokes `CSMIntercept::ClassifyLayout` + `LogCallerStack` (the original probe machinery, which is what got us here)
 
 ---
 

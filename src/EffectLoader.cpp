@@ -401,6 +401,7 @@ void EffectLoader::BuildHostAPI()
     hostAPI_.GetPreFogHDR           = HostGetPreFogHDR;
     hostAPI_.SetShadowAtlasResolution = D3D11Hook::SetShadowAtlasResolution;
     hostAPI_.SetCascadeLambda         = PssmDetour::SetLambda;
+    hostAPI_.SetCascadeFilterScale    = PssmDetour::SetCascadeFilterScale;
 }
 
 // ==================== v3: Config I/O ====================

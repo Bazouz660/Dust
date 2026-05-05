@@ -9,6 +9,7 @@
 #include "ShaderPatch.h"
 #include "OgreSwapHook.h"
 #include "ShadowProbe.h"
+#include "PssmDetour.h"
 #include "DustLog.h"
 #include <core/Functions.h>
 #include <d3d11.h>
@@ -1264,6 +1265,11 @@ static void STDMETHODCALLTYPE HookedUnmap(
     {
         CSMIntercept::ClassifyLayout(mappedData);  // one-shot atlas-vs-separate verdict
         CSMIntercept::LogCallerStack(mappedData, "HookedUnmap"); // one-shot stack dump
+
+        // Apply user's per-cascade filter scales to csmParams[i].y in-place.
+        // Map(WRITE_DISCARD) means OGRE writes fresh values each frame, so we
+        // multiply once per commit — no cumulative drift.
+        PssmDetour::ApplyFilterScalesToCbuffer(mappedData);
 
         // Throttled raw dump on the Unmap path — diagnostic for figuring out
         // when (if ever) real cascade data lands. First 3 calls + every 600.

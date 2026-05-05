@@ -32,6 +32,10 @@ struct ShadowConfig {
                                       // pure linear (close shadows extend
                                       // far, but blockier); 1.0 = pure log
                                       // (close shadows tiny+sharp, far blurry)
+    float cascade0Filter    = 1.0f;   // per-cascade filter-radius multipliers
+    float cascade1Filter    = 1.0f;   // (relative to Kenshi's vanilla per-
+    float cascade2Filter    = 1.0f;   // cascade taper; default 1.0 = vanilla)
+    float cascade3Filter    = 1.0f;
 };
 
 static ShadowConfig gConfig;
@@ -274,6 +278,13 @@ static int ShadowInit(ID3D11Device* device, uint32_t w, uint32_t h, const DustHo
         host->SetShadowAtlasResolution(GetSelectedShadowResolution());
     if (host->SetCascadeLambda)
         host->SetCascadeLambda(gConfig.pssmLambda);
+    if (host->SetCascadeFilterScale)
+    {
+        host->SetCascadeFilterScale(0, gConfig.cascade0Filter);
+        host->SetCascadeFilterScale(1, gConfig.cascade1Filter);
+        host->SetCascadeFilterScale(2, gConfig.cascade2Filter);
+        host->SetCascadeFilterScale(3, gConfig.cascade3Filter);
+    }
     // NB: shadow range is written to settings.cfg from DustEffectCreate,
     // which runs early enough to beat Kenshi's startup read. A write here
     // would land too late and could clobber the early write with a stale
@@ -333,6 +344,13 @@ static void ShadowOnSettingChanged()
         gHost->SetShadowAtlasResolution(GetSelectedShadowResolution());
     if (gHost && gHost->SetCascadeLambda)
         gHost->SetCascadeLambda(gConfig.pssmLambda);
+    if (gHost && gHost->SetCascadeFilterScale)
+    {
+        gHost->SetCascadeFilterScale(0, gConfig.cascade0Filter);
+        gHost->SetCascadeFilterScale(1, gConfig.cascade1Filter);
+        gHost->SetCascadeFilterScale(2, gConfig.cascade2Filter);
+        gHost->SetCascadeFilterScale(3, gConfig.cascade3Filter);
+    }
     PushShadowRangeToGame();
 }
 
@@ -347,6 +365,10 @@ static DustSettingDesc gSettings[] = {
     { "Shadow Resolution",   DUST_SETTING_ENUM,  &gConfig.resolutionIndex,  0.0f, 6.0f,  "Resolution",       kShadowResolutionLabels, "Override the shadow atlas resolution. Higher = sharper shadows, more VRAM (16384 ~= 1 GB). Restart the game to apply.",                                              DUST_PERF_LOW    },
     { "Shadow Range",        DUST_SETTING_INT,   &gConfig.shadowRange,      500.0f, 50000.0f, "Range",        nullptr, "Maximum distance shadows render. Bypasses the in-game UI's 9000 cap by writing settings.cfg directly. Restart to apply. Touching the in-game Shadow Range slider will overwrite this.", DUST_PERF_MEDIUM },
     { "Cascade Lambda",      DUST_SETTING_FLOAT, &gConfig.pssmLambda,       0.0f, 1.0f,  "CascadeLambda",   nullptr, "PSSM cascade split distribution. 0.0 = pure linear (close shadows extend further but blockier); 1.0 = pure logarithmic (close shadows tiny+sharp, far cascades huge). Kenshi's native is ~0.95.", DUST_PERF_NONE },
+    { "Cascade 0 Filter",    DUST_SETTING_FLOAT, &gConfig.cascade0Filter,   0.0f, 5.0f,  "Cascade0Filter",  nullptr, "Filter-radius multiplier for the closest cascade (covers the sharpest near-camera shadows). 1.0 = Kenshi's vanilla taper, >1.0 = softer.", DUST_PERF_NONE },
+    { "Cascade 1 Filter",    DUST_SETTING_FLOAT, &gConfig.cascade1Filter,   0.0f, 5.0f,  "Cascade1Filter",  nullptr, "Filter-radius multiplier for cascade 1 (mid-range shadows).", DUST_PERF_NONE },
+    { "Cascade 2 Filter",    DUST_SETTING_FLOAT, &gConfig.cascade2Filter,   0.0f, 5.0f,  "Cascade2Filter",  nullptr, "Filter-radius multiplier for cascade 2 (far-mid shadows).", DUST_PERF_NONE },
+    { "Cascade 3 Filter",    DUST_SETTING_FLOAT, &gConfig.cascade3Filter,   0.0f, 5.0f,  "Cascade3Filter",  nullptr, "Filter-radius multiplier for the farthest cascade (where blockiness shows most). >1.0 softens the far-cascade artifacts.", DUST_PERF_NONE },
 };
 
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)

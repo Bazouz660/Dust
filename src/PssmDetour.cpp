@@ -234,10 +234,13 @@ static std::atomic<float> sLambda{0.95f};
 // Kenshi only calls getFloatPointer(pos=24) once at scene init — the cbuffer
 // values then live in GpuSharedParameters and field_0x10 forever — so we
 // have to write to both ourselves whenever lambda changes.
-static void*  sSharedParams   = nullptr;  // GpuSharedParameters instance
-static float* sSplitsArray    = nullptr;  // orchestrator-this->field_0x10
-static float  sCachedNear     = 0.0f;
-static float  sCachedFar      = 0.0f;
+static void*  sSharedParams         = nullptr;  // GpuSharedParameters instance
+static float* sSplitsArray          = nullptr;  // orchestrator-this->field_0x10
+static float  sCachedNear           = 0.0f;
+static float  sCachedFar            = 0.0f;
+static std::atomic<float> sCascadeFilterScale[4] = {
+    {1.0f}, {1.0f}, {1.0f}, {1.0f}              // per-cascade filter multipliers
+};
 
 // Compute and write splits[1..3] into a 5-float [near, s1, s2, s3, far] array
 // using the current lambda + cached near/far. Returns true if writes happened.
@@ -257,35 +260,63 @@ static bool RecomputeSplits()
     return true;
 }
 
+// Push current splits to OGRE's GpuSharedParameters (csmParams[i].x) and to
+// Kenshi's source array (field_0x10). Idempotent; safe to call from any
+// setter. csmParams[i].y (filter radius) is patched separately at cbuffer
+// commit time by ApplyFilterScalesToCbuffer — Kenshi doesn't write .y
+// through GpuSharedParameters so we can't reach it from here.
+static void RepushAll()
+{
+    if (!RecomputeSplits()) return;
+    if (!sSharedParams || !sOrig_getFloatPointer) return;
+    float* dest = sOrig_getFloatPointer(sSharedParams, 24);
+    if (!dest) return;
+    for (int i = 0; i < 4; i++)
+        dest[i*4 + 0] = sSplitsArray[i+1] - sCachedNear;
+}
+
 void SetLambda(float lambda)
 {
     if (lambda < 0.0f) lambda = 0.0f;
     if (lambda > 1.0f) lambda = 1.0f;
     sLambda.store(lambda);
-
-    // Update Kenshi's source array (field_0x10).
-    if (!RecomputeSplits()) return;
-
-    // Update OGRE's GpuSharedParameters float buffer so the shader-side
-    // csmParams.x reflects the new splits. csmParams[i].x = split[i+1] - near
-    // (the orchestrator's pre-computed offset). We preserve csmParams[i].yzw
-    // (filter radius, biases, etc.) by only writing .x.
-    if (sSharedParams && sOrig_getFloatPointer)
-    {
-        float* dest = sOrig_getFloatPointer(sSharedParams, 24);
-        if (dest)
-        {
-            for (int i = 0; i < 4; i++)
-                dest[i*4 + 0] = sSplitsArray[i+1] - sCachedNear;
-        }
-    }
+    RepushAll();
 }
 
 float GetLambda() { return sLambda.load(); }
 
+void SetCascadeFilterScale(int idx, float scale)
+{
+    if (idx < 0 || idx >= 4) return;
+    if (scale < 0.0f) scale = 0.0f;
+    if (scale > 5.0f) scale = 5.0f;
+    sCascadeFilterScale[idx].store(scale);
+    // No RepushAll needed — filter scaling lands at cbuffer commit time.
+}
+
+float GetCascadeFilterScale(int idx)
+{
+    if (idx < 0 || idx >= 4) return 1.0f;
+    return sCascadeFilterScale[idx].load();
+}
+
+void ApplyFilterScalesToCbuffer(void* cbufferData)
+{
+    if (!cbufferData) return;
+    // csmParams is at byte offset 208; per-cascade .y is at +4 within each
+    // 16-byte float4. Cascades 0..3 → offsets 212, 228, 244, 260.
+    char* base = (char*)cbufferData;
+    for (int i = 0; i < 4; i++)
+    {
+        float* y = (float*)(base + 208 + i*16 + 4);
+        *y = (*y) * sCascadeFilterScale[i].load();
+    }
+}
+
 static float* Hook_getFloatPointer(void* self, size_t pos)
 {
     int n = ++sCount_getFloatPointer;
+
 
     // When pos==24 (csmParams), unwind the call stack to locate the Kenshi
     // orchestrator frame, recover its RDI (= this), and patch the splits
@@ -351,15 +382,8 @@ static float* Hook_getFloatPointer(void* self, size_t pos)
                     sSplitsArray  = fp;
                     sCachedNear   = nearD;
                     sCachedFar    = farD;
-
-                    // Diagnostic: log every 600 frames so we can see whether
-                    // the slider's writes actually reach our atomic.
-                    static int sFrameLog = 0;
-                    if ((sFrameLog++ % 600) == 0)
-                        Log("PssmDetour: per-frame patch tick lambda=%.4f "
-                            "near=%g far=%g (frame %d)",
-                            (double)lambda, (double)nearD, (double)farD,
-                            sFrameLog);
+                    // Filter radii (csmParams[i].y) get captured on a later
+                    // hook call — see top of Hook_getFloatPointer.
 
                     if (firstTime)
                         Log("PssmDetour: splits BEFORE=[%g, %g, %g, %g, %g] "

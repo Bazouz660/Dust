@@ -182,6 +182,12 @@ typedef struct DustHostAPI {
     // tiny, far cascade huge). Kenshi's native value is ~0.95. Effect is
     // visible next frame; no restart needed. Pass any value — it's clamped.
     void (*SetCascadeLambda)(float lambda);
+
+    // Per-cascade filter-radius multiplier on top of Kenshi's vanilla
+    // per-cascade filter taper. cascadeIdx in [0..3]; 1.0 = unchanged from
+    // vanilla, >1.0 = softer that cascade. Clamped to [0, 5]. Composes with
+    // the global Filter Radius slider.
+    void (*SetCascadeFilterScale)(int cascadeIdx, float scale);
 } DustHostAPI;
 
 // Performance impact hint for a single setting (API v3.2+).
