@@ -72,6 +72,8 @@ void OnVertexShaderCreated(const void* bytecode, SIZE_T bytecodeSize,
         reflector->Release();
         return;
     }
+    UINT verMajor = D3D11_SHVER_GET_MAJOR(shaderDesc.Version);
+    UINT verMinor = D3D11_SHVER_GET_MINOR(shaderDesc.Version);
 
     VSConstantBufferInfo info;
     bool foundClip = false;
@@ -129,8 +131,8 @@ void OnVertexShaderCreated(const void* bytecode, SIZE_T bytecodeSize,
     if (info.transformType != VSTransformType::UNKNOWN)
     {
         const char* typeStr = (info.transformType == VSTransformType::SKINNED) ? "SKINNED" : "STATIC";
-        Log("ShaderMetadata: VS %p classified as %s — clip @%u (%uB), world @%u (%uB), cb slot %u size %u",
-            vs, typeStr,
+        Log("ShaderMetadata: VS %p classified as %s sm=%u_%u — clip @%u (%uB), world @%u (%uB), cb slot %u size %u",
+            vs, typeStr, verMajor, verMinor,
             info.clipMatrixOffset, info.clipMatrixSize,
             info.worldMatrixOffset, info.worldMatrixSize,
             info.cbSlot, info.cbTotalSize);

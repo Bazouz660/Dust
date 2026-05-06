@@ -72,7 +72,7 @@
 extern "C" {
 #endif
 
-#define DUST_API_VERSION 5
+#define DUST_API_VERSION 6
 
 // Injection points in the rendering pipeline
 typedef enum DustInjectionPoint {
@@ -103,6 +103,24 @@ typedef struct DustCameraData {
     float   inverseView[16];   // Raw 4x4 inverse view matrix (row-major in memory)
 } DustCameraData;
 
+// CSM shadow data snapshot (API v6+). Captured each frame from the deferred
+// lighting cbuffer. All matrices are row-major in memory; multiply as
+// mul(matrix, vec). Cascades 0..3 ordered near-to-far. Cascade selection
+// follows Kenshi's deferred shader: pick the smallest i where
+//   posLs.z < csmParams[i][0]  (split distance in linear view-space depth)
+// then sample at:
+//   atlasUv = csmTrans[i].xyz + csmScale[i].xyz * posLs
+// where posLs = mul(shadowViewMat, float4(worldPos, 1)).xyz
+typedef struct DustCSMData {
+    int     valid;             // Non-zero if a complete snapshot is available
+    float   _pad0[3];          // Pad to align next field to 16 bytes
+    float   sunDirection[4];   // World-space sun direction (Kenshi convention); xyz used, w padding
+    float   shadowViewMat[16]; // World-space -> shadow view-space (row-major)
+    float   csmScale[16];      // 4 cascades x float4: world-LS-to-atlas-UV scale (xyz used)
+    float   csmTrans[16];      // 4 cascades x float4: world-LS-to-atlas-UV translation (xyz used)
+    float   csmParams[16];     // 4 cascades x float4: (split, filter radius, fixed bias, depth radius)
+} DustCSMData;
+
 // Per-frame context passed to effect callbacks
 typedef struct DustFrameContext {
     ID3D11Device*           device;
@@ -116,11 +134,16 @@ typedef struct DustFrameContext {
 } DustFrameContext;
 
 // Resource name constants for GetSRV / GetRTV / GetSceneCopy
-#define DUST_RESOURCE_DEPTH     "depth"
-#define DUST_RESOURCE_ALBEDO    "albedo"
-#define DUST_RESOURCE_NORMALS   "normals"
-#define DUST_RESOURCE_HDR_RT    "hdr_rt"
-#define DUST_RESOURCE_LDR_RT    "ldr_rt"
+#define DUST_RESOURCE_DEPTH         "depth"
+#define DUST_RESOURCE_ALBEDO        "albedo"
+#define DUST_RESOURCE_NORMALS       "normals"
+#define DUST_RESOURCE_HDR_RT        "hdr_rt"
+#define DUST_RESOURCE_LDR_RT        "ldr_rt"
+// API v6+: CSM shadow depth atlas SRV. Captured at deferred lighting pass
+// (PS slot 5). Available from POST_LIGHTING onwards in CSM-mode shadows.
+// Sample with the matrices from GetCSMData() to test sun visibility per
+// world-space point.
+#define DUST_RESOURCE_SHADOW_DEPTH  "shadow_depth"
 
 // Shader categories for Kenshi's known GBuffer shaders (API v4+)
 typedef enum DustShaderCategory {
@@ -285,6 +308,14 @@ typedef struct DustHostAPI {
     void (*SetPOMThreshold)(float threshold);        // luminance below this -> no displacement
     void (*SetPOMThresholdWidth)(float width);       // saturate((lum-threshold)/width)
     void (*SetPOMSamples)(int minSamples, int maxSamples);
+
+    // === API v6 additions ===
+
+    // Snapshot the deferred lighting CSM cbuffer (sun direction, shadow view
+    // matrix, per-cascade atlas-UV scale/trans, per-cascade params). Returns
+    // 1 on success (outData filled), 0 if the snapshot isn't ready yet
+    // (offsets not discovered, RTW shadow mode active, etc.).
+    int (*GetCSMData)(DustCSMData* outData);
 } DustHostAPI;
 
 // Performance impact hint for a single setting (API v3.2+).

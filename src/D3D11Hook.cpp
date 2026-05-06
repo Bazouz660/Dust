@@ -14,6 +14,8 @@
 #include "ShaderDatabase.h"
 #include "GeometryCapture.h"
 #include "POMState.h"
+#include "TerrainTess.h"
+#include "CSMCapture.h"
 #include "DustLog.h"
 #include <core/Functions.h>
 #include <d3d11.h>
@@ -476,6 +478,7 @@ static void TryCaptureDevice(ID3D11Device* device)
     device->GetImmediateContext(&gContext);
     GeometryCapture::SetDevice(device);
     POMState::SetDevice(device);
+    TerrainTess::Init(device);
 
     Log("Captured real D3D11 device=%p, context=%p", gDevice, gContext);
 
@@ -837,7 +840,11 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
 
     GeometryCapture::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 
-    oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
+    if (!TerrainTess::TryDrawTessellated(pThis, IndexCount, StartIndexLocation,
+                                          BaseVertexLocation, oDrawIndexed))
+    {
+        oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
+    }
 }
 
 static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
@@ -855,6 +862,8 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
                                             StartIndexLocation, BaseVertexLocation,
                                             StartInstanceLocation);
 
+    // Instanced terrain draws aren't typical (terrain isn't instanced), so
+    // skip tessellation routing here for now.
     oDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
                           StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
 }
@@ -1303,6 +1312,12 @@ static void STDMETHODCALLTYPE HookedUnmap(
         // Map(WRITE_DISCARD) means OGRE writes fresh values each frame, so we
         // multiply once per commit — no cumulative drift.
         PssmDetour::ApplyFilterScalesToCbuffer(mappedData);
+
+        // Snapshot the cbuffer fields for plugins that need shadow-space
+        // sampling (e.g. volumetric fog). Reads at offsets discovered via
+        // D3DReflect on the patched deferred PS at compile time. No-op until
+        // those offsets are known.
+        CSMCapture::OnUnmap(mappedData, CSMIntercept::kCbSize);
 
         // Throttled raw dump on the Unmap path — diagnostic for figuring out
         // when (if ever) real cascade data lands. First 3 calls + every 600.

@@ -139,12 +139,25 @@ void PipelineDetector::CaptureLightingResources(ID3D11DeviceContext* ctx)
         depthSRV->Release();
     }
 
+    // Slot 5 = shadow depth atlas in Kenshi's deferred sun pass (4096x4096
+    // R32_FLOAT in CSM mode). Empty in RTW mode — slot 5 isn't bound, so
+    // PSGetShaderResources returns null and the registry stays empty.
+    ID3D11ShaderResourceView* shadowSRV = nullptr;
+    ctx->PSGetShaderResources(5, 1, &shadowSRV);
+    if (shadowSRV)
+    {
+        gResourceRegistry.SetSRV(ResourceName::SHADOW_DEPTH_SRV, shadowSRV);
+        shadowSRV->Release();
+    }
+
     if (!sFirstDetectLogged)
     {
-        Log("Pipeline: Lighting pass detected (albedo=%p, normals=%p, depth=%p, hdrRT=%p)",
+        Log("Pipeline: Lighting pass detected (albedo=%p, normals=%p, depth=%p, "
+            "shadowDepth=%p, hdrRT=%p)",
             gResourceRegistry.GetSRV(ResourceName::ALBEDO_SRV),
             gResourceRegistry.GetSRV(ResourceName::NORMALS_SRV),
             gResourceRegistry.GetSRV(ResourceName::DEPTH_SRV),
+            gResourceRegistry.GetSRV(ResourceName::SHADOW_DEPTH_SRV),
             gResourceRegistry.GetRTV(ResourceName::HDR_RTV));
         sFirstDetectLogged = true;
     }

@@ -7,11 +7,12 @@
 
 namespace ResourceName
 {
-    constexpr const char* DEPTH_SRV     = "depth";
-    constexpr const char* NORMALS_SRV   = "normals";
-    constexpr const char* ALBEDO_SRV    = "albedo";
-    constexpr const char* HDR_RTV       = "hdr_rt";
-    constexpr const char* LDR_RTV       = "ldr_rt";
+    constexpr const char* DEPTH_SRV        = "depth";
+    constexpr const char* NORMALS_SRV      = "normals";
+    constexpr const char* ALBEDO_SRV       = "albedo";
+    constexpr const char* HDR_RTV          = "hdr_rt";
+    constexpr const char* LDR_RTV          = "ldr_rt";
+    constexpr const char* SHADOW_DEPTH_SRV = "shadow_depth";
 }
 
 class ResourceRegistry

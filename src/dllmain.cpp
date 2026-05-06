@@ -17,6 +17,7 @@
 #include "GeometryCapture.h"
 #include "GeometryReplay.h"
 #include "POMState.h"
+#include "TerrainTess.h"
 
 static HMODULE gDllModule = nullptr;
 
@@ -92,7 +93,7 @@ static std::string BuildCacheStamp(const std::string& modDir)
 
     // Bump this suffix when ShaderPatch HLSL injection changes, so RE_Kenshi
     // discards cached bytecode that was compiled with an older injection.
-    stamp += "|patch=pom-r7-no-terrain";
+    stamp += "|patch=tess-r13-skip-degen";
     return stamp;
 }
 
@@ -306,6 +307,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
         DustGUI::Shutdown();
         gEffectLoader.ShutdownAll();
         POMState::Shutdown();
+        TerrainTess::Shutdown();
         GeometryReplay::Shutdown();
         GeometryCapture::Shutdown();
         ShaderDatabase::Shutdown();

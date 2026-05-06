@@ -1,7 +1,9 @@
 #include "ShaderPatch.h"
+#include "CSMCapture.h"
 #include "DustLog.h"
 #include "SurveyRecorder.h"
 #include "D3D11Hook.h"
+#include "TerrainTess.h"
 
 #include <d3d11shader.h>
 #include <d3dcompiler.h>
@@ -540,6 +542,7 @@ static std::string PatchObjectsShaderForPOM(const std::string& src)
     return result;
 }
 
+
 // Diagnostic: log the compiled shader's resource binding layout (cbuffer
 // slots, sampler slots, texture slots). This is ground truth for which
 // registers are actually used — no guessing about whether a slot is free
@@ -560,6 +563,10 @@ static void LogPatchedShaderReflection(const void* bytecode, SIZE_T bytecodeSize
     reflector->GetDesc(&desc);
     Log("Patched shader %d: %u cbuffers, %u bound resources, %u instructions",
         idx, desc.ConstantBuffers, desc.BoundResources, desc.InstructionCount);
+
+    // Capture cbuffer field offsets for the volumetric/shadow-aware plugins
+    // (no-op outside the CSM-variant deferred main_fs).
+    CSMCapture::DiscoverOffsets(reflector);
 
     for (UINT i = 0; i < desc.BoundResources; i++)
     {
@@ -617,6 +624,86 @@ HRESULT WINAPI HookedD3DCompile(
         return oD3DCompile(pSrcData, SrcDataSize, pSourceName,
                             pDefines, pInclude, pEntrypoint, pTarget,
                             Flags1, Flags2, ppCode, ppErrorMsgs);
+
+    // [Dust] Terrain VS upgrade: Kenshi compiles terrain.hlsl main_vs as
+    // vs_4_0, which cannot be paired with HS/DS (D3D silently drops geometry
+    // with mismatched stage versions). Upgrade to vs_5_0 so we can route
+    // these draws through tessellation. Detection: entry "main_vs" + source
+    // contains terrain-uniform markers.
+    if (pEntrypoint && pTarget && pSrcData && SrcDataSize > 0 &&
+        strcmp(pEntrypoint, "main_vs") == 0 &&
+        strncmp(pTarget, "vs_4_", 5) == 0)
+    {
+        std::string src((const char*)pSrcData, SrcDataSize);
+        bool isTerrainVs = src.find("biomeData") != std::string::npos &&
+                           src.find("overlayData") != std::string::npos &&
+                           src.find("morph") != std::string::npos;
+        if (isTerrainVs)
+        {
+            // [Dust] Add new VS output `oWvpCol1` carrying column 1 of the
+            // worldViewProjMatrix (the Y-axis projection vector). The DS
+            // uses it for sub-vertex Y displacement: clip += h * wvp_col1.
+            // No matrix mirror to DS needed — VS has the matrix natively.
+            //
+            // Two injection points:
+            //   1. Output param after `oTexV : TEXCOORD5,` (TEXTURED block).
+            //   2. Assignment after `oPosition = mul(worldViewProjMatrix,...);`.
+            const std::string outAnchor = "out float4 oTexV        : TEXCOORD5,";
+            size_t outPos = src.find(outAnchor);
+            if (outPos != std::string::npos)
+            {
+                const std::string outInjection =
+                    outAnchor +
+                    std::string("\n\tout float4 oWvpCol1     : TEXCOORD6,  // [Dust] WVP column 1 for DS displacement");
+                src.replace(outPos, outAnchor.size(), outInjection);
+            }
+            const std::string asgnAnchor = "oPosition = mul(worldViewProjMatrix, position);";
+            size_t asgnPos = src.find(asgnAnchor);
+            if (asgnPos != std::string::npos && outPos != std::string::npos)
+            {
+                const std::string asgnInjection = asgnAnchor + std::string(
+                    "\n#ifdef TEXTURED\n"
+                    "\toWvpCol1 = float4(worldViewProjMatrix._12, worldViewProjMatrix._22,"
+                    " worldViewProjMatrix._32, worldViewProjMatrix._42);\n"
+                    "#endif");
+                src.replace(asgnPos, asgnAnchor.size(), asgnInjection);
+                Log("ShaderPatch: injected oWvpCol1 output into terrain main_vs");
+            }
+            else
+            {
+                Log("ShaderPatch: terrain VS oWvpCol1 anchors not all found");
+            }
+            HRESULT hr = oD3DCompile(src.c_str(), src.size(), pSourceName,
+                                      pDefines, pInclude, pEntrypoint, "vs_5_0",
+                                      Flags1, Flags2, ppCode, ppErrorMsgs);
+            if (SUCCEEDED(hr))
+            {
+                Log("ShaderPatch: upgraded terrain main_vs %s → vs_5_0", pTarget);
+                if (ppCode && *ppCode)
+                {
+                    // Log every upgraded terrain VS signature so we can see both
+                    // TEXTURED and non-TEXTURED variants and compare to HS input.
+                    static int sLogged = 0;
+                    sLogged++;
+                    char tag[32];
+                    snprintf(tag, sizeof(tag), "VS_terrain#%d", sLogged);
+                    TerrainTess::LogShaderSignature(
+                        (*ppCode)->GetBufferPointer(),
+                        (*ppCode)->GetBufferSize(), tag);
+                    SurveyRecorder::OnShaderCompiled(pSrcData, SrcDataSize,
+                        pEntrypoint, "vs_5_0", pSourceName,
+                        (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+                }
+                return hr;
+            }
+            Log("ShaderPatch: terrain VS upgrade failed (0x%08X), falling back", hr);
+            if (ppErrorMsgs && *ppErrorMsgs) {
+                Log("ShaderPatch: error: %s", (const char*)(*ppErrorMsgs)->GetBufferPointer());
+                (*ppErrorMsgs)->Release();
+                *ppErrorMsgs = nullptr;
+            }
+        }
+    }
 
     // Detect the deferred lighting pixel shader: entry point is "main_fs"
     // and source contains deferred-specific identifiers.

@@ -7,6 +7,7 @@
 #include "GeometryReplay.h"
 #include "ShaderDatabase.h"
 #include "POMState.h"
+#include "CSMCapture.h"
 #include "DustLog.h"
 #include <d3dcompiler.h>
 #include <cstring>
@@ -591,6 +592,9 @@ void EffectLoader::BuildHostAPI()
     hostAPI_.SetPOMThreshold      = HostSetPOMThreshold;
     hostAPI_.SetPOMThresholdWidth = HostSetPOMThresholdWidth;
     hostAPI_.SetPOMSamples        = HostSetPOMSamples;
+
+    // v6 additions
+    hostAPI_.GetCSMData           = CSMCapture::GetSnapshot;
 }
 
 // ==================== v3: Config I/O ====================

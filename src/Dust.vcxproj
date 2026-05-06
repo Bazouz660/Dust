@@ -106,6 +106,8 @@
     <ClCompile Include="GeometryCapture.cpp" />
     <ClCompile Include="GeometryReplay.cpp" />
     <ClCompile Include="POMState.cpp" />
+    <ClCompile Include="TerrainTess.cpp" />
+    <ClCompile Include="CSMCapture.cpp" />
     <ClCompile Include="ShaderPatch.cpp" />
     <ClCompile Include="OgreSwapHook.cpp" />
     <ClCompile Include="ShadowProbe.cpp" />
@@ -137,6 +139,8 @@
     <ClInclude Include="GeometryCapture.h" />
     <ClInclude Include="GeometryReplay.h" />
     <ClInclude Include="POMState.h" />
+    <ClInclude Include="TerrainTess.h" />
+    <ClInclude Include="CSMCapture.h" />
     <ClInclude Include="ShaderPatch.h" />
     <ClInclude Include="OgreSwapHook.h" />
     <ClInclude Include="ShadowProbe.h" />
