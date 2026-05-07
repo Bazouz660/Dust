@@ -18,21 +18,24 @@ struct TerrainTessConfig
     // Master enable
     bool  enabled          = true;
 
-    // Tessellation factor + LOD fade
-    int   maxFactor        = 64;     // integer subdivision count
+    // Tessellation factor + LOD fade. 32 default keeps near-camera detail
+    // strong while halving worst-case GPU vertex work vs 64.
+    int   maxFactor        = 32;     // integer subdivision count
     float factFadeStart    = 20.0f;
-    float factFadeEnd      = 200.0f;
+    float factFadeEnd      = 150.0f;
     int   factorSnapStep   = 4;      // factor quantum (integer)
 
-    // Displacement
+    // Displacement. Amp fade is on by default — combined with the DS
+    // early-out, distant chunks become nearly free (no heightmap fetches).
     float amplitude        = 1.0f;
     float displacementBias = 0.3f;
-    bool  ampFadeEnabled   = false;
-    float ampFadeStart     = 50.0f;
-    float ampFadeEnd       = 200.0f;
+    bool  ampFadeEnabled   = true;
+    float ampFadeStart     = 80.0f;
+    float ampFadeEnd       = 150.0f;
     float mipBias          = 0.0f;
     float dispDirWorldUp   = 0.0f;
     float uvTileFactor     = 250.0f;
+    float chunkBoundaryFade = 0.01f;  // 1% of chunk UV — narrow seam-hiding band
 
     // Bake-time (require rebake to apply)
     int   bakeHpCutoff     = 0;      // cutoff in cycles/image (integer)
@@ -78,7 +81,8 @@ static void PushRuntime()
     buf[11] = (float)gConfig.factorSnapStep;
     buf[12] = gConfig.dispDirWorldUp;
     buf[13] = gConfig.mipBias;
-    // buf[14], buf[15] are pad — left zero.
+    buf[14] = gConfig.chunkBoundaryFade;
+    // buf[15] is pad — left zero.
     gHost->SetTerrainTessControls(buf);
 }
 
@@ -166,17 +170,18 @@ static DustSettingDesc gSettings[] = {
     { "Factor Snap Step",  DUST_SETTING_INT,   &gConfig.factorSnapStep,  1.0f,  16.0f, "FactorSnapStep",  nullptr, "Quantize tess factor to multiples of this for stable LOD as the camera moves. Bigger = more stable, coarser steps.", DUST_PERF_NONE },
 
     // Displacement
-    { "Amplitude",         DUST_SETTING_FLOAT, &gConfig.amplitude,       0.0f,  5.0f,  "Amplitude",       nullptr, "Vertex displacement magnitude in world units (signed around the bias point).", DUST_PERF_NONE },
+    { "Amplitude",         DUST_SETTING_FLOAT, &gConfig.amplitude,       0.0f, 20.0f,  "Amplitude",       nullptr, "Vertex displacement magnitude in world units (signed around the bias point).", DUST_PERF_NONE },
     { "Displacement Bias", DUST_SETTING_FLOAT, &gConfig.displacementBias,0.0f,  0.5f,  "DisplacementBias",nullptr, "Mid-point of the heightmap that maps to ground level. Lower = displacement biased upward, fewer pixels sink.", DUST_PERF_NONE },
     { "Disp Dir World-Up", DUST_SETTING_FLOAT, &gConfig.dispDirWorldUp,  0.0f,  1.0f,  "DispDirWorldUp",  nullptr, "Blend between per-vertex normal (0) and world-up (1) for displacement direction. 1 fixes seams between chunks with mismatched boundary normals.", DUST_PERF_NONE },
     { "Mip Bias",          DUST_SETTING_FLOAT, &gConfig.mipBias,         0.0f,  6.0f,  "MipBias",         nullptr, "Extra blur on the heightmap sampling. Higher = smoother displacement, less spike potential at low tess density.", DUST_PERF_NONE },
+    { "Chunk Edge Fade",   DUST_SETTING_FLOAT, &gConfig.chunkBoundaryFade, 0.0f, 0.05f,"ChunkBoundaryFade", nullptr, "Width (in chunk-UV units, 0..1) over which displacement fades to zero at chunk edges. Eliminates cross-region seams at the cost of a narrow valley along every chunk boundary. 0 = disabled.", DUST_PERF_NONE },
     { "Amp Fade Enabled",  DUST_SETTING_BOOL,  &gConfig.ampFadeEnabled,  0.0f,  1.0f,  "AmpFadeEnabled",  nullptr, "Fade displacement amplitude with distance.", DUST_PERF_NONE },
     { "Amp Fade Start",    DUST_SETTING_FLOAT, &gConfig.ampFadeStart,    0.0f,  500.0f,"AmpFadeStart",    nullptr, "Distance at which amplitude begins fading toward zero.", DUST_PERF_NONE },
     { "Amp Fade End",      DUST_SETTING_FLOAT, &gConfig.ampFadeEnd,     10.0f,  500.0f,"AmpFadeEnd",      nullptr, "Distance at which amplitude reaches zero.", DUST_PERF_NONE },
 
     // Bake-time (auto-rebake on change)
     { "Bake: Lum Mix",         DUST_SETTING_FLOAT, &gConfig.bakeLumMix,     0.0f,  1.0f,  "BakeLumMix",     nullptr, "Bake-time blend between FFT-from-normal (0) and luminance-as-height (1). 0.5 default works well across rocky and dune textures. Auto-rebakes on change.", DUST_PERF_LOW },
-    { "Bake: HP Cutoff",       DUST_SETTING_INT,   &gConfig.bakeHpCutoff,   0.0f, 64.0f,  "BakeHpCutoff",   nullptr, "Bake-time Gaussian high-pass sigma in cycles/image. 0 disables. Lower = suppress wider macro features. Auto-rebakes on change.", DUST_PERF_LOW },
+    { "Bake: HP Cutoff",       DUST_SETTING_INT,   &gConfig.bakeHpCutoff,   0.0f, 256.0f, "BakeHpCutoff",   nullptr, "Bake-time Gaussian high-pass sigma in cycles/image. 0 disables. HIGHER = nukes more frequencies (suppresses smaller features). Try 64-128 for a visible flattening effect. Auto-rebakes on change.", DUST_PERF_LOW },
     { "Bake: HP Strength",     DUST_SETTING_FLOAT, &gConfig.bakeHpStrength, 0.0f,  1.0f,  "BakeHpStrength", nullptr, "How aggressively low-frequencies are attenuated. Auto-rebakes on change.", DUST_PERF_LOW },
 
     // Debug

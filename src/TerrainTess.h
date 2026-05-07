@@ -57,7 +57,14 @@ namespace TerrainTess
         // at the cost of fine detail. Negative values are clamped to 0
         // (forcing more detail can re-introduce sub-tessellation spikes).
         float mipBias          = 0.0f;
-        float _pad[2]          = { 0, 0 };  // align to 64 bytes
+        // Width (in chunk-UV units, 0..1) over which displacement fades
+        // to zero at the patch's chunk-UV edges. Adjacent chunks ALSO
+        // fade to zero at the shared boundary, so the boundary vertex
+        // displaces by 0 from both sides — eliminates cross-region seams.
+        // Cost: a narrow valley along every chunk boundary.
+        // 0 = disabled.
+        float chunkBoundaryFade = 0.01f;
+        float _pad[1]          = { 0 };  // align to 64 bytes
     };
 
     Controls* GetControls();
@@ -134,4 +141,16 @@ namespace TerrainTess
     // since the HLSL source layout may differ from the compiled bytecode
     // due to optimizer-driven uniform stripping.
     void OnPixelShaderCreated(const void* bytecode, size_t size, ID3D11PixelShader* ps);
+
+    // Reflect the terrain VS to find byte offsets of `worldMatrix` and
+    // `overlayData` in its $Globals cbuffer — used at draw time to extract
+    // chunk world position and chunk size for cross-region neighbor lookup.
+    void OnVertexShaderCreated(const void* bytecode, size_t size, ID3D11VertexShader* vs);
+
+    // Called from the Map/Unmap hooks to snoop terrain VS cbuffer writes.
+    // OnCbufferMap stashes the mapped pointer; OnCbufferUnmap reads bytes
+    // BEFORE the unmap commits to GPU. Both are no-ops for non-tracked
+    // buffers and skip a fast atomic check before any work.
+    void OnCbufferMap(ID3D11Buffer* buf, void* dataPtr);
+    void OnCbufferUnmap(ID3D11Buffer* buf);
 }

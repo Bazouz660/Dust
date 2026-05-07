@@ -243,6 +243,12 @@ static void CaptureDraw(ID3D11DeviceContext* ctx, UINT indexCount,
 {
     if (!sInGBufferPass)
         return;
+    // No plugin has opted in via SetGeometryCaptureFlags — skip the
+    // ~12 atomic ref-count ops and push_back per draw entirely. With ~200
+    // GBuffer draws per frame this saves measurable CPU time when no
+    // plugin actually consumes the captured data.
+    if (sCaptureFlags == 0)
+        return;
 
     CapturedDraw draw;
     draw.indexCount            = indexCount;

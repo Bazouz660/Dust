@@ -12,6 +12,7 @@
 #include <complex>
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace TerrainTess
@@ -69,7 +70,8 @@ cbuffer TessControl : register(b1)
     float gFactorSnapStep;
     float gDispDirWorldUp;
     float gMipBias;
-    float2 _ctrlPad_;
+    float gChunkBoundaryFade;
+    float _ctrlPad_;
 };
 
 HsConst HsConstFn(InputPatch<VsOut, 3> patch, uint patchID : SV_PrimitiveID)
@@ -142,6 +144,13 @@ struct DsOut
 
 Texture2DArray heightArr  : register(t0);
 Texture2D      overlayMap : register(t1);
+// Cross-region neighbor heightArrays (-X, +X, -Z, +Z). Default-bound to
+// the primary heightArray when no neighbor exists, so the blend collapses
+// to a no-op (own == neighbor → lerp returns own).
+Texture2DArray heightArrNX : register(t2);
+Texture2DArray heightArrPX : register(t3);
+Texture2DArray heightArrNZ : register(t4);
+Texture2DArray heightArrPZ : register(t5);
 SamplerState   heightSamp : register(s0);
 
 // Mirror of PS $Globals cbuffer for terrain. Offsets verified by reflecting
@@ -179,8 +188,34 @@ cbuffer TessControl : register(b1)
     float gFactorSnapStep;
     float gDispDirWorldUp;
     float gMipBias;
-    float2 _ctrlPad_;
+    float gChunkBoundaryFade;
+    float _ctrlPad_;
 };
+
+// Replicate the PS's computeBiome blend chain over a single heightArray.
+// Used both for the chunk's own heightArray and for an axis-aligned neighbor
+// when sampling near a chunk boundary for cross-region blending.
+float SampleHeightChain(Texture2DArray ha, float3 tex0, float2 uvblend,
+                        float4 weights, float4 omap,
+                        float mipBase, float mipSlope, float mipGrass,
+                        float mipDirt, float mipRoad, float mipCliff)
+{
+    float hBase   = ha.SampleLevel(heightSamp, float3(tex0.xy * gPsScalesB.xy, 0.0), mipBase).r;
+    float hSlope  = ha.SampleLevel(heightSamp, float3(tex0.xy * gPsScalesA.xy, 1.0), mipSlope).r;
+    float hGrass  = ha.SampleLevel(heightSamp, float3(tex0.xy * gPsScalesB.zw, 3.0), mipGrass).r;
+    float hDirt   = ha.SampleLevel(heightSamp, float3(tex0.xy * gPsScalesC.xy, 4.0), mipDirt).r;
+    float hRoad   = ha.SampleLevel(heightSamp, float3(tex0.xy * gPsScalesC.zw, 5.0), mipRoad).r;
+    float hCliffX = ha.SampleLevel(heightSamp, float3(tex0.yz * gPsScalesA.zw, 2.0), mipCliff).r;
+    float hCliffZ = ha.SampleLevel(heightSamp, float3(tex0.xz * gPsScalesA.zw, 2.0), mipCliff).r;
+    float hCliff  = hCliffX * uvblend.x + hCliffZ * uvblend.y;
+    float h = hBase;
+    h = lerp(h, hGrass, omap.r);
+    h = lerp(h, hSlope, weights.x);
+    h = lerp(h, hDirt,  omap.b);
+    h = lerp(h, hRoad,  omap.a);
+    h = lerp(h, hCliff, weights.y);
+    return h;
+}
 
 [domain("tri")]
 DsOut main(HsConst c, float3 bary : SV_DomainLocation, const OutputPatch<VsOut, 3> patch)
@@ -197,6 +232,17 @@ DsOut main(HsConst c, float3 bary : SV_DomainLocation, const OutputPatch<VsOut, 
     float4 passClip = patch[0].pos * bary.x + patch[1].pos * bary.y + patch[2].pos * bary.z;
     float ampScale = lerp(1.0, 1.0 - smoothstep(gAmpFadeStart, gAmpFadeEnd, passClip.w), gAmpFadeEnabled);
 
+    // Early-out: if total displacement amplitude is essentially zero, skip
+    // all heightmap sampling (7+ texture fetches) and return the patch
+    // un-displaced. Common for distant tess'd terrain where amp fade has
+    // taken effect, OR when the user dialed amplitude to 0 to compare.
+    float ampScaledTotal = gAmplitude * ampScale;
+    if (ampScaledTotal < 1e-4)
+    {
+        o.pos      = passClip;
+        return o;
+    }
+
     // Replicate PS biome blend: weights = slope coverage from normal.y,
     // omap from overlayMap drives grass/dirt overlays, cliff is triplanar.
     float3 nrm = normalize(o.normal);
@@ -211,11 +257,26 @@ DsOut main(HsConst c, float3 bary : SV_DomainLocation, const OutputPatch<VsOut, 
     // spacing in UV space. Larger UV scale (more tiling) → smaller texel
     // span per tess step → higher mip needed to avoid sub-tess-vertex
     // spikes. The base 2048 corresponds to the heightmap's mip-0 width.
-    float uvE01 = length(patch[0].tex0.xy - patch[1].tex0.xy);
-    float uvE02 = length(patch[0].tex0.xy - patch[2].tex0.xy);
-    float uvE12 = length(patch[1].tex0.xy - patch[2].tex0.xy);
-    float uvSpan = max(max(uvE01, uvE02), uvE12);
-    float tessF  = max(max(c.edges[0], c.edges[1]), c.edges[2]);
+    // Per-edge UV spans (what the edge spans in tex0 space). Edge[i] is the
+    // edge OPPOSITE vertex i, so:
+    //   edge[0] connects vertices 1 and 2
+    //   edge[1] connects vertices 0 and 2
+    //   edge[2] connects vertices 0 and 1
+    float uvSpan0 = length(patch[1].tex0.xy - patch[2].tex0.xy);
+    float uvSpan1 = length(patch[0].tex0.xy - patch[2].tex0.xy);
+    float uvSpan2 = length(patch[0].tex0.xy - patch[1].tex0.xy);
+
+    // Pick the SHARED EDGE's factor AND UV span based on closest edge to
+    // this output vertex (in barycentric space). On a shared edge, both
+    // adjacent patches see the same edge endpoints — therefore the same
+    // factor (integer partitioning) AND the same UV span — so they compute
+    // identical mip levels and sample the heightmap consistently. Using
+    // max(edges) or max(uvSpans) here breaks this symmetry across
+    // patch boundaries and causes internal seams within a chunk.
+    float tessF, uvSpan;
+    if (bary.x <= bary.y && bary.x <= bary.z) { tessF = c.edges[0]; uvSpan = uvSpan0; }
+    else if (bary.y <= bary.z)                 { tessF = c.edges[1]; uvSpan = uvSpan1; }
+    else                                        { tessF = c.edges[2]; uvSpan = uvSpan2; }
     float uvPerTess = uvSpan / max(tessF, 1.0);
     const float kHmRes = 2048.0;
     float mipBase  = max(0.0, log2(max(uvPerTess * length(gPsScalesB.xy) * kHmRes, 1.0)) - 1.0) + gMipBias;
@@ -225,28 +286,55 @@ DsOut main(HsConst c, float3 bary : SV_DomainLocation, const OutputPatch<VsOut, 
     float mipRoad  = max(0.0, log2(max(uvPerTess * length(gPsScalesC.zw) * kHmRes, 1.0)) - 1.0) + gMipBias;
     float mipCliff = max(0.0, log2(max(uvPerTess * length(gPsScalesA.zw) * kHmRes, 1.0)) - 1.0) + gMipBias;
 
-    // Sample all 6 slice roles with the same UV scales the PS uses.
-    // Slice index by role: 0 base, 1 slope, 2 cliff, 3 grass, 4 dirt, 5 road.
-    float hBase   = heightArr.SampleLevel(heightSamp, float3(o.tex0.xy * gPsScalesB.xy, 0.0), mipBase).r;
-    float hSlope  = heightArr.SampleLevel(heightSamp, float3(o.tex0.xy * gPsScalesA.xy, 1.0), mipSlope).r;
-    float hGrass  = heightArr.SampleLevel(heightSamp, float3(o.tex0.xy * gPsScalesB.zw, 3.0), mipGrass).r;
-    float hDirt   = heightArr.SampleLevel(heightSamp, float3(o.tex0.xy * gPsScalesC.xy, 4.0), mipDirt).r;
-    float hRoad   = heightArr.SampleLevel(heightSamp, float3(o.tex0.xy * gPsScalesC.zw, 5.0), mipRoad).r;
-    // Cliff uses triplanar projection — yz and xz planes blended by uvblend (TEXCOORD4).
-    float hCliffX = heightArr.SampleLevel(heightSamp, float3(o.tex0.yz * gPsScalesA.zw, 2.0), mipCliff).r;
-    float hCliffZ = heightArr.SampleLevel(heightSamp, float3(o.tex0.xz * gPsScalesA.zw, 2.0), mipCliff).r;
-    float hCliff  = hCliffX * o.uvblend.x + hCliffZ * o.uvblend.y;
+    // Sample our own heightArray's full blend chain.
+    float hBlend = SampleHeightChain(heightArr, o.tex0, o.uvblend, weights, omap,
+                                     mipBase, mipSlope, mipGrass, mipDirt, mipRoad, mipCliff);
 
-    // PS blend chain (computeBiome → main_fs):
-    //   lerp(base, grass, map.r) → lerp(.., slope, weights.x)
-    //   lerp(.., dirt, map.b)    → lerp(.., road, map.a)
-    //   lerp(.., cliff, weights.y)
-    float hBlend = hBase;
-    hBlend = lerp(hBlend, hGrass, omap.r);
-    hBlend = lerp(hBlend, hSlope, weights.x);
-    hBlend = lerp(hBlend, hDirt,  omap.b);
-    hBlend = lerp(hBlend, hRoad,  omap.a);
-    hBlend = lerp(hBlend, hCliff, weights.y);
+    // Cross-region neighbor blending: o.tex1.xy is the per-CHUNK UV (0..1
+    // across one chunk). Near each chunk-UV edge, blend with the matching
+    // axis-aligned neighbor's heightArray so the boundary vertex sees the
+    // same value from both sides of the seam:
+    //
+    //   selfWeight = 0.5 + 0.5 * smoothstep(0, fadeWidth, distFromEdge)
+    //   h = lerp(h_neighbor, h_self, selfWeight)
+    //
+    // At the edge: selfWeight = 0.5 → h = (h_self + h_neighbor) / 2.
+    // The other side computes the SAME (h_neighbor + h_self) / 2 because
+    // both sides see each other as their respective neighbor. Seamless.
+    //
+    // Skipped when fadeWidth is zero (user disabled cross-region blending)
+    // or when we're far enough into the chunk that selfWeight is already 1.
+    if (gChunkBoundaryFade > 1e-5)
+    {
+        float2 cu = o.tex1.xy;
+        float distXNeg = cu.x;
+        float distXPos = 1.0 - cu.x;
+        float distZNeg = cu.y;
+        float distZPos = 1.0 - cu.y;
+        float minDist = min(min(distXNeg, distXPos), min(distZNeg, distZPos));
+        float selfWeight = 0.5 + 0.5 * smoothstep(0.0, gChunkBoundaryFade, minDist);
+
+        if (selfWeight < 0.999)
+        {
+            // Pick the neighbor heightArray whose direction matches the
+            // closest edge. Branch is coherent across nearby threads
+            // (geometric coherence) so it's cheap on the GPU.
+            float h_nbr;
+            if      (distXNeg == minDist)
+                h_nbr = SampleHeightChain(heightArrNX, o.tex0, o.uvblend, weights, omap,
+                                          mipBase, mipSlope, mipGrass, mipDirt, mipRoad, mipCliff);
+            else if (distXPos == minDist)
+                h_nbr = SampleHeightChain(heightArrPX, o.tex0, o.uvblend, weights, omap,
+                                          mipBase, mipSlope, mipGrass, mipDirt, mipRoad, mipCliff);
+            else if (distZNeg == minDist)
+                h_nbr = SampleHeightChain(heightArrNZ, o.tex0, o.uvblend, weights, omap,
+                                          mipBase, mipSlope, mipGrass, mipDirt, mipRoad, mipCliff);
+            else
+                h_nbr = SampleHeightChain(heightArrPZ, o.tex0, o.uvblend, weights, omap,
+                                          mipBase, mipSlope, mipGrass, mipDirt, mipRoad, mipCliff);
+            hBlend = lerp(h_nbr, hBlend, selfWeight);
+        }
+    }
 
     // Debug override:
     //   0..5  = force a single slice with its PS-correct UV scale.
@@ -256,20 +344,23 @@ DsOut main(HsConst c, float3 bary : SV_DomainLocation, const OutputPatch<VsOut, 
     if (gDebugSlice >= 0.0)
     {
         int s = (int)gDebugSlice;
-        if (s == 0)      hBlend = hBase;
-        else if (s == 1) hBlend = hSlope;
-        else if (s == 2) hBlend = hCliff;
-        else if (s == 3) hBlend = hGrass;
-        else if (s == 4) hBlend = hDirt;
-        else if (s == 5) hBlend = heightArr.SampleLevel(heightSamp,
-                                    float3(o.tex0.xy * gPsScalesC.zw, 5.0), 0).r;
+        if (s == 0)      hBlend = heightArr.SampleLevel(heightSamp, float3(o.tex0.xy * gPsScalesB.xy, 0.0), mipBase).r;
+        else if (s == 1) hBlend = heightArr.SampleLevel(heightSamp, float3(o.tex0.xy * gPsScalesA.xy, 1.0), mipSlope).r;
+        else if (s == 2) {
+            float hCliffX = heightArr.SampleLevel(heightSamp, float3(o.tex0.yz * gPsScalesA.zw, 2.0), mipCliff).r;
+            float hCliffZ = heightArr.SampleLevel(heightSamp, float3(o.tex0.xz * gPsScalesA.zw, 2.0), mipCliff).r;
+            hBlend = hCliffX * o.uvblend.x + hCliffZ * o.uvblend.y;
+        }
+        else if (s == 3) hBlend = heightArr.SampleLevel(heightSamp, float3(o.tex0.xy * gPsScalesB.zw, 3.0), mipGrass).r;
+        else if (s == 4) hBlend = heightArr.SampleLevel(heightSamp, float3(o.tex0.xy * gPsScalesC.xy, 4.0), mipDirt).r;
+        else if (s == 5) hBlend = heightArr.SampleLevel(heightSamp, float3(o.tex0.xy * gPsScalesC.zw, 5.0), mipRoad).r;
         else if (s == 6) hBlend = saturate(weights.x);
         else if (s == 7) hBlend = saturate(weights.y);
         else if (s == 8) hBlend = saturate(omap.r);
         else             hBlend = saturate(omap.b);
     }
 
-    float h = (hBlend - gDisplacementBias) * gAmplitude * ampScale;
+    float h = (hBlend - gDisplacementBias) * ampScaledTotal;
 
     // Displace along a blend of surface normal and world-up. Blend = 1 uses
     // pure world-up, which is identical across all chunks (no per-vertex
@@ -417,8 +508,13 @@ void FFT_1D(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
 
     int2 o0 = (fAxis == 0) ? int2(t,        lineIdx) : int2(lineIdx, t);
     int2 o1 = (fAxis == 0) ? int2(t+HALF_N, lineIdx) : int2(lineIdx, t+HALF_N);
-    fOutput[o0] = fftLine[t];
-    fOutput[o1] = fftLine[t+HALF_N];
+    // Apply 1/N scale on inverse so a forward+inverse round-trip is identity.
+    // Each 1D pass contributes 1/N; for 2D total scale is 1/N². Lets the
+    // normalize step compare apples-to-apples regardless of how many FFT
+    // passes the value went through (e.g. integrate/IFFT vs re-FFT/HP/IFFT).
+    float scale = (fInverse != 0) ? (1.0 / float(N)) : 1.0;
+    fOutput[o0] = fftLine[t]        * scale;
+    fOutput[o1] = fftLine[t+HALF_N] * scale;
 }
 
 // ============= Frankot-Chellappa integrate + Gaussian high-pass =============
@@ -519,22 +615,88 @@ void ExtractLumCentered(uint3 dtid : SV_DispatchThreadID)
     if (dtid.x >= lWidth || dtid.y >= lHeight) return;
     float4 d = gDiffuse.Load(int4(dtid.xy, lSlice, 0));
     float lum = dot(d.rgb, float3(0.299, 0.587, 0.114));
-    gLumOut[dtid.xy] = float2(lum - 0.5, 0.0);
+    // Raw luminance (no -0.5 offset) — downstream MinMax reduction finds
+    // the actual midpoint of this slice, so each slice's full range maps
+    // to [0, 1] regardless of where its mean sits.
+    gLumOut[dtid.xy] = float2(lum, 0.0);
+}
+
+// ============= Reduce MIN and MAX of luminance =============
+// Min-max normalization gives "all textures the same displacement range"
+// behavior — each slice's actual lum range maps to [0, 1], no clipping.
+// Trick: for non-negative floats, asuint(x) is monotonic, so InterlockedMin
+// and InterlockedMax on uint give correct float-min and float-max.
+Texture2D<float2>             mmH      : register(t0);
+RWStructuredBuffer<uint>      mmMinBuf : register(u0);
+RWStructuredBuffer<uint>      mmMaxBuf : register(u1);
+
+cbuffer MinMaxParams : register(b0)
+{
+    uint  mmWidth, mmHeight, _mmpad0, _mmpad1;
+};
+
+groupshared uint groupMin;
+groupshared uint groupMmMax;
+
+[numthreads(1024, 1, 1)]
+void ReduceMinMax(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID)
+{
+    if (gtid.x == 0)
+    {
+        groupMin    = 0xFFFFFFFFu;
+        groupMmMax  = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    uint baseIdx = gid.x * 4096u + gtid.x * 4u;
+    uint localMin = 0xFFFFFFFFu;
+    uint localMax = 0;
+    [unroll]
+    for (uint kk = 0; kk < 4u; kk++)
+    {
+        uint idx = baseIdx + kk;
+        if (idx < mmWidth * mmHeight)
+        {
+            uint x = idx % mmWidth;
+            uint y = idx / mmWidth;
+            float val = mmH[uint2(x, y)].x;
+            // Handle negatives that may appear after HP roundtrip:
+            // bias by adding 1.0 so the value is non-negative before bit-cast.
+            // Range becomes [≈0, ≈2] which still has monotonic asuint.
+            uint asInt = asuint(val + 1.0);
+            localMin = min(localMin, asInt);
+            localMax = max(localMax, asInt);
+        }
+    }
+    InterlockedMin(groupMin, localMin);
+    InterlockedMax(groupMmMax, localMax);
+    GroupMemoryBarrierWithGroupSync();
+    if (gtid.x == 0)
+    {
+        InterlockedMin(mmMinBuf[0], groupMin);
+        InterlockedMax(mmMaxBuf[0], groupMmMax);
+    }
 }
 
 // ============= Normalize FFT + Luminance, blend, write =============
-// fft+lum each get normalized to [-1, 1] via their own max-abs. Linear
-// blend by nMix, then map to [0, 1] centered at 0.5.
+// FFT branch: max-abs normalize (centered at 0 — the integrate step zeroes
+// the DC bin so spatial mean is 0).
+// Lum branch: min-max normalize. Each slice's actual midpoint maps to 0.5,
+// each slice's full range maps to [0, 1] — same output range across all
+// textures regardless of their natural luminance distribution. The min/max
+// values were captured BIASED by +1.0 (to dodge the asuint sign issue for
+// post-HP negatives), so we un-bias here.
 Texture2D<float2>             nFft       : register(t0);
 StructuredBuffer<uint>        nMaxFft    : register(t1);
 Texture2D<float2>             nLum       : register(t2);
 StructuredBuffer<uint>        nMaxLum    : register(t3);
+StructuredBuffer<uint>        nMinLum    : register(t4);
 RWTexture2DArray<float>       nOut       : register(u0);
 
 cbuffer NormalizeParams : register(b0)
 {
     uint  nWidth, nHeight, nSlice;
-    float nMix;  // 0 = pure FFT (current), 1 = pure luminance
+    float nMix;  // 0 = pure FFT, 1 = pure luminance
 };
 
 [numthreads(8, 8, 1)]
@@ -544,11 +706,41 @@ void Normalize(uint3 dtid : SV_DispatchThreadID)
     float fft    = nFft[dtid.xy].x;
     float lum    = nLum[dtid.xy].x;
     float maxFft = max(asfloat(nMaxFft[0]), 1e-9);
-    float maxLum = max(asfloat(nMaxLum[0]), 1e-9);
+    float lumMin = asfloat(nMinLum[0]) - 1.0;   // un-bias
+    float lumMax = asfloat(nMaxLum[0]) - 1.0;
+    float lumMid    = (lumMin + lumMax) * 0.5;
+    float lumHalfR  = max((lumMax - lumMin) * 0.5, 1e-9);
     float fftN   = fft / maxFft;
-    float lumN   = lum / maxLum;
+    float lumN   = (lum - lumMid) / lumHalfR;
     float h      = lerp(fftN, lumN, nMix);
     nOut[uint3(dtid.xy, nSlice)] = saturate(0.5 + h * 0.5);
+}
+
+// ============= Standalone Gaussian high-pass =============
+// Same attenuation curve as Integrate's optional HP block, but operates
+// directly on a spectrum buffer without redoing the Frankot-Chellappa
+// quotient. Used by the "flipped" pipeline where the HP runs AFTER the
+// max-reduction so it doesn't lose its visual effect to a post-normalize.
+Texture2D<float2>    hpIn  : register(t0);
+RWTexture2D<float2>  hpOut : register(u0);
+
+cbuffer HighPassParams : register(b0)
+{
+    uint  hpWidth, hpHeight;
+    float hpCutoff;
+    float hpStrength;
+};
+
+[numthreads(8, 8, 1)]
+void HighPass(uint3 dtid : SV_DispatchThreadID)
+{
+    if (dtid.x >= hpWidth || dtid.y >= hpHeight) return;
+    float u = (dtid.x < hpWidth/2)  ? float(dtid.x) : (float(dtid.x) - float(hpWidth));
+    float v = (dtid.y < hpHeight/2) ? float(dtid.y) : (float(dtid.y) - float(hpHeight));
+    float atten = 1.0;
+    if (hpStrength > 0.0 && hpCutoff > 0.0)
+        atten = 1.0 - hpStrength * exp(-(u*u + v*v) / (2.0 * hpCutoff * hpCutoff));
+    hpOut[dtid.xy] = hpIn[dtid.xy] * atten;
 }
 
 // ============= Init max buffer to zero =============
@@ -576,6 +768,8 @@ ID3D11ComputeShader*      gReduceCs      = nullptr;
 ID3D11ComputeShader*      gNormalizeCs   = nullptr;
 ID3D11ComputeShader*      gInitMaxCs     = nullptr;
 ID3D11ComputeShader*      gExtractLumCs  = nullptr;
+ID3D11ComputeShader*      gHighPassCs    = nullptr;
+ID3D11ComputeShader*      gReduceMinMaxCs = nullptr;
 
 // Working buffers for the GPU bake. R32G32_FLOAT 2K x 2K — 32MB each.
 // Reused across slices, allocated once at Init for FFT_N=2048.
@@ -590,6 +784,9 @@ struct GpuBakeBuffers
     ID3D11Buffer*              maxBufLum   = nullptr;
     ID3D11ShaderResourceView*  maxSrvLum   = nullptr;
     ID3D11UnorderedAccessView* maxUavLum   = nullptr;
+    ID3D11Buffer*              minBufLum   = nullptr;
+    ID3D11ShaderResourceView*  minSrvLum   = nullptr;
+    ID3D11UnorderedAccessView* minUavLum   = nullptr;
     ID3D11Buffer*              cbExtract   = nullptr;
     ID3D11Buffer*              cbFft       = nullptr;
     ID3D11Buffer*              cbIntegrate = nullptr;
@@ -611,6 +808,15 @@ struct HeightArray
 };
 std::unordered_map<ID3D11Resource*, HeightArray> gHeightArrays;
 
+// Per-frame chunk grid: maps integer (gridX, gridZ) → heightArray SRV.
+// Populated as terrain draws come in; allows neighbor lookups in O(1).
+// Definition hoisted here so RebakeAll() can clear it (the SRV pointers
+// it stores otherwise dangle when gHeightArrays is wiped).
+struct ChunkKey { int x; int z; bool operator==(const ChunkKey& o) const { return x == o.x && z == o.z; } };
+struct ChunkKeyHash { size_t operator()(const ChunkKey& k) const { return (size_t)k.x * 73856093u ^ (size_t)k.z * 19349663u; } };
+std::unordered_map<ChunkKey, ID3D11ShaderResourceView*, ChunkKeyHash> gChunkGrid;
+float gChunkGridUnit = 0.0f;
+
 // Captured PS bytecode by PS pointer, for cbuffer-layout reflection.
 std::unordered_map<ID3D11PixelShader*, std::vector<uint8_t>> gPsBytecode;
 
@@ -630,6 +836,10 @@ struct SavedState
     ID3D11Buffer*             dsCb1   = nullptr;
     ID3D11ShaderResourceView* dsSrv0  = nullptr;
     ID3D11ShaderResourceView* dsSrv1  = nullptr;
+    ID3D11ShaderResourceView* dsSrv2  = nullptr;  // -X neighbor heightArray
+    ID3D11ShaderResourceView* dsSrv3  = nullptr;  // +X neighbor
+    ID3D11ShaderResourceView* dsSrv4  = nullptr;  // -Z neighbor
+    ID3D11ShaderResourceView* dsSrv5  = nullptr;  // +Z neighbor
     ID3D11SamplerState*       dsSamp0 = nullptr;
     ID3D11ShaderResourceView* psSrv12 = nullptr;
     ID3D11Buffer*             psCb1   = nullptr;
@@ -734,6 +944,12 @@ void RebakeAll()
         if (kv.second.tex) kv.second.tex->Release();
     }
     gHeightArrays.clear();
+    // Critical: gChunkGrid stores raw SRV pointers that just got released.
+    // Leaving them in place would let the next terrain draw bind dangling
+    // pointers to DS slots → crash. Cleared, the first frame after rebake
+    // has no neighbors (cross-region seams briefly visible) but the grid
+    // re-populates within 1-2 frames as draws come in.
+    gChunkGrid.clear();
     Log("TerrainTess: cleared height array cache; next terrain draw will rebake");
 }
 
@@ -743,6 +959,14 @@ void RebakeAll()
 // the freed slot.
 void OnFrameEnd()
 {
+    // We DON'T clear gChunkGrid here — entries persist across frames so
+    // neighbor lookups succeed on the very first draw of each frame
+    // (otherwise the first few draws would have no neighbors yet, producing
+    // visible seams that vanish on subsequent frames). Stale entries point
+    // to heightArrays in gHeightArrays which are kept for the session, so
+    // their SRVs remain valid. (gridX, gridZ) keys are unique per chunk
+    // so new chunks don't collide with old ones.
+
     ID3D11DeviceContext* ctx = D3D11Hook::gContext;
     if (!ctx) return;
 
@@ -835,6 +1059,135 @@ void OnPixelShaderCreated(const void* bytecode, size_t size, ID3D11PixelShader* 
         refl->Release();
     }
     gPsBlendLevel[ps] = blendLevel;
+}
+
+// === Per-draw chunk-position snoop (for cross-region neighbor binding) ===
+//
+// Each terrain VS has a $Globals cbuffer holding worldMatrix (4x4) and
+// overlayData (float4 = chunk world bounds: x0,z0,x1,z1). We reflect each
+// terrain VS at create time to find those byte offsets in its cbuffer
+// layout (ordering can differ from source due to optimizer-driven uniform
+// stripping). At draw time we look up the bound VS's offsets, read the
+// snooped cbuffer data captured by Map/Unmap hooks, and extract the chunk
+// origin + size in world units.
+
+struct VsCbLayout
+{
+    int worldMatOffset   = -1;  // byte offset of float4x4 worldMatrix
+    int overlayDataOffset = -1; // byte offset of float4 overlayData
+    int cbSize            = 0;
+};
+// Keyed by VS pointer (we get this in OnVertexShaderCreated and have it
+// at draw time via VSGetShader).
+std::unordered_map<ID3D11VertexShader*, VsCbLayout> gVsCbLayout;
+
+// Per-cbuffer snooped data: latest write captured by Unmap.
+std::unordered_map<ID3D11Buffer*, std::vector<uint8_t>> gCbufSnap;
+std::unordered_map<ID3D11Buffer*, void*> gCbufMapped;
+std::unordered_set<ID3D11Buffer*> gCbufTracked;
+std::atomic<int> gCbufTrackedSize{0};
+
+void OnVertexShaderCreated(const void* bytecode, size_t size, ID3D11VertexShader* vs)
+{
+    if (!bytecode || !vs || size == 0) return;
+    ID3D11ShaderReflection* refl = nullptr;
+    if (FAILED(D3DReflect(bytecode, size, IID_ID3D11ShaderReflection, (void**)&refl)) || !refl)
+        return;
+
+    VsCbLayout layout;
+    D3D11_SHADER_DESC sd = {};
+    refl->GetDesc(&sd);
+    for (UINT i = 0; i < sd.ConstantBuffers; i++)
+    {
+        ID3D11ShaderReflectionConstantBuffer* cb = refl->GetConstantBufferByIndex(i);
+        D3D11_SHADER_BUFFER_DESC bd = {};
+        cb->GetDesc(&bd);
+        for (UINT v = 0; v < bd.Variables; v++)
+        {
+            ID3D11ShaderReflectionVariable* var = cb->GetVariableByIndex(v);
+            D3D11_SHADER_VARIABLE_DESC vd = {};
+            var->GetDesc(&vd);
+            if (!vd.Name) continue;
+            if (strcmp(vd.Name, "worldMatrix") == 0)
+            {
+                layout.worldMatOffset = (int)vd.StartOffset;
+                layout.cbSize = (int)bd.Size;
+            }
+            else if (strcmp(vd.Name, "overlayData") == 0)
+            {
+                layout.overlayDataOffset = (int)vd.StartOffset;
+            }
+        }
+    }
+    refl->Release();
+
+    // Only store if we found both — otherwise this isn't the terrain VS
+    // we expect, and per-draw lookups should fall back gracefully.
+    if (layout.worldMatOffset >= 0 && layout.overlayDataOffset >= 0)
+    {
+        gVsCbLayout[vs] = layout;
+        Log("TerrainTess: terrain VS %p layout: worldMat@%d overlayData@%d cbSize=%d",
+            vs, layout.worldMatOffset, layout.overlayDataOffset, layout.cbSize);
+    }
+}
+
+void OnCbufferMap(ID3D11Buffer* buf, void* dataPtr)
+{
+    if (gCbufTrackedSize.load(std::memory_order_acquire) == 0) return;
+    if (gCbufTracked.count(buf))
+        gCbufMapped[buf] = dataPtr;
+}
+
+void OnCbufferUnmap(ID3D11Buffer* buf)
+{
+    if (gCbufTrackedSize.load(std::memory_order_acquire) == 0) return;
+    auto it = gCbufMapped.find(buf);
+    if (it == gCbufMapped.end()) return;
+    auto& dst = gCbufSnap[buf];
+    // 256 bytes is enough for the terrain VS cbuffer (~240 bytes typical).
+    if (dst.size() < 256) dst.resize(256);
+    memcpy(dst.data(), it->second, 256);
+    gCbufMapped.erase(it);
+}
+
+// Mark a cbuffer as a terrain VS cbuffer worth snooping.
+static void TrackCbuffer(ID3D11Buffer* buf)
+{
+    if (gCbufTracked.insert(buf).second)
+        gCbufTrackedSize.fetch_add(1, std::memory_order_release);
+}
+
+// Extract chunk origin (x, z) and size (sx, sz) from a snooped VS cbuffer
+// using the layout we reflected for `vs`. Returns false if no data is
+// available yet (first frame) or the VS isn't a known terrain VS.
+static bool GetChunkBoundsFromVS(ID3D11VertexShader* vs, ID3D11Buffer* cb,
+                                  float& outOriginX, float& outOriginZ,
+                                  float& outSizeX,   float& outSizeZ)
+{
+    auto layoutIt = gVsCbLayout.find(vs);
+    if (layoutIt == gVsCbLayout.end()) return false;
+    auto snapIt = gCbufSnap.find(cb);
+    if (snapIt == gCbufSnap.end() || snapIt->second.size() < 256) return false;
+
+    const uint8_t* data = snapIt->second.data();
+    int wmOff = layoutIt->second.worldMatOffset;
+    int odOff = layoutIt->second.overlayDataOffset;
+
+    // worldMatrix translation: last 16 bytes of the float4x4. The 4th
+    // row/column overlap at offsets +48..63 regardless of column- vs
+    // row-major packing — the translation always sits there.
+    const float* tr = (const float*)(data + wmOff + 48);
+    // overlayData = float4(x0, z0, x1, z1) — chunk's world bounds.
+    const float* od = (const float*)(data + odOff);
+
+    outOriginX = od[0];
+    outOriginZ = od[1];
+    outSizeX   = od[2] - od[0];
+    outSizeZ   = od[3] - od[1];
+    // tr is unused for now (we use overlayData for both origin and size),
+    // but kept for future extension. Suppress unused-variable warning.
+    (void)tr;
+    return outSizeX > 1e-3 && outSizeZ > 1e-3;
 }
 
 // Reflect the bytecode and log its input + output signatures. Used to verify
@@ -1228,10 +1581,17 @@ static ID3D11ShaderResourceView* BakeHeightArrayGpu(ID3D11Device* device,
     ID3D11UnorderedAccessView* bufUav[3] = { gGpuBake.uav[0], gGpuBake.uav[1], gGpuBake.uav[2] };
     const int P = 0, Q = 1, S = 2; // P-buffer, Q-buffer, scratch
 
+    // Skip the FFT-from-normal pipeline entirely when the user has set
+    // lumMix to (essentially) 1 — its result would be multiplied by 0 in
+    // the normalize blend anyway, so all that work is wasted. Saves
+    // ~15 dispatches per slice and ~50% bake time.
+    const bool lumOnly = (gBakeLumMix > 0.999f) && (decodedDiffuseSrv != nullptr);
+
     // Per-slice pipeline.
     for (UINT slice = 0; slice < 6; slice++)
     {
         // (1) Extract gradients from decoded normal slice → bufP, bufQ.
+        if (!lumOnly)
         {
             uint32_t cb[4] = { W, H, slice, 0 };
             UploadCbuf(ctx, gGpuBake.cbExtract, cb);
@@ -1263,19 +1623,26 @@ static ID3D11ShaderResourceView* BakeHeightArrayGpu(ID3D11Device* device,
             ctx->CSSetShaderResources(0, 1, nullSrvs);
         };
 
-        // (2-3) Forward FFT 2D on P: P → S (rows) → P (cols).
-        fft(0, 0, P, S);
-        fft(1, 0, S, P);
-        // (4-5) Forward FFT 2D on Q: Q → S (rows) → Q (cols).
-        fft(0, 0, Q, S);
-        fft(1, 0, S, Q);
-
-        // (6) Integrate: bufP=Fp, bufQ=Fq → bufS = H spectrum.
+        if (!lumOnly)
         {
+            // (2-3) Forward FFT 2D on P: P → S (rows) → P (cols).
+            fft(0, 0, P, S);
+            fft(1, 0, S, P);
+            // (4-5) Forward FFT 2D on Q: Q → S (rows) → Q (cols).
+            fft(0, 0, Q, S);
+            fft(1, 0, S, Q);
+        }
+
+        if (!lumOnly)
+        {
+            // (6) Integrate: bufP=Fp, bufQ=Fq → bufS = H spectrum.
+            // Note: HP is NOT applied here — we want max(|H|) measured BEFORE
+            // attenuation so the post-HP normalize uses the no-HP scale and
+            // the HP visibly reduces overall amplitude.
             struct { uint32_t w, h; float cutoff, strength; } cb;
             cb.w = W; cb.h = H;
-            cb.cutoff   = gBakeHighPassCutoff;
-            cb.strength = gBakeHighPassStrength;
+            cb.cutoff   = 0.0f;  // force no HP in integrate
+            cb.strength = 0.0f;
             UploadCbuf(ctx, gGpuBake.cbIntegrate, &cb);
             ctx->CSSetShader(gIntegrateCs, nullptr, 0);
             ID3D11ShaderResourceView* srvs[2] = { bufSrv[P], bufSrv[Q] };
@@ -1285,12 +1652,12 @@ static ID3D11ShaderResourceView* BakeHeightArrayGpu(ID3D11Device* device,
             ctx->Dispatch((W + 7) / 8, (H + 7) / 8, 1);
             ctx->CSSetUnorderedAccessViews(0, 1, nullUavs, nullptr);
             ctx->CSSetShaderResources(0, 2, nullSrvs);
-        }
 
-        // (7-8) Inverse FFT 2D on H: S → P (cols) → S (rows). After this,
-        // bufS holds the real-valued height (.x = real, .y ~ 0).
-        fft(1, 1, S, P);
-        fft(0, 1, P, S);
+            // (7-8) Inverse FFT 2D on H: S → P (cols) → S (rows). After this,
+            // bufS holds the real-valued height (no HP).
+            fft(1, 1, S, P);
+            fft(0, 1, P, S);
+        }
 
         // Reduction helper (writes max-abs of bufSrv[srcIdx] into the given UAV).
         auto reduceMaxAbs = [&](int srcIdx, ID3D11UnorderedAccessView* maxUav)
@@ -1313,12 +1680,51 @@ static ID3D11ShaderResourceView* BakeHeightArrayGpu(ID3D11Device* device,
             ctx->CSSetShaderResources(0, 1, nullSrvs);
         };
 
-        // (9-10) Reduce max(|FFT|).
-        reduceMaxAbs(S, gGpuBake.maxUav);
+        // (9-10) Reduce max(|FFT|) on the NO-HP height field. This max is
+        // what we'll normalize the post-HP output against — preserving the
+        // visible amplitude reduction the high-pass produces.
+        if (!lumOnly)
+            reduceMaxAbs(S, gGpuBake.maxUav);
+
+        // (10b) If HP is enabled, re-FFT bufS, apply Gaussian high-pass,
+        // and IFFT back. Skipped when HP disabled — pipeline cost is unchanged.
+        if (!lumOnly && gBakeHighPassCutoff > 0.0f && gBakeHighPassStrength > 0.0f)
+        {
+            // Diagnostic: log once per slice so we can verify the HP is firing
+            // with the expected parameters when the user moves the slider.
+            if (slice == 0)
+                Log("TerrainTess: HP active cutoff=%.2f strength=%.2f",
+                    gBakeHighPassCutoff, gBakeHighPassStrength);
+            // Forward 2D FFT on bufS: row → bufQ, col → bufS = re-spectrum.
+            fft(0, 0, S, Q);
+            fft(1, 0, Q, S);
+
+            // Apply Gaussian HP attenuation. Output to bufQ (can't read+write
+            // same texture in one dispatch).
+            struct { uint32_t w, h; float cutoff, strength; } cb;
+            cb.w = W; cb.h = H;
+            cb.cutoff   = gBakeHighPassCutoff;
+            cb.strength = gBakeHighPassStrength;
+            UploadCbuf(ctx, gGpuBake.cbIntegrate, &cb); // reuses Integrate cb (same 16 bytes)
+            ctx->CSSetShader(gHighPassCs, nullptr, 0);
+            ctx->CSSetShaderResources(0, 1, &bufSrv[S]);
+            ctx->CSSetUnorderedAccessViews(0, 1, &bufUav[Q], initialCounts);
+            ctx->CSSetConstantBuffers(0, 1, &gGpuBake.cbIntegrate);
+            ctx->Dispatch((W + 7) / 8, (H + 7) / 8, 1);
+            ctx->CSSetUnorderedAccessViews(0, 1, nullUavs, nullptr);
+            ctx->CSSetShaderResources(0, 1, nullSrvs);
+
+            // IFFT bufQ → bufP (col) → bufS (row). bufS now has H_HP.
+            fft(1, 1, Q, P);
+            fft(0, 1, P, S);
+        }
 
         // (11) Extract centered luminance from decoded diffuse → bufP.
         // Skipped when no diffuse SRV — mix is then forced to 0.
         float effectiveMix = (decodedDiffuseSrv != nullptr) ? gBakeLumMix : 0.0f;
+        // Track which buffer holds the final lum data — defaults to P, but
+        // shifts to Q after the HP round-trip ends there.
+        int lumBufIdx = P;
         if (decodedDiffuseSrv)
         {
             uint32_t cb[4] = { W, H, slice, 0 };
@@ -1331,8 +1737,52 @@ static ID3D11ShaderResourceView* BakeHeightArrayGpu(ID3D11Device* device,
             ctx->CSSetUnorderedAccessViews(0, 1, nullUavs, nullptr);
             ctx->CSSetShaderResources(0, 1, nullSrvs);
 
-            // (12-13) Reduce max(|lum - 0.5|).
-            reduceMaxAbs(P, gGpuBake.maxUavLum);
+            // (12) Apply HP round-trip on lum (if enabled). Final HP'd lum
+            // lands in bufQ. Without HP, bufP holds raw lum unchanged.
+            if (gBakeHighPassCutoff > 0.0f && gBakeHighPassStrength > 0.0f)
+            {
+                fft(0, 0, P, Q);
+                fft(1, 0, Q, P);  // bufP = lum spectrum
+
+                struct { uint32_t w, h; float cutoff, strength; } hpCb;
+                hpCb.w = W; hpCb.h = H;
+                hpCb.cutoff   = gBakeHighPassCutoff;
+                hpCb.strength = gBakeHighPassStrength;
+                UploadCbuf(ctx, gGpuBake.cbIntegrate, &hpCb);
+                ctx->CSSetShader(gHighPassCs, nullptr, 0);
+                ctx->CSSetShaderResources(0, 1, &bufSrv[P]);
+                ctx->CSSetUnorderedAccessViews(0, 1, &bufUav[Q], initialCounts);
+                ctx->CSSetConstantBuffers(0, 1, &gGpuBake.cbIntegrate);
+                ctx->Dispatch((W + 7) / 8, (H + 7) / 8, 1);
+                ctx->CSSetUnorderedAccessViews(0, 1, nullUavs, nullptr);
+                ctx->CSSetShaderResources(0, 1, nullSrvs);
+
+                fft(1, 1, Q, P);
+                fft(0, 1, P, Q);  // bufQ = HP'd lum
+                lumBufIdx = Q;
+            }
+
+            // (13) Reduce min AND max on the FINAL lum buffer (post-HP if
+            // applicable). The Normalize CS uses these to map each slice's
+            // actual range to [0, 1] — same output range across all
+            // textures, no clipping (relative-contrast normalization).
+            const UINT minClear[4] = { 0xFFFFFFFFu, 0u, 0u, 0u };
+            const UINT maxClear[4] = { 0u, 0u, 0u, 0u };
+            ctx->ClearUnorderedAccessViewUint(gGpuBake.minUavLum, minClear);
+            ctx->ClearUnorderedAccessViewUint(gGpuBake.maxUavLum, maxClear);
+            {
+                uint32_t cb[4] = { W, H, 0, 0 };
+                UploadCbuf(ctx, gGpuBake.cbReduce, cb);
+                ctx->CSSetShader(gReduceMinMaxCs, nullptr, 0);
+                ctx->CSSetShaderResources(0, 1, &bufSrv[lumBufIdx]);
+                ID3D11UnorderedAccessView* uavs[2] = { gGpuBake.minUavLum, gGpuBake.maxUavLum };
+                ctx->CSSetUnorderedAccessViews(0, 2, uavs, initialCounts);
+                ctx->CSSetConstantBuffers(0, 1, &gGpuBake.cbReduce);
+                UINT groups = (W * H + 4095) / 4096;
+                ctx->Dispatch(groups, 1, 1);
+                ctx->CSSetUnorderedAccessViews(0, 2, nullUavs, nullptr);
+                ctx->CSSetShaderResources(0, 1, nullSrvs);
+            }
         }
 
         // (14) Normalize: blend FFT (S, maxFft) with luminance (P, maxLum) by
@@ -1342,16 +1792,23 @@ static ID3D11ShaderResourceView* BakeHeightArrayGpu(ID3D11Device* device,
             cb.w = W; cb.h = H; cb.sliceIdx = slice; cb.mix = effectiveMix;
             UploadCbuf(ctx, gGpuBake.cbNormalize, &cb);
             ctx->CSSetShader(gNormalizeCs, nullptr, 0);
-            ID3D11ShaderResourceView* srvs[4] = {
-                bufSrv[S], gGpuBake.maxSrv, bufSrv[P], gGpuBake.maxSrvLum
+            // In lumOnly mode the FFT path was skipped, so bufS / maxBuf
+            // contain stale data. Bind the lum SRVs at both slots so any
+            // bleed (with mix not exactly 1) collapses to lum-only output
+            // instead of garbage propagating through.
+            ID3D11ShaderResourceView* fftSrvBind    = lumOnly ? bufSrv[lumBufIdx] : bufSrv[S];
+            ID3D11ShaderResourceView* fftMaxSrvBind = lumOnly ? gGpuBake.maxSrvLum : gGpuBake.maxSrv;
+            ID3D11ShaderResourceView* srvs[5] = {
+                fftSrvBind, fftMaxSrvBind, bufSrv[lumBufIdx],
+                gGpuBake.maxSrvLum, gGpuBake.minSrvLum
             };
-            ctx->CSSetShaderResources(0, 4, srvs);
+            ctx->CSSetShaderResources(0, 5, srvs);
             ctx->CSSetUnorderedAccessViews(0, 1, &heightUav, initialCounts);
             ctx->CSSetConstantBuffers(0, 1, &gGpuBake.cbNormalize);
             ctx->Dispatch((W + 7) / 8, (H + 7) / 8, 1);
             ctx->CSSetUnorderedAccessViews(0, 1, nullUavs, nullptr);
-            ID3D11ShaderResourceView* nulls4[4] = { nullptr, nullptr, nullptr, nullptr };
-            ctx->CSSetShaderResources(0, 4, nulls4);
+            ID3D11ShaderResourceView* nulls5[5] = { nullptr, nullptr, nullptr, nullptr, nullptr };
+            ctx->CSSetShaderResources(0, 5, nulls5);
         }
     }
 
@@ -1763,7 +2220,9 @@ void Init(ID3D11Device* device)
                  && compileBakeCs("ReduceMaxAbs",       &gReduceCs)
                  && compileBakeCs("Normalize",          &gNormalizeCs)
                  && compileBakeCs("InitMax",            &gInitMaxCs)
-                 && compileBakeCs("ExtractLumCentered", &gExtractLumCs);
+                 && compileBakeCs("ExtractLumCentered", &gExtractLumCs)
+                 && compileBakeCs("HighPass",            &gHighPassCs)
+                 && compileBakeCs("ReduceMinMax",        &gReduceMinMaxCs);
     if (!bakeCsOk)
         Log("TerrainTess: GPU bake shaders failed to compile — will fall back to CPU FFT");
 
@@ -1806,11 +2265,11 @@ void Init(ID3D11Device* device)
             mb.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
             mb.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
             mb.StructureByteStride = sizeof(uint32_t);
-            // Two max buffers — one for FFT max-abs, one for luminance max-abs.
-            ID3D11Buffer** maxBufs[]   = { &gGpuBake.maxBuf, &gGpuBake.maxBufLum };
-            ID3D11ShaderResourceView** maxSrvs[] = { &gGpuBake.maxSrv, &gGpuBake.maxSrvLum };
-            ID3D11UnorderedAccessView** maxUavs[] = { &gGpuBake.maxUav, &gGpuBake.maxUavLum };
-            for (int i = 0; i < 2 && bufOk; i++)
+            // Three reduction buffers: FFT max-abs, lum max, lum min.
+            ID3D11Buffer** maxBufs[]   = { &gGpuBake.maxBuf, &gGpuBake.maxBufLum, &gGpuBake.minBufLum };
+            ID3D11ShaderResourceView** maxSrvs[] = { &gGpuBake.maxSrv, &gGpuBake.maxSrvLum, &gGpuBake.minSrvLum };
+            ID3D11UnorderedAccessView** maxUavs[] = { &gGpuBake.maxUav, &gGpuBake.maxUavLum, &gGpuBake.minUavLum };
+            for (int i = 0; i < 3 && bufOk; i++)
             {
                 if (FAILED(device->CreateBuffer(&mb, nullptr, maxBufs[i]))) { bufOk = false; break; }
 
@@ -1912,6 +2371,8 @@ void Shutdown()
     if (gNormalizeCs)   { gNormalizeCs->Release();   gNormalizeCs = nullptr; }
     if (gInitMaxCs)     { gInitMaxCs->Release();     gInitMaxCs = nullptr; }
     if (gExtractLumCs)  { gExtractLumCs->Release();  gExtractLumCs = nullptr; }
+    if (gHighPassCs)    { gHighPassCs->Release();    gHighPassCs = nullptr; }
+    if (gReduceMinMaxCs){ gReduceMinMaxCs->Release();gReduceMinMaxCs = nullptr; }
     for (int i = 0; i < 3; i++)
     {
         if (gGpuBake.uav[i]) gGpuBake.uav[i]->Release();
@@ -1927,6 +2388,9 @@ void Shutdown()
     if (gGpuBake.maxUavLum)   gGpuBake.maxUavLum->Release();
     if (gGpuBake.maxSrvLum)   gGpuBake.maxSrvLum->Release();
     if (gGpuBake.maxBufLum)   gGpuBake.maxBufLum->Release();
+    if (gGpuBake.minUavLum)   gGpuBake.minUavLum->Release();
+    if (gGpuBake.minSrvLum)   gGpuBake.minSrvLum->Release();
+    if (gGpuBake.minBufLum)   gGpuBake.minBufLum->Release();
     if (gGpuBake.cbExtract)   gGpuBake.cbExtract->Release();
     if (gGpuBake.cbFft)       gGpuBake.cbFft->Release();
     if (gGpuBake.cbIntegrate) gGpuBake.cbIntegrate->Release();
@@ -2230,6 +2694,10 @@ void Begin(ID3D11DeviceContext* ctx)
     ctx->DSGetConstantBuffers(1, 1, &gSaved.dsCb1);
     ctx->DSGetShaderResources(0, 1, &gSaved.dsSrv0);
     ctx->DSGetShaderResources(1, 1, &gSaved.dsSrv1);
+    ctx->DSGetShaderResources(2, 1, &gSaved.dsSrv2);
+    ctx->DSGetShaderResources(3, 1, &gSaved.dsSrv3);
+    ctx->DSGetShaderResources(4, 1, &gSaved.dsSrv4);
+    ctx->DSGetShaderResources(5, 1, &gSaved.dsSrv5);
     ctx->DSGetSamplers(0, 1, &gSaved.dsSamp0);
     // Reused by the PS heightmap-debug-view patch.
     ctx->PSGetShaderResources(12, 1, &gSaved.psSrv12);
@@ -2365,6 +2833,59 @@ void Begin(ID3D11DeviceContext* ctx)
     }
     ctx->DSSetSamplers(0, 1, &gHeightSampler);
 
+    // === Cross-region neighbor binding ===
+    // Identify this chunk's spatial neighbors via the cbuffer-snoop infrastructure
+    // and bind their heightArrays to DS slots t2..t5 (-X, +X, -Z, +Z respectively).
+    // Falls back gracefully to binding the PRIMARY heightArray when no snooped
+    // data is available yet (first frame for this VS) or no neighbor exists at
+    // a given direction. With own-as-fallback, the DS blend is a no-op there.
+    ID3D11ShaderResourceView* nbrSrv[4] = { heightArrSrv, heightArrSrv,
+                                            heightArrSrv, heightArrSrv };
+    {
+        ID3D11VertexShader* curVs = nullptr;
+        ctx->VSGetShader(&curVs, nullptr, 0);
+        ID3D11Buffer* curVsCb = nullptr;
+        ctx->VSGetConstantBuffers(0, 1, &curVsCb);
+        if (curVs && curVsCb)
+        {
+            // Mark this CB for snooping on future Maps. First sighting only —
+            // the insert is no-op on duplicate.
+            TrackCbuffer(curVsCb);
+
+            // Try to extract chunk bounds from snooped data (1-frame lag).
+            float ox = 0, oz = 0, sx = 0, sz = 0;
+            if (GetChunkBoundsFromVS(curVs, curVsCb, ox, oz, sx, sz))
+            {
+                // Quantize to grid: gridX/Z by chunk size. Use the size as
+                // the global grid unit (assumes uniform chunk size, which
+                // Kenshi terrain uses).
+                if (gChunkGridUnit < 1e-3) gChunkGridUnit = (sx + sz) * 0.5f;
+                int gx = (int)floorf(ox / gChunkGridUnit + 0.5f);
+                int gz = (int)floorf(oz / gChunkGridUnit + 0.5f);
+
+                // Record this chunk in the per-frame grid for future neighbor
+                // lookups (other draws in the same frame can find this one).
+                gChunkGrid[ChunkKey{gx, gz}] = heightArrSrv;
+
+                // Look up the 4 axis-aligned neighbors. If a neighbor was
+                // already drawn this frame, we have its heightArray. If
+                // not, we keep the fallback (own heightArray = no blend).
+                struct Off { int dx, dz; int slot; };
+                Off offsets[4] = { {-1, 0, 0}, {+1, 0, 1}, {0, -1, 2}, {0, +1, 3} };
+                for (int i = 0; i < 4; i++)
+                {
+                    auto it = gChunkGrid.find(ChunkKey{gx + offsets[i].dx,
+                                                        gz + offsets[i].dz});
+                    if (it != gChunkGrid.end() && it->second)
+                        nbrSrv[offsets[i].slot] = it->second;
+                }
+            }
+        }
+        if (curVsCb) curVsCb->Release();
+        if (curVs)   curVs->Release();
+    }
+    ctx->DSSetShaderResources(2, 4, nbrSrv);
+
     // Bind the same heightArray to PS slot 12 + the TessControl cbuffer to PS
     // slot 1 so the patched terrain main_fs can render the heightmap-as-albedo
     // debug view. Saved/restored so non-terrain PSes are unaffected.
@@ -2384,6 +2905,10 @@ void End(ID3D11DeviceContext* ctx)
     ctx->DSSetConstantBuffers(1, 1, &gSaved.dsCb1);
     ctx->DSSetShaderResources(0, 1, &gSaved.dsSrv0);
     ctx->DSSetShaderResources(1, 1, &gSaved.dsSrv1);
+    ctx->DSSetShaderResources(2, 1, &gSaved.dsSrv2);
+    ctx->DSSetShaderResources(3, 1, &gSaved.dsSrv3);
+    ctx->DSSetShaderResources(4, 1, &gSaved.dsSrv4);
+    ctx->DSSetShaderResources(5, 1, &gSaved.dsSrv5);
     ctx->DSSetSamplers(0, 1, &gSaved.dsSamp0);
     ctx->PSSetShaderResources(12, 1, &gSaved.psSrv12);
     ctx->PSSetConstantBuffers(1, 1, &gSaved.psCb1);
@@ -2396,6 +2921,10 @@ void End(ID3D11DeviceContext* ctx)
     if (gSaved.dsCb1)   { gSaved.dsCb1->Release();   gSaved.dsCb1 = nullptr; }
     if (gSaved.dsSrv0)  { gSaved.dsSrv0->Release();  gSaved.dsSrv0 = nullptr; }
     if (gSaved.dsSrv1)  { gSaved.dsSrv1->Release();  gSaved.dsSrv1 = nullptr; }
+    if (gSaved.dsSrv2)  { gSaved.dsSrv2->Release();  gSaved.dsSrv2 = nullptr; }
+    if (gSaved.dsSrv3)  { gSaved.dsSrv3->Release();  gSaved.dsSrv3 = nullptr; }
+    if (gSaved.dsSrv4)  { gSaved.dsSrv4->Release();  gSaved.dsSrv4 = nullptr; }
+    if (gSaved.dsSrv5)  { gSaved.dsSrv5->Release();  gSaved.dsSrv5 = nullptr; }
     if (gSaved.dsSamp0) { gSaved.dsSamp0->Release(); gSaved.dsSamp0 = nullptr; }
     if (gSaved.psSrv12) { gSaved.psSrv12->Release(); gSaved.psSrv12 = nullptr; }
     if (gSaved.psCb1)   { gSaved.psCb1->Release();   gSaved.psCb1 = nullptr; }

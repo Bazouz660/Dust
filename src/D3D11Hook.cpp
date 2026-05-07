@@ -662,6 +662,7 @@ static HRESULT STDMETHODCALLTYPE HookedCreateVertexShader(
         SurveyRecorder::OnVertexShaderCreated(pShaderBytecode, BytecodeLength, *ppVertexShader);
         ShaderMetadata::OnVertexShaderCreated(pShaderBytecode, BytecodeLength, *ppVertexShader);
         ShaderDatabase::OnVertexShaderCreated(*ppVertexShader);
+        TerrainTess::OnVertexShaderCreated(pShaderBytecode, BytecodeLength, *ppVertexShader);
     }
     return hr;
 }
@@ -1059,6 +1060,11 @@ namespace CSMIntercept
     static std::unordered_set<ID3D11Buffer*>           sTracked;
     static std::unordered_map<ID3D11Buffer*, void*>    sMapped;  // resource -> mapped pointer
     static std::mutex                                  sMutex;
+    // Fast path: hot Map/Unmap/UpdateSubresource hooks early-out when no
+    // CSM cbuffer has been tracked yet (true for the entire game session
+    // unless the CSM intercept actually triggers). Avoids the mutex
+    // acquire on every per-draw cbuffer update.
+    static std::atomic<int>                            sTrackedSize{0};
     static std::atomic<int>                            sUpdateCounter{0};
     static std::atomic<int>                            sUnmapCounter{0};
     static std::atomic<bool>                           sLayoutLogged{false};
@@ -1220,6 +1226,8 @@ static HRESULT STDMETHODCALLTYPE HookedCreateBuffer(
     {
         std::lock_guard<std::mutex> lock(CSMIntercept::sMutex);
         CSMIntercept::sTracked.insert(*ppBuffer);
+        CSMIntercept::sTrackedSize.store((int)CSMIntercept::sTracked.size(),
+                                          std::memory_order_release);
         Log("CSMIntercept: tracked cbuffer %p (size=%u)", *ppBuffer, pDesc->ByteWidth);
     }
     return hr;
@@ -1237,7 +1245,8 @@ static void STDMETHODCALLTYPE HookedUpdateSubresource(
     }
 
     bool tracked = false;
-    if (pDstResource && pSrcData)
+    if (pDstResource && pSrcData &&
+        CSMIntercept::sTrackedSize.load(std::memory_order_acquire) > 0)
     {
         // Cheap pointer-only check — UpdateSubresource is hot. Avoid QueryInterface
         // by reinterpreting (cbuffers and other ID3D11Buffer share vtable layout
@@ -1275,13 +1284,17 @@ static HRESULT STDMETHODCALLTYPE HookedMap(
 
     // Stash the mapped pointer so HookedUnmap can read/modify the data right
     // before commit. Only track if the resource is in our cbuffer set.
-    if (SUCCEEDED(hr) && pResource && pMappedResource && pMappedResource->pData)
+    if (SUCCEEDED(hr) && pResource && pMappedResource && pMappedResource->pData &&
+        CSMIntercept::sTrackedSize.load(std::memory_order_acquire) > 0)
     {
         std::lock_guard<std::mutex> lock(CSMIntercept::sMutex);
         ID3D11Buffer* buf = (ID3D11Buffer*)pResource;
         if (CSMIntercept::sTracked.count(buf))
             CSMIntercept::sMapped[buf] = pMappedResource->pData;
     }
+    // Terrain tess: snoop terrain VS cbuffer writes for chunk position info.
+    if (SUCCEEDED(hr) && pResource && pMappedResource && pMappedResource->pData)
+        TerrainTess::OnCbufferMap((ID3D11Buffer*)pResource, pMappedResource->pData);
     return hr;
 }
 
@@ -1291,7 +1304,7 @@ static void STDMETHODCALLTYPE HookedUnmap(
     if (gShutdownSignaled) { oUnmap(pThis, pResource, Subresource); return; }
 
     void* mappedData = nullptr;
-    if (pResource)
+    if (pResource && CSMIntercept::sTrackedSize.load(std::memory_order_acquire) > 0)
     {
         std::lock_guard<std::mutex> lock(CSMIntercept::sMutex);
         ID3D11Buffer* buf = (ID3D11Buffer*)pResource;
@@ -1302,6 +1315,9 @@ static void STDMETHODCALLTYPE HookedUnmap(
             CSMIntercept::sMapped.erase(it);
         }
     }
+    // Terrain tess: read snooped data BEFORE the original Unmap commits + frees it.
+    if (pResource)
+        TerrainTess::OnCbufferUnmap((ID3D11Buffer*)pResource);
 
     // (mappedData is a hook point for future cbuffer modification — read/write
     // before the original Unmap commits the data to the GPU.)
