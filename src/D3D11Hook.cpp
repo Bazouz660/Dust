@@ -101,6 +101,7 @@ void ResetFrameState()
     GeometryCapture::ResetFrame();
     gPipelineDetector.ResetFrame();
     gResourceRegistry.ResetFrame();
+    TerrainTess::OnFrameEnd();
     gDispatchedThisFrame = false;
     gCameraDataExtracted = false;
     gDeviceRemovedThisFrame = false;
@@ -633,6 +634,7 @@ static HRESULT STDMETHODCALLTYPE HookedCreatePixelShader(
     {
         SurveyRecorder::OnPixelShaderCreated(pShaderBytecode, BytecodeLength, *ppPixelShader);
         ShaderDatabase::OnPixelShaderCreated(*ppPixelShader);
+        TerrainTess::OnPixelShaderCreated(pShaderBytecode, BytecodeLength, *ppPixelShader);
     }
     return hr;
 }

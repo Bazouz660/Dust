@@ -8,6 +8,7 @@
 #include "ShaderDatabase.h"
 #include "POMState.h"
 #include "CSMCapture.h"
+#include "TerrainTess.h"
 #include "DustLog.h"
 #include <d3dcompiler.h>
 #include <cstring>
@@ -547,6 +548,35 @@ static void HostSetPOMThreshold(float threshold)   { POMState::SetThreshold(thre
 static void HostSetPOMThresholdWidth(float width)  { POMState::SetThresholdWidth(width); }
 static void HostSetPOMSamples(int minS, int maxS)  { POMState::SetMinSamples(minS); POMState::SetMaxSamples(maxS); }
 
+// API v7: terrain tessellation. Plugin pushes the runtime cbuffer (16 floats
+// matching TerrainTess::Controls layout) and bake-time params separately.
+static void HostSetTerrainTessControls(const float* controls16)
+{
+    if (!controls16) return;
+    auto* dst = TerrainTess::GetControls();
+    if (dst) memcpy(dst, controls16, sizeof(TerrainTess::Controls));
+}
+static void HostSetTerrainTessBakeHighPass(float cutoff, float strength)
+{
+    TerrainTess::SetBakeHighPass(cutoff, strength);
+}
+static void HostSetTerrainTessBakeLumMix(float mix)
+{
+    TerrainTess::SetBakeLumMix(mix);
+}
+static void HostRebakeTerrainHeightmaps(void)
+{
+    TerrainTess::RebakeAll();
+}
+static void HostSetTerrainTessEnabled(int enabled)
+{
+    TerrainTess::SetEnabled(enabled != 0);
+}
+static float HostGetTerrainTessGpuTimeMs(void)
+{
+    return TerrainTess::GetGpuTimeMs();
+}
+
 // ==================== EffectLoader ====================
 
 void EffectLoader::BuildHostAPI()
@@ -595,6 +625,14 @@ void EffectLoader::BuildHostAPI()
 
     // v6 additions
     hostAPI_.GetCSMData           = CSMCapture::GetSnapshot;
+
+    // v7 additions
+    hostAPI_.SetTerrainTessControls     = HostSetTerrainTessControls;
+    hostAPI_.SetTerrainTessBakeHighPass = HostSetTerrainTessBakeHighPass;
+    hostAPI_.SetTerrainTessBakeLumMix   = HostSetTerrainTessBakeLumMix;
+    hostAPI_.RebakeTerrainHeightmaps    = HostRebakeTerrainHeightmaps;
+    hostAPI_.SetTerrainTessEnabled      = HostSetTerrainTessEnabled;
+    hostAPI_.GetTerrainTessGpuTimeMs    = HostGetTerrainTessGpuTimeMs;
 }
 
 // ==================== v3: Config I/O ====================

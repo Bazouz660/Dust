@@ -72,7 +72,7 @@
 extern "C" {
 #endif
 
-#define DUST_API_VERSION 6
+#define DUST_API_VERSION 7
 
 // Injection points in the rendering pipeline
 typedef enum DustInjectionPoint {
@@ -316,6 +316,31 @@ typedef struct DustHostAPI {
     // 1 on success (outData filled), 0 if the snapshot isn't ready yet
     // (offsets not discovered, RTW shadow mode active, etc.).
     int (*GetCSMData)(DustCSMData* outData);
+
+    // === API v7 additions ===
+
+    // Terrain tessellation runtime cbuffer push (16 floats, layout matches
+    // TerrainTess::Controls). The host mirrors these into the cbuffer bound
+    // at HS+DS slot b1 each Begin(), so changes apply on the next draw.
+    void (*SetTerrainTessControls)(const float* controls16);
+
+    // Bake-time parameters. Changing these requires a rebake to take effect.
+    void (*SetTerrainTessBakeHighPass)(float cutoff, float strength);
+    void (*SetTerrainTessBakeLumMix)(float mix);
+
+    // Free all cached heightArrays so the next terrain draw rebakes them
+    // with current bake-time parameters. Safe to call from any thread the
+    // plugin runs on; resources are only touched on the render thread.
+    void (*RebakeTerrainHeightmaps)(void);
+
+    // Master enable/disable for terrain tessellation. When 0, terrain
+    // renders flat with no HS/DS routing (zero per-draw overhead).
+    void (*SetTerrainTessEnabled)(int enabled);
+
+    // GPU time spent on terrain tess draws this frame (ms). Polled per-frame
+    // by the plugin to feed the framework's perf display. Returns 0 if the
+    // most recent query data isn't ready yet.
+    float (*GetTerrainTessGpuTimeMs)(void);
 } DustHostAPI;
 
 // Performance impact hint for a single setting (API v3.2+).

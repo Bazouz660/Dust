@@ -543,6 +543,93 @@ static std::string PatchObjectsShaderForPOM(const std::string& src)
 }
 
 
+// Patch terrain main_fs to add a heightmap-as-albedo debug view.
+// The heightArray is bound by TerrainTess at PS slot t12, the TessControl
+// cbuffer at PS slot b1. When gDebugViewMode > 0.5, the patch overrides
+// biome.albedo with the same blended heightmap that drives DS displacement.
+static std::string PatchTerrainShaderForHeightDebug(const std::string& src)
+{
+    std::string result = src;
+
+    const char* anchor1 = "struct BiomeOutput {";
+    size_t pos1 = result.find(anchor1);
+    if (pos1 == std::string::npos)
+    {
+        Log("ShaderPatch[TerrainHeightDebug]: anchor 'struct BiomeOutput' not found, skipping");
+        return src;
+    }
+
+    std::string inject1 =
+        "// [Dust] Heightmap-as-albedo debug view\n"
+        "cbuffer TessControl : register(b1) {\n"
+        "\tfloat gMaxFactor; float gFactFadeStart; float gFactFadeEnd; float gAmplitude;\n"
+        "\tfloat gAmpFadeStart; float gAmpFadeEnd; float gAmpFadeEnabled; float gUvTileFactor;\n"
+        "\tfloat gDebugSlice; float gDebugViewMode; float2 _dustTessCtrlPad_;\n"
+        "};\n"
+        "Texture2DArray dustHeightArray : register(t12);\n"
+        "float DustSampleHeightArray(float3 texCoords, float3 normal, float2 cliffBlend,\n"
+        "                            float4 scales0, float4 scales1, float4 scales2,\n"
+        "                            float4 weights, float4 map) {\n"
+        "\tfloat hBase   = dustHeightArray.Sample(Anisotropic, float3(texCoords.xy * scales1.xy, 0)).r;\n"
+        "\tfloat hSlope  = dustHeightArray.Sample(Anisotropic, float3(texCoords.xy * scales0.xy, 1)).r;\n"
+        "\tfloat hGrass  = dustHeightArray.Sample(Anisotropic, float3(texCoords.xy * scales1.zw, 3)).r;\n"
+        "\tfloat hDirt   = dustHeightArray.Sample(Anisotropic, float3(texCoords.xy * scales2.xy, 4)).r;\n"
+        "\tfloat hRoad   = dustHeightArray.Sample(Anisotropic, float3(texCoords.xy * scales2.zw, 5)).r;\n"
+        "\tfloat hCliffX = dustHeightArray.Sample(Anisotropic, float3(texCoords.yz * scales0.zw, 2)).r;\n"
+        "\tfloat hCliffZ = dustHeightArray.Sample(Anisotropic, float3(texCoords.xz * scales0.zw, 2)).r;\n"
+        "\tfloat hCliff  = hCliffX * cliffBlend.x + hCliffZ * cliffBlend.y;\n"
+        "\tfloat h = lerp(hBase, hGrass, map.r);\n"
+        "\th = lerp(h, hSlope, weights.x);\n"
+        "\th = lerp(h, hDirt, map.b);\n"
+        "\t#ifndef NO_ROADS\n"
+        "\th = lerp(h, hRoad, map.a);\n"
+        "\t#endif\n"
+        "\th = lerp(h, hCliff, weights.y);\n"
+        "\treturn h;\n"
+        "}\n\n";
+    result.insert(pos1, inject1);
+
+    // Capture height for the BLEND0 layer right after biome computation,
+    // before BLEND1+ blocks overwrite weights/scales/texCoords.z. find()
+    // returns the first occurrence (in main_fs); mapfeature_fs's later copy
+    // stays unmodified — it doesn't reference dustDbgHeight, so leaving its
+    // brightnessFix line alone is fine.
+    const char* anchor2 = "biome.albedo.rgb *= brightnessFix.x;";
+    size_t pos2 = result.find(anchor2);
+    if (pos2 == std::string::npos)
+    {
+        Log("ShaderPatch[TerrainHeightDebug]: anchor 'brightnessFix.x' not found, skipping");
+        return src;
+    }
+    pos2 += strlen(anchor2);
+    std::string inject2 =
+        "\n\n\t// [Dust] Capture BLEND0 heightmap before BLEND1+ overwrites weights/scales\n"
+        "\tfloat dustDbgHeight = 0.0;\n"
+        "\tif (gDebugViewMode > 0.5) {\n"
+        "\t\tdustDbgHeight = DustSampleHeightArray(texCoords, normal, cliffBlend,\n"
+        "\t\t                                      scalesA, scalesB, scalesC, weights, map);\n"
+        "\t}";
+    result.insert(pos2, inject2);
+
+    // Override albedo at the writeAlbedo call. find() returns the first
+    // occurrence, which is in main_fs (mapfeature_fs has the same string but
+    // doesn't compute dustDbgHeight, so leave it alone).
+    const char* anchor3 = "writeAlbedo   ( buffer, biome.albedo.rgb, fragCoord.xy );";
+    size_t pos3 = result.find(anchor3);
+    if (pos3 == std::string::npos)
+    {
+        Log("ShaderPatch[TerrainHeightDebug]: anchor 'writeAlbedo' not found, skipping");
+        return src;
+    }
+    std::string replacement =
+        "if (gDebugViewMode > 0.5) biome.albedo.rgb = float3(dustDbgHeight, dustDbgHeight, dustDbgHeight);\n"
+        "\twriteAlbedo   ( buffer, biome.albedo.rgb, fragCoord.xy );";
+    result.replace(pos3, strlen(anchor3), replacement);
+
+    Log("ShaderPatch[TerrainHeightDebug]: injected heightmap debug view into terrain main_fs");
+    return result;
+}
+
 // Diagnostic: log the compiled shader's resource binding layout (cbuffer
 // slots, sampler slots, texture slots). This is ground truth for which
 // registers are actually used — no guessing about whether a slot is free
@@ -654,7 +741,9 @@ HRESULT WINAPI HookedD3DCompile(
             {
                 const std::string outInjection =
                     outAnchor +
-                    std::string("\n\tout float4 oWvpCol1     : TEXCOORD6,  // [Dust] WVP column 1 for DS displacement");
+                    std::string("\n\tout float4 oWvpCol1     : TEXCOORD6,  // [Dust] WVP column 1 (Y)"
+                                "\n\tout float4 oWvpCol0     : TEXCOORD7,  // [Dust] WVP column 0 (X)"
+                                "\n\tout float4 oWvpCol2     : TEXCOORD8,  // [Dust] WVP column 2 (Z)");
                 src.replace(outPos, outAnchor.size(), outInjection);
             }
             const std::string asgnAnchor = "oPosition = mul(worldViewProjMatrix, position);";
@@ -665,6 +754,10 @@ HRESULT WINAPI HookedD3DCompile(
                     "\n#ifdef TEXTURED\n"
                     "\toWvpCol1 = float4(worldViewProjMatrix._12, worldViewProjMatrix._22,"
                     " worldViewProjMatrix._32, worldViewProjMatrix._42);\n"
+                    "\toWvpCol0 = float4(worldViewProjMatrix._11, worldViewProjMatrix._21,"
+                    " worldViewProjMatrix._31, worldViewProjMatrix._41);\n"
+                    "\toWvpCol2 = float4(worldViewProjMatrix._13, worldViewProjMatrix._23,"
+                    " worldViewProjMatrix._33, worldViewProjMatrix._43);\n"
                     "#endif");
                 src.replace(asgnPos, asgnAnchor.size(), asgnInjection);
                 Log("ShaderPatch: injected oWvpCol1 output into terrain main_vs");
@@ -701,6 +794,44 @@ HRESULT WINAPI HookedD3DCompile(
                 Log("ShaderPatch: error: %s", (const char*)(*ppErrorMsgs)->GetBufferPointer());
                 (*ppErrorMsgs)->Release();
                 *ppErrorMsgs = nullptr;
+            }
+        }
+    }
+
+    // [Dust] Terrain main_fs heightmap-debug-view patch. Detects by markers
+    // unique to terrain (computeBiome, scalesA), distinguishing from deferred
+    // main_fs. Falls through to compile original on patcher/compile failure.
+    if (pEntrypoint && pSrcData && SrcDataSize > 0 &&
+        strcmp(pEntrypoint, "main_fs") == 0)
+    {
+        std::string src((const char*)pSrcData, SrcDataSize);
+        bool isTerrainFs = src.find("computeBiome") != std::string::npos &&
+                           src.find("scalesA") != std::string::npos &&
+                           src.find("DustSampleHeightArray") == std::string::npos;
+        if (isTerrainFs)
+        {
+            std::string patched = PatchTerrainShaderForHeightDebug(src);
+            if (patched.size() != src.size())
+            {
+                HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
+                                          pDefines, pInclude, pEntrypoint, pTarget,
+                                          Flags1, Flags2, ppCode, ppErrorMsgs);
+                if (SUCCEEDED(hr))
+                {
+                    if (ppCode && *ppCode)
+                        SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
+                            pEntrypoint, pTarget, pSourceName,
+                            (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+                    return hr;
+                }
+                Log("ShaderPatch[TerrainHeightDebug]: compile failed, falling back to original");
+                if (ppErrorMsgs && *ppErrorMsgs)
+                {
+                    Log("ShaderPatch[TerrainHeightDebug]: error: %s",
+                        (const char*)(*ppErrorMsgs)->GetBufferPointer());
+                    (*ppErrorMsgs)->Release();
+                    *ppErrorMsgs = nullptr;
+                }
             }
         }
     }

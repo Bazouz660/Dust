@@ -93,7 +93,7 @@ static std::string BuildCacheStamp(const std::string& modDir)
 
     // Bump this suffix when ShaderPatch HLSL injection changes, so RE_Kenshi
     // discards cached bytecode that was compiled with an older injection.
-    stamp += "|patch=tess-r13-skip-degen";
+    stamp += "|patch=tess-r44-anchor-fix";
     return stamp;
 }
 

@@ -36,7 +36,7 @@ Build-Project (Join-Path $Root "boot\DustBoot.vcxproj")
 # Build host
 Build-Project (Join-Path $Root "src\Dust.vcxproj")
 
-$Effects = @("ssao", "lut", "bloom", "dof", "ssil", "clarity", "outline", "kuwahara", "rtgi", "shadows", "smaa", "chromaticaberration", "deband", "filmgrain", "letterbox", "vignette", "pom")
+$Effects = @("ssao", "lut", "bloom", "dof", "ssil", "clarity", "outline", "kuwahara", "rtgi", "shadows", "smaa", "chromaticaberration", "deband", "filmgrain", "letterbox", "vignette", "pom", "terraintess")
 foreach ($effect in $Effects) {
     $vcxproj = Get-ChildItem (Join-Path $Root "effects\$effect\*.vcxproj") | Select-Object -First 1
     Build-Project $vcxproj.FullName
@@ -72,6 +72,12 @@ Copy-Item "$Root\boot\build\Release\DustBoot.dll" "$ModDir\"
 Copy-Item "$Root\src\build\Release\Dust.dll"  "$ModDir\"
 Copy-Item "$Root\mod\RE_Kenshi.json"          "$ModDir\"
 Copy-Item "$Root\mod\Dust.mod"                "$ModDir\"
+
+# Heightmaps for terrain tessellation displacement
+if (Test-Path "$Root\mod\heightmaps") {
+    New-Item -ItemType Directory -Force -Path "$ModDir\heightmaps" | Out-Null
+    Copy-Item "$Root\mod\heightmaps\*.bin" "$ModDir\heightmaps\" -Force -ErrorAction SilentlyContinue
+}
 
 foreach ($effect in $Effects) {
     $dll = Get-ChildItem "$Root\effects\$effect\build\Release\Dust*.dll" | Select-Object -First 1

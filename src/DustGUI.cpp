@@ -2063,6 +2063,9 @@ void Render()
             ImGui::Separator();
             ImGui::Spacing();
 
+            // Terrain tessellation is now a plugin (effects/terraintess) — its
+            // settings render inline with the other effects below.
+
             // Scrollable effects area
             ImGui::BeginChild("##effects", ImVec2(0, 0), false);
 
