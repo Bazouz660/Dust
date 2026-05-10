@@ -23,9 +23,12 @@ struct TerrainTessConfig
     float factFadeEnd      = 150.0f;
     int   factorSnapStep   = 4;
 
-    // Displacement.
+    // Displacement (bandpass + soft saturation).
     float amplitude        = 1.0f;
-    float displacementBias = 0.3f;
+    float displacementBias = 0.0f;
+    float sharpMip         = 1.0f;    // sharp tap mip; mid at +2, blurry at +4
+    float scale            = 0.05f;   // saturation knee
+    float hfWeight         = 0.5f;    // high-freq slice gain (2-point falloff curve)
     bool  ampFadeEnabled   = true;
     float ampFadeStart     = 80.0f;
     float ampFadeEnd       = 150.0f;
@@ -44,12 +47,12 @@ static const DustHostAPI* gHost = nullptr;
 // hook (which the framework calls regardless of injection point).
 static float sGpuTimeMs = 0.0f;
 
-// Mirror TerrainTess::Controls layout: 12 floats matching the host's HLSL
+// Mirror TerrainTess::Controls layout: 15 floats matching the host's HLSL
 // cbuffer field order. Booleans/ints converted to float here.
 static void PushRuntime()
 {
     if (!gHost || !gHost->SetTerrainTessControls) return;
-    float buf[12] = {};
+    float buf[15] = {};
     buf[0]  = (float)gConfig.maxFactor;
     buf[1]  = gConfig.factFadeStart;
     buf[2]  = gConfig.factFadeEnd;
@@ -62,6 +65,9 @@ static void PushRuntime()
     buf[9]  = (float)gConfig.factorSnapStep;
     buf[10] = gConfig.dispDirWorldUp;
     buf[11] = (float)gConfig.wireframe;
+    buf[12] = gConfig.sharpMip;
+    buf[13] = gConfig.scale;
+    buf[14] = gConfig.hfWeight;
     gHost->SetTerrainTessControls(buf);
 }
 
@@ -112,9 +118,12 @@ static DustSettingDesc gSettings[] = {
     { "Factor Fade End",   DUST_SETTING_FLOAT, &gConfig.factFadeEnd,    10.0f,  500.0f,"FactFadeEnd",     nullptr, "Distance at which tessellation fully drops to factor 1 (no subdivision).", DUST_PERF_NONE },
     { "Factor Snap Step",  DUST_SETTING_INT,   &gConfig.factorSnapStep,  1.0f,  16.0f, "FactorSnapStep",  nullptr, "Quantize tess factor to multiples of this for stable LOD. Bigger = more stable, coarser steps.", DUST_PERF_NONE },
 
-    // Displacement
-    { "Amplitude",         DUST_SETTING_FLOAT, &gConfig.amplitude,       0.0f, 20.0f,  "Amplitude",       nullptr, "Vertex displacement magnitude in world units (signed around the bias point).", DUST_PERF_NONE },
-    { "Displacement Bias", DUST_SETTING_FLOAT, &gConfig.displacementBias,0.0f,  0.5f,  "DisplacementBias",nullptr, "Mid-point of the heightmap that maps to ground level. Lower = displacement biased upward.", DUST_PERF_NONE },
+    // Displacement (bandpass + soft saturation)
+    { "Amplitude",         DUST_SETTING_FLOAT, &gConfig.amplitude,       0.0f, 20.0f,  "Amplitude",       nullptr, "Final vertex displacement magnitude in world units. The shaped signal is bounded to ~±1, so output range is ~±amp.", DUST_PERF_NONE },
+    { "Displacement Bias", DUST_SETTING_FLOAT, &gConfig.displacementBias,-0.5f, 0.5f,  "DisplacementBias",nullptr, "Pure additive output offset (independent of amp). Negative shifts terrain down, positive shifts it up.", DUST_PERF_NONE },
+    { "Smoothness",        DUST_SETTING_FLOAT, &gConfig.sharpMip,        0.0f,  4.0f,  "SharpMip",        nullptr, "Mip level for the sharp bandpass tap (blurry tap is fixed at +4). Higher = blurrier sharp tap → fewer high-freq spikes, but also less fine detail.", DUST_PERF_NONE },
+    { "Detail Scale",      DUST_SETTING_FLOAT, &gConfig.scale,           0.01f, 0.5f,  "Scale",           nullptr, "Saturation knee. Smaller = more equalized magnitude across textures (subtle and bumpy textures both produce similar displacement). Larger = more dynamic range preserved.", DUST_PERF_NONE },
+    { "HF Weight",         DUST_SETTING_FLOAT, &gConfig.hfWeight,        0.0f,  1.0f,  "HfWeight",        nullptr, "High-frequency bump amplitude relative to mid-frequency. 1.0 = flat response (high-freq bumps full amplitude). 0 = mid-band only (high-freq bumps killed). Forms a 2-point frequency falloff curve.", DUST_PERF_NONE },
     { "Disp Dir World-Up", DUST_SETTING_FLOAT, &gConfig.dispDirWorldUp,  0.0f,  1.0f,  "DispDirWorldUp",  nullptr, "Blend between per-vertex normal (0) and world-up (1) for displacement direction. 1 fixes seams from boundary normal mismatches.", DUST_PERF_NONE },
     { "Amp Fade Enabled",  DUST_SETTING_BOOL,  &gConfig.ampFadeEnabled,  0.0f,  1.0f,  "AmpFadeEnabled",  nullptr, "Fade displacement amplitude with distance.", DUST_PERF_NONE },
     { "Amp Fade Start",    DUST_SETTING_FLOAT, &gConfig.ampFadeStart,    0.0f,  500.0f,"AmpFadeStart",    nullptr, "Distance at which amplitude begins fading toward zero.", DUST_PERF_NONE },

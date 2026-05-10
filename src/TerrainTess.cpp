@@ -68,6 +68,10 @@ cbuffer TessControl : register(b1)
     float gFactorSnapStep;
     float gDispDirWorldUp;
     float gWireframeMode;
+    float gSharpMip;
+    float gScale;
+    float gHfWeight;
+    float _gPad0;
     float4 gBlend1Mask;
     float4 gBlend2Mask;
     float4 gBlend3Mask;
@@ -214,6 +218,13 @@ cbuffer TessControl : register(b1)
     float gFactorSnapStep;
     float gDispDirWorldUp;
     float gWireframeMode;
+    // Bandpass tap mips: sharp tap at gSharpMip, mid at +2, blurry at +4.
+    float gSharpMip;
+    // Soft-saturation knee: shaped = bp / (|bp| + gScale).
+    float gScale;
+    // Frequency-falloff weight on the high-freq slice. 1=flat response, 0=mid only.
+    float gHfWeight;
+    float _gPad0;
     // Per-PS BLEND# channel selectors. Each PS variant uses BLEND1/2/3
     // #defines to pick a channel of blendMap; host fills these per-draw.
     // (1,0,0,0)=R, (0,1,0,0)=G, etc. All-zero = layer inactive.
@@ -226,19 +237,21 @@ float Lum(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
 
 // One BLEND layer's albedo. Mirrors computeBiome from terrainfp4.hlsl,
 // minus the normal/absorbance branches and distance fadeout (irrelevant
-// for displacement amplitude).
+// for displacement amplitude). mipLevel overrides the explicit LOD on
+// every diffuse sample (DS has no ddx/ddy → must use SampleLevel anyway).
 float3 ComputeBiomeAlbedo(Texture2DArray dmap, float3 tc, float2 cliffBlend,
                           float4 weights, float4 omap, float3 colour,
-                          float4 sA, float4 sB, float4 sC, float4 oMult)
+                          float4 sA, float4 sB, float4 sC, float4 oMult,
+                          float mipLevel)
 {
     const float3 white = float3(1, 1, 1);
-    float3 cB  = dmap.SampleLevel(linearWrap, float3(tc.xy * sB.xy, 0.0), 0.0).rgb * colour;
-    float3 cS  = dmap.SampleLevel(linearWrap, float3(tc.xy * sA.xy, 1.0), 0.0).rgb * colour;
-    float3 cG  = dmap.SampleLevel(linearWrap, float3(tc.xy * sB.zw, 3.0), 0.0).rgb * lerp(white, colour, oMult.y);
-    float3 cD  = dmap.SampleLevel(linearWrap, float3(tc.xy * sC.xy, 4.0), 0.0).rgb * lerp(white, colour, oMult.z);
-    float3 cR  = dmap.SampleLevel(linearWrap, float3(tc.xy * sC.zw, 5.0), 0.0).rgb * lerp(white, colour, oMult.w);
-    float3 cCx = dmap.SampleLevel(linearWrap, float3(tc.yz * sA.zw, 2.0), 0.0).rgb;
-    float3 cCz = dmap.SampleLevel(linearWrap, float3(tc.xz * sA.zw, 2.0), 0.0).rgb;
+    float3 cB  = dmap.SampleLevel(linearWrap, float3(tc.xy * sB.xy, 0.0), mipLevel).rgb * colour;
+    float3 cS  = dmap.SampleLevel(linearWrap, float3(tc.xy * sA.xy, 1.0), mipLevel).rgb * colour;
+    float3 cG  = dmap.SampleLevel(linearWrap, float3(tc.xy * sB.zw, 3.0), mipLevel).rgb * lerp(white, colour, oMult.y);
+    float3 cD  = dmap.SampleLevel(linearWrap, float3(tc.xy * sC.xy, 4.0), mipLevel).rgb * lerp(white, colour, oMult.z);
+    float3 cR  = dmap.SampleLevel(linearWrap, float3(tc.xy * sC.zw, 5.0), mipLevel).rgb * lerp(white, colour, oMult.w);
+    float3 cCx = dmap.SampleLevel(linearWrap, float3(tc.yz * sA.zw, 2.0), mipLevel).rgb;
+    float3 cCz = dmap.SampleLevel(linearWrap, float3(tc.xz * sA.zw, 2.0), mipLevel).rgb;
     float3 cC  = (cCx * cliffBlend.x + cCz * cliffBlend.y) * lerp(white, colour, oMult.x);
     float3 a = lerp(cB, cG, omap.r);
     a = lerp(a, cS, weights.x);
@@ -252,8 +265,11 @@ float3 ComputeBiomeAlbedo(Texture2DArray dmap, float3 tc, float2 cliffBlend,
 // chain with channel-masked blendMap weights). Both sides of any chunk
 // boundary compute the same value (since the PS does, by construction) →
 // displacement is continuous across boundaries → no mesh seams.
+// mipLevel is forwarded to the diffuse samples only — colourMap / blendMap /
+// overlayMap stay at mip 0 because they're already low-frequency and we want
+// per-pixel weights to remain crisp.
 float ComputePsLum(float3 tex0, float2 cliffBlend, float4 mapCoords,
-                   float3 normal, float3 texV)
+                   float3 normal, float3 texV, float mipLevel)
 {
     float slope = 1.0 - normalize(normal).y;
     float4 omap = overlayMap.SampleLevel(linearWrap, mapCoords.xy, 0).rgba;
@@ -263,7 +279,7 @@ float ComputePsLum(float3 tex0, float2 cliffBlend, float4 mapCoords,
     float4 w0 = smoothstep(gPsSlopeMin - gPsSlopeBlend, gPsSlopeMin, slope)
               * smoothstep(gPsSlopeMax + gPsSlopeBlend, gPsSlopeMax, slope);
     float3 a = ComputeBiomeAlbedo(diffuseMaps, tex0, cliffBlend, w0, omap, colour,
-                                  gPsScalesA, gPsScalesB, gPsScalesC, gPsOverlayMult);
+                                  gPsScalesA, gPsScalesB, gPsScalesC, gPsOverlayMult, mipLevel);
     a *= gPsBrightnessFix.x;
 
     float4 bw = blendMap.SampleLevel(linearWrap, mapCoords.zw, 0);
@@ -278,7 +294,7 @@ float ComputePsLum(float3 tex0, float2 cliffBlend, float4 mapCoords,
         float4 w1w = smoothstep(gPsSlopeMin1 - gPsSlopeBlend1, gPsSlopeMin1, slope)
                    * smoothstep(gPsSlopeMax1 + gPsSlopeBlend1, gPsSlopeMax1, slope);
         float3 a1 = ComputeBiomeAlbedo(diffuseMaps1, tc1, cliffBlend, w1w, omap, colour,
-                                       gPsScalesA1, gPsScalesB1, gPsScalesC1, gPsOverlayMult1);
+                                       gPsScalesA1, gPsScalesB1, gPsScalesC1, gPsOverlayMult1, mipLevel);
         a += a1 * gPsBrightnessFix.y * w1;
     }
     if (w2 > 1e-5)
@@ -287,7 +303,7 @@ float ComputePsLum(float3 tex0, float2 cliffBlend, float4 mapCoords,
         float4 w2w = smoothstep(gPsSlopeMin2 - gPsSlopeBlend2, gPsSlopeMin2, slope)
                    * smoothstep(gPsSlopeMax2 + gPsSlopeBlend2, gPsSlopeMax2, slope);
         float3 a2 = ComputeBiomeAlbedo(diffuseMaps2, tc2, cliffBlend, w2w, omap, colour,
-                                       gPsScalesA2, gPsScalesB2, gPsScalesC2, gPsOverlayMult2);
+                                       gPsScalesA2, gPsScalesB2, gPsScalesC2, gPsOverlayMult2, mipLevel);
         a += a2 * gPsBrightnessFix.z * w2;
     }
     if (w3 > 1e-5)
@@ -296,7 +312,7 @@ float ComputePsLum(float3 tex0, float2 cliffBlend, float4 mapCoords,
         float4 w3w = smoothstep(gPsSlopeMin3 - gPsSlopeBlend3, gPsSlopeMin3, slope)
                    * smoothstep(gPsSlopeMax3 + gPsSlopeBlend3, gPsSlopeMax3, slope);
         float3 a3 = ComputeBiomeAlbedo(diffuseMaps3, tc3, cliffBlend, w3w, omap, colour,
-                                       gPsScalesA3, gPsScalesB3, gPsScalesC3, gPsOverlayMult3);
+                                       gPsScalesA3, gPsScalesB3, gPsScalesC3, gPsOverlayMult3, mipLevel);
         a += a3 * gPsBrightnessFix.w * w3;
     }
     return Lum(a);
@@ -326,8 +342,51 @@ DsOut main(HsConst c, float3 bary : SV_DomainLocation, const OutputPatch<VsOut, 
         return o;
     }
 
-    float hLum = ComputePsLum(o.tex0, o.uvblend, o.tex1, o.normal, o.texV.xyz);
-    float h = (hLum - gDisplacementBias) * ampScaledTotal;
+    // 4-tap multi-band bandpass with frequency-falloff curve. Replicas at
+    // mips K, K+2, K+4, K+8 split the visible-luminance spectrum into three
+    // slices spanning ~8x in spatial scale (vs the previous 4x):
+    //   slice_hi  = v0 - v1    → highest-freq band (where spikes live)
+    //   slice_mid = v1 - v2    → mid-freq band     (where most bumps live)
+    //   slice_lo  = v2 - v3    → low-freq band     (where dune-scale features live)
+    // Dune-scale features need slice_lo because they're too smooth to register
+    // strongly in the previous K..K+4 band — both mid and blurry samples
+    // captured them equally and cancelled out. All four taps are per-pixel
+    // continuous → seam-safe.
+    float v0 = ComputePsLum(o.tex0, o.uvblend, o.tex1, o.normal, o.texV.xyz, gSharpMip);
+    float v1 = ComputePsLum(o.tex0, o.uvblend, o.tex1, o.normal, o.texV.xyz, gSharpMip + 2.0);
+    float v2 = ComputePsLum(o.tex0, o.uvblend, o.tex1, o.normal, o.texV.xyz, gSharpMip + 4.0);
+    float v3 = ComputePsLum(o.tex0, o.uvblend, o.tex1, o.normal, o.texV.xyz, gSharpMip + 8.0);
+
+    // Normalize by colourMap luminance so dark biomes don't shrink the
+    // bandpass amplitude (visible_lum scales with colour_lum on both terms).
+    float refLum = max(Lum(colourMap.SampleLevel(linearWrap, o.tex1.xy, 0).rgb * 1.2), 0.05);
+
+    float slice_hi  = v0 - v1;
+    float slice_mid = v1 - v2;
+    float slice_lo  = v2 - v3;
+
+    // Gate slice_hi by whether the mid-band has matching evidence of a bump.
+    // Threshold is derived from gScale (no extra slider) — small mid-band
+    // signal (≤ scale*0.5) → kill the high-freq slice (likely spike).
+    float threshold = max(gScale, 1e-5) * 0.5;
+    float keep      = smoothstep(threshold, threshold * 2.0, abs(slice_mid));
+
+    // Frequency-falloff curve: low-freq slice gets full weight, mid gets
+    // gHfWeight, high gets gHfWeight² (with the spike gate). Power-curve so
+    // dune-scale bumps win on amplitude over rocky high-freq textures.
+    float w_md = gHfWeight;
+    float w_hi = gHfWeight * gHfWeight * keep;
+    float bp   = (slice_lo + slice_mid * w_md + slice_hi * w_hi) / refLum;
+
+    // Soft saturation: bounds |output| < 1 regardless of input magnitude.
+    //   Small bp → roughly bp/gScale (linear, preserves subtle detail).
+    //   Large bp → asymptotes to ±1 (caps spikes; equalizes across textures).
+    // Smaller gScale = more aggressive equalization (subtle and bumpy textures
+    // both produce displacement near ±1). Larger = more dynamic range preserved.
+    float shaped = bp / (abs(bp) + max(gScale, 1e-5));
+
+    // Bias is a pure additive offset; amp is the final magnitude.
+    float h = (shaped + gDisplacementBias) * ampScaledTotal;
 
     // Displace along a blend of surface normal and world-up. Blend = 1 uses
     // pure world-up, identical across all chunks (no boundary normal divergence

@@ -13,9 +13,21 @@ namespace TerrainTess
     // each Begin() so changes take effect on the next draw.
     //
     // Layout:
-    //   12 plugin-set floats (sent via SetTerrainTessControls)
+    //   15 plugin-set floats + 1 pad (sent via SetTerrainTessControls; pad
+    //     aligns the following float4 masks to a 16-byte boundary)
     //   12 host-set floats (per-PS BLEND# channel masks)
-    // Total 24 floats = 96 bytes (6 float4 rows).
+    // Total 28 floats = 112 bytes (7 float4 rows).
+    //
+    // Displacement formula (DS): 4-tap multi-band bandpass with frequency-falloff
+    // curve so dune-scale bumps register and high-freq bumps get less amplitude.
+    //   v0..v3  = ComputePsLum at mips sharpMip, +2, +4, +8
+    //   slice_hi  = v0 - v1   (high-freq band — spikes)
+    //   slice_mid = v1 - v2   (mid-freq band — most bumps)
+    //   slice_lo  = v2 - v3   (low-freq band — dune-scale features)
+    //   keep    = smoothstep(scale*0.5, scale, |slice_mid|)            (spike gate)
+    //   bp      = (slice_lo + slice_mid * hfWeight + slice_hi * hfWeight² * keep) / refLum
+    //   shaped  = bp / (|bp| + scale)                                  (soft saturation)
+    //   h       = (shaped + bias) * amp
     struct Controls
     {
         float maxFactor       = 64.0f;
@@ -27,7 +39,8 @@ namespace TerrainTess
         float ampFadeEnabled  = 0.0f;
         // 0 = off, 1 = PS visible-luminance grayscale, 2 = DS-replica diff overlay.
         float debugViewMode   = 0.0f;
-        float displacementBias = 0.3f;
+        // Pure additive output offset on the saturated signal — independent of amp.
+        float displacementBias = 0.0f;
         float factorSnapStep   = 4.0f;
         // Blend per-vertex normal (0) → world-up (1) for displacement direction.
         // 1 fixes seams from boundary normal mismatches.
@@ -35,6 +48,20 @@ namespace TerrainTess
         // 0 = off, 1 = tess wireframe, 2 = vanilla mesh wireframe (no tess),
         // 3 = strip→list IB conversion + TRIANGLELIST + no tess (isolates IB conversion).
         float wireframe        = 0.0f;
+        // Mip level for the SHARP bandpass tap. Higher = blurrier sharp tap →
+        // fewer high-freq spikes. Mid tap is fixed at +2, blurry at +4.
+        float sharpMip         = 1.0f;
+        // Saturation knee for the soft-saturation curve. Smaller = more
+        // equalized magnitude across textures (bumpy and subtle textures both
+        // produce similar displacement). Larger = more dynamic range preserved.
+        float scale            = 0.05f;
+        // Frequency-falloff weight on the high-freq slice (slice_hi = sharp - mid).
+        // 1.0 = flat response (high-freq bumps full amplitude), 0 = mid-band
+        // only (high-freq bumps killed). Forms a 2-point falloff curve over
+        // frequency. Independent of the spike gate.
+        float hfWeight         = 0.5f;
+        // Pad to float4 boundary so the mask arrays below match HLSL cbuffer alignment.
+        float _pad0 = 0.0f;
         // Per-PS BLEND# channel selectors. Each PS variant uses BLEND1/2/3
         // #defines to pick a channel (0..3 = R/G/B/A) of blendMap. Host fills
         // these per-draw based on the PS's captured defines (see

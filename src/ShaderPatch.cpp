@@ -561,11 +561,12 @@ static std::string PatchTerrainShaderForHeightDebug(const std::string& src)
 
     std::string inject1 =
         "// [Dust] Terrain debug overlay driven by gDebugViewMode (TessControl b1).\n"
-        "// Layout MUST match TerrainTess::Controls (12 plugin floats + 3 float4 masks).\n"
+        "// Layout MUST match TerrainTess::Controls (15 plugin floats + 1 pad + 3 float4 masks).\n"
         "cbuffer TessControl : register(b1) {\n"
         "\tfloat gMaxFactor; float gFactFadeStart; float gFactFadeEnd; float gAmplitude;\n"
         "\tfloat gAmpFadeStart; float gAmpFadeEnd; float gAmpFadeEnabled; float gDebugViewMode;\n"
         "\tfloat gDisplacementBias; float gFactorSnapStep; float gDispDirWorldUp; float gWireframeMode;\n"
+        "\tfloat gSharpMip; float gScale; float gHfWeight; float _gPad0;\n"
         "\tfloat4 gBlend1Mask; float4 gBlend2Mask; float4 gBlend3Mask;\n"
         "};\n"
         "float DustLum(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }\n\n"
