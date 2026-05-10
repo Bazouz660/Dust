@@ -63,8 +63,28 @@ namespace TerrainTess
         // displaces by 0 from both sides — eliminates cross-region seams.
         // Cost: a narrow valley along every chunk boundary.
         // 0 = disabled.
-        float chunkBoundaryFade = 0.01f;
-        float _pad[1]          = { 0 };  // align to 64 bytes
+        // 0 = off, 1 = tess wireframe, 2 = vanilla mesh wireframe (no tess),
+        // 3 = strip→list IB conversion + TRIANGLELIST + no tess (isolates the
+        // IB conversion from the tess pipeline).
+        float wireframe = 0.0f;
+        // User-tunable chunk size in world units. Plugin sends this as the
+        // 16th float; the host appends per-draw chunk origin below.
+        float chunkSizeWorld = 32.0f;
+        // Host-populated per draw from the snooped worldMatrix translation —
+        // gives the chunk's world-space corner so the DS/PS can compute
+        // per-chunk UV as (worldPos.xz - origin) / chunkSizeWorld. Aligns
+        // gradient to the actual chunk grid regardless of where worldPos = 0
+        // falls.
+        float chunkOriginX = 0.0f;
+        float chunkOriginZ = 0.0f;
+        float _hostPad[2]  = { 0, 0 };
+        // Per-PS BLEND# channel selectors. Each PS variant uses BLEND1/2/3
+        // #defines to pick a channel (0..3 = R/G/B/A) of blendMap. Host fills
+        // these per-draw based on the bound PS's captured defines.
+        // (1,0,0,0) = R, (0,1,0,0) = G, etc. All-zero = layer inactive.
+        float blend1Mask[4] = { 0, 0, 0, 0 };
+        float blend2Mask[4] = { 0, 0, 0, 0 };
+        float blend3Mask[4] = { 0, 0, 0, 0 };
     };
 
     Controls* GetControls();
@@ -141,6 +161,13 @@ namespace TerrainTess
     // since the HLSL source layout may differ from the compiled bytecode
     // due to optimizer-driven uniform stripping.
     void OnPixelShaderCreated(const void* bytecode, size_t size, ID3D11PixelShader* ps);
+
+    // Called from the D3DCompile hook for each successful main_fs/mapfeature_fs
+    // compile. Captures BLEND1/2/3 #define values (channel indices for
+    // blendMap, 0..3) keyed by bytecode hash. OnPixelShaderCreated then
+    // moves the entry into a PS*-keyed map for per-draw lookup.
+    void OnTerrainPsCompiled(const void* bytecode, size_t size,
+                             int blend1, int blend2, int blend3);
 
     // Reflect the terrain VS to find byte offsets of `worldMatrix` and
     // `overlayData` in its $Globals cbuffer — used at draw time to extract

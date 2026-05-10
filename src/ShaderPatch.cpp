@@ -560,60 +560,44 @@ static std::string PatchTerrainShaderForHeightDebug(const std::string& src)
     }
 
     std::string inject1 =
-        "// [Dust] Heightmap-as-albedo debug view\n"
+        "// [Dust] Terrain debug overlays driven by gDebugViewMode (TessControl b1).\n"
+        "// Layout MUST match TerrainTess::Controls (20 floats: 16 plugin + 4 host).\n"
         "cbuffer TessControl : register(b1) {\n"
         "\tfloat gMaxFactor; float gFactFadeStart; float gFactFadeEnd; float gAmplitude;\n"
         "\tfloat gAmpFadeStart; float gAmpFadeEnd; float gAmpFadeEnabled; float gUvTileFactor;\n"
-        "\tfloat gDebugSlice; float gDebugViewMode; float2 _dustTessCtrlPad_;\n"
+        "\tfloat gDebugSlice; float gDebugViewMode; float gDisplacementBias; float gFactorSnapStep;\n"
+        "\tfloat gDispDirWorldUp; float gMipBias; float gWireframeMode; float gChunkSizeWorld;\n"
+        "\tfloat gChunkOriginX; float gChunkOriginZ; float _dustHostPad0; float _dustHostPad1;\n"
         "};\n"
-        "Texture2DArray dustHeightArray : register(t12);\n"
-        "float DustSampleHeightArray(float3 texCoords, float3 normal, float2 cliffBlend,\n"
-        "                            float4 scales0, float4 scales1, float4 scales2,\n"
-        "                            float4 weights, float4 map) {\n"
-        "\tfloat hBase   = dustHeightArray.Sample(Anisotropic, float3(texCoords.xy * scales1.xy, 0)).r;\n"
-        "\tfloat hSlope  = dustHeightArray.Sample(Anisotropic, float3(texCoords.xy * scales0.xy, 1)).r;\n"
-        "\tfloat hGrass  = dustHeightArray.Sample(Anisotropic, float3(texCoords.xy * scales1.zw, 3)).r;\n"
-        "\tfloat hDirt   = dustHeightArray.Sample(Anisotropic, float3(texCoords.xy * scales2.xy, 4)).r;\n"
-        "\tfloat hRoad   = dustHeightArray.Sample(Anisotropic, float3(texCoords.xy * scales2.zw, 5)).r;\n"
-        "\tfloat hCliffX = dustHeightArray.Sample(Anisotropic, float3(texCoords.yz * scales0.zw, 2)).r;\n"
-        "\tfloat hCliffZ = dustHeightArray.Sample(Anisotropic, float3(texCoords.xz * scales0.zw, 2)).r;\n"
-        "\tfloat hCliff  = hCliffX * cliffBlend.x + hCliffZ * cliffBlend.y;\n"
-        "\tfloat h = lerp(hBase, hGrass, map.r);\n"
-        "\th = lerp(h, hSlope, weights.x);\n"
-        "\th = lerp(h, hDirt, map.b);\n"
-        "\t#ifndef NO_ROADS\n"
-        "\th = lerp(h, hRoad, map.a);\n"
-        "\t#endif\n"
-        "\th = lerp(h, hCliff, weights.y);\n"
-        "\treturn h;\n"
+        "float DustLum(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }\n\n"
+        "// Single-biome-layer replica: mirrors computeBiome's albedo math\n"
+        "// without the normal/absorbance branches and without distance fadeout.\n"
+        "// Each BLEND# layer calls this with its own dmap + per-layer uniforms.\n"
+        "float3 DustReplicaBiomeAlbedo(Texture2DArray dmap, float3 tc, float2 cliffBlend,\n"
+        "\tfloat4 weights, float4 map, float4 colour, float4 sA, float4 sB, float4 sC, float4 oMult)\n"
+        "{\n"
+        "\tconst float3 white = float3(1,1,1);\n"
+        "\tfloat3 cB  = dmap.Sample(Anisotropic, float3(tc.xy * sB.xy, 0)).rgb * colour.rgb;\n"
+        "\tfloat3 cS  = dmap.Sample(Anisotropic, float3(tc.xy * sA.xy, 1)).rgb * colour.rgb;\n"
+        "\tfloat3 cG  = dmap.Sample(Anisotropic, float3(tc.xy * sB.zw, 3)).rgb * lerp(white, colour.rgb, oMult.y);\n"
+        "\tfloat3 cD  = dmap.Sample(Anisotropic, float3(tc.xy * sC.xy, 4)).rgb * lerp(white, colour.rgb, oMult.z);\n"
+        "\tfloat3 cR  = dmap.Sample(Anisotropic, float3(tc.xy * sC.zw, 5)).rgb * lerp(white, colour.rgb, oMult.w);\n"
+        "\tfloat3 cCx = dmap.Sample(Anisotropic, float3(tc.yz * sA.zw, 2)).rgb;\n"
+        "\tfloat3 cCz = dmap.Sample(Anisotropic, float3(tc.xz * sA.zw, 2)).rgb;\n"
+        "\tfloat3 cC  = (cCx * cliffBlend.x + cCz * cliffBlend.y) * lerp(white, colour.rgb, oMult.x);\n"
+        "\tfloat3 a = lerp(cB, cG, map.r);\n"
+        "\ta = lerp(a, cS, weights.x);\n"
+        "\ta = lerp(a, cD, map.b);\n"
+        "\ta = lerp(a, cR, map.a);\n"
+        "\ta = lerp(a, cC, weights.y);\n"
+        "\treturn a;\n"
         "}\n\n";
     result.insert(pos1, inject1);
 
-    // Capture height for the BLEND0 layer right after biome computation,
-    // before BLEND1+ blocks overwrite weights/scales/texCoords.z. find()
-    // returns the first occurrence (in main_fs); mapfeature_fs's later copy
-    // stays unmodified — it doesn't reference dustDbgHeight, so leaving its
-    // brightnessFix line alone is fine.
-    const char* anchor2 = "biome.albedo.rgb *= brightnessFix.x;";
-    size_t pos2 = result.find(anchor2);
-    if (pos2 == std::string::npos)
-    {
-        Log("ShaderPatch[TerrainHeightDebug]: anchor 'brightnessFix.x' not found, skipping");
-        return src;
-    }
-    pos2 += strlen(anchor2);
-    std::string inject2 =
-        "\n\n\t// [Dust] Capture BLEND0 heightmap before BLEND1+ overwrites weights/scales\n"
-        "\tfloat dustDbgHeight = 0.0;\n"
-        "\tif (gDebugViewMode > 0.5) {\n"
-        "\t\tdustDbgHeight = DustSampleHeightArray(texCoords, normal, cliffBlend,\n"
-        "\t\t                                      scalesA, scalesB, scalesC, weights, map);\n"
-        "\t}";
-    result.insert(pos2, inject2);
-
-    // Override albedo at the writeAlbedo call. find() returns the first
-    // occurrence, which is in main_fs (mapfeature_fs has the same string but
-    // doesn't compute dustDbgHeight, so leave it alone).
+    // Override albedo at the writeAlbedo call. At this point biome.albedo.rgb
+    // is the FINAL composed PS color. Mode 1 = grayscale luminance debug;
+    // mode 2 = chunk-edge highlight (red ridges along chunk boundaries, or the
+    // whole chunk magenta if chunk bounds couldn't be detected for this draw).
     const char* anchor3 = "writeAlbedo   ( buffer, biome.albedo.rgb, fragCoord.xy );";
     size_t pos3 = result.find(anchor3);
     if (pos3 == std::string::npos)
@@ -622,7 +606,54 @@ static std::string PatchTerrainShaderForHeightDebug(const std::string& src)
         return src;
     }
     std::string replacement =
-        "if (gDebugViewMode > 0.5) biome.albedo.rgb = float3(dustDbgHeight, dustDbgHeight, dustDbgHeight);\n"
+        "if (gDebugViewMode > 2.5) {\n"
+        "\t\t// Mode 3: diff overlay. Compute the FULL BLEND0+1+2+3 replica\n"
+        "\t\t// (matching the PS's BLEND chain at lines 211-256), and display\n"
+        "\t\t// |gtLum - candLum| × 5 as grayscale. Pure black = pixel-exact.\n"
+        "\t\tfloat dust_slope = 1.0 - normalize(normal).y;\n"
+        "\t\tfloat4 dust_w0 = smoothstep(slopeMin-slopeBlend, slopeMin, dust_slope) * smoothstep(slopeMax+slopeBlend, slopeMax, dust_slope);\n"
+        "\t\tfloat3 dust_a = DustReplicaBiomeAlbedo(diffuseMaps, texCoords, cliffBlend, dust_w0, map, colour, scalesA, scalesB, scalesC, overlayMult);\n"
+        "\t\tdust_a *= brightnessFix.x;\n"
+        "\t\t#ifdef BLEND1\n"
+        "\t\tfloat4 dust_bw = blendMap.Sample(Linear, mapCoords.zw);\n"
+        "\t\tfloat dust_w = 1.0 - dust_bw[BLEND1];\n"
+        "\t\t#ifdef BLEND2\n"
+        "\t\tdust_w -= dust_bw[BLEND2];\n"
+        "\t\t#ifdef BLEND3\n"
+        "\t\tdust_w -= dust_bw[BLEND3];\n"
+        "\t\t#endif\n"
+        "\t\t#endif\n"
+        "\t\tdust_a *= dust_w;\n"
+        "\t\tfloat3 dust_tc1 = float3(texCoords.xy, texCoordsV.x);\n"
+        "\t\tfloat4 dust_w1 = smoothstep(slopeMin1-slopeBlend1, slopeMin1, dust_slope) * smoothstep(slopeMax1+slopeBlend1, slopeMax1, dust_slope);\n"
+        "\t\tfloat3 dust_a1 = DustReplicaBiomeAlbedo(diffuseMaps1, dust_tc1, cliffBlend, dust_w1, map, colour, scalesA1, scalesB1, scalesC1, overlayMult1);\n"
+        "\t\tdust_a += dust_a1 * brightnessFix.y * dust_bw[BLEND1];\n"
+        "\t\t#ifdef BLEND2\n"
+        "\t\tfloat3 dust_tc2 = float3(texCoords.xy, texCoordsV.y);\n"
+        "\t\tfloat4 dust_w2 = smoothstep(slopeMin2-slopeBlend2, slopeMin2, dust_slope) * smoothstep(slopeMax2+slopeBlend2, slopeMax2, dust_slope);\n"
+        "\t\tfloat3 dust_a2 = DustReplicaBiomeAlbedo(diffuseMaps2, dust_tc2, cliffBlend, dust_w2, map, colour, scalesA2, scalesB2, scalesC2, overlayMult2);\n"
+        "\t\tdust_a += dust_a2 * brightnessFix.z * dust_bw[BLEND2];\n"
+        "\t\t#ifdef BLEND3\n"
+        "\t\tfloat3 dust_tc3 = float3(texCoords.xy, texCoordsV.z);\n"
+        "\t\tfloat4 dust_w3 = smoothstep(slopeMin3-slopeBlend3, slopeMin3, dust_slope) * smoothstep(slopeMax3+slopeBlend3, slopeMax3, dust_slope);\n"
+        "\t\tfloat3 dust_a3 = DustReplicaBiomeAlbedo(diffuseMaps3, dust_tc3, cliffBlend, dust_w3, map, colour, scalesA3, scalesB3, scalesC3, overlayMult3);\n"
+        "\t\tdust_a += dust_a3 * brightnessFix.w * dust_bw[BLEND3];\n"
+        "\t\t#endif\n"
+        "\t\t#endif\n"
+        "\t\t#endif\n"
+        "\t\tfloat dust_gtLum   = DustLum(biome.albedo.rgb);\n"
+        "\t\tfloat dust_candLum = DustLum(dust_a);\n"
+        "\t\tfloat dust_diff = saturate(abs(dust_gtLum - dust_candLum) * 5.0);\n"
+        "\t\tbiome.albedo.rgb = float3(dust_diff, dust_diff, dust_diff);\n"
+        "\t} else if (gDebugViewMode > 1.5) {\n"
+        "\t\t// Mode 2: per-chunk UV anchored to chunk origin (snooped per draw).\n"
+        "\t\tfloat dustInvSize = (gChunkSizeWorld > 1e-3) ? (1.0 / gChunkSizeWorld) : (1.0 / 32.0);\n"
+        "\t\tfloat2 dustCuv = frac((worldPos.xz - float2(gChunkOriginX, gChunkOriginZ)) * dustInvSize);\n"
+        "\t\tbiome.albedo.rgb = float3(dustCuv.x, dustCuv.y, 0.0);\n"
+        "\t} else if (gDebugViewMode > 0.5) {\n"
+        "\t\tfloat dustDbgL = DustLum(biome.albedo.rgb);\n"
+        "\t\tbiome.albedo.rgb = float3(dustDbgL, dustDbgL, dustDbgL);\n"
+        "\t}\n"
         "\twriteAlbedo   ( buffer, biome.albedo.rgb, fragCoord.xy );";
     result.replace(pos3, strlen(anchor3), replacement);
 
@@ -798,6 +829,28 @@ HRESULT WINAPI HookedD3DCompile(
         }
     }
 
+    // Local helper: capture BLEND1/2/3 #defines for any terrain PS variant.
+    // Must be called for EVERY successful main_fs / mapfeature_fs compile —
+    // including the terrain-debug-patched path below — so the DS knows which
+    // blendMap channel weights each layer at draw time.
+    auto captureBlendDefines = [&](const void* code, size_t codeSize) {
+        if (!pEntrypoint || !code || codeSize == 0) return;
+        if (strcmp(pEntrypoint, "main_fs") != 0 &&
+            strcmp(pEntrypoint, "mapfeature_fs") != 0) return;
+        int b1 = -1, b2 = -1, b3 = -1;
+        if (pDefines)
+        {
+            for (const D3D_SHADER_MACRO* m = pDefines; m->Name; m++)
+            {
+                if (!m->Definition) continue;
+                if      (strcmp(m->Name, "BLEND1") == 0) b1 = atoi(m->Definition);
+                else if (strcmp(m->Name, "BLEND2") == 0) b2 = atoi(m->Definition);
+                else if (strcmp(m->Name, "BLEND3") == 0) b3 = atoi(m->Definition);
+            }
+        }
+        TerrainTess::OnTerrainPsCompiled(code, codeSize, b1, b2, b3);
+    };
+
     // [Dust] Terrain main_fs heightmap-debug-view patch. Detects by markers
     // unique to terrain (computeBiome, scalesA), distinguishing from deferred
     // main_fs. Falls through to compile original on patcher/compile failure.
@@ -819,9 +872,13 @@ HRESULT WINAPI HookedD3DCompile(
                 if (SUCCEEDED(hr))
                 {
                     if (ppCode && *ppCode)
+                    {
                         SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
                             pEntrypoint, pTarget, pSourceName,
                             (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+                        captureBlendDefines((*ppCode)->GetBufferPointer(),
+                                            (*ppCode)->GetBufferSize());
+                    }
                     return hr;
                 }
                 Log("ShaderPatch[TerrainHeightDebug]: compile failed, falling back to original");
@@ -939,6 +996,9 @@ HRESULT WINAPI HookedD3DCompile(
         SurveyRecorder::OnShaderCompiled(pSrcData, SrcDataSize,
             pEntrypoint, pTarget, pSourceName,
             (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+
+        captureBlendDefines((*ppCode)->GetBufferPointer(),
+                            (*ppCode)->GetBufferSize());
     }
 
     return hr;

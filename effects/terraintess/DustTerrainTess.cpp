@@ -35,7 +35,6 @@ struct TerrainTessConfig
     float mipBias          = 0.0f;
     float dispDirWorldUp   = 0.0f;
     float uvTileFactor     = 250.0f;
-    float chunkBoundaryFade = 0.01f;  // 1% of chunk UV — narrow seam-hiding band
 
     // Bake-time (require rebake to apply)
     int   bakeHpCutoff     = 0;      // cutoff in cycles/image (integer)
@@ -43,8 +42,10 @@ struct TerrainTessConfig
     float bakeLumMix       = 0.5f;
 
     // Debug
-    bool  debugViewMode    = false;
+    int   debugViewMode    = 0;       // 0=off, 1=heightmap-as-albedo, 2=chunk-edge ridge
     int   debugSlice       = -1;
+    int   wireframe        = 0;       // 0=off, 1=tess wf, 2=vanilla wf, 3=IB-conv wf
+    float chunkSizeWorld   = 32.0f;   // world units per chunk for boundary fade
 };
 
 static TerrainTessConfig gConfig;
@@ -76,13 +77,13 @@ static void PushRuntime()
     buf[6]  = gConfig.ampFadeEnabled ? 1.0f : 0.0f;
     buf[7]  = gConfig.uvTileFactor;
     buf[8]  = (float)gConfig.debugSlice;
-    buf[9]  = gConfig.debugViewMode ? 1.0f : 0.0f;
+    buf[9]  = (float)gConfig.debugViewMode;
     buf[10] = gConfig.displacementBias;
     buf[11] = (float)gConfig.factorSnapStep;
     buf[12] = gConfig.dispDirWorldUp;
     buf[13] = gConfig.mipBias;
-    buf[14] = gConfig.chunkBoundaryFade;
-    // buf[15] is pad — left zero.
+    buf[14] = (float)gConfig.wireframe;
+    buf[15] = gConfig.chunkSizeWorld;
     gHost->SetTerrainTessControls(buf);
 }
 
@@ -174,7 +175,6 @@ static DustSettingDesc gSettings[] = {
     { "Displacement Bias", DUST_SETTING_FLOAT, &gConfig.displacementBias,0.0f,  0.5f,  "DisplacementBias",nullptr, "Mid-point of the heightmap that maps to ground level. Lower = displacement biased upward, fewer pixels sink.", DUST_PERF_NONE },
     { "Disp Dir World-Up", DUST_SETTING_FLOAT, &gConfig.dispDirWorldUp,  0.0f,  1.0f,  "DispDirWorldUp",  nullptr, "Blend between per-vertex normal (0) and world-up (1) for displacement direction. 1 fixes seams between chunks with mismatched boundary normals.", DUST_PERF_NONE },
     { "Mip Bias",          DUST_SETTING_FLOAT, &gConfig.mipBias,         0.0f,  6.0f,  "MipBias",         nullptr, "Extra blur on the heightmap sampling. Higher = smoother displacement, less spike potential at low tess density.", DUST_PERF_NONE },
-    { "Chunk Edge Fade",   DUST_SETTING_FLOAT, &gConfig.chunkBoundaryFade, 0.0f, 0.05f,"ChunkBoundaryFade", nullptr, "Width (in chunk-UV units, 0..1) over which displacement fades to zero at chunk edges. Eliminates cross-region seams at the cost of a narrow valley along every chunk boundary. 0 = disabled.", DUST_PERF_NONE },
     { "Amp Fade Enabled",  DUST_SETTING_BOOL,  &gConfig.ampFadeEnabled,  0.0f,  1.0f,  "AmpFadeEnabled",  nullptr, "Fade displacement amplitude with distance.", DUST_PERF_NONE },
     { "Amp Fade Start",    DUST_SETTING_FLOAT, &gConfig.ampFadeStart,    0.0f,  500.0f,"AmpFadeStart",    nullptr, "Distance at which amplitude begins fading toward zero.", DUST_PERF_NONE },
     { "Amp Fade End",      DUST_SETTING_FLOAT, &gConfig.ampFadeEnd,     10.0f,  500.0f,"AmpFadeEnd",      nullptr, "Distance at which amplitude reaches zero.", DUST_PERF_NONE },
@@ -185,8 +185,10 @@ static DustSettingDesc gSettings[] = {
     { "Bake: HP Strength",     DUST_SETTING_FLOAT, &gConfig.bakeHpStrength, 0.0f,  1.0f,  "BakeHpStrength", nullptr, "How aggressively low-frequencies are attenuated. Auto-rebakes on change.", DUST_PERF_LOW },
 
     // Debug
-    { "Debug: View Heightmap", DUST_SETTING_BOOL,  &gConfig.debugViewMode,  0.0f,  1.0f,  "DebugViewMode",  nullptr, "Override terrain albedo with the blended heightmap so you can see what's being applied.", DUST_PERF_NONE },
+    { "Debug: View Mode",      DUST_SETTING_INT,   &gConfig.debugViewMode,  0.0f,  3.0f,  "DebugViewMode",  nullptr, "0=off, 1=PS visible luminance (grayscale), 2=per-chunk UV gradient (calibrate Chunk Size), 3=DS-replica diff overlay (red=where our DS-side displacement formula diverges from the PS visible; black=pixel-exact match).", DUST_PERF_NONE },
+    { "Chunk Size (world)",    DUST_SETTING_FLOAT, &gConfig.chunkSizeWorld, 1.0f, 5000.0f, "ChunkSizeWorld", nullptr, "World units per terrain chunk for the boundary-fade band. Use Debug: View Mode 2 to dial in: when red→yellow gradient tiles match the actual chunk grid, this value is correct.", DUST_PERF_NONE },
     { "Debug: Force Slice",    DUST_SETTING_INT,   &gConfig.debugSlice,    -1.0f,  9.0f,  "DebugSlice",     nullptr, "-1 = full PS-style blend (real). 0..5 = force a single slice (0 base, 1 slope, 2 cliff, 3 grass, 4 dirt, 5 road). 6..9 = show blend weights.", DUST_PERF_NONE },
+    { "Debug: Wireframe",      DUST_SETTING_INT,   &gConfig.wireframe,      0.0f,  3.0f,  "Wireframe",      nullptr, "0=off, 1=tess wireframe, 2=vanilla mesh wireframe (no tess), 3=strip→list IB conversion + TRIANGLELIST + no tess (isolates IB conversion).", DUST_PERF_NONE },
 };
 
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)

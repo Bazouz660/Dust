@@ -70,7 +70,7 @@ cbuffer TessControl : register(b1)
     float gFactorSnapStep;
     float gDispDirWorldUp;
     float gMipBias;
-    float gChunkBoundaryFade;
+    float gWireframeMode;
     float _ctrlPad_;
 };
 
@@ -144,32 +144,74 @@ struct DsOut
 
 Texture2DArray heightArr  : register(t0);
 Texture2D      overlayMap : register(t1);
-// Cross-region neighbor heightArrays (-X, +X, -Z, +Z). Default-bound to
-// the primary heightArray when no neighbor exists, so the blend collapses
-// to a no-op (own == neighbor → lerp returns own).
+// Cross-region neighbor heightArrays — kept for future neighbor-aware blends
+// but currently unused; default-bound to primary heightArr.
 Texture2DArray heightArrNX : register(t2);
 Texture2DArray heightArrPX : register(t3);
 Texture2DArray heightArrNZ : register(t4);
 Texture2DArray heightArrPZ : register(t5);
-SamplerState   heightSamp : register(s0);
+// Live PS textures mirrored per draw — the DS replicates the PS BLEND chain
+// over these to compute displacement = PS-visible luminance, eliminating
+// seams (since both sides of any chunk boundary compute the same lum the PS
+// computes, which is texture-continuous by art-side construction).
+Texture2DArray diffuseMaps  : register(t6);
+Texture2D      colourMap    : register(t7);
+Texture2DArray diffuseMaps1 : register(t8);
+Texture2DArray diffuseMaps2 : register(t9);
+Texture2DArray diffuseMaps3 : register(t10);
+Texture2D      blendMap     : register(t11);
+SamplerState   heightSamp   : register(s0);    // host binds Anisotropic here
 
-// Mirror of PS $Globals cbuffer for terrain. Offsets verified by reflecting
-// the actual PS bytecode at runtime (logged at first terrain draw):
-//   viewport       0       farClip       16     cameraPos    20
-//   waterHeightRel 32      wetness       36     scalesA      48
-//   scalesB        64      scalesC       80     slopeMin     96
-//   slopeMax       112     slopeBlend    128    overlayMult  144
+// Mirror of PS $Globals cbuffer. Offsets verified by reflection at runtime
+// (see Dust.log after first terrain draw): each BLEND# layer occupies
+// 160 bytes (10 × float4) starting at 48 / 224 / 384 / 544.
 cbuffer PsTerrainCb : register(b0)
 {
     float4 gPsViewport      : packoffset(c0);
-    float4 gPsFarClipCamPos : packoffset(c1);   // farClip(.x), cameraPos(.yzw)
-    float4 gPsWaterWetness  : packoffset(c2);   // waterHeightRel(.x), wetness(.y)
-    float4 gPsScalesA       : packoffset(c3);   // slope, cliff
-    float4 gPsScalesB       : packoffset(c4);   // base, grass
-    float4 gPsScalesC       : packoffset(c5);   // dirt, road
+    float4 gPsFarClipCamPos : packoffset(c1);
+    float4 gPsWaterWetness  : packoffset(c2);
+    // BLEND0 (offsets 48..207).
+    float4 gPsScalesA       : packoffset(c3);
+    float4 gPsScalesB       : packoffset(c4);
+    float4 gPsScalesC       : packoffset(c5);
     float4 gPsSlopeMin      : packoffset(c6);
     float4 gPsSlopeMax      : packoffset(c7);
     float4 gPsSlopeBlend    : packoffset(c8);
+    float4 gPsOverlayMult   : packoffset(c9);
+    float4 gPsTextureFade   : packoffset(c10);
+    float4 gPsAbsorbance0   : packoffset(c11);
+    float4 gPsAbsorbance1   : packoffset(c12);
+    float4 gPsBrightnessFix : packoffset(c13);
+    // BLEND1 (offsets 224..383).
+    float4 gPsScalesA1      : packoffset(c14);
+    float4 gPsScalesB1      : packoffset(c15);
+    float4 gPsScalesC1      : packoffset(c16);
+    float4 gPsSlopeMin1     : packoffset(c17);
+    float4 gPsSlopeMax1     : packoffset(c18);
+    float4 gPsSlopeBlend1   : packoffset(c19);
+    float4 gPsOverlayMult1  : packoffset(c20);
+    float4 _padBlend1       : packoffset(c21);
+    float4 _padBlend1b      : packoffset(c22);
+    float4 _padBlend1c      : packoffset(c23);
+    // BLEND2 (offsets 384..543).
+    float4 gPsScalesA2      : packoffset(c24);
+    float4 gPsScalesB2      : packoffset(c25);
+    float4 gPsScalesC2      : packoffset(c26);
+    float4 gPsSlopeMin2     : packoffset(c27);
+    float4 gPsSlopeMax2     : packoffset(c28);
+    float4 gPsSlopeBlend2   : packoffset(c29);
+    float4 gPsOverlayMult2  : packoffset(c30);
+    float4 _padBlend2       : packoffset(c31);
+    float4 _padBlend2b      : packoffset(c32);
+    float4 _padBlend2c      : packoffset(c33);
+    // BLEND3 (offsets 544..703).
+    float4 gPsScalesA3      : packoffset(c34);
+    float4 gPsScalesB3      : packoffset(c35);
+    float4 gPsScalesC3      : packoffset(c36);
+    float4 gPsSlopeMin3     : packoffset(c37);
+    float4 gPsSlopeMax3     : packoffset(c38);
+    float4 gPsSlopeBlend3   : packoffset(c39);
+    float4 gPsOverlayMult3  : packoffset(c40);
 };
 
 cbuffer TessControl : register(b1)
@@ -183,40 +225,109 @@ cbuffer TessControl : register(b1)
     float gAmpFadeEnabled;
     float gUvTileFactor;
     float gDebugSlice;
-    float gDebugViewMode;
+    float gDebugViewMode;       // 0=off, 1=PS lum overlay, 2=DS chunk-edge ridge debug
     float gDisplacementBias;
     float gFactorSnapStep;
     float gDispDirWorldUp;
     float gMipBias;
-    float gChunkBoundaryFade;
-    float _ctrlPad_;
+    float gWireframeMode;
+    float gChunkSizeWorld;
+    // Host-set per draw.
+    float gChunkOriginX;
+    float gChunkOriginZ;
+    float2 _ctrlPadTail;
+    // Per-PS blendMap channel selectors: PS variants use BLEND1/2/3 #defines
+    // to pick which channel of blendMap weights each layer. Host fills these
+    // per-draw from captured PS defines. (1,0,0,0)=R, (0,1,0,0)=G, etc.
+    // All-zero = layer inactive; the BLEND chain skips it.
+    float4 gBlend1Mask;
+    float4 gBlend2Mask;
+    float4 gBlend3Mask;
 };
 
-// Replicate the PS's computeBiome blend chain over a single heightArray.
-// Used both for the chunk's own heightArray and for an axis-aligned neighbor
-// when sampling near a chunk boundary for cross-region blending.
-float SampleHeightChain(Texture2DArray ha, float3 tex0, float2 uvblend,
-                        float4 weights, float4 omap,
-                        float mipBase, float mipSlope, float mipGrass,
-                        float mipDirt, float mipRoad, float mipCliff)
+float Lum(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
+
+// One BLEND layer's albedo, mirroring computeBiome from terrainfp4.hlsl.
+// Skips distance-fadeout (we don't have distance.a/distant.rgb) and the
+// makeWet wetness modulation — both irrelevant for displacement amplitude.
+float3 ComputeBiomeAlbedo(Texture2DArray dmap, float3 tc, float2 cliffBlend,
+                          float4 weights, float4 omap, float3 colour,
+                          float4 sA, float4 sB, float4 sC, float4 oMult)
 {
-    float hBase   = ha.SampleLevel(heightSamp, float3(tex0.xy * gPsScalesB.xy, 0.0), mipBase).r;
-    float hSlope  = ha.SampleLevel(heightSamp, float3(tex0.xy * gPsScalesA.xy, 1.0), mipSlope).r;
-    float hGrass  = ha.SampleLevel(heightSamp, float3(tex0.xy * gPsScalesB.zw, 3.0), mipGrass).r;
-    float hDirt   = ha.SampleLevel(heightSamp, float3(tex0.xy * gPsScalesC.xy, 4.0), mipDirt).r;
-    float hRoad   = ha.SampleLevel(heightSamp, float3(tex0.xy * gPsScalesC.zw, 5.0), mipRoad).r;
-    float hCliffX = ha.SampleLevel(heightSamp, float3(tex0.yz * gPsScalesA.zw, 2.0), mipCliff).r;
-    float hCliffZ = ha.SampleLevel(heightSamp, float3(tex0.xz * gPsScalesA.zw, 2.0), mipCliff).r;
-    float hCliff  = hCliffX * uvblend.x + hCliffZ * uvblend.y;
-    float h = hBase;
-    h = lerp(h, hGrass, omap.r);
-    h = lerp(h, hSlope, weights.x);
-    h = lerp(h, hDirt,  omap.b);
-    h = lerp(h, hRoad,  omap.a);
-    h = lerp(h, hCliff, weights.y);
-    return h;
+    const float3 white = float3(1, 1, 1);
+    float3 cB  = dmap.SampleLevel(heightSamp, float3(tc.xy * sB.xy, 0.0), 0.0).rgb * colour;
+    float3 cS  = dmap.SampleLevel(heightSamp, float3(tc.xy * sA.xy, 1.0), 0.0).rgb * colour;
+    float3 cG  = dmap.SampleLevel(heightSamp, float3(tc.xy * sB.zw, 3.0), 0.0).rgb * lerp(white, colour, oMult.y);
+    float3 cD  = dmap.SampleLevel(heightSamp, float3(tc.xy * sC.xy, 4.0), 0.0).rgb * lerp(white, colour, oMult.z);
+    float3 cR  = dmap.SampleLevel(heightSamp, float3(tc.xy * sC.zw, 5.0), 0.0).rgb * lerp(white, colour, oMult.w);
+    float3 cCx = dmap.SampleLevel(heightSamp, float3(tc.yz * sA.zw, 2.0), 0.0).rgb;
+    float3 cCz = dmap.SampleLevel(heightSamp, float3(tc.xz * sA.zw, 2.0), 0.0).rgb;
+    float3 cC  = (cCx * cliffBlend.x + cCz * cliffBlend.y) * lerp(white, colour, oMult.x);
+    float3 a = lerp(cB, cG, omap.r);
+    a = lerp(a, cS, weights.x);
+    a = lerp(a, cD, omap.b);
+    a = lerp(a, cR, omap.a);
+    a = lerp(a, cC, weights.y);
+    return a;
 }
 
+// Compute the PS-visible luminance via the SAME formula the PS uses (BLEND0
+// + BLEND1/2/3 chain with channel-masked blendMap weights). For chunks
+// where the visible texture is continuous across a boundary (verified via
+// PS debug mode 3 = pixel-exact match), this DS computation produces the
+// same value on both sides of the boundary → displacement is continuous → no
+// mesh seam.
+float ComputePsLum(float3 tex0, float2 cliffBlend, float4 mapCoords,
+                   float3 normal, float3 texV)
+{
+    float slope = 1.0 - normalize(normal).y;
+    float4 omap = overlayMap.SampleLevel(heightSamp, mapCoords.xy, 0).rgba;
+    omap.r = max(omap.r, omap.g);
+    float3 colour = colourMap.SampleLevel(heightSamp, mapCoords.xy, 0).rgb * 1.2;
+
+    float4 w0 = smoothstep(gPsSlopeMin - gPsSlopeBlend, gPsSlopeMin, slope)
+              * smoothstep(gPsSlopeMax + gPsSlopeBlend, gPsSlopeMax, slope);
+    float3 a = ComputeBiomeAlbedo(diffuseMaps, tex0, cliffBlend, w0, omap, colour,
+                                  gPsScalesA, gPsScalesB, gPsScalesC, gPsOverlayMult);
+    a *= gPsBrightnessFix.x;
+
+    // BLEND1/2/3 chain: gated by the host-supplied channel masks.
+    float4 bw = blendMap.SampleLevel(heightSamp, mapCoords.zw, 0);
+    float w1 = dot(bw, gBlend1Mask);
+    float w2 = dot(bw, gBlend2Mask);
+    float w3 = dot(bw, gBlend3Mask);
+    float wOwn = 1.0 - w1 - w2 - w3;
+    a *= wOwn;
+
+    if (w1 > 1e-5)
+    {
+        float3 tc1 = float3(tex0.xy, texV.x);
+        float4 w1w = smoothstep(gPsSlopeMin1 - gPsSlopeBlend1, gPsSlopeMin1, slope)
+                   * smoothstep(gPsSlopeMax1 + gPsSlopeBlend1, gPsSlopeMax1, slope);
+        float3 a1 = ComputeBiomeAlbedo(diffuseMaps1, tc1, cliffBlend, w1w, omap, colour,
+                                       gPsScalesA1, gPsScalesB1, gPsScalesC1, gPsOverlayMult1);
+        a += a1 * gPsBrightnessFix.y * w1;
+    }
+    if (w2 > 1e-5)
+    {
+        float3 tc2 = float3(tex0.xy, texV.y);
+        float4 w2w = smoothstep(gPsSlopeMin2 - gPsSlopeBlend2, gPsSlopeMin2, slope)
+                   * smoothstep(gPsSlopeMax2 + gPsSlopeBlend2, gPsSlopeMax2, slope);
+        float3 a2 = ComputeBiomeAlbedo(diffuseMaps2, tc2, cliffBlend, w2w, omap, colour,
+                                       gPsScalesA2, gPsScalesB2, gPsScalesC2, gPsOverlayMult2);
+        a += a2 * gPsBrightnessFix.z * w2;
+    }
+    if (w3 > 1e-5)
+    {
+        float3 tc3 = float3(tex0.xy, texV.z);
+        float4 w3w = smoothstep(gPsSlopeMin3 - gPsSlopeBlend3, gPsSlopeMin3, slope)
+                   * smoothstep(gPsSlopeMax3 + gPsSlopeBlend3, gPsSlopeMax3, slope);
+        float3 a3 = ComputeBiomeAlbedo(diffuseMaps3, tc3, cliffBlend, w3w, omap, colour,
+                                       gPsScalesA3, gPsScalesB3, gPsScalesC3, gPsOverlayMult3);
+        a += a3 * gPsBrightnessFix.w * w3;
+    }
+    return Lum(a);
+}
 [domain("tri")]
 DsOut main(HsConst c, float3 bary : SV_DomainLocation, const OutputPatch<VsOut, 3> patch)
 {
@@ -232,10 +343,7 @@ DsOut main(HsConst c, float3 bary : SV_DomainLocation, const OutputPatch<VsOut, 
     float4 passClip = patch[0].pos * bary.x + patch[1].pos * bary.y + patch[2].pos * bary.z;
     float ampScale = lerp(1.0, 1.0 - smoothstep(gAmpFadeStart, gAmpFadeEnd, passClip.w), gAmpFadeEnabled);
 
-    // Early-out: if total displacement amplitude is essentially zero, skip
-    // all heightmap sampling (7+ texture fetches) and return the patch
-    // un-displaced. Common for distant tess'd terrain where amp fade has
-    // taken effect, OR when the user dialed amplitude to 0 to compare.
+    // Early-out for zero amplitude (avoids the 7-slice * 5-chunk = 35 sample fetch).
     float ampScaledTotal = gAmplitude * ampScale;
     if (ampScaledTotal < 1e-4)
     {
@@ -243,123 +351,12 @@ DsOut main(HsConst c, float3 bary : SV_DomainLocation, const OutputPatch<VsOut, 
         return o;
     }
 
-    // Replicate PS biome blend: weights = slope coverage from normal.y,
-    // omap from overlayMap drives grass/dirt overlays, cliff is triplanar.
-    float3 nrm = normalize(o.normal);
-    float slope = 1.0 - nrm.y;
-    float4 weights = smoothstep(gPsSlopeMin - gPsSlopeBlend, gPsSlopeMin, slope)
-                    * smoothstep(gPsSlopeMax + gPsSlopeBlend, gPsSlopeMax, slope);
-
-    float4 omap = overlayMap.SampleLevel(heightSamp, o.tex1.xy, 0);
-    omap.r = max(omap.r, omap.g);
-
-    // Per-slice mip: pick the level whose texel size matches the tess-vertex
-    // spacing in UV space. Larger UV scale (more tiling) → smaller texel
-    // span per tess step → higher mip needed to avoid sub-tess-vertex
-    // spikes. The base 2048 corresponds to the heightmap's mip-0 width.
-    // Per-edge UV spans (what the edge spans in tex0 space). Edge[i] is the
-    // edge OPPOSITE vertex i, so:
-    //   edge[0] connects vertices 1 and 2
-    //   edge[1] connects vertices 0 and 2
-    //   edge[2] connects vertices 0 and 1
-    float uvSpan0 = length(patch[1].tex0.xy - patch[2].tex0.xy);
-    float uvSpan1 = length(patch[0].tex0.xy - patch[2].tex0.xy);
-    float uvSpan2 = length(patch[0].tex0.xy - patch[1].tex0.xy);
-
-    // Pick the SHARED EDGE's factor AND UV span based on closest edge to
-    // this output vertex (in barycentric space). On a shared edge, both
-    // adjacent patches see the same edge endpoints — therefore the same
-    // factor (integer partitioning) AND the same UV span — so they compute
-    // identical mip levels and sample the heightmap consistently. Using
-    // max(edges) or max(uvSpans) here breaks this symmetry across
-    // patch boundaries and causes internal seams within a chunk.
-    float tessF, uvSpan;
-    if (bary.x <= bary.y && bary.x <= bary.z) { tessF = c.edges[0]; uvSpan = uvSpan0; }
-    else if (bary.y <= bary.z)                 { tessF = c.edges[1]; uvSpan = uvSpan1; }
-    else                                        { tessF = c.edges[2]; uvSpan = uvSpan2; }
-    float uvPerTess = uvSpan / max(tessF, 1.0);
-    const float kHmRes = 2048.0;
-    float mipBase  = max(0.0, log2(max(uvPerTess * length(gPsScalesB.xy) * kHmRes, 1.0)) - 1.0) + gMipBias;
-    float mipSlope = max(0.0, log2(max(uvPerTess * length(gPsScalesA.xy) * kHmRes, 1.0)) - 1.0) + gMipBias;
-    float mipGrass = max(0.0, log2(max(uvPerTess * length(gPsScalesB.zw) * kHmRes, 1.0)) - 1.0) + gMipBias;
-    float mipDirt  = max(0.0, log2(max(uvPerTess * length(gPsScalesC.xy) * kHmRes, 1.0)) - 1.0) + gMipBias;
-    float mipRoad  = max(0.0, log2(max(uvPerTess * length(gPsScalesC.zw) * kHmRes, 1.0)) - 1.0) + gMipBias;
-    float mipCliff = max(0.0, log2(max(uvPerTess * length(gPsScalesA.zw) * kHmRes, 1.0)) - 1.0) + gMipBias;
-
-    // Sample our own heightArray's full blend chain.
-    float hBlend = SampleHeightChain(heightArr, o.tex0, o.uvblend, weights, omap,
-                                     mipBase, mipSlope, mipGrass, mipDirt, mipRoad, mipCliff);
-
-    // Cross-region neighbor blending: o.tex1.xy is the per-CHUNK UV (0..1
-    // across one chunk). Near each chunk-UV edge, blend with the matching
-    // axis-aligned neighbor's heightArray so the boundary vertex sees the
-    // same value from both sides of the seam:
-    //
-    //   selfWeight = 0.5 + 0.5 * smoothstep(0, fadeWidth, distFromEdge)
-    //   h = lerp(h_neighbor, h_self, selfWeight)
-    //
-    // At the edge: selfWeight = 0.5 → h = (h_self + h_neighbor) / 2.
-    // The other side computes the SAME (h_neighbor + h_self) / 2 because
-    // both sides see each other as their respective neighbor. Seamless.
-    //
-    // Skipped when fadeWidth is zero (user disabled cross-region blending)
-    // or when we're far enough into the chunk that selfWeight is already 1.
-    if (gChunkBoundaryFade > 1e-5)
-    {
-        float2 cu = o.tex1.xy;
-        float distXNeg = cu.x;
-        float distXPos = 1.0 - cu.x;
-        float distZNeg = cu.y;
-        float distZPos = 1.0 - cu.y;
-        float minDist = min(min(distXNeg, distXPos), min(distZNeg, distZPos));
-        float selfWeight = 0.5 + 0.5 * smoothstep(0.0, gChunkBoundaryFade, minDist);
-
-        if (selfWeight < 0.999)
-        {
-            // Pick the neighbor heightArray whose direction matches the
-            // closest edge. Branch is coherent across nearby threads
-            // (geometric coherence) so it's cheap on the GPU.
-            float h_nbr;
-            if      (distXNeg == minDist)
-                h_nbr = SampleHeightChain(heightArrNX, o.tex0, o.uvblend, weights, omap,
-                                          mipBase, mipSlope, mipGrass, mipDirt, mipRoad, mipCliff);
-            else if (distXPos == minDist)
-                h_nbr = SampleHeightChain(heightArrPX, o.tex0, o.uvblend, weights, omap,
-                                          mipBase, mipSlope, mipGrass, mipDirt, mipRoad, mipCliff);
-            else if (distZNeg == minDist)
-                h_nbr = SampleHeightChain(heightArrNZ, o.tex0, o.uvblend, weights, omap,
-                                          mipBase, mipSlope, mipGrass, mipDirt, mipRoad, mipCliff);
-            else
-                h_nbr = SampleHeightChain(heightArrPZ, o.tex0, o.uvblend, weights, omap,
-                                          mipBase, mipSlope, mipGrass, mipDirt, mipRoad, mipCliff);
-            hBlend = lerp(h_nbr, hBlend, selfWeight);
-        }
-    }
-
-    // Debug override:
-    //   0..5  = force a single slice with its PS-correct UV scale.
-    //   6..9  = show a blend WEIGHT as displacement so we can see WHERE each
-    //           layer triggers: 6=weights.x slope, 7=weights.y cliff,
-    //           8=omap.r grass, 9=omap.b dirt.
-    if (gDebugSlice >= 0.0)
-    {
-        int s = (int)gDebugSlice;
-        if (s == 0)      hBlend = heightArr.SampleLevel(heightSamp, float3(o.tex0.xy * gPsScalesB.xy, 0.0), mipBase).r;
-        else if (s == 1) hBlend = heightArr.SampleLevel(heightSamp, float3(o.tex0.xy * gPsScalesA.xy, 1.0), mipSlope).r;
-        else if (s == 2) {
-            float hCliffX = heightArr.SampleLevel(heightSamp, float3(o.tex0.yz * gPsScalesA.zw, 2.0), mipCliff).r;
-            float hCliffZ = heightArr.SampleLevel(heightSamp, float3(o.tex0.xz * gPsScalesA.zw, 2.0), mipCliff).r;
-            hBlend = hCliffX * o.uvblend.x + hCliffZ * o.uvblend.y;
-        }
-        else if (s == 3) hBlend = heightArr.SampleLevel(heightSamp, float3(o.tex0.xy * gPsScalesB.zw, 3.0), mipGrass).r;
-        else if (s == 4) hBlend = heightArr.SampleLevel(heightSamp, float3(o.tex0.xy * gPsScalesC.xy, 4.0), mipDirt).r;
-        else if (s == 5) hBlend = heightArr.SampleLevel(heightSamp, float3(o.tex0.xy * gPsScalesC.zw, 5.0), mipRoad).r;
-        else if (s == 6) hBlend = saturate(weights.x);
-        else if (s == 7) hBlend = saturate(weights.y);
-        else if (s == 8) hBlend = saturate(omap.r);
-        else             hBlend = saturate(omap.b);
-    }
-
+    // Displacement = PS visible luminance computed via the exact PS BLEND
+    // chain. Verified pixel-exact against the actual PS via debug mode 3
+    // (terrain rendered as |gtLum - replicaLum| = ~0). Both sides of any
+    // chunk boundary compute the same lum (the PS does, by construction) →
+    // no displacement seam.
+    float hBlend = ComputePsLum(o.tex0, o.uvblend, o.tex1, o.normal, o.texV.xyz);
     float h = (hBlend - gDisplacementBias) * ampScaledTotal;
 
     // Displace along a blend of surface normal and world-up. Blend = 1 uses
@@ -758,6 +755,7 @@ ID3D11DomainShader*       gDs            = nullptr;
 ID3D11ComputeShader*      gDecodeNormalsCs = nullptr;
 ID3D11SamplerState*       gHeightSampler = nullptr;
 ID3D11Buffer*             gControlCb     = nullptr;
+ID3D11RasterizerState*    gWireframeRs   = nullptr;  // lazy-created for wireframe debug modes
 Controls                  gControls;
 
 // GPU bake compute shaders (one per pipeline stage).
@@ -807,6 +805,10 @@ struct HeightArray
     ID3D11ShaderResourceView* srv = nullptr;
 };
 std::unordered_map<ID3D11Resource*, HeightArray> gHeightArrays;
+// Shared heightArr — set on first bake. All subsequent terrain chunks bind
+// this same SRV → identical height at the same world position across chunks
+// → no chunk seams. Trade-off: same height pattern for every biome.
+ID3D11ShaderResourceView* gSharedHeightArr = nullptr;
 
 // Per-frame chunk grid: maps integer (gridX, gridZ) → heightArray SRV.
 // Populated as terrain draws come in; allows neighbor lookups in O(1).
@@ -817,6 +819,7 @@ struct ChunkKeyHash { size_t operator()(const ChunkKey& k) const { return (size_
 std::unordered_map<ChunkKey, ID3D11ShaderResourceView*, ChunkKeyHash> gChunkGrid;
 float gChunkGridUnit = 0.0f;
 
+
 // Captured PS bytecode by PS pointer, for cbuffer-layout reflection.
 std::unordered_map<ID3D11PixelShader*, std::vector<uint8_t>> gPsBytecode;
 
@@ -824,6 +827,21 @@ std::unordered_map<ID3D11PixelShader*, std::vector<uint8_t>> gPsBytecode;
 // only, 1/2/3 with extra normalMaps1/2/3 sets. We tessellate level 0 only
 // for now since higher levels need their own baked heightmap arrays.
 std::unordered_map<ID3D11PixelShader*, int> gPsBlendLevel;
+
+// Captured BLEND1/2/3 channel-index #defines (0..3 = R/G/B/A) per PS.
+// OnTerrainPsCompiled stashes by bytecode hash; OnPixelShaderCreated
+// re-hashes the bytecode and moves the entry into the PS-pointer map.
+struct PsBlendDefines { int b1 = -1, b2 = -1, b3 = -1; };
+static std::unordered_map<uint64_t, PsBlendDefines>             gBlendDefsByHash;
+static std::unordered_map<ID3D11PixelShader*, PsBlendDefines>   gPsBlendDefs;
+
+static uint64_t HashBytecode(const void* data, size_t size)
+{
+    const uint8_t* p = (const uint8_t*)data;
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (size_t i = 0; i < size; i++) { h ^= p[i]; h *= 0x100000001b3ULL; }
+    return h;
+}
 
 struct SavedState
 {
@@ -840,30 +858,17 @@ struct SavedState
     ID3D11ShaderResourceView* dsSrv3  = nullptr;  // +X neighbor
     ID3D11ShaderResourceView* dsSrv4  = nullptr;  // -Z neighbor
     ID3D11ShaderResourceView* dsSrv5  = nullptr;  // +Z neighbor
+    ID3D11ShaderResourceView* dsSrv6  = nullptr;  // mirrored PS diffuseMaps
+    ID3D11ShaderResourceView* dsSrv7  = nullptr;  // mirrored PS colourMap
+    ID3D11ShaderResourceView* dsSrv8  = nullptr;  // mirrored PS diffuseMaps1
+    ID3D11ShaderResourceView* dsSrv9  = nullptr;  // mirrored PS diffuseMaps2
+    ID3D11ShaderResourceView* dsSrv10 = nullptr;  // mirrored PS diffuseMaps3
+    ID3D11ShaderResourceView* dsSrv11 = nullptr;  // mirrored PS blendMap
     ID3D11SamplerState*       dsSamp0 = nullptr;
     ID3D11ShaderResourceView* psSrv12 = nullptr;
     ID3D11Buffer*             psCb1   = nullptr;
 };
 SavedState gSaved;
-
-// Strip-to-list conversion cache. Key is constructed from source IB pointer
-// + range (start, count). Value is the converted immutable list IB plus its
-// new index count. Cached entries are released at Shutdown.
-struct ConvertedIB
-{
-    ID3D11Buffer* listIB = nullptr;
-    UINT          listIndexCount = 0;
-};
-std::unordered_map<uint64_t, ConvertedIB> gIBCache;
-
-uint64_t MakeIBKey(ID3D11Buffer* ib, UINT startIdx, UINT indexCount)
-{
-    // Cheap mixing — pointer is the dominant identity, plus range.
-    uint64_t k = (uint64_t)(uintptr_t)ib;
-    k ^= (uint64_t)startIdx * 0x9E3779B97F4A7C15ULL;
-    k ^= (uint64_t)indexCount * 0xBF58476D1CE4E5B9ULL;
-    return k;
-}
 
 bool CompileShader(const char* src, const char* target, ID3DBlob** outBlob)
 {
@@ -938,12 +943,18 @@ float GetGpuTimeMs() { return gGpuTimeMs; }
 
 void RebakeAll()
 {
+    // Alias entries (tex == nullptr) share their srv with the owning entry;
+    // only release owning ones so we don't double-release the shared SRV.
     for (auto& kv : gHeightArrays)
     {
-        if (kv.second.srv) kv.second.srv->Release();
-        if (kv.second.tex) kv.second.tex->Release();
+        if (kv.second.tex)
+        {
+            if (kv.second.srv) kv.second.srv->Release();
+            kv.second.tex->Release();
+        }
     }
     gHeightArrays.clear();
+    gSharedHeightArr = nullptr;
     // Critical: gChunkGrid stores raw SRV pointers that just got released.
     // Leaving them in place would let the next terrain draw bind dangling
     // pointers to DS slots → crash. Cleared, the first frame after rebake
@@ -1059,6 +1070,24 @@ void OnPixelShaderCreated(const void* bytecode, size_t size, ID3D11PixelShader* 
         refl->Release();
     }
     gPsBlendLevel[ps] = blendLevel;
+
+    // If a BLEND-defines record was stashed by OnTerrainPsCompiled (called
+    // earlier from the D3DCompile hook), associate it with the PS pointer.
+    auto bdIt = gBlendDefsByHash.find(HashBytecode(bytecode, size));
+    if (bdIt != gBlendDefsByHash.end())
+    {
+        gPsBlendDefs[ps] = bdIt->second;
+        gBlendDefsByHash.erase(bdIt);
+    }
+}
+
+void OnTerrainPsCompiled(const void* bytecode, size_t size,
+                         int blend1, int blend2, int blend3)
+{
+    if (!bytecode || size == 0) return;
+    PsBlendDefines bd;
+    bd.b1 = blend1; bd.b2 = blend2; bd.b3 = blend3;
+    gBlendDefsByHash[HashBytecode(bytecode, size)] = bd;
 }
 
 // === Per-draw chunk-position snoop (for cross-region neighbor binding) ===
@@ -1173,21 +1202,24 @@ static bool GetChunkBoundsFromVS(ID3D11VertexShader* vs, ID3D11Buffer* cb,
     int wmOff = layoutIt->second.worldMatOffset;
     int odOff = layoutIt->second.overlayDataOffset;
 
-    // worldMatrix translation: last 16 bytes of the float4x4. The 4th
-    // row/column overlap at offsets +48..63 regardless of column- vs
-    // row-major packing — the translation always sits there.
+    // worldMatrix translation at offsets +48..56 (4th row in row-major == 4th
+    // column in column-major: both layouts put translation x/y/z at bytes
+    // 48,52,56 within the matrix).
     const float* tr = (const float*)(data + wmOff + 48);
-    // overlayData = float4(x0, z0, x1, z1) — chunk's world bounds.
+    // overlayData = float4(x0, z0, x1, z1) in CHUNK-LOCAL space (matches the
+    // VS's `position` input, which is local). Size = max - min.
     const float* od = (const float*)(data + odOff);
 
-    outOriginX = od[0];
-    outOriginZ = od[1];
+    // We only expose the worldMatrix translation here — used by the per-frame
+    // chunk grid (gChunkGrid) for neighbor lookup. Chunk-local UV in the
+    // shaders is derived via frac(worldPos.xz / chunkSizeWorld) using the
+    // user-tunable chunkSizeWorld slider, since overlayData is region-scoped
+    // and Kenshi exposes no per-draw per-chunk extent.
+    outOriginX = tr[0];
+    outOriginZ = tr[2];
     outSizeX   = od[2] - od[0];
     outSizeZ   = od[3] - od[1];
-    // tr is unused for now (we use overlayData for both origin and size),
-    // but kept for future extension. Suppress unused-variable warning.
-    (void)tr;
-    return outSizeX > 1e-3 && outSizeZ > 1e-3;
+    return true;
 }
 
 // Reflect the bytecode and log its input + output signatures. Used to verify
@@ -2356,11 +2388,6 @@ void Init(ID3D11Device* device)
 
 void Shutdown()
 {
-    for (auto& kv : gIBCache)
-    {
-        if (kv.second.listIB) kv.second.listIB->Release();
-    }
-    gIBCache.clear();
     if (gHs)            { gHs->Release();            gHs = nullptr; }
     if (gDs)            { gDs->Release();            gDs = nullptr; }
     if (gDecodeNormalsCs) { gDecodeNormalsCs->Release(); gDecodeNormalsCs = nullptr; }
@@ -2399,6 +2426,7 @@ void Shutdown()
     gGpuBake = GpuBakeBuffers{};
     if (gHeightSampler) { gHeightSampler->Release(); gHeightSampler = nullptr; }
     if (gControlCb)     { gControlCb->Release();     gControlCb = nullptr; }
+    if (gWireframeRs)   { gWireframeRs->Release();   gWireframeRs = nullptr; }
     for (int f = 0; f < kTimerFrames; f++)
     {
         if (gTimerFrames[f].disjoint) { gTimerFrames[f].disjoint->Release(); gTimerFrames[f].disjoint = nullptr; }
@@ -2413,10 +2441,14 @@ void Shutdown()
     gGpuTimeMs = 0.0f;
     for (auto& kv : gHeightArrays)
     {
-        if (kv.second.srv) kv.second.srv->Release();
-        if (kv.second.tex) kv.second.tex->Release();
+        if (kv.second.tex)
+        {
+            if (kv.second.srv) kv.second.srv->Release();
+            kv.second.tex->Release();
+        }
     }
     gHeightArrays.clear();
+    gSharedHeightArr = nullptr;
     gPsBytecode.clear();
     gPsBlendLevel.clear();
 }
@@ -2467,14 +2499,11 @@ bool PrepareStripConversion(ID3D11DeviceContext* ctx,
     if (origFormat != DXGI_FORMAT_R16_UINT && origFormat != DXGI_FORMAT_R32_UINT)
         return false;
 
-    uint64_t key = MakeIBKey(origIB, stripStartIndex, stripIndexCount);
-    auto it = gIBCache.find(key);
-    if (it != gIBCache.end())
-    {
-        *outListIB = it->second.listIB;
-        *outListIndexCount = it->second.listIndexCount;
-        return true;
-    }
+    // No caching: Kenshi reuses the same IB pointer with MAP_DISCARD writes
+    // for different chunks, so any cache keyed by (IB,start,count) returns
+    // stale conversions when the IB content changes between draws (visible
+    // as fan artifacts at chunk seams in wireframe). Always re-convert. The
+    // caller is responsible for Releasing the returned listIB after the draw.
 
     ID3D11Device* device = nullptr;
     ctx->GetDevice(&device);
@@ -2591,19 +2620,6 @@ bool PrepareStripConversion(ID3D11DeviceContext* ctx,
 
     if (FAILED(hr)) return false;
 
-    ConvertedIB cv;
-    cv.listIB         = listIB;
-    cv.listIndexCount = listIndexCount;
-    gIBCache[key]     = cv;
-
-    static int sLogCount = 0;
-    if (sLogCount < 3)
-    {
-        sLogCount++;
-        Log("TerrainTess: converted strip→list (cache=%zu, src=%u → list=%u indices)",
-            gIBCache.size(), stripIndexCount, listIndexCount);
-    }
-
     *outListIB         = listIB;
     *outListIndexCount = listIndexCount;
     return true;
@@ -2639,6 +2655,14 @@ void Begin(ID3D11DeviceContext* ctx)
                 {
                     heightArrSrv = it->second.srv;
                 }
+                else if (gSharedHeightArr)
+                {
+                    // SHARED HEIGHTMAP: never bake more than one. All chunks
+                    // bind the first heightArr we ever produced → no per-chunk
+                    // variation, no seams.
+                    heightArrSrv = gSharedHeightArr;
+                    gHeightArrays[res] = HeightArray{nullptr, gSharedHeightArr};
+                }
                 else
                 {
                     ID3D11Device* dev = nullptr;
@@ -2653,6 +2677,8 @@ void Begin(ID3D11DeviceContext* ctx)
                         heightArrSrv = BakeHeightArray(dev, ctx, psSrv1, psSrv0, res);
                         if (psSrv0) psSrv0->Release();
                         dev->Release();
+                        // Promote the very first bake to global shared.
+                        if (heightArrSrv && !gSharedHeightArr) gSharedHeightArr = heightArrSrv;
                     }
                 }
                 res->Release();
@@ -2698,6 +2724,12 @@ void Begin(ID3D11DeviceContext* ctx)
     ctx->DSGetShaderResources(3, 1, &gSaved.dsSrv3);
     ctx->DSGetShaderResources(4, 1, &gSaved.dsSrv4);
     ctx->DSGetShaderResources(5, 1, &gSaved.dsSrv5);
+    ctx->DSGetShaderResources(6, 1, &gSaved.dsSrv6);
+    ctx->DSGetShaderResources(7, 1, &gSaved.dsSrv7);
+    ctx->DSGetShaderResources(8, 1, &gSaved.dsSrv8);
+    ctx->DSGetShaderResources(9, 1, &gSaved.dsSrv9);
+    ctx->DSGetShaderResources(10, 1, &gSaved.dsSrv10);
+    ctx->DSGetShaderResources(11, 1, &gSaved.dsSrv11);
     ctx->DSGetSamplers(0, 1, &gSaved.dsSamp0);
     // Reused by the PS heightmap-debug-view patch.
     ctx->PSGetShaderResources(12, 1, &gSaved.psSrv12);
@@ -2710,19 +2742,6 @@ void Begin(ID3D11DeviceContext* ctx)
     // Defensive: clear any GS that might be bound between DS and rasterizer.
     ID3D11GeometryShader* nullGs = nullptr;
     ctx->GSSetShader(nullGs, nullptr, 0);
-
-    // Upload current Controls to cbuffer slot b1 for HS+DS.
-    if (gControlCb)
-    {
-        D3D11_MAPPED_SUBRESOURCE m = {};
-        if (SUCCEEDED(ctx->Map(gControlCb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
-        {
-            memcpy(m.pData, &gControls, sizeof(gControls));
-            ctx->Unmap(gControlCb, 0);
-        }
-        ctx->HSSetConstantBuffers(1, 1, &gControlCb);
-        ctx->DSSetConstantBuffers(1, 1, &gControlCb);
-    }
 
     // Mirror PS cb0 (terrain $Globals: scalesA/B/C, slopeMin/Max/Blend, etc.)
     // to DS cb0 so DS can replicate the PS's slope/UV-scale logic when
@@ -2831,7 +2850,46 @@ void Begin(ID3D11DeviceContext* ctx)
         ctx->DSSetShaderResources(1, 1, &psOverlay);
         if (psOverlay) psOverlay->Release();
     }
+    // Mirror PS textures used by the BLEND chain to DS slots 6-11. The DS
+    // replicates the PS's exact computeBiome(BLEND0..3) over these.
+    {
+        ID3D11ShaderResourceView* psSrvs[6] = {};
+        ctx->PSGetShaderResources(0,  1, &psSrvs[0]);  // diffuseMaps  → DS t6
+        ctx->PSGetShaderResources(3,  1, &psSrvs[1]);  // colourMap    → DS t7
+        ctx->PSGetShaderResources(6,  1, &psSrvs[2]);  // diffuseMaps1 → DS t8
+        ctx->PSGetShaderResources(8,  1, &psSrvs[3]);  // diffuseMaps2 → DS t9
+        ctx->PSGetShaderResources(10, 1, &psSrvs[4]);  // diffuseMaps3 → DS t10
+        ctx->PSGetShaderResources(5,  1, &psSrvs[5]);  // blendMap     → DS t11
+        ctx->DSSetShaderResources(6, 6, psSrvs);
+        for (int i = 0; i < 6; i++) if (psSrvs[i]) psSrvs[i]->Release();
+    }
     ctx->DSSetSamplers(0, 1, &gHeightSampler);
+
+    // Populate per-PS BLEND# channel masks so the DS replica weights the
+    // BLEND1/2/3 layers exactly as the PS does (PS uses #defines for channel
+    // index, host captures these via OnTerrainPsCompiled and looks them up by
+    // PS pointer here).
+    {
+        for (int i = 0; i < 4; i++)
+        {
+            gControls.blend1Mask[i] = 0.0f;
+            gControls.blend2Mask[i] = 0.0f;
+            gControls.blend3Mask[i] = 0.0f;
+        }
+        ID3D11PixelShader* curPsForMask = nullptr;
+        ctx->PSGetShader(&curPsForMask, nullptr, 0);
+        if (curPsForMask)
+        {
+            auto it = gPsBlendDefs.find(curPsForMask);
+            if (it != gPsBlendDefs.end())
+            {
+                if (it->second.b1 >= 0 && it->second.b1 < 4) gControls.blend1Mask[it->second.b1] = 1.0f;
+                if (it->second.b2 >= 0 && it->second.b2 < 4) gControls.blend2Mask[it->second.b2] = 1.0f;
+                if (it->second.b3 >= 0 && it->second.b3 < 4) gControls.blend3Mask[it->second.b3] = 1.0f;
+            }
+            curPsForMask->Release();
+        }
+    }
 
     // === Cross-region neighbor binding ===
     // Identify this chunk's spatial neighbors via the cbuffer-snoop infrastructure
@@ -2856,12 +2914,21 @@ void Begin(ID3D11DeviceContext* ctx)
             float ox = 0, oz = 0, sx = 0, sz = 0;
             if (GetChunkBoundsFromVS(curVs, curVsCb, ox, oz, sx, sz))
             {
-                // Quantize to grid: gridX/Z by chunk size. Use the size as
-                // the global grid unit (assumes uniform chunk size, which
-                // Kenshi terrain uses).
-                if (gChunkGridUnit < 1e-3) gChunkGridUnit = (sx + sz) * 0.5f;
-                int gx = (int)floorf(ox / gChunkGridUnit + 0.5f);
-                int gz = (int)floorf(oz / gChunkGridUnit + 0.5f);
+                // Push chunk origin (= worldMatrix translation) to shader cb
+                // so debug + boundary fade anchor to the actual chunk grid.
+                gControls.chunkOriginX = ox;
+                gControls.chunkOriginZ = oz;
+
+                // Quantize to grid by user-set chunk size. Falls back to
+                // overlayData region size if the user hasn't tuned the slider
+                // yet (better than nothing — at least region-level neighbors).
+                float unit = gControls.chunkSizeWorld > 1e-3f
+                                ? gControls.chunkSizeWorld
+                                : (sx + sz) * 0.5f;
+                if (unit < 1e-3f) unit = 32.0f;
+                gChunkGridUnit = unit;
+                int gx = (int)floorf(ox / unit + 0.5f);
+                int gz = (int)floorf(oz / unit + 0.5f);
 
                 // Record this chunk in the per-frame grid for future neighbor
                 // lookups (other draws in the same frame can find this one).
@@ -2886,12 +2953,23 @@ void Begin(ID3D11DeviceContext* ctx)
     }
     ctx->DSSetShaderResources(2, 4, nbrSrv);
 
-    // Bind the same heightArray to PS slot 12 + the TessControl cbuffer to PS
-    // slot 1 so the patched terrain main_fs can render the heightmap-as-albedo
-    // debug view. Saved/restored so non-terrain PSes are unaffected.
-    ctx->PSSetShaderResources(12, 1, &heightArrSrv);
+    // Upload TessControl cbuffer NOW (after chunkBounds is set above).
+    // Bind to HS/DS b1 and PS b1 (PS reads gDebugViewMode for the debug view).
     if (gControlCb)
+    {
+        D3D11_MAPPED_SUBRESOURCE m = {};
+        if (SUCCEEDED(ctx->Map(gControlCb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        {
+            memcpy(m.pData, &gControls, sizeof(gControls));
+            ctx->Unmap(gControlCb, 0);
+        }
+        ctx->HSSetConstantBuffers(1, 1, &gControlCb);
+        ctx->DSSetConstantBuffers(1, 1, &gControlCb);
         ctx->PSSetConstantBuffers(1, 1, &gControlCb);
+    }
+
+    // Bind same heightArray to PS slot 12 (used by the heightmap-debug-view PS patch).
+    ctx->PSSetShaderResources(12, 1, &heightArrSrv);
 }
 
 void End(ID3D11DeviceContext* ctx)
@@ -2909,6 +2987,12 @@ void End(ID3D11DeviceContext* ctx)
     ctx->DSSetShaderResources(3, 1, &gSaved.dsSrv3);
     ctx->DSSetShaderResources(4, 1, &gSaved.dsSrv4);
     ctx->DSSetShaderResources(5, 1, &gSaved.dsSrv5);
+    ctx->DSSetShaderResources(6, 1, &gSaved.dsSrv6);
+    ctx->DSSetShaderResources(7, 1, &gSaved.dsSrv7);
+    ctx->DSSetShaderResources(8, 1, &gSaved.dsSrv8);
+    ctx->DSSetShaderResources(9, 1, &gSaved.dsSrv9);
+    ctx->DSSetShaderResources(10, 1, &gSaved.dsSrv10);
+    ctx->DSSetShaderResources(11, 1, &gSaved.dsSrv11);
     ctx->DSSetSamplers(0, 1, &gSaved.dsSamp0);
     ctx->PSSetShaderResources(12, 1, &gSaved.psSrv12);
     ctx->PSSetConstantBuffers(1, 1, &gSaved.psCb1);
@@ -2925,6 +3009,12 @@ void End(ID3D11DeviceContext* ctx)
     if (gSaved.dsSrv3)  { gSaved.dsSrv3->Release();  gSaved.dsSrv3 = nullptr; }
     if (gSaved.dsSrv4)  { gSaved.dsSrv4->Release();  gSaved.dsSrv4 = nullptr; }
     if (gSaved.dsSrv5)  { gSaved.dsSrv5->Release();  gSaved.dsSrv5 = nullptr; }
+    if (gSaved.dsSrv6)  { gSaved.dsSrv6->Release();  gSaved.dsSrv6 = nullptr; }
+    if (gSaved.dsSrv7)  { gSaved.dsSrv7->Release();  gSaved.dsSrv7 = nullptr; }
+    if (gSaved.dsSrv8)  { gSaved.dsSrv8->Release();  gSaved.dsSrv8 = nullptr; }
+    if (gSaved.dsSrv9)  { gSaved.dsSrv9->Release();  gSaved.dsSrv9 = nullptr; }
+    if (gSaved.dsSrv10) { gSaved.dsSrv10->Release(); gSaved.dsSrv10 = nullptr; }
+    if (gSaved.dsSrv11) { gSaved.dsSrv11->Release(); gSaved.dsSrv11 = nullptr; }
     if (gSaved.dsSamp0) { gSaved.dsSamp0->Release(); gSaved.dsSamp0 = nullptr; }
     if (gSaved.psSrv12) { gSaved.psSrv12->Release(); gSaved.psSrv12 = nullptr; }
     if (gSaved.psCb1)   { gSaved.psCb1->Release();   gSaved.psCb1 = nullptr; }
@@ -2950,6 +3040,7 @@ void TimerEndDraw(ID3D11DeviceContext* ctx, bool started)
     ctx->End(tf.tsEnd[tf.used]);
     tf.used++;
 }
+
 } // anon
 
 bool TryDrawTessellated(ID3D11DeviceContext* ctx,
@@ -2959,15 +3050,86 @@ bool TryDrawTessellated(ID3D11DeviceContext* ctx,
     if (!ctx || !gHs || !gDs || !drawFn) return false;
     if (!IsTerrainShaderBound(ctx)) return false;
 
+    // Lazy-create wireframe rasterizer state on first wireframe-mode draw.
+    if (gControls.wireframe > 0.5f && !gWireframeRs)
+    {
+        ID3D11Device* dev = nullptr;
+        ctx->GetDevice(&dev);
+        if (dev)
+        {
+            D3D11_RASTERIZER_DESC rd = {};
+            rd.FillMode = D3D11_FILL_WIREFRAME;
+            rd.CullMode = D3D11_CULL_NONE;
+            rd.DepthClipEnable = TRUE;
+            dev->CreateRasterizerState(&rd, &gWireframeRs);
+            dev->Release();
+        }
+    }
+
     D3D11_PRIMITIVE_TOPOLOGY topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
     ctx->IAGetPrimitiveTopology(&topo);
 
+    // Wireframe mode 2: vanilla strip draw with wireframe rasterizer (no tess,
+    // no IB conversion). Shows Kenshi's untouched terrain mesh.
+    if (gControls.wireframe > 1.5f && gControls.wireframe < 2.5f)
+    {
+        ID3D11RasterizerState* prevRs = nullptr;
+        ctx->RSGetState(&prevRs);
+        if (gWireframeRs) ctx->RSSetState(gWireframeRs);
+        drawFn(ctx, indexCount, startIndex, baseVertex);
+        ctx->RSSetState(prevRs);
+        if (prevRs) prevRs->Release();
+        return true;
+    }
+
+    // Wireframe mode 3: strip→list conversion + TRIANGLELIST topology, NO HS/DS.
+    // Isolates the IB conversion from the tess pipeline so we can verify the
+    // converted triangles match what strip rasterization would produce.
+    if (gControls.wireframe > 2.5f && topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP)
+    {
+        ID3D11Buffer* origIB = nullptr;
+        DXGI_FORMAT   origFormat = DXGI_FORMAT_UNKNOWN;
+        UINT          origOffset = 0;
+        ctx->IAGetIndexBuffer(&origIB, &origFormat, &origOffset);
+        if (!origIB) return false;
+        ID3D11Buffer* listIB = nullptr;
+        UINT listIC = 0;
+        bool ok = PrepareStripConversion(ctx, origIB, origFormat, origOffset,
+                                         indexCount, startIndex, &listIB, &listIC);
+        if (!ok) { origIB->Release(); return false; }
+        ID3D11RasterizerState* prevRs = nullptr;
+        ctx->RSGetState(&prevRs);
+        ID3D11HullShader*   prevHs = nullptr; ctx->HSGetShader(&prevHs, nullptr, nullptr);
+        ID3D11DomainShader* prevDs = nullptr; ctx->DSGetShader(&prevDs, nullptr, nullptr);
+        if (gWireframeRs) ctx->RSSetState(gWireframeRs);
+        ctx->HSSetShader(nullptr, nullptr, 0);
+        ctx->DSSetShader(nullptr, nullptr, 0);
+        ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ctx->IASetIndexBuffer(listIB, origFormat, 0);
+        drawFn(ctx, listIC, 0, baseVertex);
+        ctx->IASetIndexBuffer(origIB, origFormat, origOffset);
+        ctx->IASetPrimitiveTopology(topo);
+        ctx->HSSetShader(prevHs, nullptr, 0);
+        ctx->DSSetShader(prevDs, nullptr, 0);
+        ctx->RSSetState(prevRs);
+        if (prevHs) prevHs->Release();
+        if (prevDs) prevDs->Release();
+        if (prevRs) prevRs->Release();
+        if (listIB) listIB->Release();
+        origIB->Release();
+        return true;
+    }
+
+    // Mode 1 = tess wireframe: same tess path but with wireframe rasterizer.
+    // Begin()/End() save and restore RS, so we override AFTER Begin() and let
+    // End() restore.
+    bool wfTess = (gControls.wireframe > 0.5f && gControls.wireframe < 1.5f);
+
     if (topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
     {
-        // Direct path — patchlist with N control points takes the same indices
-        // as a TRIANGLELIST. Just override topology, bind HS/DS, draw.
         bool timed = TimerBeginDraw(ctx);
         Begin(ctx);
+        if (wfTess && gWireframeRs) ctx->RSSetState(gWireframeRs);
         drawFn(ctx, indexCount, startIndex, baseVertex);
         End(ctx);
         TimerEndDraw(ctx, timed);
@@ -2992,13 +3154,16 @@ bool TryDrawTessellated(ID3D11DeviceContext* ctx,
             return false;
         }
 
+        // Main tess pass: use converted list IB.
         ctx->IASetIndexBuffer(listIB, origFormat, 0);
         bool timed = TimerBeginDraw(ctx);
         Begin(ctx);
+        if (wfTess && gWireframeRs) ctx->RSSetState(gWireframeRs);
         drawFn(ctx, listIC, 0, baseVertex);
         End(ctx);
         TimerEndDraw(ctx, timed);
         ctx->IASetIndexBuffer(origIB, origFormat, origOffset);
+        if (listIB) listIB->Release();
         origIB->Release();
         return true;
     }

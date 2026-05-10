@@ -554,7 +554,9 @@ static void HostSetTerrainTessControls(const float* controls16)
 {
     if (!controls16) return;
     auto* dst = TerrainTess::GetControls();
-    if (dst) memcpy(dst, controls16, sizeof(TerrainTess::Controls));
+    // Plugin sends exactly 16 floats; never overwrite host-only fields that
+    // follow (chunk bounds, etc.).
+    if (dst) memcpy(dst, controls16, 16 * sizeof(float));
 }
 static void HostSetTerrainTessBakeHighPass(float cutoff, float strength)
 {
