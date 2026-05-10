@@ -2,23 +2,20 @@
 
 #include <d3d11.h>
 
-// Pass-through tessellation spike for terrain. Inserts a Hull Shader and
-// Domain Shader that subdivide each triangle to a 1-tri patch (no actual
-// subdivision yet). Goal of the spike: prove we can change topology and
-// attach HS/DS without breaking Kenshi's rendering.
-//
-// Once the spike is verified, this module will grow:
-//   - Distance-based tessellation factors in the HS
-//   - Heightmap-driven displacement in the DS
-//   - Multiple HS/DS variants for the different terrain VS variants
-//     (TEXTURED GBuffer / non-TEXTURED shadow / cubemap)
-//
-// For now, only the GBuffer TEXTURED variant is tessellated (where both VS
-// and PS classify as DUST_SHADER_TERRAIN).
+// Terrain tessellation. Inserts a Hull/Domain shader pair on TEXTURED GBuffer
+// terrain draws to subdivide and displace vertices. Displacement = the PS's
+// visible luminance (BLEND0+1+2+3 chain), computed in the DS by replicating
+// the PS's exact composition — so DS output equals what the PS draws → no
+// chunk seams.
 namespace TerrainTess
 {
     // Tunable parameters exposed to the GUI. Mirrored into a HLSL cbuffer
     // each Begin() so changes take effect on the next draw.
+    //
+    // Layout:
+    //   12 plugin-set floats (sent via SetTerrainTessControls)
+    //   12 host-set floats (per-PS BLEND# channel masks)
+    // Total 24 floats = 96 bytes (6 float4 rows).
     struct Controls
     {
         float maxFactor       = 64.0f;
@@ -27,92 +24,37 @@ namespace TerrainTess
         float amplitude       = 1.0f;
         float ampFadeStart    = 50.0f;
         float ampFadeEnd      = 200.0f;
-        float ampFadeEnabled  = 0.0f;   // 0 = no fade, 1 = fade with depth
-        float uvTileFactor    = 250.0f;
-        // Diagnostic: -1 = use full PS-style blend, 0-5 = force display
-        // that single slice across all terrain. Helps verify slice mapping
-        // (slice 0 = base, 1 = slope, 2 = cliff, 3 = grass, 4 = dirt, 5 = road).
-        float debugSlice      = -1.0f;
-        // Override terrain albedo with the blended heightmap when > 0.5,
-        // so we can SEE the heightmap painted on the terrain in-game.
-        // Only takes effect on BLEND0 PS variants (where displacement runs).
+        float ampFadeEnabled  = 0.0f;
+        // 0 = off, 1 = PS visible-luminance grayscale, 2 = DS-replica diff overlay.
         float debugViewMode   = 0.0f;
-        // Where in [0..1] the heightmap maps to "ground level". 0.5 = signed
-        // around mean (equal up + down). Lower values bias displacement
-        // upward — most pixels rise above the original mesh, fewer dip below.
-        // Useful to keep characters/objects from sinking into the ground.
         float displacementBias = 0.3f;
-        // Quantize the per-edge tess factor to multiples of this for visual
-        // stability — small camera moves no longer flip vertices in/out as
-        // factors crawl through integer thresholds.
         float factorSnapStep   = 4.0f;
-        // Blend factor between per-vertex normal (0) and world-up (1) for
-        // the displacement direction. Adjacent chunks have per-vertex
-        // normals that differ by tiny amounts at the shared boundary,
-        // causing cracks when displaced. World-up is identical across
-        // all chunks, so 1.0 eliminates cross-chunk seams entirely.
+        // Blend per-vertex normal (0) → world-up (1) for displacement direction.
+        // 1 fixes seams from boundary normal mismatches.
         float dispDirWorldUp   = 0.0f;
-        // Extra mip bias added on top of the auto-computed mip. Positive
-        // values force sampling from blurrier mips → smoother displacement
-        // at the cost of fine detail. Negative values are clamped to 0
-        // (forcing more detail can re-introduce sub-tessellation spikes).
-        float mipBias          = 0.0f;
-        // Width (in chunk-UV units, 0..1) over which displacement fades
-        // to zero at the patch's chunk-UV edges. Adjacent chunks ALSO
-        // fade to zero at the shared boundary, so the boundary vertex
-        // displaces by 0 from both sides — eliminates cross-region seams.
-        // Cost: a narrow valley along every chunk boundary.
-        // 0 = disabled.
         // 0 = off, 1 = tess wireframe, 2 = vanilla mesh wireframe (no tess),
-        // 3 = strip→list IB conversion + TRIANGLELIST + no tess (isolates the
-        // IB conversion from the tess pipeline).
-        float wireframe = 0.0f;
-        // User-tunable chunk size in world units. Plugin sends this as the
-        // 16th float; the host appends per-draw chunk origin below.
-        float chunkSizeWorld = 32.0f;
-        // Host-populated per draw from the snooped worldMatrix translation —
-        // gives the chunk's world-space corner so the DS/PS can compute
-        // per-chunk UV as (worldPos.xz - origin) / chunkSizeWorld. Aligns
-        // gradient to the actual chunk grid regardless of where worldPos = 0
-        // falls.
-        float chunkOriginX = 0.0f;
-        float chunkOriginZ = 0.0f;
-        float _hostPad[2]  = { 0, 0 };
+        // 3 = strip→list IB conversion + TRIANGLELIST + no tess (isolates IB conversion).
+        float wireframe        = 0.0f;
         // Per-PS BLEND# channel selectors. Each PS variant uses BLEND1/2/3
         // #defines to pick a channel (0..3 = R/G/B/A) of blendMap. Host fills
-        // these per-draw based on the bound PS's captured defines.
-        // (1,0,0,0) = R, (0,1,0,0) = G, etc. All-zero = layer inactive.
-        float blend1Mask[4] = { 0, 0, 0, 0 };
-        float blend2Mask[4] = { 0, 0, 0, 0 };
-        float blend3Mask[4] = { 0, 0, 0, 0 };
+        // these per-draw based on the PS's captured defines (see
+        // OnTerrainPsCompiled). (1,0,0,0) = R, (0,1,0,0) = G, etc.
+        // All-zero = layer inactive; the BLEND chain skips it.
+        float blend1Mask[4]    = { 0, 0, 0, 0 };
+        float blend2Mask[4]    = { 0, 0, 0, 0 };
+        float blend3Mask[4]    = { 0, 0, 0, 0 };
     };
 
     Controls* GetControls();
 
-    // Bake-time high-pass: suppresses low-frequency macro shape so amplitude
-    // can be cranked up without characters floating/sinking over hills.
-    // cutoff is in cycles/image (Gaussian sigma in freq domain) — lower =
-    // suppresses wider features. strength is 0..1. cutoff=0 disables.
-    // Changing these requires a rebake to take effect.
-    float GetBakeHighPassCutoff();
-    float GetBakeHighPassStrength();
-    void  SetBakeHighPass(float cutoff, float strength);
-
-    // Bake-time mix between FFT-from-normal (0) and luminance-as-height (1).
-    // For textures where the normal map is flat but the diffuse encodes
-    // visible depth, raising mix toward 1 recovers that depth signal.
-    // Requires rebake to take effect.
-    float GetBakeLumMix();
-    void  SetBakeLumMix(float mix);
-
-    // Master enable/disable for the whole tessellation pipeline. When off,
-    // terrain renders flat — no HS/DS, no bake.
+    // Master enable/disable. When off, IsTerrainShaderBound returns false and
+    // the HS/DS path is bypassed entirely.
     bool  GetEnabled();
     void  SetEnabled(bool enabled);
 
-    // GPU time consumed by terrain tess draws on the most recent frame
-    // (in ms). 0 if no tess this frame, or if the timestamp data isn't
-    // ready yet (queries lag by ~1 frame).
+    // GPU time consumed by terrain tess draws on the most recent frame (ms).
+    // 0 if no tess this frame, or if the timestamp data isn't ready yet
+    // (queries lag by ~1 frame).
     float GetGpuTimeMs();
 
     // Called by D3D11Hook::ResetFrameState at the start of each frame —
@@ -120,16 +62,10 @@ namespace TerrainTess
     // the prior frame's results into GpuTimeMs.
     void OnFrameEnd();
 
-    // Free all cached heightmap arrays so the next terrain draw rebakes them
-    // with current high-pass settings. Safe to call from the GUI thread —
-    // resources only get touched on the render thread.
-    void RebakeAll();
-
-    // Compiles the passthrough HS and DS, and loads the heightmap from
-    // <modDir>/heightmaps/sharpgravel_HGT.bin. Called once at device capture.
+    // Compiles the HS/DS. Called once at device capture.
     void Init(ID3D11Device* device);
 
-    // Releases compiled shaders and any cached converted index buffers.
+    // Releases compiled shaders and any cached state.
     void Shutdown();
 
     // Function-pointer signature matching ID3D11DeviceContext::DrawIndexed.
@@ -137,47 +73,32 @@ namespace TerrainTess
         ID3D11DeviceContext* ctx, UINT indexCount,
         UINT startIndex, INT baseVertex);
 
-    // Try to render a draw call with tessellation. Returns true if the function
-    // handled the draw entirely (caller MUST NOT call drawFn again). Returns
-    // false for non-terrain draws — caller should do the standard draw.
+    // Try to render a draw call with tessellation. Returns true if the
+    // function handled the draw entirely (caller MUST NOT call drawFn again).
+    // Returns false for non-terrain draws — caller should do the standard draw.
     //
-    // For TRIANGLELIST terrain draws: overrides topology to PATCHLIST and
-    // routes through HS/DS.
-    // For TRIANGLESTRIP terrain draws: converts source index buffer to a
-    // list IB (cached per source-IB), binds the converted IB, then routes
-    // through HS/DS. Restores original IB binding before returning.
+    // TRIANGLELIST terrain draws: overrides topology to PATCHLIST and routes
+    // through HS/DS.
+    // TRIANGLESTRIP terrain draws: converts source IB to a list IB, binds it,
+    // routes through HS/DS, restores the original IB binding before returning.
     bool TryDrawTessellated(ID3D11DeviceContext* ctx,
                             UINT indexCount, UINT startIndex,
                             INT baseVertex, DrawIndexedFn drawFn);
 
     // Diagnostic: reflect a shader's I/O signatures and log them. Used to
-    // compare VS output vs HS input + DS output vs PS input for mismatches
-    // that cause silent tessellation pipeline failures.
+    // verify VS-HS-DS-PS semantic chains.
     void LogShaderSignature(const void* bytecode, size_t size, const char* tag);
 
-    // Called from the CreatePixelShader hook so we can keep the bytecode
-    // around for reflection. Used to determine the actual PS cbuffer layout
-    // (offsets of scalesA/B/C, slopeMin/Max/Blend) at first terrain draw,
-    // since the HLSL source layout may differ from the compiled bytecode
-    // due to optimizer-driven uniform stripping.
+    // Called from CreatePixelShader hook. Looks up the BLEND-define record
+    // (stashed earlier by OnTerrainPsCompiled) and associates it with the PS
+    // pointer for per-draw mask lookup; also reflects the PS to determine
+    // the cb0 BLEND level (number of layers active).
     void OnPixelShaderCreated(const void* bytecode, size_t size, ID3D11PixelShader* ps);
 
-    // Called from the D3DCompile hook for each successful main_fs/mapfeature_fs
-    // compile. Captures BLEND1/2/3 #define values (channel indices for
-    // blendMap, 0..3) keyed by bytecode hash. OnPixelShaderCreated then
-    // moves the entry into a PS*-keyed map for per-draw lookup.
+    // Called from the D3DCompile hook for each successful main_fs / mapfeature_fs
+    // compile. Captures BLEND1/2/3 #define values (channel indices for blendMap,
+    // 0..3) keyed by bytecode hash. OnPixelShaderCreated then moves the entry
+    // into a PS*-keyed map for per-draw lookup.
     void OnTerrainPsCompiled(const void* bytecode, size_t size,
                              int blend1, int blend2, int blend3);
-
-    // Reflect the terrain VS to find byte offsets of `worldMatrix` and
-    // `overlayData` in its $Globals cbuffer — used at draw time to extract
-    // chunk world position and chunk size for cross-region neighbor lookup.
-    void OnVertexShaderCreated(const void* bytecode, size_t size, ID3D11VertexShader* vs);
-
-    // Called from the Map/Unmap hooks to snoop terrain VS cbuffer writes.
-    // OnCbufferMap stashes the mapped pointer; OnCbufferUnmap reads bytes
-    // BEFORE the unmap commits to GPU. Both are no-ops for non-tracked
-    // buffers and skip a fast atomic check before any work.
-    void OnCbufferMap(ID3D11Buffer* buf, void* dataPtr);
-    void OnCbufferUnmap(ID3D11Buffer* buf);
 }

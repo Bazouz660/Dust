@@ -560,19 +560,19 @@ static std::string PatchTerrainShaderForHeightDebug(const std::string& src)
     }
 
     std::string inject1 =
-        "// [Dust] Terrain debug overlays driven by gDebugViewMode (TessControl b1).\n"
-        "// Layout MUST match TerrainTess::Controls (20 floats: 16 plugin + 4 host).\n"
+        "// [Dust] Terrain debug overlay driven by gDebugViewMode (TessControl b1).\n"
+        "// Layout MUST match TerrainTess::Controls (12 plugin floats + 3 float4 masks).\n"
         "cbuffer TessControl : register(b1) {\n"
         "\tfloat gMaxFactor; float gFactFadeStart; float gFactFadeEnd; float gAmplitude;\n"
-        "\tfloat gAmpFadeStart; float gAmpFadeEnd; float gAmpFadeEnabled; float gUvTileFactor;\n"
-        "\tfloat gDebugSlice; float gDebugViewMode; float gDisplacementBias; float gFactorSnapStep;\n"
-        "\tfloat gDispDirWorldUp; float gMipBias; float gWireframeMode; float gChunkSizeWorld;\n"
-        "\tfloat gChunkOriginX; float gChunkOriginZ; float _dustHostPad0; float _dustHostPad1;\n"
+        "\tfloat gAmpFadeStart; float gAmpFadeEnd; float gAmpFadeEnabled; float gDebugViewMode;\n"
+        "\tfloat gDisplacementBias; float gFactorSnapStep; float gDispDirWorldUp; float gWireframeMode;\n"
+        "\tfloat4 gBlend1Mask; float4 gBlend2Mask; float4 gBlend3Mask;\n"
         "};\n"
         "float DustLum(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }\n\n"
         "// Single-biome-layer replica: mirrors computeBiome's albedo math\n"
-        "// without the normal/absorbance branches and without distance fadeout.\n"
-        "// Each BLEND# layer calls this with its own dmap + per-layer uniforms.\n"
+        "// minus the normal/absorbance branches and distance fadeout. The DS\n"
+        "// uses the same formula on its mirrored textures to compute\n"
+        "// displacement = visible PS luminance (no chunk seams).\n"
         "float3 DustReplicaBiomeAlbedo(Texture2DArray dmap, float3 tc, float2 cliffBlend,\n"
         "\tfloat4 weights, float4 map, float4 colour, float4 sA, float4 sB, float4 sC, float4 oMult)\n"
         "{\n"
@@ -606,10 +606,11 @@ static std::string PatchTerrainShaderForHeightDebug(const std::string& src)
         return src;
     }
     std::string replacement =
-        "if (gDebugViewMode > 2.5) {\n"
-        "\t\t// Mode 3: diff overlay. Compute the FULL BLEND0+1+2+3 replica\n"
-        "\t\t// (matching the PS's BLEND chain at lines 211-256), and display\n"
-        "\t\t// |gtLum - candLum| × 5 as grayscale. Pure black = pixel-exact.\n"
+        "if (gDebugViewMode > 1.5) {\n"
+        "\t\t// Mode 2: diff overlay. Computes the same BLEND0+1+2+3 replica\n"
+        "\t\t// the DS uses for displacement, displays |gtLum - replicaLum|\n"
+        "\t\t// as grayscale. Black = pixel-exact (DS displacement matches PS\n"
+        "\t\t// visible). Bright = where any DS seam comes from.\n"
         "\t\tfloat dust_slope = 1.0 - normalize(normal).y;\n"
         "\t\tfloat4 dust_w0 = smoothstep(slopeMin-slopeBlend, slopeMin, dust_slope) * smoothstep(slopeMax+slopeBlend, slopeMax, dust_slope);\n"
         "\t\tfloat3 dust_a = DustReplicaBiomeAlbedo(diffuseMaps, texCoords, cliffBlend, dust_w0, map, colour, scalesA, scalesB, scalesC, overlayMult);\n"
@@ -645,12 +646,8 @@ static std::string PatchTerrainShaderForHeightDebug(const std::string& src)
         "\t\tfloat dust_candLum = DustLum(dust_a);\n"
         "\t\tfloat dust_diff = saturate(abs(dust_gtLum - dust_candLum) * 5.0);\n"
         "\t\tbiome.albedo.rgb = float3(dust_diff, dust_diff, dust_diff);\n"
-        "\t} else if (gDebugViewMode > 1.5) {\n"
-        "\t\t// Mode 2: per-chunk UV anchored to chunk origin (snooped per draw).\n"
-        "\t\tfloat dustInvSize = (gChunkSizeWorld > 1e-3) ? (1.0 / gChunkSizeWorld) : (1.0 / 32.0);\n"
-        "\t\tfloat2 dustCuv = frac((worldPos.xz - float2(gChunkOriginX, gChunkOriginZ)) * dustInvSize);\n"
-        "\t\tbiome.albedo.rgb = float3(dustCuv.x, dustCuv.y, 0.0);\n"
         "\t} else if (gDebugViewMode > 0.5) {\n"
+        "\t\t// Mode 1: visible PS luminance as grayscale.\n"
         "\t\tfloat dustDbgL = DustLum(biome.albedo.rgb);\n"
         "\t\tbiome.albedo.rgb = float3(dustDbgL, dustDbgL, dustDbgL);\n"
         "\t}\n"
@@ -860,7 +857,7 @@ HRESULT WINAPI HookedD3DCompile(
         std::string src((const char*)pSrcData, SrcDataSize);
         bool isTerrainFs = src.find("computeBiome") != std::string::npos &&
                            src.find("scalesA") != std::string::npos &&
-                           src.find("DustSampleHeightArray") == std::string::npos;
+                           src.find("DustReplicaBiomeAlbedo") == std::string::npos;
         if (isTerrainFs)
         {
             std::string patched = PatchTerrainShaderForHeightDebug(src);

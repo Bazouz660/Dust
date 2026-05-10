@@ -662,7 +662,6 @@ static HRESULT STDMETHODCALLTYPE HookedCreateVertexShader(
         SurveyRecorder::OnVertexShaderCreated(pShaderBytecode, BytecodeLength, *ppVertexShader);
         ShaderMetadata::OnVertexShaderCreated(pShaderBytecode, BytecodeLength, *ppVertexShader);
         ShaderDatabase::OnVertexShaderCreated(*ppVertexShader);
-        TerrainTess::OnVertexShaderCreated(pShaderBytecode, BytecodeLength, *ppVertexShader);
     }
     return hr;
 }
@@ -1292,9 +1291,6 @@ static HRESULT STDMETHODCALLTYPE HookedMap(
         if (CSMIntercept::sTracked.count(buf))
             CSMIntercept::sMapped[buf] = pMappedResource->pData;
     }
-    // Terrain tess: snoop terrain VS cbuffer writes for chunk position info.
-    if (SUCCEEDED(hr) && pResource && pMappedResource && pMappedResource->pData)
-        TerrainTess::OnCbufferMap((ID3D11Buffer*)pResource, pMappedResource->pData);
     return hr;
 }
 
@@ -1315,10 +1311,6 @@ static void STDMETHODCALLTYPE HookedUnmap(
             CSMIntercept::sMapped.erase(it);
         }
     }
-    // Terrain tess: read snooped data BEFORE the original Unmap commits + frees it.
-    if (pResource)
-        TerrainTess::OnCbufferUnmap((ID3D11Buffer*)pResource);
-
     // (mappedData is a hook point for future cbuffer modification — read/write
     // before the original Unmap commits the data to the GPU.)
     if (mappedData)

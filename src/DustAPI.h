@@ -317,24 +317,15 @@ typedef struct DustHostAPI {
     // (offsets not discovered, RTW shadow mode active, etc.).
     int (*GetCSMData)(DustCSMData* outData);
 
-    // === API v7 additions ===
+    // === Terrain tessellation ===
 
-    // Terrain tessellation runtime cbuffer push (16 floats, layout matches
-    // TerrainTess::Controls). The host mirrors these into the cbuffer bound
-    // at HS+DS slot b1 each Begin(), so changes apply on the next draw.
-    void (*SetTerrainTessControls)(const float* controls16);
+    // Plugin pushes the runtime cbuffer (12 floats, layout matches the
+    // plugin-set portion of TerrainTess::Controls). The host mirrors these
+    // into the cbuffer bound at HS+DS slot b1 each Begin().
+    void (*SetTerrainTessControls)(const float* controls);
 
-    // Bake-time parameters. Changing these requires a rebake to take effect.
-    void (*SetTerrainTessBakeHighPass)(float cutoff, float strength);
-    void (*SetTerrainTessBakeLumMix)(float mix);
-
-    // Free all cached heightArrays so the next terrain draw rebakes them
-    // with current bake-time parameters. Safe to call from any thread the
-    // plugin runs on; resources are only touched on the render thread.
-    void (*RebakeTerrainHeightmaps)(void);
-
-    // Master enable/disable for terrain tessellation. When 0, terrain
-    // renders flat with no HS/DS routing (zero per-draw overhead).
+    // Master enable/disable. When 0, terrain renders flat with no HS/DS
+    // routing (zero per-draw overhead).
     void (*SetTerrainTessEnabled)(int enabled);
 
     // GPU time spent on terrain tess draws this frame (ms). Polled per-frame

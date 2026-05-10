@@ -548,27 +548,15 @@ static void HostSetPOMThreshold(float threshold)   { POMState::SetThreshold(thre
 static void HostSetPOMThresholdWidth(float width)  { POMState::SetThresholdWidth(width); }
 static void HostSetPOMSamples(int minS, int maxS)  { POMState::SetMinSamples(minS); POMState::SetMaxSamples(maxS); }
 
-// API v7: terrain tessellation. Plugin pushes the runtime cbuffer (16 floats
-// matching TerrainTess::Controls layout) and bake-time params separately.
-static void HostSetTerrainTessControls(const float* controls16)
+// Terrain tessellation. Plugin pushes the runtime cbuffer (12 floats matching
+// the plugin-set portion of TerrainTess::Controls).
+static void HostSetTerrainTessControls(const float* controls)
 {
-    if (!controls16) return;
+    if (!controls) return;
     auto* dst = TerrainTess::GetControls();
-    // Plugin sends exactly 16 floats; never overwrite host-only fields that
-    // follow (chunk bounds, etc.).
-    if (dst) memcpy(dst, controls16, 16 * sizeof(float));
-}
-static void HostSetTerrainTessBakeHighPass(float cutoff, float strength)
-{
-    TerrainTess::SetBakeHighPass(cutoff, strength);
-}
-static void HostSetTerrainTessBakeLumMix(float mix)
-{
-    TerrainTess::SetBakeLumMix(mix);
-}
-static void HostRebakeTerrainHeightmaps(void)
-{
-    TerrainTess::RebakeAll();
+    // Plugin sends exactly 12 floats; never overwrite host-only mask fields
+    // that follow.
+    if (dst) memcpy(dst, controls, 12 * sizeof(float));
 }
 static void HostSetTerrainTessEnabled(int enabled)
 {
@@ -628,11 +616,8 @@ void EffectLoader::BuildHostAPI()
     // v6 additions
     hostAPI_.GetCSMData           = CSMCapture::GetSnapshot;
 
-    // v7 additions
+    // Terrain tessellation
     hostAPI_.SetTerrainTessControls     = HostSetTerrainTessControls;
-    hostAPI_.SetTerrainTessBakeHighPass = HostSetTerrainTessBakeHighPass;
-    hostAPI_.SetTerrainTessBakeLumMix   = HostSetTerrainTessBakeLumMix;
-    hostAPI_.RebakeTerrainHeightmaps    = HostRebakeTerrainHeightmaps;
     hostAPI_.SetTerrainTessEnabled      = HostSetTerrainTessEnabled;
     hostAPI_.GetTerrainTessGpuTimeMs    = HostGetTerrainTessGpuTimeMs;
 }
