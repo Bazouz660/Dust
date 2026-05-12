@@ -13,10 +13,9 @@ namespace TerrainTess
     // each Begin() so changes take effect on the next draw.
     //
     // Layout:
-    //   15 plugin-set floats + 1 pad (sent via SetTerrainTessControls; pad
-    //     aligns the following float4 masks to a 16-byte boundary)
+    //   20 plugin-set floats (sent via SetTerrainTessControls)
     //   12 host-set floats (per-PS BLEND# channel masks)
-    // Total 28 floats = 112 bytes (7 float4 rows).
+    // Total 32 floats = 128 bytes (8 float4 rows).
     //
     // Displacement formula (DS): 4-tap multi-band bandpass with frequency-falloff
     // curve so dune-scale bumps register and high-freq bumps get less amplitude.
@@ -60,8 +59,18 @@ namespace TerrainTess
         // only (high-freq bumps killed). Forms a 2-point falloff curve over
         // frequency. Independent of the spike gate.
         float hfWeight         = 0.5f;
-        // Pad to float4 boundary so the mask arrays below match HLSL cbuffer alignment.
-        float _pad0 = 0.0f;
+        // LF-aware spike cap. DS computes h with both full and LF-only
+        // pipelines; soft-caps the (h_full − h_lf) excess. 0 = off.
+        float spikeCap         = 0.0f;
+        // Per-slice mip offsets ("smoothness per band"). Each band has its
+        // own tap pair; raising one blurs that band without touching the
+        // others. 0 = current behavior (tight contiguous bands).
+        // Band ranges (with offsets = 0): hi=K..K+1, hm=K+1..K+2,
+        //                                 mid=K+2..K+4, lo=K+4..K+8.
+        float smoothHi         = 0.0f;  // slice_hi tap pair (K..K+1)
+        float smoothHiMid      = 0.0f;  // slice_hm tap pair (K+1..K+2)
+        float smoothMid        = 0.0f;  // slice_mid tap pair (K+2..K+4)
+        float smoothLo         = 0.0f;  // slice_lo tap pair (K+4..K+8)
         // Per-PS BLEND# channel selectors. Each PS variant uses BLEND1/2/3
         // #defines to pick a channel (0..3 = R/G/B/A) of blendMap. Host fills
         // these per-draw based on the PS's captured defines (see

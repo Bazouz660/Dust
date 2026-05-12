@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cmath>
+#include <string>
 #include <vector>
 #include <unordered_map>
 
@@ -33,7 +34,13 @@ namespace {
 //   TEXCOORD6/7/8 : float4 (wvpCol1/0/2 — Y/X/Z columns of the WVP matrix,
 //                  used for h * wvpCol* clip-space displacement).
 
-static const char* kPassthroughHS = R"HLSL(
+// Shared shader code used by BOTH HS and DS — struct VsOut/HsConst, texture
+// bindings, cbuffers, and the ComputeDisplacementH helper. The HS uses the
+// helper to compute h at each patch corner (gSpikeCap > 0 only); the DS uses
+// the helper at the interpolated tess-vertex position. Linking corners → DS
+// allows a soft cap on h_actual − h_interp, which flattens spatially-contained
+// spikes (cones/pyramids) while leaving spatially-extended ridges (dunes) alone.
+static const char* kCommonShader = R"HLSL(
 struct VsOut
 {
     float4 pos      : SV_Position;
@@ -54,101 +61,8 @@ struct HsConst
     float inside   : SV_InsideTessFactor;
 };
 
-cbuffer TessControl : register(b1)
-{
-    float gMaxFactor;
-    float gFactFadeStart;
-    float gFactFadeEnd;
-    float gAmplitude;
-    float gAmpFadeStart;
-    float gAmpFadeEnd;
-    float gAmpFadeEnabled;
-    float gDebugViewMode;
-    float gDisplacementBias;
-    float gFactorSnapStep;
-    float gDispDirWorldUp;
-    float gWireframeMode;
-    float gSharpMip;
-    float gScale;
-    float gHfWeight;
-    float _gPad0;
-    float4 gBlend1Mask;
-    float4 gBlend2Mask;
-    float4 gBlend3Mask;
-};
-
-HsConst HsConstFn(InputPatch<VsOut, 3> patch, uint patchID : SV_PrimitiveID)
-{
-    float w0 = patch[0].pos.w;
-    float w1 = patch[1].pos.w;
-    float w2 = patch[2].pos.w;
-    float wEdge0 = (w1 + w2) * 0.5;
-    float wEdge1 = (w0 + w2) * 0.5;
-    float wEdge2 = (w0 + w1) * 0.5;
-
-    HsConst c;
-    float e0 = lerp(gMaxFactor, 1.0, smoothstep(gFactFadeStart, gFactFadeEnd, wEdge0));
-    float e1 = lerp(gMaxFactor, 1.0, smoothstep(gFactFadeStart, gFactFadeEnd, wEdge1));
-    float e2 = lerp(gMaxFactor, 1.0, smoothstep(gFactFadeStart, gFactFadeEnd, wEdge2));
-    // Snap to factorSnapStep multiples so per-frame depth jitter doesn't
-    // hop tess vertices in and out. Adjacent patches sharing an edge see the
-    // same wEdge values and snap to the same factor → no T-junctions.
-    float snap = max(1.0, gFactorSnapStep);
-    c.edges[0] = max(1.0, round(e0 / snap) * snap);
-    c.edges[1] = max(1.0, round(e1 / snap) * snap);
-    c.edges[2] = max(1.0, round(e2 / snap) * snap);
-    c.inside   = (c.edges[0] + c.edges[1] + c.edges[2]) / 3.0;
-    return c;
-}
-
-[domain("tri")]
-[partitioning("integer")]
-[outputtopology("triangle_cw")]
-[outputcontrolpoints(3)]
-[patchconstantfunc("HsConstFn")]
-[maxtessfactor(64.0)]
-VsOut main(InputPatch<VsOut, 3> patch, uint i : SV_OutputControlPointID)
-{
-    return patch[i];
-}
-)HLSL";
-
-// DS replicates the PS BLEND0+1+2+3 chain to compute displacement = visible
-// luminance. Verified pixel-exact via the PS-side debug overlay (PatchTerrainShaderForHeightDebug).
-static const char* kPassthroughDS = R"HLSL(
-struct VsOut
-{
-    float4 pos      : SV_Position;
-    float3 normal   : TEXCOORD0;
-    float3 worldPos : TEXCOORD1;
-    float3 tex0     : TEXCOORD2;
-    float4 tex1     : TEXCOORD3;
-    float2 uvblend  : TEXCOORD4;
-    float4 texV     : TEXCOORD5;
-    float4 wvpCol1  : TEXCOORD6;
-    float4 wvpCol0  : TEXCOORD7;
-    float4 wvpCol2  : TEXCOORD8;
-};
-
-struct HsConst
-{
-    float edges[3] : SV_TessFactor;
-    float inside   : SV_InsideTessFactor;
-};
-
-struct DsOut
-{
-    float4 pos      : SV_Position;
-    float3 normal   : TEXCOORD0;
-    float3 worldPos : TEXCOORD1;
-    float3 tex0     : TEXCOORD2;
-    float4 tex1     : TEXCOORD3;
-    float2 uvblend  : TEXCOORD4;
-    float4 texV     : TEXCOORD5;
-};
-
-// Live PS textures mirrored per draw. Slot numbering is DS-local, not the PS
-// slot — see Begin() for the mirror map.
+// Live PS textures mirrored per draw onto both HS and DS slots — bound by
+// Begin() before each tess draw. Slot numbering is local to HS/DS (not PS).
 Texture2D      overlayMap   : register(t0);
 Texture2DArray diffuseMaps  : register(t1);
 Texture2D      colourMap    : register(t2);
@@ -158,15 +72,12 @@ Texture2DArray diffuseMaps3 : register(t5);
 Texture2D      blendMap     : register(t6);
 SamplerState   linearWrap   : register(s0);
 
-// Mirror of PS $Globals cbuffer. Offsets verified by reflection at runtime
-// (see Dust log "reflecting bound PS" lines after first terrain draw).
-// Each BLEND# layer occupies 160 bytes (10 × float4) starting at 48/224/384/544.
+// Mirror of PS $Globals cbuffer (terrain.hlsl). Offsets verified by reflection.
 cbuffer PsTerrainCb : register(b0)
 {
     float4 gPsViewport      : packoffset(c0);
     float4 gPsFarClipCamPos : packoffset(c1);
     float4 gPsWaterWetness  : packoffset(c2);
-    // BLEND0 (offsets 48..207).
     float4 gPsScalesA       : packoffset(c3);
     float4 gPsScalesB       : packoffset(c4);
     float4 gPsScalesC       : packoffset(c5);
@@ -178,7 +89,6 @@ cbuffer PsTerrainCb : register(b0)
     float4 gPsAbsorbance0   : packoffset(c11);
     float4 gPsAbsorbance1   : packoffset(c12);
     float4 gPsBrightnessFix : packoffset(c13);
-    // BLEND1 (offsets 224..383).
     float4 gPsScalesA1      : packoffset(c14);
     float4 gPsScalesB1      : packoffset(c15);
     float4 gPsScalesC1      : packoffset(c16);
@@ -186,7 +96,6 @@ cbuffer PsTerrainCb : register(b0)
     float4 gPsSlopeMax1     : packoffset(c18);
     float4 gPsSlopeBlend1   : packoffset(c19);
     float4 gPsOverlayMult1  : packoffset(c20);
-    // BLEND2 (offsets 384..543).
     float4 gPsScalesA2      : packoffset(c24);
     float4 gPsScalesB2      : packoffset(c25);
     float4 gPsScalesC2      : packoffset(c26);
@@ -194,7 +103,6 @@ cbuffer PsTerrainCb : register(b0)
     float4 gPsSlopeMax2     : packoffset(c28);
     float4 gPsSlopeBlend2   : packoffset(c29);
     float4 gPsOverlayMult2  : packoffset(c30);
-    // BLEND3 (offsets 544..703).
     float4 gPsScalesA3      : packoffset(c34);
     float4 gPsScalesB3      : packoffset(c35);
     float4 gPsScalesC3      : packoffset(c36);
@@ -218,16 +126,19 @@ cbuffer TessControl : register(b1)
     float gFactorSnapStep;
     float gDispDirWorldUp;
     float gWireframeMode;
-    // Bandpass tap mips: sharp tap at gSharpMip, mid at +2, blurry at +4.
     float gSharpMip;
-    // Soft-saturation knee: shaped = bp / (|bp| + gScale).
     float gScale;
-    // Frequency-falloff weight on the high-freq slice. 1=flat response, 0=mid only.
     float gHfWeight;
-    float _gPad0;
-    // Per-PS BLEND# channel selectors. Each PS variant uses BLEND1/2/3
-    // #defines to pick a channel of blendMap; host fills these per-draw.
-    // (1,0,0,0)=R, (0,1,0,0)=G, etc. All-zero = layer inactive.
+    // LF-aware spike cap. Computes h with both the full pipeline and an
+    // LF-only pipeline (slice_lo). Soft-caps the difference (HF/MF excess),
+    // leaving the LF surface untouched. 0 = off.
+    float gSpikeCap;
+    // Per-slice mip offsets. Bands at offset=0: hi=K..K+1, hm=K+1..K+2,
+    // mid=K+2..K+4, lo=K+4..K+8. Raising one offset blurs that band only.
+    float gSmoothHi;
+    float gSmoothHiMid;
+    float gSmoothMid;
+    float gSmoothLo;
     float4 gBlend1Mask;
     float4 gBlend2Mask;
     float4 gBlend3Mask;
@@ -235,10 +146,7 @@ cbuffer TessControl : register(b1)
 
 float Lum(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
 
-// One BLEND layer's albedo. Mirrors computeBiome from terrainfp4.hlsl,
-// minus the normal/absorbance branches and distance fadeout (irrelevant
-// for displacement amplitude). mipLevel overrides the explicit LOD on
-// every diffuse sample (DS has no ddx/ddy → must use SampleLevel anyway).
+// One BLEND layer's albedo. Mirrors computeBiome from terrainfp4.hlsl.
 float3 ComputeBiomeAlbedo(Texture2DArray dmap, float3 tc, float2 cliffBlend,
                           float4 weights, float4 omap, float3 colour,
                           float4 sA, float4 sB, float4 sC, float4 oMult,
@@ -261,13 +169,7 @@ float3 ComputeBiomeAlbedo(Texture2DArray dmap, float3 tc, float2 cliffBlend,
     return a;
 }
 
-// PS-visible luminance via the SAME formula the PS uses (BLEND0 + BLEND1/2/3
-// chain with channel-masked blendMap weights). Both sides of any chunk
-// boundary compute the same value (since the PS does, by construction) →
-// displacement is continuous across boundaries → no mesh seams.
-// mipLevel is forwarded to the diffuse samples only — colourMap / blendMap /
-// overlayMap stay at mip 0 because they're already low-frequency and we want
-// per-pixel weights to remain crisp.
+// PS-visible luminance at a given mip via the BLEND0+1+2+3 chain.
 float ComputePsLum(float3 tex0, float2 cliffBlend, float4 mapCoords,
                    float3 normal, float3 texV, float mipLevel)
 {
@@ -318,6 +220,116 @@ float ComputePsLum(float3 tex0, float2 cliffBlend, float4 mapCoords,
     return Lum(a);
 }
 
+// Displacement pipeline: returns BOTH the full-pipeline h (slice_lo + mid +
+// hi, weighted) and an LF-only h (slice_lo alone). The two outputs share the
+// expensive 4-mip PSLum sample, so they cost ~the same as one call.
+//
+// .x = h_full (the displacement we'd normally write)
+// .y = h_lf   (the broad LF-only displacement = "dune surface")
+//
+// DS uses h_lf as a baseline and soft-caps (h_full − h_lf), which is the HF/MF
+// "excess" sitting above the broad surface. Pure-LF features (dunes) have
+// h_full ≈ h_lf → no excess → no cap. HF-rich features (rocks) have a big
+// excess → it gets capped to a small magnitude.
+float2 ComputeDisplacementH(float3 vnormal, float3 vtex0, float4 vtex1,
+                            float2 vuvblend, float3 vtexV, float vposW)
+{
+    float ampScale = lerp(1.0, 1.0 - smoothstep(gAmpFadeStart, gAmpFadeEnd, vposW), gAmpFadeEnabled);
+    float ampScaledTotal = gAmplitude * ampScale;
+    if (ampScaledTotal < 1e-4) return float2(0.0, 0.0);
+
+    // Per-slice tap pairs with independent mip offsets. Default offsets = 0
+    // give contiguous bands at K..K+1, K+1..K+2, K+2..K+4, K+4..K+8. Nonzero
+    // offsets blur a specific band without touching the others.
+    float vH0  = ComputePsLum(vtex0, vuvblend, vtex1, vnormal, vtexV, gSharpMip + gSmoothHi);
+    float vH1  = ComputePsLum(vtex0, vuvblend, vtex1, vnormal, vtexV, gSharpMip + 1.0 + gSmoothHi);
+    float vHM0 = ComputePsLum(vtex0, vuvblend, vtex1, vnormal, vtexV, gSharpMip + 1.0 + gSmoothHiMid);
+    float vHM1 = ComputePsLum(vtex0, vuvblend, vtex1, vnormal, vtexV, gSharpMip + 2.0 + gSmoothHiMid);
+    float vM0  = ComputePsLum(vtex0, vuvblend, vtex1, vnormal, vtexV, gSharpMip + 2.0 + gSmoothMid);
+    float vM1  = ComputePsLum(vtex0, vuvblend, vtex1, vnormal, vtexV, gSharpMip + 4.0 + gSmoothMid);
+    float vL0  = ComputePsLum(vtex0, vuvblend, vtex1, vnormal, vtexV, gSharpMip + 4.0 + gSmoothLo);
+    float vL1  = ComputePsLum(vtex0, vuvblend, vtex1, vnormal, vtexV, gSharpMip + 8.0 + gSmoothLo);
+
+    float refLum = max(Lum(colourMap.SampleLevel(linearWrap, vtex1.xy, 0).rgb * 1.2), 0.05);
+
+    float slice_hi  = vH0  - vH1;
+    float slice_hm  = vHM0 - vHM1;
+    float slice_mid = vM0  - vM1;
+    float slice_lo  = vL0  - vL1;
+
+    float threshold = max(gScale, 1e-5) * 0.5;
+    float keep      = smoothstep(threshold, threshold * 2.0, abs(slice_mid));
+
+    float w_md = gHfWeight;
+    float w_hf = gHfWeight * gHfWeight * keep;  // shared by slice_hi + slice_hm
+    float bp_full = (slice_lo + slice_mid * w_md + (slice_hi + slice_hm) * w_hf) / refLum;
+    float bp_lf   = slice_lo / refLum;
+
+    float shaped_full = bp_full / (abs(bp_full) + max(gScale, 1e-5));
+    float shaped_lf   = bp_lf   / (abs(bp_lf)   + max(gScale, 1e-5));
+
+    float h_full = (shaped_full + gDisplacementBias) * ampScaledTotal;
+    float h_lf   = (shaped_lf   + gDisplacementBias) * ampScaledTotal;
+    return float2(h_full, h_lf);
+}
+)HLSL";
+
+// HS entry: passthrough control points. HsConstFn just computes per-edge tess
+// factors from the view-space w. All displacement work is in the DS now.
+static const char* kHullEntry = R"HLSL(
+HsConst HsConstFn(InputPatch<VsOut, 3> patch, uint patchID : SV_PrimitiveID)
+{
+    float w0 = patch[0].pos.w;
+    float w1 = patch[1].pos.w;
+    float w2 = patch[2].pos.w;
+    float wEdge0 = (w1 + w2) * 0.5;
+    float wEdge1 = (w0 + w2) * 0.5;
+    float wEdge2 = (w0 + w1) * 0.5;
+
+    HsConst c;
+    float e0 = lerp(gMaxFactor, 1.0, smoothstep(gFactFadeStart, gFactFadeEnd, wEdge0));
+    float e1 = lerp(gMaxFactor, 1.0, smoothstep(gFactFadeStart, gFactFadeEnd, wEdge1));
+    float e2 = lerp(gMaxFactor, 1.0, smoothstep(gFactFadeStart, gFactFadeEnd, wEdge2));
+    // Snap to factorSnapStep multiples so per-frame depth jitter doesn't
+    // hop tess vertices in and out. Adjacent patches sharing an edge see the
+    // same wEdge values and snap to the same factor → no T-junctions.
+    float snap = max(1.0, gFactorSnapStep);
+    c.edges[0] = max(1.0, round(e0 / snap) * snap);
+    c.edges[1] = max(1.0, round(e1 / snap) * snap);
+    c.edges[2] = max(1.0, round(e2 / snap) * snap);
+    c.inside   = (c.edges[0] + c.edges[1] + c.edges[2]) / 3.0;
+    return c;
+}
+
+[domain("tri")]
+[partitioning("integer")]
+[outputtopology("triangle_cw")]
+[outputcontrolpoints(3)]
+[patchconstantfunc("HsConstFn")]
+[maxtessfactor(64.0)]
+VsOut main(InputPatch<VsOut, 3> patch, uint i : SV_OutputControlPointID)
+{
+    return patch[i];
+}
+)HLSL";
+
+// DS entry: per-tess-vertex displacement. Computes h_full and h_lf via the
+// shared helper, then soft-caps (h_full − h_lf) — the HF/MF excess above the
+// broad LF surface. Pure-LF features (dunes) have h_full ≈ h_lf → 0 excess →
+// no cap. HF features (rocks) have a large excess → capped → only h_lf
+// (broad LF shape) plus a small clamped HF residual.
+static const char* kDomainEntry = R"HLSL(
+struct DsOut
+{
+    float4 pos      : SV_Position;
+    float3 normal   : TEXCOORD0;
+    float3 worldPos : TEXCOORD1;
+    float3 tex0     : TEXCOORD2;
+    float4 tex1     : TEXCOORD3;
+    float2 uvblend  : TEXCOORD4;
+    float4 texV     : TEXCOORD5;
+};
+
 [domain("tri")]
 DsOut main(HsConst c, float3 bary : SV_DomainLocation, const OutputPatch<VsOut, 3> patch)
 {
@@ -331,62 +343,24 @@ DsOut main(HsConst c, float3 bary : SV_DomainLocation, const OutputPatch<VsOut, 
 
     float4 wvpCol1 = patch[0].wvpCol1;
     float4 passClip = patch[0].pos * bary.x + patch[1].pos * bary.y + patch[2].pos * bary.z;
-    float ampScale = lerp(1.0, 1.0 - smoothstep(gAmpFadeStart, gAmpFadeEnd, passClip.w), gAmpFadeEnabled);
 
-    // Early-out: skip the BLEND chain entirely when amplitude is essentially
-    // zero (e.g. distant chunks faded out, or amplitude slider at 0).
-    float ampScaledTotal = gAmplitude * ampScale;
-    if (ampScaledTotal < 1e-4)
+    // Full and LF-only h, sharing the 4-mip PSLum chain.
+    float2 hPair = ComputeDisplacementH(o.normal, o.tex0, o.tex1, o.uvblend, o.texV.xyz, passClip.w);
+    float h_full = hPair.x;
+    float h_lf   = hPair.y;
+
+    // LF-aware spike cap: keep h_lf intact, soft-cap only the HF/MF excess.
+    float h;
+    if (gSpikeCap > 1e-5)
     {
-        o.pos = passClip;
-        return o;
+        float excess        = h_full - h_lf;
+        float excess_capped = excess / (1.0 + gSpikeCap * abs(excess));
+        h = h_lf + excess_capped;
     }
-
-    // 4-tap multi-band bandpass with frequency-falloff curve. Replicas at
-    // mips K, K+2, K+4, K+8 split the visible-luminance spectrum into three
-    // slices spanning ~8x in spatial scale (vs the previous 4x):
-    //   slice_hi  = v0 - v1    → highest-freq band (where spikes live)
-    //   slice_mid = v1 - v2    → mid-freq band     (where most bumps live)
-    //   slice_lo  = v2 - v3    → low-freq band     (where dune-scale features live)
-    // Dune-scale features need slice_lo because they're too smooth to register
-    // strongly in the previous K..K+4 band — both mid and blurry samples
-    // captured them equally and cancelled out. All four taps are per-pixel
-    // continuous → seam-safe.
-    float v0 = ComputePsLum(o.tex0, o.uvblend, o.tex1, o.normal, o.texV.xyz, gSharpMip);
-    float v1 = ComputePsLum(o.tex0, o.uvblend, o.tex1, o.normal, o.texV.xyz, gSharpMip + 2.0);
-    float v2 = ComputePsLum(o.tex0, o.uvblend, o.tex1, o.normal, o.texV.xyz, gSharpMip + 4.0);
-    float v3 = ComputePsLum(o.tex0, o.uvblend, o.tex1, o.normal, o.texV.xyz, gSharpMip + 8.0);
-
-    // Normalize by colourMap luminance so dark biomes don't shrink the
-    // bandpass amplitude (visible_lum scales with colour_lum on both terms).
-    float refLum = max(Lum(colourMap.SampleLevel(linearWrap, o.tex1.xy, 0).rgb * 1.2), 0.05);
-
-    float slice_hi  = v0 - v1;
-    float slice_mid = v1 - v2;
-    float slice_lo  = v2 - v3;
-
-    // Gate slice_hi by whether the mid-band has matching evidence of a bump.
-    // Threshold is derived from gScale (no extra slider) — small mid-band
-    // signal (≤ scale*0.5) → kill the high-freq slice (likely spike).
-    float threshold = max(gScale, 1e-5) * 0.5;
-    float keep      = smoothstep(threshold, threshold * 2.0, abs(slice_mid));
-
-    // Frequency-falloff curve: low-freq slice gets full weight, mid gets
-    // gHfWeight, high gets gHfWeight² (with the spike gate). Power-curve so
-    // dune-scale bumps win on amplitude over rocky high-freq textures.
-    float w_md = gHfWeight;
-    float w_hi = gHfWeight * gHfWeight * keep;
-    float bp   = (slice_lo + slice_mid * w_md + slice_hi * w_hi) / refLum;
-
-    // Soft saturation: bounds |output| < 1 regardless of input magnitude.
-    //   Small bp → roughly bp/gScale (linear, preserves subtle detail).
-    //   Large bp → asymptotes to ±1 (caps spikes; equalizes across textures).
-    // Smaller gScale = more aggressive equalization (subtle and bumpy textures
-    // both produce displacement near ±1). Larger = more dynamic range preserved.
-    float shaped = bp / (abs(bp) + max(gScale, 1e-5));
-
-    // Bias is a pure additive offset; amp is the final magnitude.
-    float h = (shaped + gDisplacementBias) * ampScaledTotal;
+    else
+    {
+        h = h_full;
+    }
 
     // Displace along a blend of surface normal and world-up. Blend = 1 uses
     // pure world-up, identical across all chunks (no boundary normal divergence
@@ -448,6 +422,9 @@ struct SavedState
     ID3D11Buffer*             hsCb1   = nullptr;
     ID3D11Buffer*             dsCb0   = nullptr;
     ID3D11Buffer*             dsCb1   = nullptr;
+    // HS SRVs/sampler — mirrored alongside DS so corner-h sampling works.
+    ID3D11ShaderResourceView* hsSrv[7] = { nullptr };
+    ID3D11SamplerState*       hsSamp0 = nullptr;
     ID3D11ShaderResourceView* dsSrv[7] = { nullptr };  // overlayMap, diffuseMaps[0/1/2/3], colourMap, blendMap
     ID3D11SamplerState*       dsSamp0 = nullptr;
     ID3D11Buffer*             psCb1   = nullptr;
@@ -672,12 +649,17 @@ void Init(ID3D11Device* device)
     if (!device) return;
     if (gHs && gDs) return;
 
+    // Each stage source = shared common chunk (structs / textures / cbuffers /
+    // helpers including ComputeDisplacementH) + the stage-specific entry.
+    std::string hsSrc = std::string(kCommonShader) + kHullEntry;
+    std::string dsSrc = std::string(kCommonShader) + kDomainEntry;
+
     ID3DBlob* hsBlob = nullptr;
-    if (!CompileShader(kPassthroughHS, "hs_5_0", &hsBlob))
+    if (!CompileShader(hsSrc.c_str(), "hs_5_0", &hsBlob))
         return;
 
     ID3DBlob* dsBlob = nullptr;
-    if (!CompileShader(kPassthroughDS, "ds_5_0", &dsBlob))
+    if (!CompileShader(dsSrc.c_str(), "ds_5_0", &dsBlob))
     {
         hsBlob->Release();
         return;
@@ -942,6 +924,8 @@ void Begin(ID3D11DeviceContext* ctx)
     ctx->HSGetConstantBuffers(1, 1, &gSaved.hsCb1);
     ctx->DSGetConstantBuffers(0, 1, &gSaved.dsCb0);
     ctx->DSGetConstantBuffers(1, 1, &gSaved.dsCb1);
+    ctx->HSGetShaderResources(0, 7, gSaved.hsSrv);
+    ctx->HSGetSamplers(0, 1, &gSaved.hsSamp0);
     ctx->DSGetShaderResources(0, 7, gSaved.dsSrv);
     ctx->DSGetSamplers(0, 1, &gSaved.dsSamp0);
     ctx->PSGetConstantBuffers(1, 1, &gSaved.psCb1);
@@ -955,10 +939,12 @@ void Begin(ID3D11DeviceContext* ctx)
     ctx->GSSetShader(nullGs, nullptr, 0);
 
     // Mirror PS cb0 (terrain $Globals: scalesA/B/C, slopeMin/Max/Blend, etc.)
-    // to DS cb0 so the DS replica reads the same per-chunk uniforms.
+    // to both HS and DS cb0 — both stages call the shared ComputeDisplacementH
+    // helper which reads PS uniforms via the PsTerrainCb mirror.
     {
         ID3D11Buffer* psCb0 = nullptr;
         ctx->PSGetConstantBuffers(0, 1, &psCb0);
+        ctx->HSSetConstantBuffers(0, 1, &psCb0);
         ctx->DSSetConstantBuffers(0, 1, &psCb0);
 
         // Diagnostic: reflect every unique PS that hits this code path so we
@@ -1037,9 +1023,11 @@ void Begin(ID3D11DeviceContext* ctx)
         ctx->PSGetShaderResources(8,  1, &psSrvs[4]);
         ctx->PSGetShaderResources(10, 1, &psSrvs[5]);
         ctx->PSGetShaderResources(5,  1, &psSrvs[6]);
+        ctx->HSSetShaderResources(0, 7, psSrvs);
         ctx->DSSetShaderResources(0, 7, psSrvs);
         for (int i = 0; i < 7; i++) if (psSrvs[i]) psSrvs[i]->Release();
     }
+    ctx->HSSetSamplers(0, 1, &gLinearWrap);
     ctx->DSSetSamplers(0, 1, &gLinearWrap);
 
     // Populate per-PS BLEND# channel masks so the DS replica weights the
@@ -1095,6 +1083,8 @@ void End(ID3D11DeviceContext* ctx)
     ctx->HSSetConstantBuffers(1, 1, &gSaved.hsCb1);
     ctx->DSSetConstantBuffers(0, 1, &gSaved.dsCb0);
     ctx->DSSetConstantBuffers(1, 1, &gSaved.dsCb1);
+    ctx->HSSetShaderResources(0, 7, gSaved.hsSrv);
+    ctx->HSSetSamplers(0, 1, &gSaved.hsSamp0);
     ctx->DSSetShaderResources(0, 7, gSaved.dsSrv);
     ctx->DSSetSamplers(0, 1, &gSaved.dsSamp0);
     ctx->PSSetConstantBuffers(1, 1, &gSaved.psCb1);
@@ -1105,6 +1095,8 @@ void End(ID3D11DeviceContext* ctx)
     if (gSaved.hsCb1)   { gSaved.hsCb1->Release();   gSaved.hsCb1 = nullptr; }
     if (gSaved.dsCb0)   { gSaved.dsCb0->Release();   gSaved.dsCb0 = nullptr; }
     if (gSaved.dsCb1)   { gSaved.dsCb1->Release();   gSaved.dsCb1 = nullptr; }
+    for (int i = 0; i < 7; i++) if (gSaved.hsSrv[i]) { gSaved.hsSrv[i]->Release(); gSaved.hsSrv[i] = nullptr; }
+    if (gSaved.hsSamp0) { gSaved.hsSamp0->Release(); gSaved.hsSamp0 = nullptr; }
     for (int i = 0; i < 7; i++) if (gSaved.dsSrv[i]) { gSaved.dsSrv[i]->Release(); gSaved.dsSrv[i] = nullptr; }
     if (gSaved.dsSamp0) { gSaved.dsSamp0->Release(); gSaved.dsSamp0 = nullptr; }
     if (gSaved.psCb1)   { gSaved.psCb1->Release();   gSaved.psCb1 = nullptr; }

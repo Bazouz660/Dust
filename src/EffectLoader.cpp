@@ -548,15 +548,15 @@ static void HostSetPOMThreshold(float threshold)   { POMState::SetThreshold(thre
 static void HostSetPOMThresholdWidth(float width)  { POMState::SetThresholdWidth(width); }
 static void HostSetPOMSamples(int minS, int maxS)  { POMState::SetMinSamples(minS); POMState::SetMaxSamples(maxS); }
 
-// Terrain tessellation. Plugin pushes the runtime cbuffer (15 floats matching
+// Terrain tessellation. Plugin pushes the runtime cbuffer (20 floats matching
 // the plugin-set portion of TerrainTess::Controls).
 static void HostSetTerrainTessControls(const float* controls)
 {
     if (!controls) return;
     auto* dst = TerrainTess::GetControls();
-    // Plugin sends exactly 15 floats; never overwrite the pad/mask fields
+    // Plugin sends exactly 20 floats; never overwrite the mask fields
     // that follow.
-    if (dst) memcpy(dst, controls, 15 * sizeof(float));
+    if (dst) memcpy(dst, controls, 20 * sizeof(float));
 }
 static void HostSetTerrainTessEnabled(int enabled)
 {

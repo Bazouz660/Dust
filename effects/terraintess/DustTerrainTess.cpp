@@ -29,6 +29,11 @@ struct TerrainTessConfig
     float sharpMip         = 1.0f;    // sharp tap mip; mid at +2, blurry at +4
     float scale            = 0.05f;   // saturation knee
     float hfWeight         = 0.5f;    // high-freq slice gain (2-point falloff curve)
+    float spikeCap         = 0.0f;    // LF-aware spike cap on the (h_full − h_lf) excess; 0 = off
+    float smoothHi         = 0.0f;    // per-slice mip offset for slice_hi tap pair (K..K+1)
+    float smoothHiMid      = 0.0f;    // per-slice mip offset for slice_hm tap pair (K+1..K+2)
+    float smoothMid        = 0.0f;    // per-slice mip offset for slice_mid tap pair (K+2..K+4)
+    float smoothLo         = 0.0f;    // per-slice mip offset for slice_lo tap pair (K+4..K+8)
     bool  ampFadeEnabled   = true;
     float ampFadeStart     = 80.0f;
     float ampFadeEnd       = 150.0f;
@@ -47,12 +52,12 @@ static const DustHostAPI* gHost = nullptr;
 // hook (which the framework calls regardless of injection point).
 static float sGpuTimeMs = 0.0f;
 
-// Mirror TerrainTess::Controls layout: 15 floats matching the host's HLSL
+// Mirror TerrainTess::Controls layout: 20 floats matching the host's HLSL
 // cbuffer field order. Booleans/ints converted to float here.
 static void PushRuntime()
 {
     if (!gHost || !gHost->SetTerrainTessControls) return;
-    float buf[15] = {};
+    float buf[20] = {};
     buf[0]  = (float)gConfig.maxFactor;
     buf[1]  = gConfig.factFadeStart;
     buf[2]  = gConfig.factFadeEnd;
@@ -68,6 +73,11 @@ static void PushRuntime()
     buf[12] = gConfig.sharpMip;
     buf[13] = gConfig.scale;
     buf[14] = gConfig.hfWeight;
+    buf[15] = gConfig.spikeCap;
+    buf[16] = gConfig.smoothHi;
+    buf[17] = gConfig.smoothHiMid;
+    buf[18] = gConfig.smoothMid;
+    buf[19] = gConfig.smoothLo;
     gHost->SetTerrainTessControls(buf);
 }
 
@@ -124,6 +134,11 @@ static DustSettingDesc gSettings[] = {
     { "Smoothness",        DUST_SETTING_FLOAT, &gConfig.sharpMip,        0.0f,  4.0f,  "SharpMip",        nullptr, "Mip level for the sharp bandpass tap (blurry tap is fixed at +4). Higher = blurrier sharp tap → fewer high-freq spikes, but also less fine detail.", DUST_PERF_NONE },
     { "Detail Scale",      DUST_SETTING_FLOAT, &gConfig.scale,           0.01f, 0.5f,  "Scale",           nullptr, "Saturation knee. Smaller = more equalized magnitude across textures (subtle and bumpy textures both produce similar displacement). Larger = more dynamic range preserved.", DUST_PERF_NONE },
     { "HF Weight",         DUST_SETTING_FLOAT, &gConfig.hfWeight,        0.0f,  1.0f,  "HfWeight",        nullptr, "High-frequency bump amplitude relative to mid-frequency. 1.0 = flat response (high-freq bumps full amplitude). 0 = mid-band only (high-freq bumps killed). Forms a 2-point frequency falloff curve.", DUST_PERF_NONE },
+    { "Spike Cap",         DUST_SETTING_FLOAT, &gConfig.spikeCap,        0.0f,  50.0f, "SpikeCap",        nullptr, "LF-aware spike cap. DS computes h with the full pipeline AND with slice_lo only (broad LF surface). Soft-caps the difference (HF/MF excess sitting above the LF surface). Pure-LF features (dunes) have h_full ≈ h_lf → no excess → no cap. HF features (rocks) have a large excess → capped. 0 = off.", DUST_PERF_NONE },
+    { "Smooth Hi",         DUST_SETTING_FLOAT, &gConfig.smoothHi,        0.0f,  6.0f,  "SmoothHi",        nullptr, "Per-slice mip offset for the slice_hi tap pair. 0 = standard band at gSharpMip..+1 (finest detail). Raising it blurs the sharpest band only.", DUST_PERF_LOW },
+    { "Smooth Hi-Mid",     DUST_SETTING_FLOAT, &gConfig.smoothHiMid,     0.0f,  6.0f,  "SmoothHiMid",     nullptr, "Per-slice mip offset for the slice_hm tap pair. 0 = standard band at gSharpMip+1..+2 (in-between hi and mid). Raising it blurs this intermediate band only.", DUST_PERF_LOW },
+    { "Smooth Mid",        DUST_SETTING_FLOAT, &gConfig.smoothMid,       0.0f,  6.0f,  "SmoothMid",       nullptr, "Per-slice mip offset for the slice_mid tap pair. 0 = standard band at gSharpMip+2..+4. Raising it blurs the mid-freq band only.", DUST_PERF_LOW },
+    { "Smooth Lo",         DUST_SETTING_FLOAT, &gConfig.smoothLo,        0.0f,  6.0f,  "SmoothLo",        nullptr, "Per-slice mip offset for the slice_lo tap pair. 0 = standard band at gSharpMip+4..+8. Raising it blurs the low-freq band only (dune-scale features get smoother).", DUST_PERF_LOW },
     { "Disp Dir World-Up", DUST_SETTING_FLOAT, &gConfig.dispDirWorldUp,  0.0f,  1.0f,  "DispDirWorldUp",  nullptr, "Blend between per-vertex normal (0) and world-up (1) for displacement direction. 1 fixes seams from boundary normal mismatches.", DUST_PERF_NONE },
     { "Amp Fade Enabled",  DUST_SETTING_BOOL,  &gConfig.ampFadeEnabled,  0.0f,  1.0f,  "AmpFadeEnabled",  nullptr, "Fade displacement amplitude with distance.", DUST_PERF_NONE },
     { "Amp Fade Start",    DUST_SETTING_FLOAT, &gConfig.ampFadeStart,    0.0f,  500.0f,"AmpFadeStart",    nullptr, "Distance at which amplitude begins fading toward zero.", DUST_PERF_NONE },
