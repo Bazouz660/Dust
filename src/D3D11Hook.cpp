@@ -18,6 +18,9 @@
 #include "CSMCapture.h"
 #include "DustLog.h"
 #include <tracy/Tracy.hpp>
+#ifdef TRACY_ENABLE
+#include <tracy/TracyD3D11.hpp>
+#endif
 #include <core/Functions.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
@@ -87,6 +90,47 @@ static UINT gShadowAtlasOverride = 0;
 
 void SetShadowAtlasResolution(UINT size) { gShadowAtlasOverride = size; }
 UINT GetShadowAtlasResolution()          { return gShadowAtlasOverride; }
+
+// Shadow-pass profiling state. gShadowAtlasIdentity holds the IUnknown
+// identity pointer (QueryInterface(IID_IUnknown)) of the atlas Texture2D —
+// COM identity rule guarantees this matches across any interface query, even
+// if a wrapper layer (RE_Kenshi, debug layer) sits between us and the real
+// texture. gInShadowPass flips in HookedOMSetRenderTargets when the bound
+// DSV's resource resolves to the same IUnknown identity. Weak pointer — we
+// don't AddRef and tolerate the texture outliving us.
+// Up to 8 atlas identities tracked simultaneously. Kenshi can create multiple
+// DSV-bound atlas textures (RTW + CSM modes, workspace recreate on resolution
+// change, etc.) and a single-slot identity caused us to lose track every time
+// a new one appeared. Slot 0 is the most recently captured (just informational
+// — the compare scans all slots). Atomic so OMSet hooks read without a lock.
+static constexpr size_t kMaxShadowIdentities = 8;
+static IUnknown* gShadowAtlasIdentities[kMaxShadowIdentities] = {};
+static std::atomic<size_t> gShadowAtlasIdentityCount{0};
+static bool      gInShadowPass        = false;
+
+// Deferred-lighting PS detection. The shader patch fires for every permutation
+// of the deferred main_fs (shadow on/off, RTW/CSM, cascade counts, ...), so we
+// have to track all of them — capturing only the first one means most binds
+// don't match. Set in HookedCreatePixelShader when bytecode contains
+// "DustShadowParams" (our b7 cbuffer, present only in patched variants).
+// Flipped in HookedPSSetShader when any of these PSes binds.
+static constexpr size_t kMaxDeferredPSes = 16;
+static ID3D11PixelShader* gDeferredShadowPSes[kMaxDeferredPSes] = {};
+static std::atomic<size_t> gDeferredShadowPSCount{0};
+static bool gInDeferredShadowPass = false;
+// Diagnostic counters — surface in HookedPresent so we can read them
+// without a debugger. gShadowMatchCount = times the DSV bind compare
+// succeeded; gShadowDrawCount = times a draw fired while gInShadowPass
+// was true. If matches >> draws, our flag is stale by draw time and we
+// need a different detection strategy (e.g., check bound DSV at draw).
+static std::atomic<uint64_t> gShadowMatchCount{0};
+static std::atomic<uint64_t> gShadowDrawCount{0};
+
+#ifdef TRACY_ENABLE
+// Tracy GPU context. Created after gContext is captured; one per immediate
+// context. Tracy handles per-frame Collect + query pool; we just emit zones.
+static TracyD3D11Ctx gTracyGpuCtx = nullptr;
+#endif
 
 bool GetCameraWorldPos(float outXYZ[3])
 {
@@ -232,6 +276,15 @@ typedef void(STDMETHODCALLTYPE* PFN_OMSetRenderTargets)(
     ID3D11RenderTargetView* const* ppRenderTargetViews,
     ID3D11DepthStencilView* pDepthStencilView);
 
+typedef void(STDMETHODCALLTYPE* PFN_OMSetRenderTargetsAndUAV)(
+    ID3D11DeviceContext* pThis,
+    UINT NumRTVs,
+    ID3D11RenderTargetView* const* ppRenderTargetViews,
+    ID3D11DepthStencilView* pDepthStencilView,
+    UINT UAVStartSlot, UINT NumUAVs,
+    ID3D11UnorderedAccessView* const* ppUnorderedAccessViews,
+    const UINT* pUAVInitialCounts);
+
 typedef HRESULT(STDMETHODCALLTYPE* PFN_Present)(
     IDXGISwapChain* pThis, UINT SyncInterval, UINT Flags);
 
@@ -245,6 +298,7 @@ static PFN_Draw                     oDraw = nullptr;
 static PFN_DrawIndexed              oDrawIndexed = nullptr;
 static PFN_DrawIndexedInstanced     oDrawIndexedInstanced = nullptr;
 static PFN_OMSetRenderTargets       oOMSetRenderTargets = nullptr;
+static PFN_OMSetRenderTargetsAndUAV oOMSetRenderTargetsAndUAV = nullptr;
 static PFN_Present                  oPresent = nullptr;
 static PFN_ResizeBuffers            oResizeBuffers = nullptr;
 
@@ -495,6 +549,15 @@ static void TryCaptureDevice(ID3D11Device* device)
 
     Log("Captured real D3D11 device=%p, context=%p", gDevice, gContext);
 
+#ifdef TRACY_ENABLE
+    // Tracy GPU profiling — must run after gContext is valid. The context
+    // takes its own ref on device + immediate context; safe to leak at exit
+    // since Tracy tears down with the process.
+    gTracyGpuCtx = TracyD3D11Context(gDevice, gContext);
+    TracyD3D11ContextName(gTracyGpuCtx, "Kenshi", 6);
+    Log("Tracy GPU context created");
+#endif
+
     // Try to get resolution from current RT
     {
         ID3D11RenderTargetView* rtv = nullptr;
@@ -613,19 +676,50 @@ static HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
     }
 
     UINT override = gShadowAtlasOverride;
+    const D3D11_TEXTURE2D_DESC* finalDesc = pDesc;
+    D3D11_TEXTURE2D_DESC modDesc;
     if (override != 0 && IsShadowAtlasDesc(pDesc) && pDesc->Width != override)
     {
-        D3D11_TEXTURE2D_DESC modDesc = *pDesc;
+        modDesc = *pDesc;
         modDesc.Width  = override;
         modDesc.Height = override;
         Log("Shadow atlas override: %ux%u %s -> %ux%u",
             pDesc->Width, pDesc->Height,
             FormatName(pDesc->Format) ? FormatName(pDesc->Format) : "?",
             override, override);
-        return oCreateTexture2D(pThis, &modDesc, pInitialData, ppTexture2D);
+        finalDesc = &modDesc;
     }
 
-    return oCreateTexture2D(pThis, pDesc, pInitialData, ppTexture2D);
+    HRESULT hr = oCreateTexture2D(pThis, finalDesc, pInitialData, ppTexture2D);
+
+    // Capture every DSV-bound atlas-like Texture2D for shadow-pass profiling.
+    // Resolve to IUnknown identity so the OMSet compare survives any wrapper
+    // (RE_Kenshi, debug layer). Append to the identity set rather than
+    // overwriting — Kenshi creates more than one atlas (separate RTW + CSM
+    // path, workspace recreate, etc.) and a single-slot store kept losing
+    // track every time a new one appeared.
+    if (SUCCEEDED(hr) && pDesc && ppTexture2D && *ppTexture2D &&
+        (pDesc->BindFlags & D3D11_BIND_DEPTH_STENCIL) != 0 &&
+        IsShadowAtlasDesc(pDesc))
+    {
+        IUnknown* unk = nullptr;
+        (*ppTexture2D)->QueryInterface(IID_IUnknown, (void**)&unk);
+        if (unk)
+        {
+            size_t idx = gShadowAtlasIdentityCount.load(std::memory_order_relaxed);
+            if (idx < kMaxShadowIdentities)
+            {
+                gShadowAtlasIdentities[idx] = unk;
+                gShadowAtlasIdentityCount.store(idx + 1, std::memory_order_release);
+            }
+            unk->Release();  // weak ref — see comment on the array.
+        }
+        Log("Shadow atlas DSV texture captured: tex=%p identity=%p (%ux%u) slot=%zu",
+            *ppTexture2D, unk, finalDesc->Width, finalDesc->Height,
+            gShadowAtlasIdentityCount.load(std::memory_order_relaxed) - 1);
+    }
+
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE HookedCreatePixelShader(
@@ -647,6 +741,33 @@ static HRESULT STDMETHODCALLTYPE HookedCreatePixelShader(
         SurveyRecorder::OnPixelShaderCreated(pShaderBytecode, BytecodeLength, *ppPixelShader);
         ShaderDatabase::OnPixelShaderCreated(*ppPixelShader);
         TerrainTess::OnPixelShaderCreated(pShaderBytecode, BytecodeLength, *ppPixelShader);
+
+        // Detect the patched deferred main_fs by the b7 cbuffer name our
+        // shader patch injects. DXBC stores cbuffer names in the RDEF chunk
+        // as plain ASCII, so a linear byte scan is enough. Append every
+        // variant — there are multiple permutations (RTW/CSM, shadow on/off,
+        // ...) and capturing just one misses the rest.
+        if (pShaderBytecode && BytecodeLength >= 16)
+        {
+            static const char kNeedle[] = "DustShadowParams";
+            const size_t needleLen = sizeof(kNeedle) - 1;
+            const char* hay = (const char*)pShaderBytecode;
+            for (size_t i = 0; i + needleLen <= BytecodeLength; i++)
+            {
+                if (memcmp(hay + i, kNeedle, needleLen) == 0)
+                {
+                    size_t idx = gDeferredShadowPSCount.load(std::memory_order_relaxed);
+                    if (idx < kMaxDeferredPSes)
+                    {
+                        gDeferredShadowPSes[idx] = *ppPixelShader;
+                        gDeferredShadowPSCount.store(idx + 1, std::memory_order_release);
+                        Log("Captured patched deferred PS: %p (slot=%zu)",
+                            *ppPixelShader, idx);
+                    }
+                    break;
+                }
+            }
+        }
     }
     return hr;
 }
@@ -683,6 +804,12 @@ static void STDMETHODCALLTYPE HookedDraw(
     ID3D11DeviceContext* pThis, UINT VertexCount, UINT StartVertexLocation)
 {
     if (gShutdownSignaled) { oDraw(pThis, VertexCount, StartVertexLocation); return; }
+
+    ZoneScoped;
+    if (gInDeferredShadowPass) { ZoneName("ShadowSample", 12); }
+#ifdef TRACY_ENABLE
+    TracyD3D11NamedZone(gTracyGpuCtx, _gpuSampleZoneDraw, "ShadowSample", gInDeferredShadowPass);
+#endif
 
     // Try to install swap chain hooks early — DustBoot may already have captured the
     // swap chain, and we don't need device capture for that path. Pass pThis so
@@ -866,6 +993,19 @@ static void STDMETHODCALLTYPE HookedPSSetShader(
 {
     ZoneScoped;
     oPSSetShader(pThis, pPixelShader, ppClassInstances, NumClassInstances);
+    // Flag deferred-lighting draws so the Draw hook can bracket them as
+    // ShadowSample (PCSS + cascade-blend cost). Scan the captured set of
+    // patched deferred main_fs PSes — multiple permutations exist.
+    bool match = false;
+    if (pPixelShader)
+    {
+        size_t count = gDeferredShadowPSCount.load(std::memory_order_acquire);
+        for (size_t i = 0; i < count; i++)
+        {
+            if (gDeferredShadowPSes[i] == pPixelShader) { match = true; break; }
+        }
+    }
+    gInDeferredShadowPass = match;
     // Skip bookkeeping when tess is off — nothing reads gIsTerrainBoundFlag.
     // When tess flips on later, the next shader bind repopulates the cache.
     if (!gShutdownSignaled && TerrainTess::GetEnabled())
@@ -888,6 +1028,22 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
 {
     ZoneScoped;
     if (gShutdownSignaled) { oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation); return; }
+
+    // Label the CPU zone when this draw is part of the shadow caster pass.
+    // Cheap when gInShadowPass is false (the macro is a no-op then).
+    if (gInShadowPass) {
+        ZoneName("ShadowCast", 10);
+        gShadowDrawCount.fetch_add(1, std::memory_order_relaxed);
+    }
+    else if (gInDeferredShadowPass) {
+        ZoneName("ShadowSample", 12);
+    }
+#ifdef TRACY_ENABLE
+    // GPU zone only when in shadow pass — Tracy uses ID3D11Query timestamps,
+    // ~2 queries per zone. 64K query pool, so we can afford per-draw here.
+    TracyD3D11NamedZone(gTracyGpuCtx, _gpuShadowZone, "ShadowCast", gInShadowPass);
+    TracyD3D11NamedZone(gTracyGpuCtx, _gpuSampleZone, "ShadowSample", gInDeferredShadowPass);
+#endif
 
     if (Survey::IsActive())
         SurveyRecorder::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
@@ -917,6 +1073,18 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
     ZoneScoped;
     if (gShutdownSignaled) { oDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation); return; }
 
+    if (gInShadowPass) {
+        ZoneName("ShadowCast", 10);
+        gShadowDrawCount.fetch_add(1, std::memory_order_relaxed);
+    }
+    else if (gInDeferredShadowPass) {
+        ZoneName("ShadowSample", 12);
+    }
+#ifdef TRACY_ENABLE
+    TracyD3D11NamedZone(gTracyGpuCtx, _gpuShadowZone, "ShadowCast", gInShadowPass);
+    TracyD3D11NamedZone(gTracyGpuCtx, _gpuSampleZone, "ShadowSample", gInDeferredShadowPass);
+#endif
+
     if (Survey::IsActive())
         SurveyRecorder::OnDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
                                                 StartIndexLocation, BaseVertexLocation,
@@ -933,6 +1101,30 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
                           StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
 }
 
+// Check if the bound DSV refers to one of the captured shadow atlas
+// textures. Resolves via IUnknown identity (the only pointer COM guarantees
+// stable across interface queries). Scans the identity set — typically 1-4
+// entries — so the cost is a couple virtual calls plus a tiny linear search.
+static bool ResolveIsShadowDsv(ID3D11DepthStencilView* dsv)
+{
+    if (!dsv) return false;
+    size_t count = gShadowAtlasIdentityCount.load(std::memory_order_acquire);
+    if (count == 0) return false;
+    ID3D11Resource* res = nullptr;
+    dsv->GetResource(&res);
+    if (!res) return false;
+    IUnknown* unk = nullptr;
+    res->QueryInterface(IID_IUnknown, (void**)&unk);
+    res->Release();
+    bool match = false;
+    for (size_t i = 0; i < count; i++)
+    {
+        if (gShadowAtlasIdentities[i] == unk) { match = true; break; }
+    }
+    if (unk) unk->Release();
+    return match;
+}
+
 static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
     ID3D11DeviceContext* pThis, UINT NumViews,
     ID3D11RenderTargetView* const* ppRenderTargetViews,
@@ -944,6 +1136,12 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
     bool wasInGBuffer = GeometryCapture::IsInGBufferPass();
     bool isGBuffer    = GeometryCapture::CheckGBufferConfig(NumViews, ppRenderTargetViews, pDepthStencilView);
 
+    // Update shadow-pass flag whenever a DSV (or no DSV) is bound. Cheap if
+    // gShadowAtlasIdentity is null (resolver early-exits).
+    bool nowInShadowPass = ResolveIsShadowDsv(pDepthStencilView);
+    if (nowInShadowPass) gShadowMatchCount.fetch_add(1, std::memory_order_relaxed);
+    gInShadowPass = nowInShadowPass;
+
     oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView);
     GeometryCapture::OnOMSetRenderTargetsWithResult(isGBuffer);
 
@@ -953,6 +1151,35 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
         POMState::OnGBufferEnter(pThis);
     else if (wasInGBuffer && !isGBuffer)
         POMState::OnGBufferLeave(pThis);
+}
+
+// OGRE 2.0 binds RTV/DSV through this combined call rather than the plain
+// OMSetRenderTargets — so the shadow caster pass is invisible to slot-33
+// hooks alone. Mirror the DSV-identity check here so gInShadowPass tracks
+// shadow binds regardless of which API the engine used.
+static void STDMETHODCALLTYPE HookedOMSetRenderTargetsAndUAV(
+    ID3D11DeviceContext* pThis,
+    UINT NumRTVs, ID3D11RenderTargetView* const* ppRenderTargetViews,
+    ID3D11DepthStencilView* pDepthStencilView,
+    UINT UAVStartSlot, UINT NumUAVs,
+    ID3D11UnorderedAccessView* const* ppUnorderedAccessViews,
+    const UINT* pUAVInitialCounts)
+{
+    ZoneScoped;
+    if (gShutdownSignaled) {
+        oOMSetRenderTargetsAndUAV(pThis, NumRTVs, ppRenderTargetViews,
+            pDepthStencilView, UAVStartSlot, NumUAVs, ppUnorderedAccessViews,
+            pUAVInitialCounts);
+        return;
+    }
+
+    bool nowInShadowPass = ResolveIsShadowDsv(pDepthStencilView);
+    if (nowInShadowPass) gShadowMatchCount.fetch_add(1, std::memory_order_relaxed);
+    gInShadowPass = nowInShadowPass;
+
+    oOMSetRenderTargetsAndUAV(pThis, NumRTVs, ppRenderTargetViews,
+        pDepthStencilView, UAVStartSlot, NumUAVs, ppUnorderedAccessViews,
+        pUAVInitialCounts);
 }
 
 // ==================== Swap chain hooks (ImGui) ====================
@@ -1068,6 +1295,29 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(
 {
     ZoneScoped;
     if (!gShutdownSignaled) TickGuiOnPresent(pThis, "Present");
+#ifdef TRACY_ENABLE
+    // Harvest finished GPU timestamps for this frame. Must run on the same
+    // context that issued the zones. Cheap when there are no completed
+    // queries; Tracy polls non-blocking.
+    if (gTracyGpuCtx) TracyD3D11Collect(gTracyGpuCtx);
+#endif
+    // Periodic diagnostic for shadow-pass detection. Every 120 frames
+    // (~1-2s) log "matches=X draws=Y" so we can tell whether our DSV
+    // compare ever lands (matches > 0) and whether draws actually fire
+    // with gInShadowPass=true (draws > 0). The pair tells us where the
+    // shadow profiling is breaking.
+    if ((gPresentHookCallCount % 120) == 0)
+    {
+        static uint64_t sPrevMatches = 0;
+        static uint64_t sPrevDraws   = 0;
+        uint64_t m = gShadowMatchCount.load(std::memory_order_relaxed);
+        uint64_t d = gShadowDrawCount.load(std::memory_order_relaxed);
+        Log("Shadow diag: matches=%llu (+%llu) draws=%llu (+%llu)",
+            (unsigned long long)m, (unsigned long long)(m - sPrevMatches),
+            (unsigned long long)d, (unsigned long long)(d - sPrevDraws));
+        sPrevMatches = m;
+        sPrevDraws   = d;
+    }
     HRESULT hr = oPresent(pThis, SyncInterval, Flags);
     FrameMark;
     return hr;
@@ -1079,6 +1329,9 @@ static HRESULT STDMETHODCALLTYPE HookedPresent1(
 {
     ZoneScoped;
     if (!gShutdownSignaled) TickGuiOnPresent(pThis, "Present1");
+#ifdef TRACY_ENABLE
+    if (gTracyGpuCtx) TracyD3D11Collect(gTracyGpuCtx);
+#endif
     HRESULT hr = oPresent1(pThis, SyncInterval, PresentFlags, pPresentParameters);
     FrameMark;
     return hr;
@@ -1512,6 +1765,7 @@ static const int VTIDX_CTX_Map                      = 14;
 static const int VTIDX_CTX_Unmap                    = 15;
 static const int VTIDX_CTX_DrawIndexedInstanced     = 20;
 static const int VTIDX_CTX_OMSetRenderTargets       = 33;
+static const int VTIDX_CTX_OMSetRenderTargetsAndUAV = 34;
 static const int VTIDX_CTX_CopyResource             = 47;
 static const int VTIDX_CTX_UpdateSubresource        = 48;
 // VTIDX_SC_* constants moved to top of file (needed by deferred hook code)
@@ -1571,6 +1825,7 @@ bool Install()
     void* addrDrawIndexed  = ctxVtable[VTIDX_CTX_DrawIndexed];
     void* addrDrawIdxInst  = ctxVtable[VTIDX_CTX_DrawIndexedInstanced];
     void* addrOMSetRT      = ctxVtable[VTIDX_CTX_OMSetRenderTargets];
+    void* addrOMSetRTUAV   = ctxVtable[VTIDX_CTX_OMSetRenderTargetsAndUAV];
     void* addrCopyRes      = ctxVtable[VTIDX_CTX_CopyResource];
     void* addrUpdateSubres = ctxVtable[VTIDX_CTX_UpdateSubresource];
     void* addrMap          = ctxVtable[VTIDX_CTX_Map];
@@ -1598,6 +1853,7 @@ bool Install()
     Log("  DrawIndexed           = %p", addrDrawIndexed);
     Log("  DrawIndexedInstanced  = %p", addrDrawIdxInst);
     Log("  OMSetRenderTargets    = %p", addrOMSetRT);
+    Log("  OMSetRTAndUAV         = %p", addrOMSetRTUAV);
     Log("  Present               = %p", addrPresent);
     Log("  Present1              = %p", addrPresent1);
     Log("  ResizeBuffers         = %p", addrResizeBuf);
@@ -1704,6 +1960,10 @@ bool Install()
     if (KenshiLib::AddHook(addrOMSetRT, (void*)HookedOMSetRenderTargets,
                            (void**)&oOMSetRenderTargets) != KenshiLib::SUCCESS)
     { Log("ERROR: Failed to hook OMSetRenderTargets"); ok = false; }
+
+    if (KenshiLib::AddHook(addrOMSetRTUAV, (void*)HookedOMSetRenderTargetsAndUAV,
+                           (void**)&oOMSetRenderTargetsAndUAV) != KenshiLib::SUCCESS)
+    { Log("ERROR: Failed to hook OMSetRenderTargetsAndUnorderedAccessViews"); ok = false; }
 
     // Present/Present1/ResizeBuffers hooks are DEFERRED until the first Draw call.
     // This avoids a race with overlay DLLs (Steam, Discord, ReShade) that also hook

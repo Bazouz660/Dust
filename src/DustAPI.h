@@ -72,7 +72,7 @@
 extern "C" {
 #endif
 
-#define DUST_API_VERSION 8
+#define DUST_API_VERSION 9
 
 // Injection points in the rendering pipeline
 typedef enum DustInjectionPoint {
@@ -339,6 +339,17 @@ typedef struct DustHostAPI {
     // bound). Read from the bound terrain PS's $Globals.cameraPos uniform —
     // updated each time a terrain draw passes through the engine.
     int (*GetCameraPos)(float outXYZ[3]);
+
+    // === API v9 additions ===
+
+    // Set the engine-internal shadow far distance live (no restart). Mutates
+    // Kenshi's cascade source array AND re-pushes the cbuffer splits — both
+    // shadow camera frusta and the deferred lighting's cascade selection see
+    // the new far on the next frame. Returns 1 on success, 0 if PssmDetour
+    // hasn't captured Kenshi's splits source pointer yet (very early frames).
+    // Plugins should still write the user-facing value to settings.cfg if
+    // they want it to persist across restarts.
+    int (*SetShadowRange)(float farDistance);
 } DustHostAPI;
 
 // Performance impact hint for a single setting (API v3.2+).

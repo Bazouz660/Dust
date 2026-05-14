@@ -16,22 +16,32 @@
 DustLogFn gLogFn = nullptr;
 
 struct ShadowConfig {
+    // === Shared ===
     bool  enabled           = true;
-    float filterRadius      = 1.0f;
-    float lightSize         = 3.0f;
-    bool  pcssEnabled       = true;
+    int   resolutionIndex   = 2;      // index into kShadowResolutions (default = 4096)
+    int   shadowRange       = 6000;   // overridden in DustEffectCreate from settings.cfg
+                                      // if a value is already present there
+
+    // === RTWSM ===
+    float filterRadius      = 1.0f;   // RTW UV-space filter radius (scaled by 0.001 * resScale)
+    float lightSize         = 3.0f;   // RTW PCSS light size
+    bool  pcssEnabled       = true;   // RTW PCSS toggle
     float biasScale         = 1.0f;
     bool  cliffFix          = false;  // off by default: previous always-on caused
                                       // close-range vertical shadows to disappear
     float cliffFixDistance  = 0.10f;  // fraction of shadow range where the bias
                                       // ramps in; smooth saturate curve, not a hard cutoff
-    int   resolutionIndex   = 2;      // index into kShadowResolutions (default = 4096)
-    int   shadowRange       = 6000;   // overridden in DustEffectCreate from settings.cfg
-                                      // if a value is already present there
+
+    // === CSM ===
     float pssmLambda        = 0.95f;  // PSSM cascade split distribution. 0.0 =
                                       // pure linear (close shadows extend
                                       // far, but blockier); 1.0 = pure log
                                       // (close shadows tiny+sharp, far blurry)
+    float csmFilterRadius   = 1.0f;   // global scale on top of per-cascade radii
+    float csmLightSize      = 2.0f;   // PCSS blocker-search/penumbra scale (multiplier on baseRadius)
+    bool  csmPcssEnabled    = true;
+    bool  csmBlendEnabled   = true;   // smooth blend between adjacent cascades
+    float csmBlendWidth     = 0.15f;  // fraction of cascade depth range used as blend band
     float cascade0Filter    = 1.0f;   // per-cascade filter-radius multipliers
     float cascade1Filter    = 1.0f;   // (relative to Kenshi's vanilla per-
     float cascade2Filter    = 1.0f;   // cascade taper; default 1.0 = vanilla)
@@ -251,15 +261,25 @@ static void PushShadowRangeToGame()
     }
 }
 
+// b7 cbuffer layout — must match the HLSL declaration injected by
+// ShaderPatch::PatchDeferredShader. 12 floats, no explicit padding required
+// because HLSL packs floats tightly within 16-byte rows.
 struct alignas(16) ShadowCBData {
+    // Shared
     float enabled;
-    float filterRadius;
-    float lightSize;
-    float pcssEnabled;
-    float biasScale;
-    float cliffFixEnabled;
-    float cliffFixDistance;
-    float csmFilterScale;
+    // RTWSM
+    float rtwFilterRadius;
+    float rtwLightSize;
+    float rtwPcssEnabled;
+    float rtwBiasScale;
+    float rtwCliffFixEnabled;
+    float rtwCliffFixDistance;
+    // CSM
+    float csmFilterRadius;
+    float csmLightSize;
+    float csmPcssEnabled;
+    float csmBlendEnabled;
+    float csmBlendWidth;
 };
 
 static int ShadowInit(ID3D11Device* device, uint32_t w, uint32_t h, const DustHostAPI* host)
@@ -285,7 +305,15 @@ static int ShadowInit(ID3D11Device* device, uint32_t w, uint32_t h, const DustHo
         host->SetCascadeFilterScale(2, gConfig.cascade2Filter);
         host->SetCascadeFilterScale(3, gConfig.cascade3Filter);
     }
-    // NB: shadow range is written to settings.cfg from DustEffectCreate,
+    // Live shadow-range push. PssmDetour may not yet have captured Kenshi's
+    // splits source pointer at Init time (scene init runs later) — if so,
+    // SetShadowRange returns 0 and we rely on OnSettingChanged or a deferred
+    // push to apply the value once the capture lands. Failure is silent and
+    // expected on early init; we still wrote settings.cfg in DustEffectCreate
+    // so a restart will apply the value regardless.
+    if (host->SetShadowRange)
+        host->SetShadowRange((float)gConfig.shadowRange);
+    // NB: shadow range was already written to settings.cfg from DustEffectCreate,
     // which runs early enough to beat Kenshi's startup read. A write here
     // would land too late and could clobber the early write with a stale
     // per-effect INI value (the framework's INI load runs after our seed).
@@ -305,24 +333,28 @@ static void ShadowPreExecute(const DustFrameContext* ctx, const DustHostAPI* hos
     if (!gCB) return;
 
     ShadowCBData data;
-    data.enabled          = gConfig.enabled ? 1.0f : 0.0f;
-    // Scale the UV-space filter radius by texel size so the filter always covers
-    // the same number of shadow texels regardless of atlas resolution. The 0.001
-    // factor was originally tuned for a 4096 atlas; at lower resolutions the
-    // Poisson samples were clustering on a single texel and producing visible
-    // squares. Using (4096 / atlasRes) preserves existing tuning at 4096 and
-    // widens the kernel proportionally at smaller sizes.
-    float resScale        = 4096.0f / (float)GetSelectedShadowResolution();
-    data.filterRadius     = gConfig.filterRadius * 0.001f * resScale;
-    data.lightSize        = gConfig.lightSize * 0.001f * resScale;
-    data.pcssEnabled      = gConfig.pcssEnabled ? 1.0f : 0.0f;
-    data.biasScale        = gConfig.biasScale;
-    data.cliffFixEnabled  = gConfig.cliffFix ? 1.0f : 0.0f;
-    data.cliffFixDistance = gConfig.cliffFixDistance;
-    // CSM uses gConfig.filterRadius as a raw multiplier on csmParams[i][1]
-    // (vanilla per-cascade PCF radius). RTW uses the same slider value but
-    // multiplied by 0.001 above for UV-space. Same slider, two interpretations.
-    data.csmFilterScale   = gConfig.filterRadius;
+    data.enabled             = gConfig.enabled ? 1.0f : 0.0f;
+    // Scale the UV-space RTW filter radius by texel size so the filter always
+    // covers the same number of shadow texels regardless of atlas resolution.
+    // The 0.001 factor was tuned for a 4096 atlas; at lower resolutions the
+    // Poisson samples cluster on a single texel and produce visible squares.
+    // (4096 / atlasRes) preserves existing tuning at 4096.
+    float resScale           = 4096.0f / (float)GetSelectedShadowResolution();
+    data.rtwFilterRadius     = gConfig.filterRadius * 0.001f * resScale;
+    data.rtwLightSize        = gConfig.lightSize * 0.001f * resScale;
+    data.rtwPcssEnabled      = gConfig.pcssEnabled ? 1.0f : 0.0f;
+    data.rtwBiasScale        = gConfig.biasScale;
+    data.rtwCliffFixEnabled  = gConfig.cliffFix ? 1.0f : 0.0f;
+    data.rtwCliffFixDistance = gConfig.cliffFixDistance;
+    // CSM filter radius scales csmParams[i][1] (the per-cascade PCF radius the
+    // engine baked into the lighting cbuffer). 1.0 = vanilla. The per-cascade
+    // multipliers (cascade0Filter..) are applied separately via PssmDetour
+    // writing directly into csmParams[i][1] — they compound with this global.
+    data.csmFilterRadius     = gConfig.csmFilterRadius;
+    data.csmLightSize        = gConfig.csmLightSize;
+    data.csmPcssEnabled      = gConfig.csmPcssEnabled ? 1.0f : 0.0f;
+    data.csmBlendEnabled     = gConfig.csmBlendEnabled ? 1.0f : 0.0f;
+    data.csmBlendWidth       = gConfig.csmBlendWidth;
 
     host->UpdateConstantBuffer(ctx->context, gCB, &data, sizeof(data));
     // Bind to b7: b2 collides with CSM's auto-allocated $Globals cbuffer
@@ -351,24 +383,41 @@ static void ShadowOnSettingChanged()
         gHost->SetCascadeFilterScale(2, gConfig.cascade2Filter);
         gHost->SetCascadeFilterScale(3, gConfig.cascade3Filter);
     }
+    // Live runtime push to Kenshi's engine far; complements the settings.cfg
+    // write below which only takes effect on next launch.
+    if (gHost && gHost->SetShadowRange)
+        gHost->SetShadowRange((float)gConfig.shadowRange);
     PushShadowRangeToGame();
 }
 
 static DustSettingDesc gSettings[] = {
-    { "Enabled",             DUST_SETTING_BOOL,  &gConfig.enabled,          0.0f, 1.0f,  "Enabled",          nullptr, "Enable or disable shadow filtering",                                                                                                                                          DUST_PERF_LOW    },
-    { "Filter Radius",       DUST_SETTING_FLOAT, &gConfig.filterRadius,     0.1f, 5.0f,  "FilterRadius",     nullptr, "Size of the shadow softening filter",                                                                                                                                         DUST_PERF_NONE   },
-    { "Light Size",          DUST_SETTING_FLOAT, &gConfig.lightSize,        0.5f, 10.0f, "LightSize",        nullptr, "Simulated light source size for contact-hardening shadows",                                                                                                                   DUST_PERF_NONE   },
-    { "PCSS",                DUST_SETTING_BOOL,  &gConfig.pcssEnabled,      0.0f, 1.0f,  "PCSS",             nullptr, "Enable Percentage-Closer Soft Shadows for distance-based softness",                                                                                                           DUST_PERF_MEDIUM },
-    { "Bias Scale",          DUST_SETTING_FLOAT, &gConfig.biasScale,        0.0f, 3.0f,  "BiasScale",        nullptr, "Shadow bias multiplier to reduce shadow acne artifacts",                                                                                                                      DUST_PERF_NONE },
-    { "Cliff Shadow Fix",    DUST_SETTING_BOOL,  &gConfig.cliffFix,         0.0f, 1.0f,  "CliffFix",         nullptr, "Reduce shadow acne on steep cliffs and vertical faces (can make close-range vertical shadows fade out). Integration of Crunk Aint Dead's Cliff Face Shadow Fix mod.",      DUST_PERF_NONE },
-    { "Cliff Fix Distance",  DUST_SETTING_FLOAT, &gConfig.cliffFixDistance, 0.0f, 1.0f,  "CliffFixDistance", nullptr, "Fraction of shadow range where the cliff fix smoothly ramps in (higher = preserves more close-range vertical shadows)",                                                     DUST_PERF_NONE },
+    // === Common (affect both RTWSM and CSM) ===
+    { "Common",              DUST_SETTING_SECTION, nullptr,                 0.0f, 0.0f,  nullptr,            nullptr, nullptr, DUST_PERF_NONE },
+    { "Enabled",             DUST_SETTING_BOOL,  &gConfig.enabled,          0.0f, 1.0f,  "Enabled",          nullptr, "Enable or disable Dust's improved shadow filtering (RTWSM and CSM). When off, vanilla Kenshi filtering is used.",                                                                                  DUST_PERF_LOW    },
     { "Shadow Resolution",   DUST_SETTING_ENUM,  &gConfig.resolutionIndex,  0.0f, 6.0f,  "Resolution",       kShadowResolutionLabels, "Override the shadow atlas resolution. Higher = sharper shadows, more VRAM (16384 ~= 1 GB). Restart the game to apply.",                                              DUST_PERF_LOW    },
-    { "Shadow Range",        DUST_SETTING_INT,   &gConfig.shadowRange,      500.0f, 50000.0f, "Range",        nullptr, "Maximum distance shadows render. Bypasses the in-game UI's 9000 cap by writing settings.cfg directly. Restart to apply. Touching the in-game Shadow Range slider will overwrite this.", DUST_PERF_MEDIUM },
-    { "Cascade Lambda",      DUST_SETTING_FLOAT, &gConfig.pssmLambda,       0.0f, 1.0f,  "CascadeLambda",   nullptr, "PSSM cascade split distribution. 0.0 = pure linear (close shadows extend further but blockier); 1.0 = pure logarithmic (close shadows tiny+sharp, far cascades huge). Kenshi's native is ~0.95.", DUST_PERF_NONE },
-    { "Cascade 0 Filter",    DUST_SETTING_FLOAT, &gConfig.cascade0Filter,   0.0f, 5.0f,  "Cascade0Filter",  nullptr, "Filter-radius multiplier for the closest cascade (covers the sharpest near-camera shadows). 1.0 = Kenshi's vanilla taper, >1.0 = softer.", DUST_PERF_NONE },
-    { "Cascade 1 Filter",    DUST_SETTING_FLOAT, &gConfig.cascade1Filter,   0.0f, 5.0f,  "Cascade1Filter",  nullptr, "Filter-radius multiplier for cascade 1 (mid-range shadows).", DUST_PERF_NONE },
-    { "Cascade 2 Filter",    DUST_SETTING_FLOAT, &gConfig.cascade2Filter,   0.0f, 5.0f,  "Cascade2Filter",  nullptr, "Filter-radius multiplier for cascade 2 (far-mid shadows).", DUST_PERF_NONE },
-    { "Cascade 3 Filter",    DUST_SETTING_FLOAT, &gConfig.cascade3Filter,   0.0f, 5.0f,  "Cascade3Filter",  nullptr, "Filter-radius multiplier for the farthest cascade (where blockiness shows most). >1.0 softens the far-cascade artifacts.", DUST_PERF_NONE },
+    { "Shadow Range",        DUST_SETTING_INT,   &gConfig.shadowRange,      500.0f, 50000.0f, "Range",        nullptr, "Maximum distance shadows render. Bypasses the in-game UI's 9000 cap. Applies live (cascade splits + shadow camera frusta re-derive next frame). Also written to settings.cfg so the value survives a restart. Touching the in-game Shadow Range slider will overwrite this.", DUST_PERF_MEDIUM },
+
+    // === RTWSM (warped shadow map — Kenshi's default in some configs) ===
+    { "RTWSM",               DUST_SETTING_SECTION, nullptr,                 0.0f, 0.0f,  nullptr,            nullptr, nullptr, DUST_PERF_NONE },
+    { "Filter Radius",       DUST_SETTING_FLOAT, &gConfig.filterRadius,     0.1f, 5.0f,  "FilterRadius",     nullptr, "Size of the shadow softening filter (RTWSM only).",                                                                                                                                         DUST_PERF_NONE   },
+    { "Light Size",          DUST_SETTING_FLOAT, &gConfig.lightSize,        0.5f, 10.0f, "LightSize",        nullptr, "Simulated light source size for contact-hardening shadows (RTWSM PCSS).",                                                                                                                   DUST_PERF_NONE   },
+    { "PCSS",                DUST_SETTING_BOOL,  &gConfig.pcssEnabled,      0.0f, 1.0f,  "PCSS",             nullptr, "Enable Percentage-Closer Soft Shadows for RTWSM (distance-based softness).",                                                                                                                DUST_PERF_MEDIUM },
+    { "Bias Scale",          DUST_SETTING_FLOAT, &gConfig.biasScale,        0.0f, 3.0f,  "BiasScale",        nullptr, "Shadow bias multiplier to reduce RTWSM acne artifacts.",                                                                                                                                    DUST_PERF_NONE },
+    { "Cliff Shadow Fix",    DUST_SETTING_BOOL,  &gConfig.cliffFix,         0.0f, 1.0f,  "CliffFix",         nullptr, "Reduce shadow acne on steep cliffs and vertical faces (RTWSM only). Can make close-range vertical shadows fade out. Integration of Crunk Aint Dead's Cliff Face Shadow Fix mod.",        DUST_PERF_NONE },
+    { "Cliff Fix Distance",  DUST_SETTING_FLOAT, &gConfig.cliffFixDistance, 0.0f, 1.0f,  "CliffFixDistance", nullptr, "Fraction of shadow range where the cliff fix smoothly ramps in (higher = preserves more close-range vertical shadows).",                                                                  DUST_PERF_NONE },
+
+    // === CSM (cascaded shadow maps) ===
+    { "CSM",                 DUST_SETTING_SECTION, nullptr,                 0.0f, 0.0f,  nullptr,            nullptr, nullptr, DUST_PERF_NONE },
+    { "Cascade Lambda",      DUST_SETTING_FLOAT, &gConfig.pssmLambda,       0.0f, 1.0f,  "CascadeLambda",    nullptr, "PSSM cascade split distribution. 0.0 = pure linear (close shadows extend further but blockier); 1.0 = pure logarithmic (close shadows tiny+sharp, far cascades huge). Kenshi's native is ~0.95.", DUST_PERF_NONE },
+    { "CSM Filter Radius",   DUST_SETTING_FLOAT, &gConfig.csmFilterRadius,  0.1f, 5.0f,  "CsmFilterRadius",  nullptr, "Global scale on CSM PCF filter radius. Composes with the per-cascade multipliers below.",                                                                                                   DUST_PERF_NONE },
+    { "CSM Light Size",      DUST_SETTING_FLOAT, &gConfig.csmLightSize,     0.5f, 10.0f, "CsmLightSize",     nullptr, "Simulated light source size for CSM PCSS (contact-hardening). Multiplier on the per-cascade filter radius.",                                                                               DUST_PERF_NONE },
+    { "CSM PCSS",            DUST_SETTING_BOOL,  &gConfig.csmPcssEnabled,   0.0f, 1.0f,  "CsmPcss",          nullptr, "Enable Percentage-Closer Soft Shadows for CSM. Blocker search + variable penumbra. Significant cost.",                                                                                     DUST_PERF_HIGH },
+    { "Cascade Blending",    DUST_SETTING_BOOL,  &gConfig.csmBlendEnabled,  0.0f, 1.0f,  "CascadeBlending",  nullptr, "Smoothly blend between adjacent CSM cascades near their split boundary. Hides the hard resolution step where cascades meet.",                                                            DUST_PERF_MEDIUM },
+    { "Cascade Blend Width", DUST_SETTING_FLOAT, &gConfig.csmBlendWidth,    0.0f, 0.5f,  "CascadeBlendWidth", nullptr, "Width of the blend band at each cascade boundary, as a fraction of cascade depth range (0.05 = subtle, 0.25 = wide).",                                                                    DUST_PERF_NONE },
+    { "Cascade 0 Filter",    DUST_SETTING_FLOAT, &gConfig.cascade0Filter,   0.0f, 5.0f,  "Cascade0Filter",   nullptr, "Filter-radius multiplier for the closest CSM cascade. 1.0 = Kenshi's vanilla taper, >1.0 = softer.",                                                                                       DUST_PERF_NONE },
+    { "Cascade 1 Filter",    DUST_SETTING_FLOAT, &gConfig.cascade1Filter,   0.0f, 5.0f,  "Cascade1Filter",   nullptr, "Filter-radius multiplier for CSM cascade 1 (mid-range shadows).",                                                                                                                            DUST_PERF_NONE },
+    { "Cascade 2 Filter",    DUST_SETTING_FLOAT, &gConfig.cascade2Filter,   0.0f, 5.0f,  "Cascade2Filter",   nullptr, "Filter-radius multiplier for CSM cascade 2 (far-mid shadows).",                                                                                                                              DUST_PERF_NONE },
+    { "Cascade 3 Filter",    DUST_SETTING_FLOAT, &gConfig.cascade3Filter,   0.0f, 5.0f,  "Cascade3Filter",   nullptr, "Filter-radius multiplier for the farthest CSM cascade (where blockiness shows most). >1.0 softens the far-cascade artifacts.",                                                            DUST_PERF_NONE },
 };
 
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)

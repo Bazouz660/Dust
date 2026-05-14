@@ -13,6 +13,16 @@ bool IsInstalled();
 void  SetLambda(float lambda);
 float GetLambda();
 
+// Set the engine-internal shadow far distance (field_0x10[4]). This is the
+// value that drives both the cbuffer split distances AND the shadow camera
+// frusta — so changing it at runtime reshapes the shadow coverage live (as
+// long as Kenshi's orchestrator re-derives camera frusta from this field
+// each frame; verified empirically by observing the next-frame cbuffer).
+// Returns false if PssmDetour hasn't yet captured Kenshi's splits source
+// pointer (sSplitsArray is null until scene-init's first getFloatPointer hit).
+bool  SetShadowFar(float farDistance);
+float GetShadowFar();
+
 // Per-cascade filter-radius multiplier on top of Kenshi's vanilla per-cascade
 // filter taper (csmParams[i].y). idx in [0..3]; scale clamped to [0, 5]. The
 // global "Filter Radius" slider remains in effect on top of this.

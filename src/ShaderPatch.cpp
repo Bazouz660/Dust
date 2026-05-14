@@ -95,15 +95,20 @@ static std::string PatchDeferredShader(const std::string& src)
             // game data. RTW happened to work at b2 because its uniform set
             // is much smaller and stays in b0.
             "// [Dust] Shadow filtering parameters (bound by Shadows plugin at b7)\n"
+            "// Layout must match ShadowCBData in effects/shadows/DustShadows.cpp.\n"
             "cbuffer DustShadowParams : register(b7) {\n"
             "\tfloat dustShadowEnabled;\n"
-            "\tfloat dustFilterRadius;\n"
-            "\tfloat dustLightSize;\n"
-            "\tfloat dustPCSSEnabled;\n"
-            "\tfloat dustBiasScale;\n"
-            "\tfloat dustCliffFixEnabled;\n"
-            "\tfloat dustCliffFixDistance;\n"
-            "\tfloat dustCsmFilterScale;\n"
+            "\tfloat dustRtwFilterRadius;\n"
+            "\tfloat dustRtwLightSize;\n"
+            "\tfloat dustRtwPcssEnabled;\n"
+            "\tfloat dustRtwBiasScale;\n"
+            "\tfloat dustRtwCliffFixEnabled;\n"
+            "\tfloat dustRtwCliffFixDistance;\n"
+            "\tfloat dustCsmFilterRadius;\n"
+            "\tfloat dustCsmLightSize;\n"
+            "\tfloat dustCsmPcssEnabled;\n"
+            "\tfloat dustCsmBlendEnabled;\n"
+            "\tfloat dustCsmBlendWidth;\n"
             "};\n\n"
             // The warp map is 513x2 R32_FLOAT, sampled by vanilla GetOffsetLocationS
             // with tex2Dlod. The warp sampler is point-filtered, so adjacent screen
@@ -144,10 +149,10 @@ static std::string PatchDeferredShader(const std::string& src)
             // (near-vertical) faces past a smoothly-ramped distance to suppress
             // shadow acne on cliffs. Off by default; enabling at low CliffFixDistance
             // can fade out close-range vertical shadows.
-            "\tif (dustCliffFixEnabled > 0.5) {\n"
+            "\tif (dustRtwCliffFixEnabled > 0.5) {\n"
             "\t\tfloat cf_ny = abs(normal.y);\n"
             "\t\tfloat cf_steep = saturate((0.42 - cf_ny) * 4.25);\n"
-            "\t\tfloat cf_gate = saturate((dist - shadowRange * dustCliffFixDistance) * 0.0035);\n"
+            "\t\tfloat cf_gate = saturate((dist - shadowRange * dustRtwCliffFixDistance) * 0.0035);\n"
             "\t\tb += (cf_steep * cf_steep) * cf_gate * 0.0032;\n"
             "\t}\n"
             "\n"
@@ -172,11 +177,11 @@ static std::string PatchDeferredShader(const std::string& src)
             "\t\tfloat2(-0.791559, -0.597705)\n"
             "\t};\n"
             "\n"
-            "\tfloat fr = dustFilterRadius;\n"
-            "\tfloat ls = dustLightSize;\n"
-            "\tb += fr * dustBiasScale;\n"
+            "\tfloat fr = dustRtwFilterRadius;\n"
+            "\tfloat ls = dustRtwLightSize;\n"
+            "\tb += fr * dustRtwBiasScale;\n"
             "\n"
-            "\tif (dustPCSSEnabled > 0.5) {\n"
+            "\tif (dustRtwPcssEnabled > 0.5) {\n"
             "\t\tfloat bSum = 0;\n"
             "\t\tfloat bCnt = 0;\n"
             "\t\t[unroll]\n"
@@ -210,11 +215,136 @@ static std::string PatchDeferredShader(const std::string& src)
             "\tshadow /= 12.0;\n"
             "\treturn shadow;\n"
             "}\n\n"
-            // CSM filter wrapper: scales the per-cascade PCF filter radius
-            // (csmParams[i][1] = kCsmPcfFilterRadius) by user-controllable
-            // dustCsmFilterScale before forwarding to vanilla. Cascade
-            // selection, sampleProj basis, and PCF kernel are vanilla — only
-            // the radius changes. Disabled flag falls back to scale = 1.0.
+            // CSM Poisson disk for blocker search + PCF. Reuse the same 12-tap
+            // table as DustRTWShadow; values are pre-normalized to length ~1.
+            "static const float2 kDustCsmPoisson[12] = {\n"
+            "\tfloat2(-0.326212, -0.405810),\n"
+            "\tfloat2(-0.840144, -0.073580),\n"
+            "\tfloat2(-0.695914,  0.457137),\n"
+            "\tfloat2(-0.203345,  0.620716),\n"
+            "\tfloat2( 0.962340, -0.194983),\n"
+            "\tfloat2( 0.473434, -0.480026),\n"
+            "\tfloat2( 0.519456,  0.767022),\n"
+            "\tfloat2( 0.185461, -0.893124),\n"
+            "\tfloat2( 0.507431,  0.064425),\n"
+            "\tfloat2( 0.896420,  0.412458),\n"
+            "\tfloat2(-0.321940, -0.932615),\n"
+            "\tfloat2(-0.791559, -0.597705)\n"
+            "};\n\n"
+
+            // Sample a single cascade with Poisson PCF + optional PCSS.
+            //
+            // Two specializations:
+            //   DustSampleCascade8 — 8 taps, 4-tap PCSS early-exit. Used for
+            //                       cascades 0..N-2 (near + mid).
+            //   DustSampleCascade4 — 4 taps, 2-tap PCSS early-exit. Used for
+            //                       the far cascade where texels are huge
+            //                       and extra samples only blur noise.
+            //
+            // Both specializations:
+            //   - PCSS blocker search does a half-count probe first, exits if
+            //     no blockers found. Wave-uniform when the surface is fully
+            //     lit (most pixels in the common case), saving ~half the
+            //     blocker search cost on those waves.
+            //   - sampleProj is the vanilla surface-aligned basis kept so the
+            //     filter footprint stays tangent to the lit surface — same
+            //     acne suppression the vanilla PCF gets.
+            //   - pcfSample (from shadowFunctions.hlsl) returns
+            //     storedDepth - receiverDepth, so a negative result means
+            //     this sample is occluded.
+            "float DustSampleCascade8(\n"
+            "\tsampler2D shadowDepthMap, sampler2D jitterMap,\n"
+            "\tfloat3 shadowUv, float3x3 sampleProj, float baseRadius)\n"
+            "{\n"
+            "\tfloat2 noise = tex2Dlod(jitterMap, float4(shadowUv.xy * 1024.0, 0, 0)).xy;\n"
+            "\tfloat sa, ca;\n"
+            "\tsincos(noise.x * 6.28318530718, sa, ca);\n"
+            "\tfloat2x2 rotBase = float2x2(ca, sa, -sa, ca);\n"
+            "\n"
+            "\tfloat radius = baseRadius;\n"
+            "\tif (dustCsmPcssEnabled > 0.5) {\n"
+            "\t\tfloat searchR = baseRadius * dustCsmLightSize;\n"
+            "\t\tfloat2x2 searchRot = rotBase * searchR;\n"
+            "\t\tfloat blockerDeltaSum = 0;\n"
+            "\t\tfloat blockerCnt = 0;\n"
+            // Probe with first 4 taps; if no blockers, surface is fully lit
+            // and we can skip the remaining 4 taps entirely.
+            "\t\t[unroll]\n"
+            "\t\tfor (int j = 0; j < 4; j++) {\n"
+            "\t\t\tfloat d = pcfSample(shadowDepthMap, shadowUv, sampleProj, searchRot, kDustCsmPoisson[j]);\n"
+            "\t\t\tif (d < 0) { blockerDeltaSum -= d; blockerCnt += 1; }\n"
+            "\t\t}\n"
+            "\t\tif (blockerCnt > 0) {\n"
+            "\t\t\t[unroll]\n"
+            "\t\t\tfor (int j = 4; j < 8; j++) {\n"
+            "\t\t\t\tfloat d = pcfSample(shadowDepthMap, shadowUv, sampleProj, searchRot, kDustCsmPoisson[j]);\n"
+            "\t\t\t\tif (d < 0) { blockerDeltaSum -= d; blockerCnt += 1; }\n"
+            "\t\t\t}\n"
+            "\t\t\tfloat avgDelta = blockerDeltaSum / blockerCnt;\n"
+            "\t\t\tfloat receiver = max(shadowUv.z, 0.001);\n"
+            "\t\t\tfloat pen = (avgDelta / (receiver - avgDelta)) * (dustCsmLightSize * baseRadius);\n"
+            "\t\t\tradius = clamp(pen, baseRadius * 0.5, baseRadius * 4.0);\n"
+            "\t\t}\n"
+            "\t}\n"
+            "\n"
+            "\tfloat2x2 rotFinal = rotBase * radius;\n"
+            "\tfloat shadow = 0;\n"
+            "\t[unroll]\n"
+            "\tfor (int k = 0; k < 8; k++) {\n"
+            "\t\tfloat d = pcfSample(shadowDepthMap, shadowUv, sampleProj, rotFinal, kDustCsmPoisson[k]);\n"
+            "\t\tshadow += (d >= 0) ? 1.0 : 0.0;\n"
+            "\t}\n"
+            "\treturn shadow * (1.0 / 8.0);\n"
+            "}\n\n"
+
+            "float DustSampleCascade4(\n"
+            "\tsampler2D shadowDepthMap, sampler2D jitterMap,\n"
+            "\tfloat3 shadowUv, float3x3 sampleProj, float baseRadius)\n"
+            "{\n"
+            "\tfloat2 noise = tex2Dlod(jitterMap, float4(shadowUv.xy * 1024.0, 0, 0)).xy;\n"
+            "\tfloat sa, ca;\n"
+            "\tsincos(noise.x * 6.28318530718, sa, ca);\n"
+            "\tfloat2x2 rotBase = float2x2(ca, sa, -sa, ca);\n"
+            "\n"
+            "\tfloat radius = baseRadius;\n"
+            "\tif (dustCsmPcssEnabled > 0.5) {\n"
+            "\t\tfloat searchR = baseRadius * dustCsmLightSize;\n"
+            "\t\tfloat2x2 searchRot = rotBase * searchR;\n"
+            "\t\tfloat blockerDeltaSum = 0;\n"
+            "\t\tfloat blockerCnt = 0;\n"
+            "\t\t[unroll]\n"
+            "\t\tfor (int j = 0; j < 2; j++) {\n"
+            "\t\t\tfloat d = pcfSample(shadowDepthMap, shadowUv, sampleProj, searchRot, kDustCsmPoisson[j]);\n"
+            "\t\t\tif (d < 0) { blockerDeltaSum -= d; blockerCnt += 1; }\n"
+            "\t\t}\n"
+            "\t\tif (blockerCnt > 0) {\n"
+            "\t\t\t[unroll]\n"
+            "\t\t\tfor (int j = 2; j < 4; j++) {\n"
+            "\t\t\t\tfloat d = pcfSample(shadowDepthMap, shadowUv, sampleProj, searchRot, kDustCsmPoisson[j]);\n"
+            "\t\t\t\tif (d < 0) { blockerDeltaSum -= d; blockerCnt += 1; }\n"
+            "\t\t\t}\n"
+            "\t\t\tfloat avgDelta = blockerDeltaSum / blockerCnt;\n"
+            "\t\t\tfloat receiver = max(shadowUv.z, 0.001);\n"
+            "\t\t\tfloat pen = (avgDelta / (receiver - avgDelta)) * (dustCsmLightSize * baseRadius);\n"
+            "\t\t\tradius = clamp(pen, baseRadius * 0.5, baseRadius * 4.0);\n"
+            "\t\t}\n"
+            "\t}\n"
+            "\n"
+            "\tfloat2x2 rotFinal = rotBase * radius;\n"
+            "\tfloat shadow = 0;\n"
+            "\t[unroll]\n"
+            "\tfor (int k = 0; k < 4; k++) {\n"
+            "\t\tfloat d = pcfSample(shadowDepthMap, shadowUv, sampleProj, rotFinal, kDustCsmPoisson[k]);\n"
+            "\t\tshadow += (d >= 0) ? 1.0 : 0.0;\n"
+            "\t}\n"
+            "\treturn shadow * (1.0 / 4.0);\n"
+            "}\n\n"
+
+            // DustCascadeShadow: replaces vanilla computeShadowMultiplier when
+            // dustShadowEnabled > 0.5. Falls back to vanilla otherwise so the
+            // Shadows plugin's Enabled toggle works.
+            // Adds: Poisson PCF, optional PCSS blocker search, smooth blend
+            // between adjacent cascades in the band [splitFar - bandWidth, splitFar].
             "float DustCascadeShadow(\n"
             "\tfloat4 shadowParams,\n"
             "\tfloat4x4 shadowViewMat,\n"
@@ -229,18 +359,71 @@ static std::string PatchDeferredShader(const std::string& src)
             "\tfloat3 normalWs,\n"
             "\tout float3 debugColorMask)\n"
             "{\n"
-            "\tfloat radiusScale = (dustShadowEnabled > 0.5) ? dustCsmFilterScale : 1.0;\n"
-            "\tfloat4 modCsmParams[SHADOW_MAP_COUNT];\n"
+            "\tdebugColorMask = float3(1, 1, 1);\n"
+            "\tif (dustShadowEnabled < 0.5)\n"
+            "\t\treturn computeShadowMultiplier(\n"
+            "\t\t\tshadowParams, shadowViewMat,\n"
+            "\t\t\tcsmScale, csmTrans, csmParams, csmUvBounds,\n"
+            "\t\t\tshadowDepthMap, shadowJitterMap,\n"
+            "\t\t\tposWs, posSs, normalWs, debugColorMask);\n"
+            "\n"
+            // Past the last cascade: no shadow.
+            "\tif (posSs.z > csmParams[SHADOW_MAP_COUNT - 1][0])\n"
+            "\t\treturn 1.0;\n"
+            "\n"
+            // Cascade selection — matches vanilla's monotone bucketing.
+            // After the loop, idx is the smallest i where posSs.z <= csmParams[i][0].
+            "\tint idx = 0;\n"
             "\t[unroll]\n"
-            "\tfor (int i = 0; i < SHADOW_MAP_COUNT; i++) {\n"
-            "\t\tmodCsmParams[i] = csmParams[i];\n"
-            "\t\tmodCsmParams[i][1] *= radiusScale;\n"
+            "\tfor (int i = 0; i < SHADOW_MAP_COUNT - 1; i++) {\n"
+            "\t\tif (posSs.z > csmParams[i][0]) idx = i + 1;\n"
             "\t}\n"
-            "\treturn computeShadowMultiplier(\n"
-            "\t\tshadowParams, shadowViewMat,\n"
-            "\t\tcsmScale, csmTrans, modCsmParams, csmUvBounds,\n"
-            "\t\tshadowDepthMap, shadowJitterMap,\n"
-            "\t\tposWs, posSs, normalWs, debugColorMask);\n"
+            "\n"
+            // Surface-aligned sample basis (vanilla pattern). Computed once
+            // and shared between both cascade samples in the blend band.
+            "\tfloat3 normalLs = normalize(mul(shadowViewMat, float4(normalWs, 0)).xyz);\n"
+            "\tfloat3 xDir = float3(1, 0, 0) - normalLs.x * normalLs;\n"
+            "\tfloat3 yDir = float3(0, 1, 0) - normalLs.y * normalLs;\n"
+            "\tfloat3 zDir = float3(0, 0, 1) - normalLs.z * normalLs;\n"
+            "\tfloat3x3 sampleProj = float3x3(xDir, yDir, zDir);\n"
+            "\n"
+            "\tfloat3 posLs = mul(shadowViewMat, posWs).xyz;\n"
+            "\n"
+            // Sample primary cascade. Far cascade uses the cheaper 4-tap
+            // path: huge texels mean extra samples mostly blur noise.
+            "\tfloat3 shadowUv0 = csmTrans[idx].xyz + csmScale[idx].xyz * posLs;\n"
+            "\tfloat baseRadius0 = csmParams[idx][1] * dustCsmFilterRadius;\n"
+            "\tfloat s0 = (idx >= SHADOW_MAP_COUNT - 1)\n"
+            "\t\t? DustSampleCascade4(shadowDepthMap, shadowJitterMap, shadowUv0, sampleProj, baseRadius0)\n"
+            "\t\t: DustSampleCascade8(shadowDepthMap, shadowJitterMap, shadowUv0, sampleProj, baseRadius0);\n"
+            "\n"
+            "\tfloat shadowMul = s0;\n"
+            "\n"
+            // Cascade blending. Activate inside the band approaching this
+            // cascade's far split. Sample the next cascade only when the
+            // band is actually entered (uniform branch in screen tiles).
+            // Next cascade is always farther — if next is the last one, use
+            // the cheap 4-tap path; otherwise the 8-tap.
+            "\tif (dustCsmBlendEnabled > 0.5 && idx + 1 < SHADOW_MAP_COUNT) {\n"
+            "\t\tfloat splitFar  = csmParams[idx][0];\n"
+            "\t\tfloat splitNear = (idx > 0) ? csmParams[idx - 1][0] : 0.0;\n"
+            "\t\tfloat band      = max((splitFar - splitNear) * dustCsmBlendWidth, 1e-5);\n"
+            "\t\tfloat blendT    = saturate((posSs.z - (splitFar - band)) / band);\n"
+            "\t\tif (blendT > 0.0) {\n"
+            "\t\t\tfloat3 shadowUv1 = csmTrans[idx + 1].xyz + csmScale[idx + 1].xyz * posLs;\n"
+            "\t\t\tfloat baseRadius1 = csmParams[idx + 1][1] * dustCsmFilterRadius;\n"
+            "\t\t\tfloat s1 = (idx + 1 >= SHADOW_MAP_COUNT - 1)\n"
+            "\t\t\t\t? DustSampleCascade4(shadowDepthMap, shadowJitterMap, shadowUv1, sampleProj, baseRadius1)\n"
+            "\t\t\t\t: DustSampleCascade8(shadowDepthMap, shadowJitterMap, shadowUv1, sampleProj, baseRadius1);\n"
+            "\t\t\tshadowMul = lerp(s0, s1, blendT);\n"
+            "\t\t}\n"
+            "\t}\n"
+            "\n"
+            // Vanilla ambient-floor pass: shadow value is lifted by the
+            // ambient term so unlit areas stay above shadowAmbient.
+            "\tfloat shadowAmbient = shadowParams[2];\n"
+            "\tshadowMul = shadowAmbient + shadowMul * (1.0 - shadowAmbient);\n"
+            "\treturn shadowMul;\n"
             "}\n\n";
         result.insert(pos3, inject3);
         Log("ShaderPatch: injected DustShadowParams cbuffer + DustRTWShadow + DustCascadeShadow passthrough");

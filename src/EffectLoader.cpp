@@ -572,6 +572,10 @@ static int HostGetCameraPos(float outXYZ[3])
 {
     return TerrainTess::GetCameraPos(outXYZ) ? 1 : 0;
 }
+static int HostSetShadowRange(float farDistance)
+{
+    return PssmDetour::SetShadowFar(farDistance) ? 1 : 0;
+}
 
 // ==================== EffectLoader ====================
 
@@ -627,6 +631,9 @@ void EffectLoader::BuildHostAPI()
     hostAPI_.SetTerrainTessEnabled      = HostSetTerrainTessEnabled;
     hostAPI_.GetTerrainTessGpuTimeMs    = HostGetTerrainTessGpuTimeMs;
     hostAPI_.GetCameraPos               = HostGetCameraPos;
+
+    // v9 additions
+    hostAPI_.SetShadowRange             = HostSetShadowRange;
 }
 
 // ==================== v3: Config I/O ====================

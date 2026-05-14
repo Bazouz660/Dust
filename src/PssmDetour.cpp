@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <atomic>
 #include <cmath>
+#include <limits>
 
 namespace PssmDetour
 {
@@ -241,6 +242,10 @@ static float  sCachedFar            = 0.0f;
 static std::atomic<float> sCascadeFilterScale[4] = {
     {1.0f}, {1.0f}, {1.0f}, {1.0f}              // per-cascade filter multipliers
 };
+// User-requested shadow far. NaN means "no override requested yet" — capture
+// path leaves Kenshi's native value alone. Otherwise capture applies this
+// value at the moment sSplitsArray becomes non-null.
+static std::atomic<float> sRequestedFar{std::numeric_limits<float>::quiet_NaN()};
 
 // Compute and write splits[1..3] into a 5-float [near, s1, s2, s3, far] array
 // using the current lambda + cached near/far. Returns true if writes happened.
@@ -284,6 +289,26 @@ void SetLambda(float lambda)
 }
 
 float GetLambda() { return sLambda.load(); }
+
+bool SetShadowFar(float farDistance)
+{
+    if (farDistance < 1.0f)       farDistance = 1.0f;
+    if (farDistance > 100000.0f)  farDistance = 100000.0f;
+    // Always remember the request; the capture path applies it later if
+    // Kenshi hasn't yet handed us a splits source pointer.
+    sRequestedFar.store(farDistance);
+
+    if (!sSplitsArray || !(sCachedNear > 0.0f)) return false;
+    float minFar = sCachedNear + 1.0f;
+    if (farDistance < minFar) farDistance = minFar;
+
+    sSplitsArray[4] = farDistance;
+    sCachedFar      = farDistance;
+    RepushAll();   // recompute splits[1..3] using new far + push to cbuffer
+    return true;
+}
+
+float GetShadowFar() { return sCachedFar; }
 
 void SetCascadeFilterScale(int idx, float scale)
 {
@@ -372,7 +397,7 @@ static float* Hook_getFloatPointer(void* self, size_t pos)
                 {
                     float* fp = (float*)field0x10;
                     const float nearD = fp[0];
-                    const float farD  = fp[4];
+                    float farD  = fp[4];
                     const float lambda = sLambda.load();
                     const int N = 4;
 
@@ -382,6 +407,17 @@ static float* Hook_getFloatPointer(void* self, size_t pos)
                     sSplitsArray  = fp;
                     sCachedNear   = nearD;
                     sCachedFar    = farD;
+                    // Apply a pending shadow-far override the plugin may
+                    // have requested before this capture happened (e.g.,
+                    // ShadowInit ran before Kenshi's scene init). Self-compare
+                    // is NaN check; default sentinel means "no override".
+                    float pending = sRequestedFar.load();
+                    if (pending == pending && pending > nearD + 1.0f)
+                    {
+                        fp[4]       = pending;
+                        farD        = pending;
+                        sCachedFar  = pending;
+                    }
                     // Filter radii (csmParams[i].y) get captured on a later
                     // hook call — see top of Hook_getFloatPointer.
 
