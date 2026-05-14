@@ -7,13 +7,15 @@ namespace GeometryCapture
 {
 
 static std::vector<CapturedDraw> sCaptures;
-static bool sInGBufferPass = false;
+// Exposed to the inline HasActiveCapture() fast-path used by D3D11 hooks.
+namespace detail { bool sInGBufferPass = false; uint32_t sCaptureFlags = 0; }
+using detail::sInGBufferPass;
+using detail::sCaptureFlags;
 static UINT sExpectedWidth  = 0;
 static UINT sExpectedHeight = 0;
 static ID3D11Device* sCachedDevice = nullptr;
 
 static uint32_t sFramesCaptured = 0;
-static uint32_t sCaptureFlags = 0;
 
 // Staging buffer pool — each buffer has its own size (must match the CB it copies
 // from, since D3D11 CopyResource requires identical ByteWidth for buffers).

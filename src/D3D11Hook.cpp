@@ -892,7 +892,10 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     if (Survey::IsActive())
         SurveyRecorder::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 
-    GeometryCapture::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
+    // Inline early-out: skip the call entirely when no capture session is
+    // active. Saves the function-call overhead on ~2000 draws/frame.
+    if (GeometryCapture::HasActiveCapture())
+        GeometryCapture::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 
     // All three checks are inline bool loads. For non-terrain/non-blood draws
     // (the vast majority — ~5000/frame in Kenshi) we never enter the function
@@ -919,9 +922,10 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
                                                 StartIndexLocation, BaseVertexLocation,
                                                 StartInstanceLocation);
 
-    GeometryCapture::OnDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
-                                            StartIndexLocation, BaseVertexLocation,
-                                            StartInstanceLocation);
+    if (GeometryCapture::HasActiveCapture())
+        GeometryCapture::OnDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
+                                                StartIndexLocation, BaseVertexLocation,
+                                                StartInstanceLocation);
 
     // Instanced terrain draws aren't typical (terrain isn't instanced), so
     // skip tessellation routing here for now.

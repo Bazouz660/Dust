@@ -59,6 +59,22 @@ struct CapturedDraw
 
 namespace GeometryCapture
 {
+    namespace detail
+    {
+        // Exposed for inline fast-path in HookedDrawIndexed. When neither flag
+        // is set (most game frames — no active capture session), the inline
+        // check below short-circuits the call into OnDrawIndexed entirely.
+        extern bool sInGBufferPass;
+        extern uint32_t sCaptureFlags;
+    }
+
+    // Inline: true when at least one OnDraw call would do meaningful work.
+    // Lets the hooks skip the function call (~5-10ns) for the dominant case.
+    inline bool HasActiveCapture()
+    {
+        return detail::sInGBufferPass && detail::sCaptureFlags != 0;
+    }
+
     // Called from HookedOMSetRenderTargets to detect GBuffer pass start/end.
     // Must be called AFTER the original OMSetRenderTargets so the state is committed.
     void OnOMSetRenderTargets(ID3D11DeviceContext* ctx, UINT numViews,
