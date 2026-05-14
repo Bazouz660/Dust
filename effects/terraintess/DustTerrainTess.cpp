@@ -18,25 +18,33 @@ struct TerrainTessConfig
     bool  enabled          = true;
 
     // Tessellation factor + LOD fade.
-    int   maxFactor        = 32;
-    float factFadeStart    = 20.0f;
-    float factFadeEnd      = 150.0f;
-    int   factorSnapStep   = 4;
+    int   maxFactor        = 16;
+    int   factorSnapStep   = 6;
 
-    // Displacement (bandpass + soft saturation).
-    float amplitude        = 1.0f;
+    // Tessellation radius in world units (Kenshi unit ~cm; 30000 ≈ 300m).
+    // Single user-facing knob that drives every distance threshold:
+    //   - factor fade band:  radius * 0.3  -> radius
+    //   - amp fade band:     radius * 0.3  -> radius
+    //   - DS HF tap cutoff:  radius * 0.15 (far-hi)
+    //   - DS mid tap cutoff: radius * 0.5  (far-mid)
+    //   - CPU per-chunk skip past:  radius * 1.05
+    // PushRuntime() derives all of these and ships them to the host. The
+    // user only ever touches Tess Radius.
+    float tessRadius       = 30000.0f;
+
+    // Displacement (bandpass + soft saturation). Kept as user-tunable
+    // because they're quality knobs, not distance knobs.
+    float amplitude        = 4.0f;
     float displacementBias = 0.0f;
-    float sharpMip         = 1.0f;    // sharp tap mip; mid at +2, blurry at +4
-    float scale            = 0.05f;   // saturation knee
-    float hfWeight         = 0.5f;    // high-freq slice gain (2-point falloff curve)
-    float spikeCap         = 0.0f;    // LF-aware spike cap on the (h_full − h_lf) excess; 0 = off
-    float smoothHi         = 0.0f;    // per-slice mip offset for slice_hi tap pair (K..K+1)
-    float smoothHiMid      = 0.0f;    // per-slice mip offset for slice_hm tap pair (K+1..K+2)
+    float sharpMip         = 0.0f;    // sharp tap mip; mid at +2, blurry at +4
+    float scale            = 0.04f;   // saturation knee
+    float hfWeight         = 1.0f;    // high-freq slice gain (2-point falloff curve)
+    float spikeCap         = 4.0f;    // LF-aware spike cap on the (h_full − h_lf) excess; 0 = off
+    float smoothHi         = 6.0f;    // per-slice mip offset for slice_hi tap pair (K..K+1)
+    float smoothHiMid      = 6.0f;    // per-slice mip offset for slice_hm tap pair (K+1..K+2)
     float smoothMid        = 0.0f;    // per-slice mip offset for slice_mid tap pair (K+2..K+4)
-    float smoothLo         = 0.0f;    // per-slice mip offset for slice_lo tap pair (K+4..K+8)
+    float smoothLo         = 2.0f;    // per-slice mip offset for slice_lo tap pair (K+4..K+8)
     bool  ampFadeEnabled   = true;
-    float ampFadeStart     = 80.0f;
-    float ampFadeEnd       = 150.0f;
     float dispDirWorldUp   = 0.0f;
 
     // Debug.
@@ -52,18 +60,35 @@ static const DustHostAPI* gHost = nullptr;
 // hook (which the framework calls regardless of injection point).
 static float sGpuTimeMs = 0.0f;
 
-// Mirror TerrainTess::Controls layout: 20 floats matching the host's HLSL
-// cbuffer field order. Booleans/ints converted to float here.
+// Mirror TerrainTess::Controls layout: 23 floats matching the host's HLSL
+// cbuffer field order. Booleans/ints converted to float here. The host
+// memcpy's these directly into the start of Controls (1 pad float and 3
+// mask float4s follow, keeping the layout 16-byte aligned).
+//
+// Distance fields (factFadeStart, ampFadeStart, farHi, farMid, skipDistance)
+// are derived from a single user-facing `tessRadius` here — never exposed
+// directly in the GUI. The ratios pick a sensible band where chunks fade
+// to factor=1 by the radius and CPU-side skip kicks in just past it.
 static void PushRuntime()
 {
     if (!gHost || !gHost->SetTerrainTessControls) return;
-    float buf[20] = {};
+
+    const float r = gConfig.tessRadius;
+    const float factFadeStart = r * 0.3f;
+    const float factFadeEnd   = r;
+    const float ampFadeStart  = r * 0.3f;
+    const float ampFadeEnd    = r;
+    const float farHi         = r * 0.15f;
+    const float farMid        = r * 0.5f;
+    const float skipDistance  = r * 1.05f;
+
+    float buf[23] = {};
     buf[0]  = (float)gConfig.maxFactor;
-    buf[1]  = gConfig.factFadeStart;
-    buf[2]  = gConfig.factFadeEnd;
+    buf[1]  = factFadeStart;
+    buf[2]  = factFadeEnd;
     buf[3]  = gConfig.amplitude;
-    buf[4]  = gConfig.ampFadeStart;
-    buf[5]  = gConfig.ampFadeEnd;
+    buf[4]  = ampFadeStart;
+    buf[5]  = ampFadeEnd;
     buf[6]  = gConfig.ampFadeEnabled ? 1.0f : 0.0f;
     buf[7]  = (float)gConfig.debugViewMode;
     buf[8]  = gConfig.displacementBias;
@@ -78,6 +103,9 @@ static void PushRuntime()
     buf[17] = gConfig.smoothHiMid;
     buf[18] = gConfig.smoothMid;
     buf[19] = gConfig.smoothLo;
+    buf[20] = farHi;
+    buf[21] = farMid;
+    buf[22] = skipDistance;
     gHost->SetTerrainTessControls(buf);
 }
 
@@ -123,9 +151,8 @@ static DustSettingDesc gSettings[] = {
     { "Enabled",           DUST_SETTING_BOOL,  &gConfig.enabled,         0.0f,  1.0f,  "Enabled",         nullptr, "Master enable. When off, terrain renders flat with no HS/DS routing.", DUST_PERF_HIGH },
 
     // Tessellation
+    { "Tess Radius",       DUST_SETTING_FLOAT, &gConfig.tessRadius,      0.0f, 200000.0f, "TessRadius",  nullptr, "World-space radius (camera-relative, in Kenshi units ~cm) of the tessellated zone. Past this, terrain is rendered without tessellation entirely. Drives all distance thresholds — factor fade, amp fade, DS LOD cutoffs, and CPU per-chunk skip — via fixed ratios. Lower = bigger fps win, smaller visible-displacement zone. HIGH perf impact.", DUST_PERF_HIGH },
     { "Max Factor",        DUST_SETTING_INT,   &gConfig.maxFactor,       1.0f,  64.0f, "MaxFactor",       nullptr, "Maximum tess subdivision factor at near range. Higher = denser mesh, more displacement detail.", DUST_PERF_HIGH },
-    { "Factor Fade Start", DUST_SETTING_FLOAT, &gConfig.factFadeStart,   0.0f,  500.0f,"FactFadeStart",   nullptr, "Distance (clip-space depth) at which tessellation begins fading out toward 1.", DUST_PERF_NONE },
-    { "Factor Fade End",   DUST_SETTING_FLOAT, &gConfig.factFadeEnd,    10.0f,  500.0f,"FactFadeEnd",     nullptr, "Distance at which tessellation fully drops to factor 1 (no subdivision).", DUST_PERF_NONE },
     { "Factor Snap Step",  DUST_SETTING_INT,   &gConfig.factorSnapStep,  1.0f,  16.0f, "FactorSnapStep",  nullptr, "Quantize tess factor to multiples of this for stable LOD. Bigger = more stable, coarser steps.", DUST_PERF_NONE },
 
     // Displacement (bandpass + soft saturation)
@@ -140,13 +167,11 @@ static DustSettingDesc gSettings[] = {
     { "Smooth Mid",        DUST_SETTING_FLOAT, &gConfig.smoothMid,       0.0f,  6.0f,  "SmoothMid",       nullptr, "Per-slice mip offset for the slice_mid tap pair. 0 = standard band at gSharpMip+2..+4. Raising it blurs the mid-freq band only.", DUST_PERF_LOW },
     { "Smooth Lo",         DUST_SETTING_FLOAT, &gConfig.smoothLo,        0.0f,  6.0f,  "SmoothLo",        nullptr, "Per-slice mip offset for the slice_lo tap pair. 0 = standard band at gSharpMip+4..+8. Raising it blurs the low-freq band only (dune-scale features get smoother).", DUST_PERF_LOW },
     { "Disp Dir World-Up", DUST_SETTING_FLOAT, &gConfig.dispDirWorldUp,  0.0f,  1.0f,  "DispDirWorldUp",  nullptr, "Blend between per-vertex normal (0) and world-up (1) for displacement direction. 1 fixes seams from boundary normal mismatches.", DUST_PERF_NONE },
-    { "Amp Fade Enabled",  DUST_SETTING_BOOL,  &gConfig.ampFadeEnabled,  0.0f,  1.0f,  "AmpFadeEnabled",  nullptr, "Fade displacement amplitude with distance.", DUST_PERF_NONE },
-    { "Amp Fade Start",    DUST_SETTING_FLOAT, &gConfig.ampFadeStart,    0.0f,  500.0f,"AmpFadeStart",    nullptr, "Distance at which amplitude begins fading toward zero.", DUST_PERF_NONE },
-    { "Amp Fade End",      DUST_SETTING_FLOAT, &gConfig.ampFadeEnd,     10.0f,  500.0f,"AmpFadeEnd",      nullptr, "Distance at which amplitude reaches zero.", DUST_PERF_NONE },
+    { "Amp Fade Enabled",  DUST_SETTING_BOOL,  &gConfig.ampFadeEnabled,  0.0f,  1.0f,  "AmpFadeEnabled",  nullptr, "Fade displacement amplitude with distance. Disabling makes displacement uniform across the tess radius (the fade band still affects factor but amp stays full).", DUST_PERF_NONE },
 
     // Debug
-    { "Debug: View Mode",  DUST_SETTING_INT,   &gConfig.debugViewMode,   0.0f,  2.0f,  "DebugViewMode",  nullptr, "0=off, 1=PS visible luminance (grayscale), 2=DS-replica diff overlay (bright = where the DS displacement formula diverges from the PS visible; black = pixel-exact match).", DUST_PERF_NONE },
-    { "Debug: Wireframe",  DUST_SETTING_INT,   &gConfig.wireframe,       0.0f,  3.0f,  "Wireframe",      nullptr, "0=off, 1=tess wireframe, 2=vanilla mesh wireframe (no tess), 3=strip→list IB conversion + TRIANGLELIST + no tess (isolates IB conversion).", DUST_PERF_NONE },
+    { "Debug: View Mode",  DUST_SETTING_INT,   &gConfig.debugViewMode,   0.0f,  3.0f,  "DebugViewMode",  nullptr, "0=off, 1=PS visible luminance (grayscale), 2=DS-replica diff overlay, 3=chunk-distance heatmap (green=close/kept by CPU-skip, red=far/would-be-skipped — mode 3 disables actual skipping so every chunk shows its color).", DUST_PERF_NONE },
+    { "Debug: Wireframe",  DUST_SETTING_INT,   &gConfig.wireframe,       0.0f,  4.0f,  "Wireframe",      nullptr, "0=off, 1=tess wireframe, 2=vanilla mesh wireframe (no tess), 3=strip→list IB conversion + TRIANGLELIST + no tess (isolates IB conversion), 4=DIAG: force-skip tess on every terrain draw (no HS/DS — for perf bisection).", DUST_PERF_NONE },
 };
 
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)

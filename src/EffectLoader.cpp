@@ -548,15 +548,17 @@ static void HostSetPOMThreshold(float threshold)   { POMState::SetThreshold(thre
 static void HostSetPOMThresholdWidth(float width)  { POMState::SetThresholdWidth(width); }
 static void HostSetPOMSamples(int minS, int maxS)  { POMState::SetMinSamples(minS); POMState::SetMaxSamples(maxS); }
 
-// Terrain tessellation. Plugin pushes the runtime cbuffer (20 floats matching
+// Terrain tessellation. Plugin pushes the runtime cbuffer (23 floats matching
 // the plugin-set portion of TerrainTess::Controls).
 static void HostSetTerrainTessControls(const float* controls)
 {
     if (!controls) return;
     auto* dst = TerrainTess::GetControls();
-    // Plugin sends exactly 20 floats; never overwrite the mask fields
-    // that follow.
-    if (dst) memcpy(dst, controls, 20 * sizeof(float));
+    // Plugin sends exactly 23 floats; the 1 pad float and 3 mask float4s
+    // that follow are owned by the host (per-PS blend masks populated in
+    // OnPixelShaderCreated) and must not be overwritten here.
+    if (dst) memcpy(dst, controls, 23 * sizeof(float));
+    TerrainTess::MarkControlsDirty();
 }
 static void HostSetTerrainTessEnabled(int enabled)
 {
@@ -565,6 +567,10 @@ static void HostSetTerrainTessEnabled(int enabled)
 static float HostGetTerrainTessGpuTimeMs(void)
 {
     return TerrainTess::GetGpuTimeMs();
+}
+static int HostGetCameraPos(float outXYZ[3])
+{
+    return TerrainTess::GetCameraPos(outXYZ) ? 1 : 0;
 }
 
 // ==================== EffectLoader ====================
@@ -620,6 +626,7 @@ void EffectLoader::BuildHostAPI()
     hostAPI_.SetTerrainTessControls     = HostSetTerrainTessControls;
     hostAPI_.SetTerrainTessEnabled      = HostSetTerrainTessEnabled;
     hostAPI_.GetTerrainTessGpuTimeMs    = HostGetTerrainTessGpuTimeMs;
+    hostAPI_.GetCameraPos               = HostGetCameraPos;
 }
 
 // ==================== v3: Config I/O ====================

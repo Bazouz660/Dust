@@ -72,7 +72,7 @@
 extern "C" {
 #endif
 
-#define DUST_API_VERSION 7
+#define DUST_API_VERSION 8
 
 // Injection points in the rendering pipeline
 typedef enum DustInjectionPoint {
@@ -332,6 +332,13 @@ typedef struct DustHostAPI {
     // by the plugin to feed the framework's perf display. Returns 0 if the
     // most recent query data isn't ready yet.
     float (*GetTerrainTessGpuTimeMs)(void);
+
+    // Camera world position (API v8+). Returns 1 and writes (x,y,z) into the
+    // 3-float output buffer when the host has a recent position, 0 otherwise
+    // (e.g., very early in the frame before any terrain shader has been
+    // bound). Read from the bound terrain PS's $Globals.cameraPos uniform —
+    // updated each time a terrain draw passes through the engine.
+    int (*GetCameraPos)(float outXYZ[3]);
 } DustHostAPI;
 
 // Performance impact hint for a single setting (API v3.2+).

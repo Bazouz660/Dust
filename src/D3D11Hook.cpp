@@ -662,6 +662,7 @@ static HRESULT STDMETHODCALLTYPE HookedCreateVertexShader(
         SurveyRecorder::OnVertexShaderCreated(pShaderBytecode, BytecodeLength, *ppVertexShader);
         ShaderMetadata::OnVertexShaderCreated(pShaderBytecode, BytecodeLength, *ppVertexShader);
         ShaderDatabase::OnVertexShaderCreated(*ppVertexShader);
+        TerrainTess::OnVertexShaderCreated(pShaderBytecode, BytecodeLength, *ppVertexShader);
     }
     return hr;
 }
@@ -831,6 +832,42 @@ static void STDMETHODCALLTYPE HookedDraw(
     }
 }
 
+// ==================== PSSetShader / VSSetShader hooks ====================
+// Maintain TerrainTess's cached "is the current VS+PS a terrain pair" bool
+// so the per-DrawIndexed check becomes a single bool load. Without this,
+// every non-terrain draw (UI, characters, props) eats two COM AddRef/Release
+// pairs + several map lookups just to confirm "not terrain".
+
+typedef void (STDMETHODCALLTYPE* PFN_PSSetShader)(
+    ID3D11DeviceContext* pThis, ID3D11PixelShader* pPixelShader,
+    ID3D11ClassInstance* const* ppClassInstances, UINT NumClassInstances);
+typedef void (STDMETHODCALLTYPE* PFN_VSSetShader)(
+    ID3D11DeviceContext* pThis, ID3D11VertexShader* pVertexShader,
+    ID3D11ClassInstance* const* ppClassInstances, UINT NumClassInstances);
+
+static PFN_PSSetShader oPSSetShader = nullptr;
+static PFN_VSSetShader oVSSetShader = nullptr;
+
+static void STDMETHODCALLTYPE HookedPSSetShader(
+    ID3D11DeviceContext* pThis, ID3D11PixelShader* pPixelShader,
+    ID3D11ClassInstance* const* ppClassInstances, UINT NumClassInstances)
+{
+    oPSSetShader(pThis, pPixelShader, ppClassInstances, NumClassInstances);
+    // Skip bookkeeping when tess is off — nothing reads gIsTerrainBoundFlag.
+    // When tess flips on later, the next shader bind repopulates the cache.
+    if (!gShutdownSignaled && TerrainTess::GetEnabled())
+        TerrainTess::OnPsBound(pPixelShader);
+}
+
+static void STDMETHODCALLTYPE HookedVSSetShader(
+    ID3D11DeviceContext* pThis, ID3D11VertexShader* pVertexShader,
+    ID3D11ClassInstance* const* ppClassInstances, UINT NumClassInstances)
+{
+    oVSSetShader(pThis, pVertexShader, ppClassInstances, NumClassInstances);
+    if (!gShutdownSignaled && TerrainTess::GetEnabled())
+        TerrainTess::OnVsBound(pVertexShader);
+}
+
 static void STDMETHODCALLTYPE HookedDrawIndexed(
     ID3D11DeviceContext* pThis, UINT IndexCount, UINT StartIndexLocation,
     INT BaseVertexLocation)
@@ -842,11 +879,17 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
 
     GeometryCapture::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 
-    if (!TerrainTess::TryDrawTessellated(pThis, IndexCount, StartIndexLocation,
-                                          BaseVertexLocation, oDrawIndexed))
+    // All three checks are inline bool loads. For non-terrain/non-blood draws
+    // (the vast majority — ~5000/frame in Kenshi) we never enter the function
+    // body of TryDrawTessellated at all, saving the call overhead.
+    if (TerrainTess::GetEnabled() &&
+        (TerrainTess::IsTerrainBound() || TerrainTess::IsBloodBound()) &&
+        TerrainTess::TryDrawTessellated(pThis, IndexCount, StartIndexLocation,
+                                         BaseVertexLocation, oDrawIndexed))
     {
-        oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
+        return;
     }
+    oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 }
 
 static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
@@ -1229,7 +1272,69 @@ static HRESULT STDMETHODCALLTYPE HookedCreateBuffer(
                                           std::memory_order_release);
         Log("CSMIntercept: tracked cbuffer %p (size=%u)", *ppBuffer, pDesc->ByteWidth);
     }
+
+    // TerrainTess CPU-side skip: cache first-vertex position for every VB
+    // created with initial data. Kenshi terrain VBs are static (uploaded
+    // once at level load), so this gets us 100% cache-hit at draw time —
+    // no per-draw CopyResource+Map(READ) stalls. Previously, every fresh
+    // chunk caused a sync stall on first sighting; rotating the camera
+    // (which exposed new chunks all at once) caused severe lag spikes.
+    if (SUCCEEDED(hr) && pDesc && ppBuffer && *ppBuffer &&
+        (pDesc->BindFlags & D3D11_BIND_VERTEX_BUFFER) &&
+        pInitialData && pInitialData->pSysMem &&
+        pDesc->ByteWidth >= 12)
+    {
+        TerrainTess::OnVertexBufferCreated(*ppBuffer, pInitialData->pSysMem);
+    }
+
+    // Register IBs so the Map/Unmap hooks shadow their content. This
+    // replaces the CopyResource+Map(READ) stall in PrepareStripConversion.
+    if (SUCCEEDED(hr) && pDesc && ppBuffer && *ppBuffer &&
+        (pDesc->BindFlags & D3D11_BIND_INDEX_BUFFER))
+    {
+        TerrainTess::OnIndexBufferCreated(
+            *ppBuffer,
+            (pInitialData && pInitialData->pSysMem) ? pInitialData->pSysMem : nullptr,
+            pDesc->ByteWidth);
+    }
+
+    // Register staging buffers so we can shadow their writes — these are
+    // typically the source of CopyResource→IB uploads in Kenshi.
+    if (SUCCEEDED(hr) && pDesc && ppBuffer && *ppBuffer &&
+        pDesc->Usage == D3D11_USAGE_STAGING &&
+        (pDesc->CPUAccessFlags & D3D11_CPU_ACCESS_WRITE))
+    {
+        TerrainTess::OnStagingBufferCreated(*ppBuffer);
+    }
     return hr;
+}
+
+// ==================== CopyResource hook ====================
+typedef void (STDMETHODCALLTYPE* PFN_CopyResource)(
+    ID3D11DeviceContext* pThis, ID3D11Resource* pDstResource,
+    ID3D11Resource* pSrcResource);
+static PFN_CopyResource oCopyResource = nullptr;
+
+static void STDMETHODCALLTYPE HookedCopyResource(
+    ID3D11DeviceContext* pThis, ID3D11Resource* pDstResource,
+    ID3D11Resource* pSrcResource)
+{
+    if (gShutdownSignaled)
+    {
+        oCopyResource(pThis, pDstResource, pSrcResource);
+        return;
+    }
+
+    // Propagate any tracked-buffer content from src to dst shadow before
+    // the actual GPU copy. This is how Kenshi's strip data flows into our
+    // IB shadow (engine pattern: Map staging → CopyResource(IB, staging)).
+    // Inline-bloom guard so non-tracked copies bail without a function call.
+    if (TerrainTess::GetEnabled() && pDstResource && pSrcResource &&
+        (TerrainTess::IsResourceTracked(pDstResource) ||
+         TerrainTess::IsResourceTracked(pSrcResource)))
+        TerrainTess::OnCopyResource(pDstResource, pSrcResource);
+
+    oCopyResource(pThis, pDstResource, pSrcResource);
 }
 
 static void STDMETHODCALLTYPE HookedUpdateSubresource(
@@ -1268,6 +1373,12 @@ static void STDMETHODCALLTYPE HookedUpdateSubresource(
         }
     }
 
+    // TerrainTess: feed any IB writes via UpdateSubresource into the
+    // CPU shadow so PrepareStripConversion can skip the GPU readback.
+    if (pDstResource && pSrcData && TerrainTess::GetEnabled() &&
+        TerrainTess::IsResourceTracked(pDstResource))
+        TerrainTess::OnIndexBufferUpdate(pDstResource, pDstBox, pSrcData, SrcRowPitch);
+
     oUpdateSubresource(pThis, pDstResource, DstSubresource, pDstBox,
                        pSrcData, SrcRowPitch, SrcDepthPitch);
 }
@@ -1291,6 +1402,15 @@ static HRESULT STDMETHODCALLTYPE HookedMap(
         if (CSMIntercept::sTracked.count(buf))
             CSMIntercept::sMapped[buf] = pMappedResource->pData;
     }
+
+    // Same idea for the terrain tessellation CPU-side far-skip — shadow the
+    // VS cbuffer that holds worldViewProjMatrix so TryDrawTessellated can read
+    // the chunk's clip-space distance without a GPU readback. The bloom test
+    // is inline (no function call) so >99% of Maps bail right here.
+    if (SUCCEEDED(hr) && pResource && pMappedResource && pMappedResource->pData &&
+        TerrainTess::GetEnabled() && TerrainTess::IsResourceTracked(pResource))
+        TerrainTess::OnContextMap(pResource, pMappedResource->pData);
+
     return hr;
 }
 
@@ -1339,6 +1459,11 @@ static void STDMETHODCALLTYPE HookedUnmap(
         }
     }
 
+    // Terrain tess shadow: commit the latest cb content to our CPU copy
+    // BEFORE the original Unmap runs (mappedData is still valid pre-Unmap).
+    if (TerrainTess::GetEnabled() && pResource && TerrainTess::IsResourceTracked(pResource))
+        TerrainTess::OnContextUnmap(pResource);
+
     oUnmap(pThis, pResource, Subresource);
 }
 
@@ -1348,12 +1473,15 @@ static const int VTIDX_DEVICE_CreateBuffer          = 3;
 static const int VTIDX_DEVICE_CreateTexture2D       = 5;
 static const int VTIDX_DEVICE_CreateVertexShader    = 12;
 static const int VTIDX_DEVICE_CreatePixelShader     = 15;
+static const int VTIDX_CTX_PSSetShader              = 9;
+static const int VTIDX_CTX_VSSetShader              = 11;
 static const int VTIDX_CTX_DrawIndexed              = 12;
 static const int VTIDX_CTX_Draw                     = 13;
 static const int VTIDX_CTX_Map                      = 14;
 static const int VTIDX_CTX_Unmap                    = 15;
 static const int VTIDX_CTX_DrawIndexedInstanced     = 20;
 static const int VTIDX_CTX_OMSetRenderTargets       = 33;
+static const int VTIDX_CTX_CopyResource             = 47;
 static const int VTIDX_CTX_UpdateSubresource        = 48;
 // VTIDX_SC_* constants moved to top of file (needed by deferred hook code)
 
@@ -1406,10 +1534,13 @@ bool Install()
     void* addrCreateTex2D  = devVtable[VTIDX_DEVICE_CreateTexture2D];
     void* addrCreateVS     = devVtable[VTIDX_DEVICE_CreateVertexShader];
     void* addrCreatePS     = devVtable[VTIDX_DEVICE_CreatePixelShader];
+    void* addrPSSetShader  = ctxVtable[VTIDX_CTX_PSSetShader];
+    void* addrVSSetShader  = ctxVtable[VTIDX_CTX_VSSetShader];
     void* addrDraw         = ctxVtable[VTIDX_CTX_Draw];
     void* addrDrawIndexed  = ctxVtable[VTIDX_CTX_DrawIndexed];
     void* addrDrawIdxInst  = ctxVtable[VTIDX_CTX_DrawIndexedInstanced];
     void* addrOMSetRT      = ctxVtable[VTIDX_CTX_OMSetRenderTargets];
+    void* addrCopyRes      = ctxVtable[VTIDX_CTX_CopyResource];
     void* addrUpdateSubres = ctxVtable[VTIDX_CTX_UpdateSubresource];
     void* addrMap          = ctxVtable[VTIDX_CTX_Map];
     void* addrUnmap        = ctxVtable[VTIDX_CTX_Unmap];
@@ -1495,6 +1626,10 @@ bool Install()
                            (void**)&oUpdateSubresource) != KenshiLib::SUCCESS)
     { Log("WARNING: Failed to hook UpdateSubresource (CSM cbuffer tracking disabled)"); }
 
+    if (KenshiLib::AddHook(addrCopyRes, (void*)HookedCopyResource,
+                           (void**)&oCopyResource) != KenshiLib::SUCCESS)
+    { Log("WARNING: Failed to hook CopyResource (TerrainTess IB shadow propagation disabled)"); }
+
     if (KenshiLib::AddHook(addrMap, (void*)HookedMap,
                            (void**)&oMap) != KenshiLib::SUCCESS)
     { Log("WARNING: Failed to hook Map (CSM cbuffer tracking disabled)"); }
@@ -1514,6 +1649,14 @@ bool Install()
     if (KenshiLib::AddHook(addrCreatePS, (void*)HookedCreatePixelShader,
                            (void**)&oCreatePixelShader) != KenshiLib::SUCCESS)
     { Log("ERROR: Failed to hook CreatePixelShader"); ok = false; }
+
+    if (KenshiLib::AddHook(addrPSSetShader, (void*)HookedPSSetShader,
+                           (void**)&oPSSetShader) != KenshiLib::SUCCESS)
+    { Log("WARNING: Failed to hook PSSetShader (TerrainTess fast-path disabled)"); }
+
+    if (KenshiLib::AddHook(addrVSSetShader, (void*)HookedVSSetShader,
+                           (void**)&oVSSetShader) != KenshiLib::SUCCESS)
+    { Log("WARNING: Failed to hook VSSetShader (TerrainTess fast-path disabled)"); }
 
     if (KenshiLib::AddHook(addrDraw, (void*)HookedDraw,
                            (void**)&oDraw) != KenshiLib::SUCCESS)
