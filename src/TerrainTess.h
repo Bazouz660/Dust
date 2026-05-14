@@ -212,14 +212,19 @@ namespace TerrainTess
     // track. Kenshi fires ~4000 Map/Unmaps per frame and >99% are for
     // resources outside our tracking set; this lets the hook bail with a
     // single atomic load + bit test, no function call into our code.
-    namespace detail { extern std::atomic<uint64_t> gTrackedBloom[16]; }
+    // 65536-bit (8 KB) single-hash bloom. Sized for ~5000 tracked entries
+    // (terrain IBs + staging buffers + cbs) at ~7% FPR — most Map/Unmap
+    // bloom tests bail with one atomic load. Smaller blooms saturate to
+    // near-100% FPR in busy Kenshi scenes, defeating the early-out — the
+    // entire point of the filter.
+    namespace detail { extern std::atomic<uint64_t> gTrackedBloom[1024]; }
     inline bool IsResourceTracked(void* p)
     {
         uintptr_t x = (uintptr_t)p;
         x ^= x >> 16;
         x *= 0x85ebca6bULL;
         x ^= x >> 13;
-        uint32_t h = (uint32_t)(x & 1023);
+        uint32_t h = (uint32_t)(x & 65535);  // 16 bits → 65536 positions
         return (detail::gTrackedBloom[h >> 6].load(std::memory_order_relaxed) &
                 (uint64_t(1) << (h & 63))) != 0;
     }
@@ -253,7 +258,7 @@ namespace TerrainTess
     // Tracking staging buffers lets the Map/Unmap hook shadow their
     // content, and the CopyResource hook propagates that content into
     // the IB shadow — closing the loop without any GPU readback.
-    void OnStagingBufferCreated(ID3D11Buffer* buf);
+    void OnStagingBufferCreated(ID3D11Buffer* buf, UINT byteWidth);
 
     // Called from HookedCopyResource. Propagates source-buffer content
     // (if shadowed) into destination IB's shadow.

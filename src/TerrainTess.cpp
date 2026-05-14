@@ -3,6 +3,7 @@
 #include "D3D11Hook.h"
 #include "DustLog.h"
 
+#include <tracy/Tracy.hpp>
 #include <d3d11shader.h>
 #include <d3dcompiler.h>
 #include <cstring>
@@ -473,6 +474,17 @@ std::unordered_map<ID3D11Buffer*, void*>   gIbPendingMaps;
 std::unordered_set<ID3D11Buffer*>          gTrackedStaging;
 std::unordered_map<ID3D11Buffer*, std::vector<uint8_t>> gStagingShadow;
 std::unordered_map<ID3D11Buffer*, void*>   gStagingPendingMaps;
+// Subset of gTrackedStaging seen flowing CopyResource → tracked IB at least
+// once. Kenshi creates ~3000 staging buffers but only a handful actually feed
+// terrain IBs; shadowing the others on Unmap costs ~21µs each (a full multi-
+// KB memcpy of unrelated upload data). Limit shadow maintenance to active.
+std::unordered_set<ID3D11Buffer*>          gActiveStaging;
+// Set of ByteWidth values seen for tracked terrain IBs. Used by the staging
+// Unmap path to skip per-call memcpy on stagings whose size matches NO IB:
+// those can't possibly be propagating IB content (the CopyResource src/dst
+// must match sizes), so shadowing them is pure waste. Reduces the dominant
+// OnContextUnmap.staging cost from ~2ms to ~0.5ms in worst-case scenes.
+std::unordered_set<UINT>                   gKnownIbSizes;
 
 struct StripConvTimer
 {
@@ -559,10 +571,33 @@ int gTerrainWorldMatrixOffset = -1;
 int gTerrainPsCameraPosOffset = -1;
 
 // Latest camera world position observed during a terrain draw. Updated
-// every terrain draw the CPU-side skip-check runs; exposed via
+// every frame the CPU-side skip-check runs; exposed via
 // TerrainTess::GetCameraPos and the host API.
 float gLastCameraPos[3] = { 0, 0, 0 };
 bool  gHaveCameraPos    = false;
+
+// Per-frame cached cb extracts. cameraPos + worldMatrix.translation are
+// frame constants in Kenshi's camera-relative rendering, so we extract
+// them once per frame instead of per terrain draw.
+//
+// Source path: CopySubresourceRegion(staging[write], psCb0/vsCb) +
+// Map(READ) staging[read]. Double-buffered ring so Map(READ) on the
+// previous slot never stalls (GPU drained it a full frame ago). One
+// frame stale data is fine for distance culling (camera moves <1 unit/
+// frame at 60fps; skipDistance is thousands of units).
+//
+// This replaces the previous gCbShadow-backed read, decoupling the tess
+// metric from the per-Map shadow path entirely — when blood is inactive,
+// PS/VS cb0 buffers no longer need to be tracked at all.
+static uint32_t gFrameSkipDataFrame = 0xFFFFFFFFu;
+static float    gFrameCamX = 0, gFrameCamY = 0, gFrameCamZ = 0;
+static float    gFrameShiftX = 0, gFrameShiftY = 0, gFrameShiftZ = 0;
+static bool     gFrameHaveCam = false, gFrameHaveShift = false;
+constexpr int kCbStagingSlots = 2;
+static ID3D11Buffer* gCamStaging[kCbStagingSlots]   = {};
+static ID3D11Buffer* gShiftStaging[kCbStagingSlots] = {};
+static int  gCbStagingWriteSlot = 0;
+static bool gCbStagingPrimed    = false;
 
 // VB[0] readback cache. Each terrain chunk has its own VB; we cache the
 // first vertex's position by VB pointer so subsequent draws are pure
@@ -621,7 +656,7 @@ inline void BloomAdd(void* p)
     x ^= x >> 16;
     x *= 0x85ebca6bULL;
     x ^= x >> 13;
-    uint32_t h = (uint32_t)(x & 1023);
+    uint32_t h = (uint32_t)(x & 65535);  // matches IsResourceTracked mask
     ::TerrainTess::detail::gTrackedBloom[h >> 6].fetch_or(
         uint64_t(1) << (h & 63), std::memory_order_relaxed);
 }
@@ -680,6 +715,7 @@ static void CaptureTerrainVbCtx(ID3D11DeviceContext* ctx,
                                 ID3D11Buffer* vb,
                                 ID3D11PixelShader* ps)
 {
+    ZoneScoped;
     if (!ctx || !vb) return;
     auto& slot = gVbTerrainCtx[vb];
     for (int i = 0; i < 7; i++)
@@ -837,7 +873,7 @@ void SetEnabled(bool enabled) { detail::gEnabledFlag = enabled; }
 
 namespace detail { bool gIsTerrainBoundFlag = false; }
 namespace detail { bool gIsBloodBoundFlag   = false; }
-namespace detail { std::atomic<uint64_t> gTrackedBloom[16] = {}; }
+namespace detail { std::atomic<uint64_t> gTrackedBloom[1024] = {}; }
 
 // Cached current-shader pointers + classifications. Updated whenever the
 // game calls PSSetShader / VSSetShader. We never AddRef these — they're
@@ -874,6 +910,7 @@ static void RecomputeIsTerrainBound()
 
 void OnPsBound(ID3D11PixelShader* ps)
 {
+    ZoneScoped;
     gCurrentPs = ps;
     // Single-entry cache: many consecutive draws share the same PS (e.g.,
     // GBuffer terrain draws across many chunks all use the same biome PS).
@@ -903,6 +940,7 @@ void OnPsBound(ID3D11PixelShader* ps)
 
 void OnVsBound(ID3D11VertexShader* vs)
 {
+    ZoneScoped;
     gCurrentVs = vs;
     // Direct pointer compare against the two terrain main_vs variants we
     // care about (TEXTURED and no-TEXTURED). Avoids the ShaderDatabase
@@ -957,6 +995,21 @@ void OnFrameEnd()
     // frame, and TryDrawTessellatedBloodImpl can ignore stale entries from
     // last frame (chunks that were tessellated then but skipped now).
     gFrameNumber++;
+
+    // Periodic tracked-set size dump for bloom-saturation diagnostics.
+    if ((gFrameNumber % 120) == 0)
+    {
+        size_t nCb = 0, nIb = 0, nStaging = 0, nActive = 0;
+        {
+            std::lock_guard<std::mutex> lock(gCbMutex);
+            nCb      = gTrackedCbs.size();
+            nIb      = gTrackedIbs.size();
+            nStaging = gTrackedStaging.size();
+            nActive  = gActiveStaging.size();
+        }
+        Log("TerrainTess: tracked sets — cb=%zu ib=%zu staging=%zu (active=%zu) (bloom=1024 bits)",
+            nCb, nIb, nStaging, nActive);
+    }
 
     // Rotate the adaptive blood-capture flag: if blood drew this frame,
     // capture next frame too. If not, we'll skip capture entirely and
@@ -1306,6 +1359,7 @@ void OnContextMap(ID3D11Resource* res, void* mappedPtr)
     // Bloom-filter bailout: ~99% of Map calls are for buffers we never
     // track. Single atomic load + bit test, no mutex.
     if (!BloomTest(res)) return;
+    ZoneScoped;
     // Bloom false-positives are rare but real, and saves-load destroys old
     // buffers + reallocates memory — a NEW texture can land at an old
     // tracked buffer's pointer address, get a bloom hit, and we'd then
@@ -1337,6 +1391,7 @@ void OnIndexBufferCreated(ID3D11Buffer* ib, const void* initialData, UINT size)
     if (!ib) return;
     std::lock_guard<std::mutex> lock(gCbMutex);
     if (gTrackedIbs.insert(ib).second) BloomAdd(ib);
+    if (size > 0) gKnownIbSizes.insert(size);
     if (initialData && size > 0)
     {
         auto& shadow = gIbShadow[ib];
@@ -1345,7 +1400,7 @@ void OnIndexBufferCreated(ID3D11Buffer* ib, const void* initialData, UINT size)
     }
 }
 
-void OnStagingBufferCreated(ID3D11Buffer* buf)
+void OnStagingBufferCreated(ID3D11Buffer* buf, UINT /*byteWidth*/)
 {
     if (!buf) return;
     std::lock_guard<std::mutex> lock(gCbMutex);
@@ -1433,6 +1488,7 @@ void OnContextUnmap(ID3D11Resource* res)
 {
     if (!res) return;
     if (!BloomTest(res)) return;
+    ZoneScoped;
     // QI verifies the bloom-hit pointer really is a buffer (saves-load can
     // realloc a texture at an old tracked buffer's address). Without this,
     // the GetDesc below would invoke a wrong vtable slot and crash.
@@ -1444,6 +1500,7 @@ void OnContextUnmap(ID3D11Resource* res)
     auto cbIt = gCbPending.find(buf);
     if (cbIt != gCbPending.end())
     {
+        ZoneScopedN("OnContextUnmap.cb");
         void* src = cbIt->second;
         gCbPending.erase(cbIt);
 
@@ -1457,6 +1514,7 @@ void OnContextUnmap(ID3D11Resource* res)
     auto ibIt = gIbPendingMaps.find(buf);
     if (ibIt != gIbPendingMaps.end())
     {
+        ZoneScopedN("OnContextUnmap.ib");
         void* src = ibIt->second;
         gIbPendingMaps.erase(ibIt);
 
@@ -1470,14 +1528,24 @@ void OnContextUnmap(ID3D11Resource* res)
     auto stgIt = gStagingPendingMaps.find(buf);
     if (stgIt != gStagingPendingMaps.end())
     {
+        ZoneScopedN("OnContextUnmap.staging");
         void* src = stgIt->second;
         gStagingPendingMaps.erase(stgIt);
 
         D3D11_BUFFER_DESC bd = {};
         buf->GetDesc(&bd);
-        auto& shadow = gStagingShadow[buf];
-        shadow.resize(bd.ByteWidth);
-        memcpy(shadow.data(), src, bd.ByteWidth);
+
+        // Only memcpy if this staging's size matches an IB we've seen —
+        // CopyResource requires matching sizes, so a staging that doesn't
+        // match any IB size can't possibly be propagating IB content. Skips
+        // the dominant per-Unmap memcpy for non-IB stagings (textures,
+        // misc uniform-style uploads of unrelated sizes).
+        if (gKnownIbSizes.count(bd.ByteWidth))
+        {
+            auto& shadow = gStagingShadow[buf];
+            shadow.resize(bd.ByteWidth);
+            memcpy(shadow.data(), src, bd.ByteWidth);
+        }
     }
     buf->Release();
 }
@@ -1648,9 +1716,11 @@ void Shutdown()
     gTrackedIbs.clear();
     gIbShadow.clear();
     gIbPendingMaps.clear();
+    gKnownIbSizes.clear();
     gTrackedStaging.clear();
     gStagingShadow.clear();
     gStagingPendingMaps.clear();
+    gActiveStaging.clear();
     for (int f = 0; f < kTimerFrames; f++)
     {
         if (gTimerFrames[f].disjoint) { gTimerFrames[f].disjoint->Release(); gTimerFrames[f].disjoint = nullptr; }
@@ -1680,6 +1750,13 @@ void Shutdown()
     gPerVsCameraPosOffset.clear();
     gVbPosCache.clear();
     if (gVbPosStaging) { gVbPosStaging->Release(); gVbPosStaging = nullptr; }
+    for (int i = 0; i < kCbStagingSlots; ++i)
+    {
+        if (gCamStaging[i])   { gCamStaging[i]->Release();   gCamStaging[i]   = nullptr; }
+        if (gShiftStaging[i]) { gShiftStaging[i]->Release(); gShiftStaging[i] = nullptr; }
+    }
+    gCbStagingWriteSlot = 0;
+    gCbStagingPrimed    = false;
     ReleaseAllTerrainVbCtx();
     gTerrainMainVs  = nullptr;
     gTerrainBloodVs = nullptr;
@@ -1918,6 +1995,7 @@ bool PrepareStripConversion(ID3D11DeviceContext* ctx,
 
 void Begin(ID3D11DeviceContext* ctx)
 {
+    ZoneScoped;
     // Save just enough state to put things back when we're done. Kenshi
     // never uses HS/DS/GS or their cbuffers/SRVs/samplers itself, so we
     // don't bother snapshotting any of that — End() just nulls them out.
@@ -2065,6 +2143,7 @@ void Begin(ID3D11DeviceContext* ctx)
 
 void End(ID3D11DeviceContext* ctx)
 {
+    ZoneScoped;
     // Restore the IA topology and PS cb1 the game expects. NULL the HS/DS
     // pipeline (we know it was null on entry — see one-shot check in Begin)
     // so nothing downstream accidentally runs a tess pass.
@@ -2261,8 +2340,16 @@ bool TryDrawTessellatedBloodImpl(ID3D11DeviceContext* ctx,
                                   UINT indexCount, UINT startIndex,
                                   INT baseVertex, DrawIndexedFn drawFn)
 {
+    ZoneScoped;
     if (!ctx || !gHs || !gDs || !drawFn) return false;
     if (!gTerrainMainVs) return false;   // never saw the TEXTURED variant
+
+    // Bootstrap: any blood-draw attempt — successful or not — arms the next
+    // frame's CaptureTerrainVbCtx via gBloodDrewLastFrame. Without this, a
+    // cold-start blood sequence is locked out forever: the success path that
+    // sets the flag also requires a captured ctx, but capture only fires
+    // when the flag was set last frame.
+    gBloodDrewThisFrame = true;
 
     ID3D11Buffer* vb = nullptr;
     UINT vbStride = 0, vbOffset = 0;
@@ -2387,6 +2474,7 @@ bool TryDrawTessellated(ID3D11DeviceContext* ctx,
                         UINT indexCount, UINT startIndex,
                         INT baseVertex, DrawIndexedFn drawFn)
 {
+    ZoneScoped;
     // Blood-on-terrain pass — re-applies tess so depth matches the displaced
     // GBuffer terrain (depth_func=equal in the blood material). Handled
     // before the terrain gate because blood draws don't set gIsTerrainBoundFlag.
@@ -2436,95 +2524,126 @@ bool TryDrawTessellated(ID3D11DeviceContext* ctx,
             float chunkPos[3] = {};
             if (TryGetVbFirstVertex(ctx, vb, vbBindOffset, chunkPos))
             {
-                // Read cameraPos from the PS cb0 ($Globals) AND worldMatrix
-                // translation from the VS cb0. Both are needed because
-                // Kenshi uses CAMERA-RELATIVE RENDERING: worldMatrix has
-                // its translation set to (terrain_origin - camera_world)
-                // to keep clip-space coords near origin for precision. So:
-                //   - VB[0] is in chunk-local-pre-shift coords.
-                //   - cameraPos is in camera-relative-rebased coords (near 0).
-                //   - To compare them in the same space, the chunk position
-                //     must be SHIFTED via worldMatrix.translation first.
-                //
-                // Skipping the shift means |chunkPos - cameraPos| ≈ |chunkPos|
-                // because |cameraPos| is tiny — making the metric appear to
-                // be anchored to a world position rather than the camera.
-                float camX = 0, camY = 0, camZ = 0;
-                float worldShiftX = 0, worldShiftY = 0, worldShiftZ = 0;
-                bool haveCam = false, haveShift = false;
+                // Per-frame cb extract: copy current PS/VS cb0 slices into
+                // ring-buffered staging buffers, Map(READ) the previous
+                // slot. Decouples the tess metric from gCbShadow → PS/VS
+                // cb0 no longer need to be in the Map/Unmap tracked set
+                // (unless blood is active, which still tracks them via
+                // CaptureTerrainVbCtx for byte-exact replay).
+                if (gFrameSkipDataFrame != gFrameNumber)
                 {
-                    std::lock_guard<std::mutex> lock(gCbMutex);
-                    // cameraPos from PS cb0
+                    gFrameSkipDataFrame = gFrameNumber;
+                    gFrameHaveCam = gFrameHaveShift = false;
+
+                    ID3D11Buffer* psCb0 = nullptr;
+                    ID3D11Buffer* vsCb  = nullptr;
                     if (gTerrainPsCameraPosOffset >= 0)
-                    {
-                        ID3D11Buffer* psCb0 = nullptr;
                         ctx->PSGetConstantBuffers(0, 1, &psCb0);
-                        if (psCb0)
-                        {
-                            if (gTrackedCbs.insert(psCb0).second) BloomAdd(psCb0);
-                            auto it = gCbShadow.find(psCb0);
-                            if (it != gCbShadow.end() &&
-                                (int)it->second.size() >= gTerrainPsCameraPosOffset + 12)
-                            {
-                                const float* p = reinterpret_cast<const float*>(
-                                    it->second.data() + gTerrainPsCameraPosOffset);
-                                camX = p[0]; camY = p[1]; camZ = p[2];
-                                haveCam = true;
-                            }
-                            psCb0->Release();
-                        }
-                    }
-                    // worldMatrix.translation from VS cb0
                     if (gTerrainWorldMatrixOffset >= 0)
-                    {
-                        ID3D11Buffer* vsCb = nullptr;
                         ctx->VSGetConstantBuffers(gTerrainWvpCbSlot, 1, &vsCb);
-                        if (vsCb)
+
+                    // Lazy-create the 16-byte staging buffers (D3D11 minimum).
+                    if (!gCamStaging[0] || !gShiftStaging[0])
+                    {
+                        ID3D11Device* dev = nullptr;
+                        ctx->GetDevice(&dev);
+                        if (dev)
                         {
-                            if (gTrackedCbs.insert(vsCb).second) BloomAdd(vsCb);
-                            auto it = gCbShadow.find(vsCb);
-                            if (it != gCbShadow.end() &&
-                                (int)it->second.size() >= gTerrainWorldMatrixOffset + 64)
+                            D3D11_BUFFER_DESC bd = {};
+                            bd.ByteWidth      = 16;
+                            bd.Usage          = D3D11_USAGE_STAGING;
+                            bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                            for (int i = 0; i < kCbStagingSlots; ++i)
                             {
-                                // Column-major 4x4: translation is column 3
-                                // → floats at indices 12, 13, 14.
-                                const float* m = reinterpret_cast<const float*>(
-                                    it->second.data() + gTerrainWorldMatrixOffset);
-                                worldShiftX = m[12];
-                                worldShiftY = m[13];
-                                worldShiftZ = m[14];
-                                haveShift = true;
+                                if (!gCamStaging[i])
+                                    dev->CreateBuffer(&bd, nullptr, &gCamStaging[i]);
+                                if (!gShiftStaging[i])
+                                    dev->CreateBuffer(&bd, nullptr, &gShiftStaging[i]);
                             }
-                            vsCb->Release();
+                            dev->Release();
                         }
                     }
+
+                    const int writeSlot = gCbStagingWriteSlot;
+                    const int readSlot  = 1 - writeSlot;
+
+                    // Copy current frame's slices into the write slot.
+                    if (psCb0 && gCamStaging[writeSlot])
+                    {
+                        D3D11_BOX box = {};
+                        box.left   = (UINT)gTerrainPsCameraPosOffset;
+                        box.right  = (UINT)gTerrainPsCameraPosOffset + 12;
+                        box.top    = 0; box.bottom = 1;
+                        box.front  = 0; box.back   = 1;
+                        ctx->CopySubresourceRegion(gCamStaging[writeSlot], 0,
+                                                    0, 0, 0, psCb0, 0, &box);
+                    }
+                    if (vsCb && gShiftStaging[writeSlot])
+                    {
+                        // worldMatrix is a 4x4 column-major. Translation is
+                        // column 3 → floats at indices 12,13,14 → byte offset
+                        // 48 within the matrix.
+                        D3D11_BOX box = {};
+                        box.left   = (UINT)gTerrainWorldMatrixOffset + 48;
+                        box.right  = (UINT)gTerrainWorldMatrixOffset + 60;
+                        box.top    = 0; box.bottom = 1;
+                        box.front  = 0; box.back   = 1;
+                        ctx->CopySubresourceRegion(gShiftStaging[writeSlot], 0,
+                                                    0, 0, 0, vsCb, 0, &box);
+                    }
+
+                    if (psCb0) psCb0->Release();
+                    if (vsCb)  vsCb->Release();
+
+                    // Read the previous slot — GPU drained it a frame ago,
+                    // no stall. First frame after init reads nothing.
+                    if (gCbStagingPrimed)
+                    {
+                        D3D11_MAPPED_SUBRESOURCE mr = {};
+                        if (gCamStaging[readSlot] &&
+                            SUCCEEDED(ctx->Map(gCamStaging[readSlot], 0,
+                                               D3D11_MAP_READ, 0, &mr)))
+                        {
+                            const float* p = reinterpret_cast<const float*>(mr.pData);
+                            gFrameCamX = p[0]; gFrameCamY = p[1]; gFrameCamZ = p[2];
+                            gFrameHaveCam = true;
+                            ctx->Unmap(gCamStaging[readSlot], 0);
+                        }
+                        if (gShiftStaging[readSlot] &&
+                            SUCCEEDED(ctx->Map(gShiftStaging[readSlot], 0,
+                                               D3D11_MAP_READ, 0, &mr)))
+                        {
+                            const float* p = reinterpret_cast<const float*>(mr.pData);
+                            gFrameShiftX = p[0]; gFrameShiftY = p[1]; gFrameShiftZ = p[2];
+                            gFrameHaveShift = true;
+                            ctx->Unmap(gShiftStaging[readSlot], 0);
+                        }
+                    }
+
+                    gCbStagingWriteSlot = readSlot;
+                    gCbStagingPrimed = true;
                 }
 
-                if (haveCam && haveShift)
+                if (gFrameHaveCam && gFrameHaveShift)
                 {
                     // Shift chunkPos into camera-relative-rebased coords
-                    // (the same space cameraPos lives in). Without this,
-                    // the metric is anchored to world origin instead of
-                    // the camera — moving the camera doesn't change which
-                    // chunks are classified as near vs far.
-                    float chunkRebX = chunkPos[0] + worldShiftX;
-                    float chunkRebY = chunkPos[1] + worldShiftY;
-                    float chunkRebZ = chunkPos[2] + worldShiftZ;
+                    // (the same space cameraPos lives in). Distance metric
+                    // is invariant under translation, so this is equivalent
+                    // to true world-space distance.
+                    float chunkRebX = chunkPos[0] + gFrameShiftX;
+                    float chunkRebY = chunkPos[1] + gFrameShiftY;
+                    float chunkRebZ = chunkPos[2] + gFrameShiftZ;
 
-                    // Now both points are in the same coord system → true
-                    // 3D distance from camera. Tracks camera POSITION
-                    // correctly; invariant under camera ROTATION.
-                    float dx = chunkRebX - camX;
-                    float dy = chunkRebY - camY;
-                    float dz = chunkRebZ - camZ;
+                    float dx = chunkRebX - gFrameCamX;
+                    float dy = chunkRebY - gFrameCamY;
+                    float dz = chunkRebZ - gFrameCamZ;
                     float dist = sqrtf(dx*dx + dy*dy + dz*dz);
 
                     // Stash actual camera world pos for the host API.
-                    // True camera world = -worldMatrix.translation (since
-                    // worldMatrix shifts world origin to camera position).
-                    gLastCameraPos[0] = -worldShiftX;
-                    gLastCameraPos[1] = -worldShiftY;
-                    gLastCameraPos[2] = -worldShiftZ;
+                    // True camera world = -worldMatrix.translation.
+                    gLastCameraPos[0] = -gFrameShiftX;
+                    gLastCameraPos[1] = -gFrameShiftY;
+                    gLastCameraPos[2] = -gFrameShiftZ;
                     gHaveCameraPos = true;
 
                     static int sDrawCount = 0;
@@ -2535,14 +2654,11 @@ bool TryDrawTessellated(ID3D11DeviceContext* ctx,
                             "camDist=%.1f  (skipDistance=%.1f)",
                             sDrawCount,
                             chunkPos[0], chunkPos[1], chunkPos[2],
-                            worldShiftX, worldShiftY, worldShiftZ,
-                            camX, camY, camZ, dist, gControls.skipDistance);
+                            gFrameShiftX, gFrameShiftY, gFrameShiftZ,
+                            gFrameCamX, gFrameCamY, gFrameCamZ,
+                            dist, gControls.skipDistance);
                     }
 
-                    // In debug heatmap mode (3), bypass the CPU skip so
-                    // every chunk goes through the PS — that's where the
-                    // heatmap is drawn. Without this, we'd skip chunks
-                    // past the threshold and never see their color.
                     if (gControls.debugViewMode < 2.5f &&
                         gControls.skipDistance > 0.0f &&
                         dist > gControls.skipDistance)

@@ -39,4 +39,10 @@ namespace D3D11Hook
     // the game creates the 4096^2 shadow atlas / depth pair.
     void SetShadowAtlasResolution(UINT size);
     UINT GetShadowAtlasResolution();
+
+    // World-space camera position, refreshed once per frame via the staging-
+    // buffer extraction path in ExtractCameraData (POST_LIGHTING). Stale until
+    // first extraction completes; returns false then. Used by TerrainTess to
+    // avoid per-draw constant-buffer shadowing for the chunk-skip metric.
+    bool GetCameraWorldPos(float outXYZ[3]);
 }

@@ -17,6 +17,7 @@
 #include "TerrainTess.h"
 #include "CSMCapture.h"
 #include "DustLog.h"
+#include <tracy/Tracy.hpp>
 #include <core/Functions.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
@@ -48,6 +49,7 @@ static bool gDispatchedThisFrame = false;
 // (staging CBs are in gCameraStagingCBs[], declared near ExtractCameraData)
 static DustCameraData gCameraData = {};
 static bool gCameraDataExtracted = false; // per-frame flag
+static bool gCameraDataEverValid  = false; // sticky once first extraction succeeds
 
 // VTable indices for swap chain methods (used by both Install() and deferred hooking)
 static const int VTIDX_SC_Present        = 8;
@@ -85,6 +87,15 @@ static UINT gShadowAtlasOverride = 0;
 
 void SetShadowAtlasResolution(UINT size) { gShadowAtlasOverride = size; }
 UINT GetShadowAtlasResolution()          { return gShadowAtlasOverride; }
+
+bool GetCameraWorldPos(float outXYZ[3])
+{
+    if (!gCameraDataEverValid || !outXYZ) return false;
+    outXYZ[0] = gCameraData.camPosition[0];
+    outXYZ[1] = gCameraData.camPosition[1];
+    outXYZ[2] = gCameraData.camPosition[2];
+    return true;
+}
 
 void SignalGameAlive(const char* via)
 {
@@ -186,6 +197,7 @@ static void ExtractCameraData(ID3D11DeviceContext* ctx)
                 gCameraData.camPosition[0] = m[12]; gCameraData.camPosition[1] = m[13]; gCameraData.camPosition[2] = m[14];
                 gCameraData.valid = 1;
                 gCameraDataExtracted = true;
+                gCameraDataEverValid = true;
             }
         }
     }
@@ -852,6 +864,7 @@ static void STDMETHODCALLTYPE HookedPSSetShader(
     ID3D11DeviceContext* pThis, ID3D11PixelShader* pPixelShader,
     ID3D11ClassInstance* const* ppClassInstances, UINT NumClassInstances)
 {
+    ZoneScoped;
     oPSSetShader(pThis, pPixelShader, ppClassInstances, NumClassInstances);
     // Skip bookkeeping when tess is off — nothing reads gIsTerrainBoundFlag.
     // When tess flips on later, the next shader bind repopulates the cache.
@@ -863,6 +876,7 @@ static void STDMETHODCALLTYPE HookedVSSetShader(
     ID3D11DeviceContext* pThis, ID3D11VertexShader* pVertexShader,
     ID3D11ClassInstance* const* ppClassInstances, UINT NumClassInstances)
 {
+    ZoneScoped;
     oVSSetShader(pThis, pVertexShader, ppClassInstances, NumClassInstances);
     if (!gShutdownSignaled && TerrainTess::GetEnabled())
         TerrainTess::OnVsBound(pVertexShader);
@@ -872,6 +886,7 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     ID3D11DeviceContext* pThis, UINT IndexCount, UINT StartIndexLocation,
     INT BaseVertexLocation)
 {
+    ZoneScoped;
     if (gShutdownSignaled) { oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation); return; }
 
     if (Survey::IsActive())
@@ -896,6 +911,7 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
     ID3D11DeviceContext* pThis, UINT IndexCountPerInstance, UINT InstanceCount,
     UINT StartIndexLocation, INT BaseVertexLocation, UINT StartInstanceLocation)
 {
+    ZoneScoped;
     if (gShutdownSignaled) { oDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation); return; }
 
     if (Survey::IsActive())
@@ -918,6 +934,7 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
     ID3D11RenderTargetView* const* ppRenderTargetViews,
     ID3D11DepthStencilView* pDepthStencilView)
 {
+    ZoneScoped;
     if (gShutdownSignaled) { oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView); return; }
 
     bool wasInGBuffer = GeometryCapture::IsInGBufferPass();
@@ -1045,16 +1062,22 @@ static void TickGuiOnPresent(IDXGISwapChain* swapChain, const char* via)
 static HRESULT STDMETHODCALLTYPE HookedPresent(
     IDXGISwapChain* pThis, UINT SyncInterval, UINT Flags)
 {
+    ZoneScoped;
     if (!gShutdownSignaled) TickGuiOnPresent(pThis, "Present");
-    return oPresent(pThis, SyncInterval, Flags);
+    HRESULT hr = oPresent(pThis, SyncInterval, Flags);
+    FrameMark;
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE HookedPresent1(
     IDXGISwapChain1* pThis, UINT SyncInterval, UINT PresentFlags,
     const DXGI_PRESENT_PARAMETERS* pPresentParameters)
 {
+    ZoneScoped;
     if (!gShutdownSignaled) TickGuiOnPresent(pThis, "Present1");
-    return oPresent1(pThis, SyncInterval, PresentFlags, pPresentParameters);
+    HRESULT hr = oPresent1(pThis, SyncInterval, PresentFlags, pPresentParameters);
+    FrameMark;
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE HookedResizeBuffers(
@@ -1304,7 +1327,7 @@ static HRESULT STDMETHODCALLTYPE HookedCreateBuffer(
         pDesc->Usage == D3D11_USAGE_STAGING &&
         (pDesc->CPUAccessFlags & D3D11_CPU_ACCESS_WRITE))
     {
-        TerrainTess::OnStagingBufferCreated(*ppBuffer);
+        TerrainTess::OnStagingBufferCreated(*ppBuffer, pDesc->ByteWidth);
     }
     return hr;
 }
@@ -1319,6 +1342,7 @@ static void STDMETHODCALLTYPE HookedCopyResource(
     ID3D11DeviceContext* pThis, ID3D11Resource* pDstResource,
     ID3D11Resource* pSrcResource)
 {
+    ZoneScoped;
     if (gShutdownSignaled)
     {
         oCopyResource(pThis, pDstResource, pSrcResource);
@@ -1341,6 +1365,7 @@ static void STDMETHODCALLTYPE HookedUpdateSubresource(
     ID3D11DeviceContext* pThis, ID3D11Resource* pDstResource, UINT DstSubresource,
     const D3D11_BOX* pDstBox, const void* pSrcData, UINT SrcRowPitch, UINT SrcDepthPitch)
 {
+    ZoneScoped;
     if (gShutdownSignaled)
     {
         oUpdateSubresource(pThis, pDstResource, DstSubresource, pDstBox,
@@ -1387,6 +1412,7 @@ static HRESULT STDMETHODCALLTYPE HookedMap(
     ID3D11DeviceContext* pThis, ID3D11Resource* pResource, UINT Subresource,
     D3D11_MAP MapType, UINT MapFlags, D3D11_MAPPED_SUBRESOURCE* pMappedResource)
 {
+    ZoneScoped;
     if (gShutdownSignaled)
         return oMap(pThis, pResource, Subresource, MapType, MapFlags, pMappedResource);
 
@@ -1417,6 +1443,7 @@ static HRESULT STDMETHODCALLTYPE HookedMap(
 static void STDMETHODCALLTYPE HookedUnmap(
     ID3D11DeviceContext* pThis, ID3D11Resource* pResource, UINT Subresource)
 {
+    ZoneScoped;
     if (gShutdownSignaled) { oUnmap(pThis, pResource, Subresource); return; }
 
     void* mappedData = nullptr;
