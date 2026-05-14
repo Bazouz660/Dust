@@ -93,11 +93,22 @@ static void ReleaseCaptures()
     sStagingPoolUsed = 0;
 }
 
-// Cache: once we've identified the GBuffer RTVs, skip expensive COM queries
-// on repeat calls with the same pointers. Invalidated on resolution change.
-static ID3D11RenderTargetView* sCachedGBufferRTVs[3] = {};
-static ID3D11DepthStencilView* sCachedGBufferDSV = nullptr;
-static bool sCacheValid = false;
+// Multi-entry classification cache. Caching ONLY the GBuffer config (one
+// slot) meant every non-GBuffer pass paid for 12 COM calls per OMSet hook
+// — Kenshi has many distinct RT configs per frame (shadow passes, post,
+// blur stages, etc.), and they kept missing the single cached slot. With
+// a small ring of recent configs, both GBuffer and non-GBuffer lookups
+// land via pointer compare instead of the COM cascade.
+struct RtClassEntry
+{
+    ID3D11RenderTargetView* rtvs[3];
+    ID3D11DepthStencilView* dsv;
+    bool isGBuffer;
+    bool valid;
+};
+static constexpr int kRtClassCacheSize = 8;  // power of two
+static RtClassEntry sRtClassCache[kRtClassCacheSize] = {};
+static uint32_t sRtClassNext = 0;
 
 static bool IsGBufferConfig(UINT numViews,
                             ID3D11RenderTargetView* const* ppRTVs,
@@ -115,29 +126,31 @@ static bool IsGBufferConfig(UINT numViews,
             return false;
     }
 
-    // Fast path: if pointers match the cached GBuffer RTVs, skip COM queries
-    if (sCacheValid &&
-        ppRTVs[0] == sCachedGBufferRTVs[0] &&
-        ppRTVs[1] == sCachedGBufferRTVs[1] &&
-        ppRTVs[2] == sCachedGBufferRTVs[2] &&
-        pDSV == sCachedGBufferDSV)
+    // Multi-entry pointer-compare cache covers BOTH "is GBuffer" and "isn't
+    // GBuffer" classifications for recently-seen configs. Most OMSet calls
+    // hit this in a few ns instead of the ~12-COM-call cascade below.
+    for (int i = 0; i < kRtClassCacheSize; ++i)
     {
-        return true;
+        const auto& e = sRtClassCache[i];
+        if (e.valid &&
+            e.rtvs[0] == ppRTVs[0] &&
+            e.rtvs[1] == ppRTVs[1] &&
+            e.rtvs[2] == ppRTVs[2] &&
+            e.dsv == pDSV)
+            return e.isGBuffer;
     }
 
-    for (UINT i = 0; i < 3; i++)
+    bool isGBuffer = true;
+    for (UINT i = 0; i < 3 && isGBuffer; i++)
     {
         ID3D11Resource* res = nullptr;
         ppRTVs[i]->GetResource(&res);
-        if (!res)
-            return false;
+        if (!res) { isGBuffer = false; break; }
 
         ID3D11Texture2D* tex = nullptr;
         HRESULT hr = res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex);
         res->Release();
-
-        if (FAILED(hr) || !tex)
-            return false;
+        if (FAILED(hr) || !tex) { isGBuffer = false; break; }
 
         D3D11_TEXTURE2D_DESC texDesc;
         tex->GetDesc(&texDesc);
@@ -149,19 +162,23 @@ static bool IsGBufferConfig(UINT numViews,
                              ? rtvDesc.Format : texDesc.Format;
 
         if (format != GBUFFER_COLOR_FORMATS[i])
-            return false;
-
-        if (texDesc.Width != sExpectedWidth || texDesc.Height != sExpectedHeight)
-            return false;
+            isGBuffer = false;
+        else if (texDesc.Width != sExpectedWidth || texDesc.Height != sExpectedHeight)
+            isGBuffer = false;
     }
 
-    // Cache these pointers for fast-path on subsequent calls
-    for (UINT i = 0; i < 3; i++)
-        sCachedGBufferRTVs[i] = ppRTVs[i];
-    sCachedGBufferDSV = pDSV;
-    sCacheValid = true;
+    // Cache the classification (positive OR negative) so the next OMSet
+    // with the same RT pointers skips the COM cascade.
+    auto& slot = sRtClassCache[sRtClassNext];
+    slot.rtvs[0] = ppRTVs[0];
+    slot.rtvs[1] = ppRTVs[1];
+    slot.rtvs[2] = ppRTVs[2];
+    slot.dsv = pDSV;
+    slot.isGBuffer = isGBuffer;
+    slot.valid = true;
+    sRtClassNext = (sRtClassNext + 1) % kRtClassCacheSize;
 
-    return true;
+    return isGBuffer;
 }
 
 void OnOMSetRenderTargets(ID3D11DeviceContext* ctx, UINT numViews,
@@ -328,7 +345,10 @@ bool CheckGBufferConfig(UINT numViews, ID3D11RenderTargetView* const* ppRTVs,
 void SetResolution(UINT width, UINT height)
 {
     if (width != sExpectedWidth || height != sExpectedHeight)
-        sCacheValid = false;
+    {
+        for (auto& e : sRtClassCache) e.valid = false;
+        sRtClassNext = 0;
+    }
     sExpectedWidth  = width;
     sExpectedHeight = height;
 }

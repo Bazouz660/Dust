@@ -77,7 +77,13 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>false</SDLCheck>
-      <PreprocessorDefinitions>NDEBUG;_CONSOLE;BOOST_USE_WINDOWS_H;BOOST_ALL_NO_LIB;BOOST_ERROR_CODE_HEADER_ONLY;TRACY_ENABLE;TRACY_ON_DEMAND;TRACY_NO_SAMPLING;TRACY_NO_SYSTEM_TRACING;TRACY_NO_CALLSTACK;TRACY_NO_CALLSTACK_INLINES;TRACY_NO_CRASH_HANDLER;TRACY_NO_VSYNC_CAPTURE;TRACY_NO_FRAME_IMAGE;$(ExtraDefines);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- Tracy profiling: zones cost ~5-10ns each × ~17K hook calls/frame
+           (≈150 µs/frame). Off by default; enable by passing
+           /p:ExtraDefines=TRACY_ENABLE;TRACY_ON_DEMAND;TRACY_NO_SAMPLING;TRACY_NO_SYSTEM_TRACING;TRACY_NO_CALLSTACK;TRACY_NO_CALLSTACK_INLINES;TRACY_NO_CRASH_HANDLER;TRACY_NO_VSYNC_CAPTURE;TRACY_NO_FRAME_IMAGE
+           to msbuild (or set the env-var ExtraDefines). All ZoneScoped /
+           FrameMark calls in our code become no-ops when TRACY_ENABLE is
+           undefined, so nothing else has to change. -->
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;BOOST_USE_WINDOWS_H;BOOST_ALL_NO_LIB;BOOST_ERROR_CODE_HEADER_ONLY;$(ExtraDefines);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>false</ConformanceMode>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
     </ClCompile>

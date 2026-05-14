@@ -479,6 +479,11 @@ std::unordered_map<ID3D11Buffer*, void*>   gStagingPendingMaps;
 // terrain IBs; shadowing the others on Unmap costs ~21µs each (a full multi-
 // KB memcpy of unrelated upload data). Limit shadow maintenance to active.
 std::unordered_set<ID3D11Buffer*>          gActiveStaging;
+// Last frame each tracked buffer was observed in a bloom hit. Stale entries
+// (not seen in many frames) get pruned periodically to keep the tracked
+// sets small — otherwise they grow unboundedly as the player explores and
+// inflate the bloom FPR back to saturation.
+std::unordered_map<ID3D11Buffer*, uint32_t> gLastUsedFrame;
 // Set of ByteWidth values seen for tracked terrain IBs. Used by the staging
 // Unmap path to skip per-call memcpy on stagings whose size matches NO IB:
 // those can't possibly be propagating IB content (the CopyResource src/dst
@@ -996,19 +1001,59 @@ void OnFrameEnd()
     // last frame (chunks that were tessellated then but skipped now).
     gFrameNumber++;
 
-    // Periodic tracked-set size dump for bloom-saturation diagnostics.
-    if ((gFrameNumber % 120) == 0)
+    // Periodic LRU sweep — STAGING ONLY. IBs are typically "used" via Bind
+    // not Map (Kenshi uploads once at chunk load, then re-binds many times
+    // without re-mapping), so Map-based last-used tracking would falsely
+    // mark active IBs as stale. Same for CBs (small fixed set, all live).
+    // Stagings ARE Map+Unmap'd on every use, so Map-based liveness is
+    // accurate. Stagings also dominate the tracked-set size (~2570 vs
+    // ~2330 IBs / 5 CBs), so this is where the bloom-saturation savings
+    // are anyway.
+    constexpr uint32_t kSweepInterval = 600;   // ~10s at 60fps
+    constexpr uint32_t kStaleFrames   = 600;   // unused-for-this-many → drop
+    if ((gFrameNumber % kSweepInterval) == 0)
     {
-        size_t nCb = 0, nIb = 0, nStaging = 0, nActive = 0;
+        std::lock_guard<std::mutex> lock(gCbMutex);
+        const uint32_t cutoff = (gFrameNumber > kStaleFrames)
+                              ? gFrameNumber - kStaleFrames : 0;
+
+        size_t stgBefore = gTrackedStaging.size();
+        for (auto it = gTrackedStaging.begin(); it != gTrackedStaging.end();)
         {
-            std::lock_guard<std::mutex> lock(gCbMutex);
-            nCb      = gTrackedCbs.size();
-            nIb      = gTrackedIbs.size();
-            nStaging = gTrackedStaging.size();
-            nActive  = gActiveStaging.size();
+            auto luIt = gLastUsedFrame.find(*it);
+            bool stale = (luIt == gLastUsedFrame.end() || luIt->second < cutoff);
+            if (stale) it = gTrackedStaging.erase(it); else ++it;
         }
-        Log("TerrainTess: tracked sets — cb=%zu ib=%zu staging=%zu (active=%zu) (bloom=1024 bits)",
-            nCb, nIb, nStaging, nActive);
+
+        // Drop pending entries + shadows for stagings no longer tracked.
+        for (auto it = gStagingPendingMaps.begin(); it != gStagingPendingMaps.end();)
+            if (!gTrackedStaging.count(it->first)) it = gStagingPendingMaps.erase(it); else ++it;
+        for (auto it = gStagingShadow.begin(); it != gStagingShadow.end();)
+            if (!gTrackedStaging.count(it->first)) it = gStagingShadow.erase(it); else ++it;
+        for (auto it = gActiveStaging.begin(); it != gActiveStaging.end();)
+            if (!gTrackedStaging.count(*it)) it = gActiveStaging.erase(it); else ++it;
+
+        // Drop gLastUsedFrame entries for stagings no longer tracked
+        // (cb/ib entries stay — they're used for future sweep liveness if
+        //  we ever extend it, and the map is small overhead either way).
+        for (auto it = gLastUsedFrame.begin(); it != gLastUsedFrame.end();)
+        {
+            const bool isTracked = gTrackedCbs.count(it->first) ||
+                                    gTrackedIbs.count(it->first) ||
+                                    gTrackedStaging.count(it->first);
+            if (!isTracked) it = gLastUsedFrame.erase(it); else ++it;
+        }
+
+        // Rebuild bloom from survivors. Fresh zero, re-add each entry.
+        for (int i = 0; i < 1024; ++i)
+            detail::gTrackedBloom[i].store(0, std::memory_order_relaxed);
+        for (auto* b : gTrackedCbs)     BloomAdd(b);
+        for (auto* b : gTrackedIbs)     BloomAdd(b);
+        for (auto* b : gTrackedStaging) BloomAdd(b);
+
+        Log("TerrainTess: bloom sweep — staging %zu→%zu  (cb=%zu ib=%zu untouched)",
+            stgBefore, gTrackedStaging.size(),
+            gTrackedCbs.size(), gTrackedIbs.size());
     }
 
     // Rotate the adaptive blood-capture flag: if blood drew this frame,
@@ -1369,12 +1414,11 @@ void OnContextMap(ID3D11Resource* res, void* mappedPtr)
     if (FAILED(res->QueryInterface(__uuidof(ID3D11Buffer), (void**)&buf)) || !buf) return;
 
     std::lock_guard<std::mutex> lock(gCbMutex);
-    if (gTrackedCbs.count(buf))
-        gCbPending[buf] = mappedPtr;
-    if (gTrackedIbs.count(buf))
-        gIbPendingMaps[buf] = mappedPtr;
-    if (gTrackedStaging.count(buf))
-        gStagingPendingMaps[buf] = mappedPtr;
+    bool inAnySet = false;
+    if (gTrackedCbs.count(buf))     { gCbPending[buf]         = mappedPtr; inAnySet = true; }
+    if (gTrackedIbs.count(buf))     { gIbPendingMaps[buf]     = mappedPtr; inAnySet = true; }
+    if (gTrackedStaging.count(buf)) { gStagingPendingMaps[buf] = mappedPtr; inAnySet = true; }
+    if (inAnySet) gLastUsedFrame[buf] = gFrameNumber;
     buf->Release();
 }
 
@@ -1721,6 +1765,7 @@ void Shutdown()
     gStagingShadow.clear();
     gStagingPendingMaps.clear();
     gActiveStaging.clear();
+    gLastUsedFrame.clear();
     for (int f = 0; f < kTimerFrames; f++)
     {
         if (gTimerFrames[f].disjoint) { gTimerFrames[f].disjoint->Release(); gTimerFrames[f].disjoint = nullptr; }
