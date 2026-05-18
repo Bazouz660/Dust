@@ -223,6 +223,44 @@ static ID3DBlob* HostCompileShader(const char* hlslSource, const char* entryPoin
     return blob;
 }
 
+// Resolves #include directives relative to the directory of the source file.
+// D3DCompile() takes the source as a memory buffer so we need our own handler
+// (D3D_COMPILE_STANDARD_FILE_INCLUDE only works with D3DCompileFromFile, which
+// requires a wide-char filename — easier to roll our own).
+class HostFileIncludeHandler : public ID3DInclude
+{
+public:
+    explicit HostFileIncludeHandler(const std::string& baseDir) : baseDir_(baseDir) {}
+
+    HRESULT STDMETHODCALLTYPE Open(D3D_INCLUDE_TYPE, LPCSTR pFileName,
+                                   LPCVOID, LPCVOID* ppData, UINT* pBytes) override
+    {
+        std::string path = baseDir_ + "\\" + pFileName;
+        HANDLE hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(GetLastError());
+        DWORD size = GetFileSize(hFile, nullptr);
+        if (size == INVALID_FILE_SIZE) { CloseHandle(hFile); return E_FAIL; }
+        char* data = new char[size];
+        DWORD read = 0;
+        BOOL ok = ReadFile(hFile, data, size, &read, nullptr);
+        CloseHandle(hFile);
+        if (!ok || read != size) { delete[] data; return E_FAIL; }
+        *ppData = data;
+        *pBytes = size;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE Close(LPCVOID pData) override
+    {
+        delete[] (const char*)pData;
+        return S_OK;
+    }
+
+private:
+    std::string baseDir_;
+};
+
 static ID3DBlob* HostCompileShaderFromFile(const char* filePath, const char* entryPoint, const char* target)
 {
     // Read the file into memory
@@ -255,10 +293,16 @@ static ID3DBlob* HostCompileShaderFromFile(const char* filePath, const char* ent
     }
     buffer[fileSize] = '\0';
 
+    // Extract directory for include resolution
+    std::string pathStr(filePath);
+    size_t sep = pathStr.find_last_of("\\/");
+    std::string baseDir = (sep != std::string::npos) ? pathStr.substr(0, sep) : ".";
+    HostFileIncludeHandler includer(baseDir);
+
     // Compile with filename for error messages
     ID3DBlob* blob = nullptr;
     ID3DBlob* errors = nullptr;
-    HRESULT hr = D3DCompile(buffer, fileSize, filePath, nullptr, nullptr,
+    HRESULT hr = D3DCompile(buffer, fileSize, filePath, nullptr, &includer,
                             entryPoint, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
                             &blob, &errors);
     delete[] buffer;
@@ -985,6 +1029,12 @@ int EffectLoader::LoadAll(const char* effectsDir, const char* gameDir)
             if (GetFileAttributesExA(le.configPath.c_str(), GetFileExInfoStandard, &fad))
                 le.configMtime = fad.ftLastWriteTime;
         }
+
+        // Plugins that need to push state to the host before Init runs
+        // (e.g. Shadows.SetShadowAtlasResolution, which has to land before
+        // Kenshi creates its shadow atlas between LoadAll and InitAll).
+        if (le.desc.OnEarlyConfigApply)
+            le.desc.OnEarlyConfigApply(&hostAPI_);
 
         effects_.push_back(std::move(le));
 

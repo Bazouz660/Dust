@@ -1,12 +1,23 @@
 param(
     [switch]$Deploy,
-    [switch]$SkipPresets
+    [switch]$SkipPresets,
+    [switch]$Tracy
 )
 
 $ErrorActionPreference = "Stop"
 
 $MSBUILD = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\MSBuild\Current\Bin\amd64\MSBuild.exe"
 $Root = $PSScriptRoot
+
+# -Tracy enables Tracy profiling. Sets the ExtraDefines env var which the
+# vcxprojs forward into PreprocessorDefinitions via $(ExtraDefines). Cannot
+# pass via /p: because the semicolons get parsed as MSBuild switch separators.
+# Includes TRACY_ON_DEMAND so the listener only spins up once a server
+# connects (~zero idle cost) plus the standard "minimal overhead" flags.
+if ($Tracy) {
+    $env:ExtraDefines = "TRACY_ENABLE;TRACY_ON_DEMAND;TRACY_NO_SAMPLING;TRACY_NO_SYSTEM_TRACING;TRACY_NO_CALLSTACK;TRACY_NO_CALLSTACK_INLINES;TRACY_NO_CRASH_HANDLER;TRACY_NO_VSYNC_CAPTURE;TRACY_NO_FRAME_IMAGE"
+    Write-Host "==> Tracy build (TRACY_ENABLE + on-demand)" -ForegroundColor Yellow
+}
 
 if ($Deploy) {
     $EnvFile = Join-Path $Root ".env"
@@ -36,7 +47,7 @@ Build-Project (Join-Path $Root "boot\DustBoot.vcxproj")
 # Build host
 Build-Project (Join-Path $Root "src\Dust.vcxproj")
 
-$Effects = @("ssao", "lut", "bloom", "dof", "ssil", "clarity", "outline", "kuwahara", "rtgi", "shadows", "smaa", "chromaticaberration", "deband", "filmgrain", "letterbox", "vignette", "pom", "terraintess")
+$Effects = @("ssao", "ssaodebug", "lut", "bloom", "dof", "ssil", "clarity", "outline", "kuwahara", "rtgi", "shadows", "smaa", "chromaticaberration", "deband", "filmgrain", "letterbox", "vignette", "pom", "terraintess")
 foreach ($effect in $Effects) {
     $vcxproj = Get-ChildItem (Join-Path $Root "effects\$effect\*.vcxproj") | Select-Object -First 1
     Build-Project $vcxproj.FullName
@@ -82,7 +93,7 @@ if (Test-Path "$Root\mod\heightmaps") {
 foreach ($effect in $Effects) {
     $dll = Get-ChildItem "$Root\effects\$effect\build\Release\Dust*.dll" | Select-Object -First 1
     Copy-Item $dll.FullName "$ModDir\effects\"
-    $shaders = Get-ChildItem "$Root\effects\$effect\shaders\*.hlsl" -ErrorAction SilentlyContinue
+    $shaders = Get-ChildItem "$Root\effects\$effect\shaders\*.hlsl","$Root\effects\$effect\shaders\*.hlsli" -ErrorAction SilentlyContinue
     if ($shaders) { Copy-Item $shaders.FullName "$ModDir\effects\shaders\" }
 }
 

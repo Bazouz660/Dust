@@ -49,7 +49,7 @@ static uint64_t gFrameIndex = 0;
 static bool gDispatchedThisFrame = false;
 
 // Camera extraction from the game's deferred lighting CB
-// (staging CBs are in gCameraStagingCBs[], declared near ExtractCameraData)
+// (staging CB is in gCameraStagingCB, declared near ExtractCameraData)
 static DustCameraData gCameraData = {};
 static bool gCameraDataExtracted = false; // per-frame flag
 static bool gCameraDataEverValid  = false; // sticky once first extraction succeeds
@@ -166,67 +166,196 @@ void ResetFrameState()
 // Extract camera basis vectors from the game's deferred lighting PS constant buffer.
 // The inverse view matrix sits at register c8 (offset 128 bytes / 32 floats).
 // Camera axes are the COLUMNS of the inverse view matrix (= rows of the view matrix).
-// Double-buffered staging: CopyResource into slot N this frame, Map slot N-1
-// (which the GPU finished long ago). Eliminates the CPU-GPU sync stall that
-// was blocking the pipeline every frame.
-static ID3D11Buffer* gCameraStagingCBs[2] = {};
-static int gCameraStagingSlot = 0;
-static bool gCameraStagingReady = false; // false until first copy has been issued
+// Single staging buffer: CopyResource + immediate Map. Trades a small GPU sync
+// stall for zero-frame-delay camera data — critical for temporal reprojection.
+static ID3D11Buffer* gCameraStagingCB = nullptr;
 
 static void ExtractCameraData(ID3D11DeviceContext* ctx)
 {
-    if (gCameraDataExtracted) return;
+    // Per-period instrumentation. Counts each failure mode + success so we
+    // can see (from the log) why gCameraData isn't updating reliably.
+    static uint32_t sCallCount         = 0;
+    static uint32_t sAlreadyExtracted  = 0;
+    static uint32_t sNoBindCount       = 0;
+    static uint32_t sSizeFailCount     = 0;
+    static uint32_t sStagingCreateFail = 0;
+    static uint32_t sMapFailCount      = 0;
+    static uint32_t sValidateFailCount = 0;
+    static uint32_t sSuccessCount      = 0;
+
+    // CB-content stability tracker. Hash the 64 matrix bytes each successful
+    // extraction; compare to the previous frame's hash. If they match on
+    // frames where the game is rendering motion, Kenshi's CB at c8 didn't
+    // refresh this frame. Definitively proves whether the strobing is
+    // game-side or downstream.
+    static uint64_t sLastMatrixHash    = 0;
+    static uint32_t sCBSameCount       = 0;   // frames where matrix == prev
+    static uint32_t sCBDiffCount       = 0;   // frames where matrix changed
+    sCallCount++;
+
+    auto logIfTime = []() {
+        if (gFrameIndex > 0 && (gFrameIndex % 120) == 0)
+        {
+            Log("[CamExtract@frame %llu over last 120 frames]: calls=%u alreadyExt=%u "
+                "noBind=%u sizeFail=%u stagingFail=%u mapFail=%u validateFail=%u success=%u | "
+                "CB-same=%u CB-diff=%u",
+                (unsigned long long)gFrameIndex, sCallCount, sAlreadyExtracted,
+                sNoBindCount, sSizeFailCount, sStagingCreateFail,
+                sMapFailCount, sValidateFailCount, sSuccessCount,
+                sCBSameCount, sCBDiffCount);
+            sCallCount = sAlreadyExtracted = sNoBindCount = sSizeFailCount = 0;
+            sStagingCreateFail = sMapFailCount = 0;
+            sValidateFailCount = sSuccessCount = 0;
+            sCBSameCount = sCBDiffCount = 0;
+        }
+    };
+
+    if (gCameraDataExtracted) { sAlreadyExtracted++; logIfTime(); return; }
 
     ID3D11Buffer* psCB = nullptr;
     ctx->PSGetConstantBuffers(0, 1, &psCB);
-    if (!psCB) return;
+    if (!psCB) { sNoBindCount++; logIfTime(); return; }
 
     D3D11_BUFFER_DESC cbDesc;
     psCB->GetDesc(&cbDesc);
-    if (cbDesc.ByteWidth < 192) { psCB->Release(); return; }
+    if (cbDesc.ByteWidth < 192) { sSizeFailCount++; psCB->Release(); logIfTime(); return; }
 
-    if (gCameraStagingCBs[0])
+    if (gCameraStagingCB)
     {
         D3D11_BUFFER_DESC stagingDesc;
-        gCameraStagingCBs[0]->GetDesc(&stagingDesc);
+        gCameraStagingCB->GetDesc(&stagingDesc);
         if (stagingDesc.ByteWidth != cbDesc.ByteWidth)
         {
-            gCameraStagingCBs[0]->Release();
-            gCameraStagingCBs[1]->Release();
-            gCameraStagingCBs[0] = nullptr;
-            gCameraStagingCBs[1] = nullptr;
-            gCameraStagingReady = false;
+            gCameraStagingCB->Release();
+            gCameraStagingCB = nullptr;
         }
     }
 
-    if (!gCameraStagingCBs[0])
+    if (!gCameraStagingCB)
     {
         D3D11_BUFFER_DESC sd = cbDesc;
         sd.Usage = D3D11_USAGE_STAGING;
         sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         sd.BindFlags = 0;
         sd.MiscFlags = 0;
-        gDevice->CreateBuffer(&sd, nullptr, &gCameraStagingCBs[0]);
-        gDevice->CreateBuffer(&sd, nullptr, &gCameraStagingCBs[1]);
+        gDevice->CreateBuffer(&sd, nullptr, &gCameraStagingCB);
     }
-    if (!gCameraStagingCBs[0] || !gCameraStagingCBs[1]) { psCB->Release(); return; }
+    if (!gCameraStagingCB)
+    {
+        sStagingCreateFail++; psCB->Release(); logIfTime(); return;
+    }
 
-    int writeSlot = gCameraStagingSlot;
-    int readSlot = 1 - writeSlot;
-
-    // Copy this frame's CB into the write slot (async, no stall)
-    ctx->CopyResource(gCameraStagingCBs[writeSlot], psCB);
+    ctx->CopyResource(gCameraStagingCB, psCB);
     psCB->Release();
 
-    // Read LAST frame's data from the other slot (GPU finished it long ago)
-    if (gCameraStagingReady)
     {
         D3D11_MAPPED_SUBRESOURCE mapped;
-        if (SUCCEEDED(ctx->Map(gCameraStagingCBs[readSlot], 0, D3D11_MAP_READ, 0, &mapped)))
+        if (SUCCEEDED(ctx->Map(gCameraStagingCB, 0, D3D11_MAP_READ, 0, &mapped)))
         {
+            // One-shot CB audit on first successful map. Scans the whole CB
+            // for matrices identifiable by mathematical properties — gives
+            // us programmatic ground truth for projection FOV, near/far,
+            // and confirms the inverse-view location.
+            static bool sAuditDone = false;
+            if (!sAuditDone)
+            {
+                D3D11_BUFFER_DESC stagingDesc;
+                gCameraStagingCB->GetDesc(&stagingDesc);
+                int numFloats = (int)(stagingDesc.ByteWidth / 4);
+                const float* cb = (const float*)mapped.pData;
+                Log("[CBAudit] === Begin one-shot CB scan: %d floats (%d bytes) ===",
+                    numFloats, (int)stagingDesc.ByteWidth);
+
+                for (int off = 0; off + 16 <= numFloats; off += 4)
+                {
+                    const float* M = cb + off;
+
+                    // Count near-zeros for projection detection.
+                    int zeros = 0;
+                    bool allFinite = true;
+                    for (int i = 0; i < 16; i++)
+                    {
+                        if (!isfinite(M[i])) { allFinite = false; break; }
+                        if (fabsf(M[i]) < 1e-5f) zeros++;
+                    }
+                    if (!allFinite) continue;
+
+                    // Test ROW-MAJOR columns for orthonormality (basis vectors
+                    // stored at strided positions m[0,4,8], m[1,5,9], m[2,6,10]).
+                    float c0[3] = {M[0], M[4], M[8]};
+                    float c1[3] = {M[1], M[5], M[9]};
+                    float c2[3] = {M[2], M[6], M[10]};
+                    float lc0 = sqrtf(c0[0]*c0[0]+c0[1]*c0[1]+c0[2]*c0[2]);
+                    float lc1 = sqrtf(c1[0]*c1[0]+c1[1]*c1[1]+c1[2]*c1[2]);
+                    float lc2 = sqrtf(c2[0]*c2[0]+c2[1]*c2[1]+c2[2]*c2[2]);
+                    bool unitCols = (fabsf(lc0-1.0f) < 0.05f && fabsf(lc1-1.0f) < 0.05f && fabsf(lc2-1.0f) < 0.05f);
+                    float dotc01 = c0[0]*c1[0]+c0[1]*c1[1]+c0[2]*c1[2];
+                    float dotc02 = c0[0]*c2[0]+c0[1]*c2[1]+c0[2]*c2[2];
+                    bool orthCols = (fabsf(dotc01) < 0.05f && fabsf(dotc02) < 0.05f);
+
+                    // Test ROW-MAJOR rows for orthonormality (basis vectors
+                    // stored contiguously: m[0..2], m[4..6], m[8..10]).
+                    float r0[3] = {M[0], M[1], M[2]};
+                    float r1[3] = {M[4], M[5], M[6]};
+                    float r2[3] = {M[8], M[9], M[10]};
+                    float lr0 = sqrtf(r0[0]*r0[0]+r0[1]*r0[1]+r0[2]*r0[2]);
+                    float lr1 = sqrtf(r1[0]*r1[0]+r1[1]*r1[1]+r1[2]*r1[2]);
+                    float lr2 = sqrtf(r2[0]*r2[0]+r2[1]*r2[1]+r2[2]*r2[2]);
+                    bool unitRows = (fabsf(lr0-1.0f) < 0.05f && fabsf(lr1-1.0f) < 0.05f && fabsf(lr2-1.0f) < 0.05f);
+                    float dotr01 = r0[0]*r1[0]+r0[1]*r1[1]+r0[2]*r1[2];
+                    float dotr02 = r0[0]*r2[0]+r0[1]*r2[1]+r0[2]*r2[2];
+                    bool orthRows = (fabsf(dotr01) < 0.05f && fabsf(dotr02) < 0.05f);
+
+                    if (unitCols && orthCols)
+                    {
+                        Log("[CBAudit] c%d (byte %d): orthonormal COLS (rowmajor), "
+                            "row3=(%.3f,%.3f,%.3f,%.3f) col3=(%.3f,%.3f,%.3f,%.3f)",
+                            off/4, off*4,
+                            M[12], M[13], M[14], M[15],
+                            M[3], M[7], M[11], M[15]);
+                    }
+                    if (unitRows && orthRows)
+                    {
+                        Log("[CBAudit] c%d (byte %d): orthonormal ROWS (colmajor), "
+                            "row3=(%.3f,%.3f,%.3f,%.3f) col3=(%.3f,%.3f,%.3f,%.3f)",
+                            off/4, off*4,
+                            M[12], M[13], M[14], M[15],
+                            M[3], M[7], M[11], M[15]);
+                    }
+
+                    // Projection-shaped: many zeros + nonzero [1][1] (which is
+                    // 1/tan(fov_y/2) for a standard perspective matrix).
+                    if (zeros >= 10 && fabsf(M[5]) > 0.1f)
+                    {
+                        float tanY = 1.0f / M[5];
+                        float fovYdeg = 2.0f * atanf(tanY) * 57.2957795f;
+                        // [2][2] and [3][2] encode near/far in row-major LH:
+                        //   [2][2] = far/(far-near),  [3][2] = -near*far/(far-near)
+                        // → near = -[3][2] / ([2][2]-1),  far = [3][2] / (1-[2][2]) ... varies by convention
+                        Log("[CBAudit] c%d (byte %d): %d zeros, diag=(%.4f,%.4f,%.4f,%.4f) → "
+                            "if perspective: tan(fovY/2)=%.4f, fovY=%.2fdeg",
+                            off/4, off*4, zeros,
+                            M[0], M[5], M[10], M[15],
+                            tanY, fovYdeg);
+                        Log("[CBAudit]    proj rows: [%.3f %.3f %.3f %.3f] [%.3f %.3f %.3f %.3f] "
+                            "[%.3f %.3f %.3f %.3f] [%.3f %.3f %.3f %.3f]",
+                            M[0],M[1],M[2],M[3], M[4],M[5],M[6],M[7],
+                            M[8],M[9],M[10],M[11], M[12],M[13],M[14],M[15]);
+                    }
+                }
+                Log("[CBAudit] === End scan ===");
+                sAuditDone = true;
+            }
+
             float m[16];
-            memcpy(m, (float*)mapped.pData + 32, 64); // c8 offset
-            ctx->Unmap(gCameraStagingCBs[readSlot], 0);
+            memcpy(m, (float*)mapped.pData + 32, 64); // c8 offset (inverse view)
+
+            float proj[16] = {};
+            int numFloats = (int)(cbDesc.ByteWidth / 4);
+            if (numFloats >= 136 + 16)
+                memcpy(proj, (float*)mapped.pData + 136, 64); // c34 offset (projection)
+
+            ctx->Unmap(gCameraStagingCB, 0);
 
             bool valid = true;
             for (int i = 0; i < 16; i++)
@@ -234,20 +363,46 @@ static void ExtractCameraData(ID3D11DeviceContext* ctx)
 
             if (valid)
             {
+                // FNV-1a hash of the 64 raw matrix bytes — fast, byte-exact
+                // comparison so we can tell if Kenshi wrote the same CB content
+                // as last frame.
+                uint64_t h = 0xcbf29ce484222325ull;
+                const uint8_t* bytes = (const uint8_t*)m;
+                for (int i = 0; i < 64; ++i) { h ^= bytes[i]; h *= 0x100000001b3ull; }
+                if (h == sLastMatrixHash) sCBSameCount++;
+                else                      sCBDiffCount++;
+                sLastMatrixHash = h;
+
                 memcpy(gCameraData.inverseView, m, 64);
-                gCameraData.camRight[0]   = m[0]; gCameraData.camRight[1]   = m[4]; gCameraData.camRight[2]   = m[8];
-                gCameraData.camUp[0]      = m[1]; gCameraData.camUp[1]      = m[5]; gCameraData.camUp[2]      = m[9];
-                gCameraData.camForward[0] = m[2]; gCameraData.camForward[1] = m[6]; gCameraData.camForward[2] = m[10];
+                // Kenshi/OGRE stores matrices column-major in memory. The inverse
+                // view matrix has columns = basis vectors in world. In column-major
+                // memory, column N occupies m[N*4 .. N*4+2] (consecutive). The
+                // previous strided extraction (m[0],m[4],m[8]) was reading rows
+                // of the math matrix — orthonormal but NOT the basis vectors,
+                // which scrambled all temporal reprojection.
+                gCameraData.camRight[0]    = m[0];  gCameraData.camRight[1]    = m[1];  gCameraData.camRight[2]    = m[2];
+                gCameraData.camUp[0]       = m[4];  gCameraData.camUp[1]       = m[5];  gCameraData.camUp[2]       = m[6];
+                gCameraData.camForward[0]  = m[8];  gCameraData.camForward[1]  = m[9];  gCameraData.camForward[2]  = m[10];
                 gCameraData.camPosition[0] = m[12]; gCameraData.camPosition[1] = m[13]; gCameraData.camPosition[2] = m[14];
                 gCameraData.valid = 1;
+                memcpy(gCameraData.projMatrix, proj, 64);
+
                 gCameraDataExtracted = true;
                 gCameraDataEverValid = true;
+                sSuccessCount++;
             }
+            else
+            {
+                sValidateFailCount++;
+            }
+        }
+        else
+        {
+            sMapFailCount++;
         }
     }
 
-    gCameraStagingSlot = readSlot;
-    gCameraStagingReady = true;
+    logIfTime();
 }
 
 // ==================== Original function pointers ====================

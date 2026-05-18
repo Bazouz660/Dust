@@ -101,6 +101,7 @@ typedef struct DustCameraData {
     float   camForward[3];     // View Z axis (behind camera) in world space — OGRE RH convention
     float   camPosition[3];    // Camera position in world space
     float   inverseView[16];   // Raw 4x4 inverse view matrix (row-major in memory)
+    float   projMatrix[16];    // Raw 4x4 projection matrix (column-major from CB at c34/byte 544)
 } DustCameraData;
 
 // CSM shadow data snapshot (API v6+). Captured each frame from the deferred
@@ -436,6 +437,13 @@ typedef struct DustEffectDesc {
     const char*         configSection;   // INI section name (NULL = use effect name)
     const char*         _effectDir;      // Set by framework after DustEffectCreate — DLL directory (read-only)
     int32_t             priority;        // Dispatch order within same injection point (lower = earlier, default 0)
+
+    // Called in LoadAll right after EffectConfigLoad has populated the
+    // plugin's gConfig from disk, BEFORE Init runs. Lets the plugin push
+    // host-API state that has to land before Kenshi finishes its own setup
+    // (e.g. SetShadowAtlasResolution must fire before Kenshi creates the
+    // shadow atlas, which happens between LoadAll and InitAll).
+    void (*OnEarlyConfigApply)(const DustHostAPI* host);
 } DustEffectDesc;
 
 // Every effect DLL must export this function.

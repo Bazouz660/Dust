@@ -24,23 +24,26 @@ static std::string PatchDeferredShader(const std::string& src)
 
     // === AO Patches ===
 
-    // Injection 1: Add aoMap + aoParams sampler declarations.
-    // Anchor: "uniform float4 ambientParams," exists in all variants.
-    const char* anchor1 = "uniform float4 ambientParams,";
-    size_t pos1 = result.find(anchor1);
-    if (pos1 == std::string::npos)
+    // Injection 1: Global AO texture/sampler declarations (SM5 explicit registers).
+    // Explicit register(t8)/register(t9) prevents the HLSL compiler from remapping
+    // texture slots — critical because main_fs and light_fs have different sampler
+    // counts, and the compiler auto-packs t-registers densely per entry point.
+    // Anchor: "void main_vs (" — insert before it so declarations are visible to
+    // both main_fs and light_fs.
+    const char* aoGlobalAnchor = "void main_vs (";
+    size_t aoGlobalPos = result.find(aoGlobalAnchor);
+    if (aoGlobalPos != std::string::npos)
     {
-        Log("ShaderPatch: anchor 'ambientParams' not found, skipping");
-        return src;
+        std::string aoGlobals =
+            "// [Dust] AO textures — explicit t-register to prevent compiler remapping\n"
+            "Texture2D<float> dustAoTex    : register(t8);\n"
+            "Texture2D<float> dustAoParams : register(t9);\n"
+            "SamplerState     dustAoSamp   : register(s8);\n\n";
+        result.insert(aoGlobalPos, aoGlobals);
     }
 
-    std::string inject1 =
-        "uniform sampler aoMap : register(s8),\n"
-        "\tuniform sampler aoParams : register(s9),\n\n\t";
-    result.insert(pos1, inject1);
-
-    // Injection 2: Add AO application code.
-    // Anchor: "LightingData ld = (LightingData)0.0f;" — right after env light calculation.
+    // Injection 2: AO application in main_fs (ambient + sun).
+    // Anchor: "LightingData ld = (LightingData)0.0f;" — right after env/sun light calculation.
     const char* anchor2 = "LightingData ld = (LightingData)0.0f;";
     size_t pos2 = result.find(anchor2);
     if (pos2 == std::string::npos)
@@ -51,8 +54,8 @@ static std::string PatchDeferredShader(const std::string& src)
 
     std::string inject2 =
         "// [Dust] Ambient occlusion\n"
-        "\tfloat ao = tex2D(aoMap, texCoord).r;\n"
-        "\tfloat directAO = tex2D(aoParams, texCoord).r;\n"
+        "\tfloat ao = dustAoTex.SampleLevel(dustAoSamp, texCoord, 0);\n"
+        "\tfloat directAO = dustAoParams.SampleLevel(dustAoSamp, texCoord, 0);\n"
         "\tenvLight.diffuse *= ao;\n"
         "\tenvLight.specular *= ao;\n"
         "\tfloat directFade = lerp(1.0, ao, directAO);\n"
@@ -484,6 +487,28 @@ static std::string PatchDeferredShader(const std::string& src)
     else
     {
         Log("ShaderPatch: '= computeShadowMultiplier(' not found, CSM redirect skipped");
+    }
+
+    // Injection 5: AO application in light_fs (point lights / spotlights).
+    // Anchor: "color = color * attenuation * power;" — unique to light_fs.
+    const char* lightAnchor = "color = color * attenuation * power;";
+    size_t lightPos = result.find(lightAnchor);
+    if (lightPos != std::string::npos)
+    {
+        size_t insertPos = lightPos + strlen(lightAnchor);
+        std::string lightAO =
+            "\n\t// [Dust] Direct light AO\n"
+            "\t{\n"
+            "\t\tfloat _ao = dustAoTex.SampleLevel(dustAoSamp, texCoord, 0);\n"
+            "\t\tfloat _dAO = dustAoParams.SampleLevel(dustAoSamp, texCoord, 0);\n"
+            "\t\tcolor *= lerp(1.0, _ao, _dAO);\n"
+            "\t}\n";
+        result.insert(insertPos, lightAO);
+        Log("ShaderPatch: injected AO into light_fs");
+    }
+    else
+    {
+        Log("ShaderPatch: 'color = color * attenuation * power;' not found, light_fs AO skipped");
     }
 
     return result;
@@ -1098,7 +1123,7 @@ HRESULT WINAPI HookedD3DCompile(
     {
         std::string src((const char*)pSrcData, SrcDataSize);
         if (src.find("CalcEnvironmentLight") != std::string::npos &&
-            src.find("aoMap") == std::string::npos)  // not already patched
+            src.find("dustAoTex") == std::string::npos)  // not already patched
         {
             std::string patched = PatchDeferredShader(src);
             if (patched.size() != src.size())
@@ -1130,6 +1155,44 @@ HRESULT WINAPI HookedD3DCompile(
                     *ppErrorMsgs = nullptr;
                 }
                 // Fall through to compile original below
+            }
+        }
+    }
+
+    // Detect deferred light_fs (point lights / spotlights): same source as main_fs,
+    // different entry point. Patch identically so the global AO declarations and
+    // the light_fs injection are present when the compiler processes this entry point.
+    if (pEntrypoint && pSrcData && SrcDataSize > 0 &&
+        strcmp(pEntrypoint, "light_fs") == 0)
+    {
+        std::string src((const char*)pSrcData, SrcDataSize);
+        if (src.find("CalcEnvironmentLight") != std::string::npos &&
+            src.find("dustAoTex") == std::string::npos)
+        {
+            std::string patched = PatchDeferredShader(src);
+            if (patched.size() != src.size())
+            {
+                Log("ShaderPatch: patched deferred light_fs (%zu -> %zu bytes)",
+                    src.size(), patched.size());
+                HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
+                                          pDefines, pInclude, pEntrypoint, pTarget,
+                                          Flags1, Flags2, ppCode, ppErrorMsgs);
+                if (SUCCEEDED(hr))
+                {
+                    if (ppCode && *ppCode)
+                        SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
+                            pEntrypoint, pTarget, pSourceName,
+                            (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+                    return hr;
+                }
+
+                Log("ShaderPatch: patched light_fs failed to compile, falling back to original");
+                if (ppErrorMsgs && *ppErrorMsgs)
+                {
+                    Log("ShaderPatch: error: %s", (const char*)(*ppErrorMsgs)->GetBufferPointer());
+                    (*ppErrorMsgs)->Release();
+                    *ppErrorMsgs = nullptr;
+                }
             }
         }
     }

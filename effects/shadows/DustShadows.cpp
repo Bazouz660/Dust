@@ -420,6 +420,16 @@ static DustSettingDesc gSettings[] = {
     { "Cascade 3 Filter",    DUST_SETTING_FLOAT, &gConfig.cascade3Filter,   0.0f, 5.0f,  "Cascade3Filter",   nullptr, "Filter-radius multiplier for the farthest CSM cascade (where blockiness shows most). >1.0 softens the far-cascade artifacts.",                                                            DUST_PERF_NONE },
 };
 
+// Runs in EffectLoader::LoadAll right after our INI is loaded, BEFORE Init.
+// Pushes the atlas-resolution override to the host hook so Kenshi's atlas
+// (created between LoadAll and InitAll) picks up the override. Doing this
+// from Init is too late — by then the atlas already exists at vanilla size.
+static void ShadowEarlyConfigApply(const DustHostAPI* host)
+{
+    if (host && host->SetShadowAtlasResolution)
+        host->SetShadowAtlasResolution(GetSelectedShadowResolution());
+}
+
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
 {
     if (!desc) return -1;
@@ -434,20 +444,21 @@ extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
     gConfig.shadowRange = resolved;
     PushShadowRangeToGame();
 
-    desc->apiVersion        = DUST_API_VERSION;
-    desc->name              = "Shadows";
-    desc->injectionPoint    = DUST_INJECT_POST_LIGHTING;
-    desc->priority          = -10;
-    desc->Init              = ShadowInit;
-    desc->Shutdown          = ShadowShutdown;
-    desc->preExecute        = ShadowPreExecute;
-    desc->postExecute       = ShadowPostExecute;
-    desc->IsEnabled         = ShadowIsEnabled;
-    desc->settings          = gSettings;
-    desc->settingCount      = sizeof(gSettings) / sizeof(gSettings[0]);
-    desc->OnSettingChanged  = ShadowOnSettingChanged;
-    desc->flags             = DUST_FLAG_FRAMEWORK_CONFIG | DUST_FLAG_FRAMEWORK_TIMING;
-    desc->configSection     = "Shadows";
+    desc->apiVersion         = DUST_API_VERSION;
+    desc->name               = "Shadows";
+    desc->injectionPoint     = DUST_INJECT_POST_LIGHTING;
+    desc->priority           = -10;
+    desc->Init               = ShadowInit;
+    desc->Shutdown           = ShadowShutdown;
+    desc->preExecute         = ShadowPreExecute;
+    desc->postExecute        = ShadowPostExecute;
+    desc->IsEnabled          = ShadowIsEnabled;
+    desc->settings           = gSettings;
+    desc->settingCount       = sizeof(gSettings) / sizeof(gSettings[0]);
+    desc->OnSettingChanged   = ShadowOnSettingChanged;
+    desc->OnEarlyConfigApply = ShadowEarlyConfigApply;
+    desc->flags              = DUST_FLAG_FRAMEWORK_CONFIG | DUST_FLAG_FRAMEWORK_TIMING;
+    desc->configSection      = "Shadows";
 
     return 0;
 }

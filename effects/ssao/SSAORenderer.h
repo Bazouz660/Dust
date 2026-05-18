@@ -16,8 +16,11 @@ namespace SSAORenderer
                                         const DustCameraData* camera);
 
     // Render debug overlay onto HDR target. Called after the lighting draw.
+    // depthSRV is passed through so debug modes can visualize depth-derived
+    // intermediates independently of the AO pipeline.
     void RenderDebugOverlay(ID3D11DeviceContext* ctx,
-                            ID3D11RenderTargetView* hdrRTV);
+                            ID3D11RenderTargetView* hdrRTV,
+                            ID3D11ShaderResourceView* depthSRV);
 
     void OnResolutionChanged(ID3D11Device* device, UINT newWidth, UINT newHeight);
     bool IsInitialized();
