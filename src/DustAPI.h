@@ -235,9 +235,9 @@ typedef struct DustHostAPI {
     ID3D11ShaderResourceView* (*GetPreFogHDR)(void);
 
     // Override the game's shadow atlas resolution. Pass 0 to disable override
-    // (game's default 4096 is used). Takes effect at the next CreateTexture2D
-    // for the shadow atlas — since the atlas is created once at world load,
-    // changes after that point require a game restart.
+    // (game's default 4096 is used). At startup, takes effect at the next
+    // CreateTexture2D for the shadow atlas. At runtime, replacement textures
+    // and views are created and swapped in at bind time next frame.
     void (*SetShadowAtlasResolution)(uint32_t size);
 
     // Set the PSSM lambda for cascade split distribution. 0.0 = pure linear

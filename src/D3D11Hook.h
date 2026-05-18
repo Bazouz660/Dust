@@ -35,8 +35,8 @@ namespace D3D11Hook
     void SignalGameAlive(const char* via);
 
     // Plugin-driven override for the shadow atlas resolution. 0 disables the
-    // override (game default 4096 used). Read by HookedCreateTexture2D when
-    // the game creates the 4096^2 shadow atlas / depth pair.
+    // override (game default 4096 used). At startup, intercepts CreateTexture2D.
+    // At runtime, creates replacement textures and swaps views at bind time.
     void SetShadowAtlasResolution(UINT size);
     UINT GetShadowAtlasResolution();
 
