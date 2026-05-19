@@ -86,4 +86,10 @@ void OnGBufferLeave(ID3D11DeviceContext* ctx)
     ctx->PSSetConstantBuffers(8, 1, &nullCB);
 }
 
+void BindPerDraw(ID3D11DeviceContext* ctx)
+{
+    if (!ctx || !gCB) return;
+    ctx->PSSetConstantBuffers(8, 1, &gCB);
+}
+
 } // namespace POMState

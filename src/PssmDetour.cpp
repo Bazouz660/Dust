@@ -235,8 +235,13 @@ static std::atomic<float> sLambda{0.95f};
 // Kenshi only calls getFloatPointer(pos=24) once at scene init — the cbuffer
 // values then live in GpuSharedParameters and field_0x10 forever — so we
 // have to write to both ourselves whenever lambda changes.
-static void*  sSharedParams         = nullptr;  // GpuSharedParameters instance
+static void*  sSharedParams         = nullptr;  // GpuSharedParameters instance (CSM)
 static float* sSplitsArray          = nullptr;  // orchestrator-this->field_0x10
+
+// RTWSM shared params: shadow_range is at float[0] of this block.
+// Captured from getFloatPointer(pos=5) on first call.
+static void*  sRtwsmSharedParams    = nullptr;
+static float* sRtwsmFloatsBase      = nullptr;
 static float  sCachedNear           = 0.0f;
 static float  sCachedFar            = 0.0f;
 static std::atomic<float> sCascadeFilterScale[4] = {
@@ -246,6 +251,45 @@ static std::atomic<float> sCascadeFilterScale[4] = {
 // path leaves Kenshi's native value alone. Otherwise capture applies this
 // value at the moment sSplitsArray becomes non-null.
 static std::atomic<float> sRequestedFar{std::numeric_limits<float>::quiet_NaN()};
+
+// SceneManager pointer captured from _injectRenderWithPass. Used to call
+// setShadowFarDistance for RTWSM mode (which ignores the CSM splits array).
+static void* sSceneManager = nullptr;
+typedef void (*SetShadowFarDistFn)(void* self, float distance);
+static SetShadowFarDistFn sFn_setShadowFarDistance = nullptr;
+
+// Getter intercepts: override shadow far distance for any OGRE code that
+// queries it (shadow camera setup, auto-constants, etc.).
+typedef float (*GetShadowFarDistFn)(const void* self);
+static GetShadowFarDistFn sOrig_SM_getShadowFarDist = nullptr;
+static GetShadowFarDistFn sOrig_Light_getShadowFarDist = nullptr;
+static GetShadowFarDistFn sOrig_SM_getShadowFarDistSq = nullptr;
+static GetShadowFarDistFn sOrig_Light_getShadowFarDistSq = nullptr;
+static float Hook_SM_getShadowFarDist(const void* self)
+{
+    float req = sRequestedFar.load();
+    return (req == req) ? req : sOrig_SM_getShadowFarDist(self);
+}
+
+static float Hook_SM_getShadowFarDistSq(const void* self)
+{
+    float req = sRequestedFar.load();
+    return (req == req) ? req * req : sOrig_SM_getShadowFarDistSq(self);
+}
+
+static float Hook_Light_getShadowFarDist(const void* self)
+{
+    float req = sRequestedFar.load();
+    float orig = sOrig_Light_getShadowFarDist(self);
+    return (req == req && orig > 0.0f) ? req : orig;
+}
+
+static float Hook_Light_getShadowFarDistSq(const void* self)
+{
+    float req = sRequestedFar.load();
+    float orig = sOrig_Light_getShadowFarDistSq(self);
+    return (req == req && orig > 0.0f) ? req * req : orig;
+}
 
 // Compute and write splits[1..3] into a 5-float [near, s1, s2, s3, far] array
 // using the current lambda + cached near/far. Returns true if writes happened.
@@ -298,7 +342,17 @@ bool SetShadowFar(float farDistance)
     // Kenshi hasn't yet handed us a splits source pointer.
     sRequestedFar.store(farDistance);
 
-    if (!sSplitsArray || !(sCachedNear > 0.0f)) return false;
+    // RTWSM: write shadow range directly to the shared params float array.
+    // The per-frame getFloatPointer(pos=5) hook also applies sRequestedFar,
+    // but this immediate write covers the case where the slider changes
+    // between two getFloatPointer calls.
+    if (sRtwsmFloatsBase)
+        sRtwsmFloatsBase[0] = farDistance;
+
+    if (sFn_setShadowFarDistance && sSceneManager)
+        sFn_setShadowFarDistance(sSceneManager, farDistance);
+
+    if (!sSplitsArray || !(sCachedNear > 0.0f)) return sRtwsmFloatsBase != nullptr;
     float minFar = sCachedNear + 1.0f;
     if (farDistance < minFar) farDistance = minFar;
 
@@ -342,6 +396,28 @@ static float* Hook_getFloatPointer(void* self, size_t pos)
 {
     int n = ++sCount_getFloatPointer;
 
+
+    // When pos==5 (RTWSM shared params), capture the float array base.
+    // shadow_range lives at floats[0]. This fires every frame so we can
+    // apply pending overrides here.
+    if (pos == 5)
+    {
+        if (!sRtwsmSharedParams)
+        {
+            sRtwsmSharedParams = self;
+            float* base = sOrig_getFloatPointer(self, 0);
+            sRtwsmFloatsBase = base;
+            if (base)
+                Log("PssmDetour: RTWSM shared params captured, shadow_range=%g", (double)base[0]);
+
+        }
+        if (sRtwsmFloatsBase)
+        {
+            float pending = sRequestedFar.load();
+            if (pending == pending && pending >= 1.0f)
+                sRtwsmFloatsBase[0] = pending;
+        }
+    }
 
     // When pos==24 (csmParams), unwind the call stack to locate the Kenshi
     // orchestrator frame, recover its RDI (= this), and patch the splits
@@ -535,6 +611,8 @@ static void Hook_setSharedFloatArr(void* self, const void* name,
 static void Hook_injectRenderWithPass(void* self, void* pass, void* rend, void* camera,
                                       bool firstRenderable, bool casterPass)
 {
+    if (!sSceneManager && self)
+        sSceneManager = self;
     int n = ++sCount_injectRenderWithPass;
     if (n <= 8 || (n % 1200) == 0)
     {
@@ -704,6 +782,28 @@ bool TryInstall()
     Log("PssmDetour: name resolvers Pass::getName=%p Pass::getParent=%p "
         "Technique::getParent=%p Resource::getName=%p",
         sFn_Pass_getName, sFn_Pass_getParent, sFn_Technique_getParent, sFn_Material_getName);
+
+    sFn_setShadowFarDistance = (SetShadowFarDistFn)GetProcAddress(m,
+        "?setShadowFarDistance@SceneManager@Ogre@@UEAAXM@Z");
+    Log("PssmDetour: SceneManager::setShadowFarDistance=%p", sFn_setShadowFarDistance);
+
+    // Getter intercepts — override any code reading shadow far distance
+    InstallOne(m,
+        "?getShadowFarDistance@SceneManager@Ogre@@UEBAMXZ",
+        (void*)&Hook_SM_getShadowFarDist,
+        (void**)&sOrig_SM_getShadowFarDist);
+    InstallOne(m,
+        "?getShadowFarDistanceSquared@SceneManager@Ogre@@UEBAMXZ",
+        (void*)&Hook_SM_getShadowFarDistSq,
+        (void**)&sOrig_SM_getShadowFarDistSq);
+    InstallOne(m,
+        "?getShadowFarDistance@Light@Ogre@@QEBAMXZ",
+        (void*)&Hook_Light_getShadowFarDist,
+        (void**)&sOrig_Light_getShadowFarDist);
+    InstallOne(m,
+        "?getShadowFarDistanceSquared@Light@Ogre@@QEBAMXZ",
+        (void*)&Hook_Light_getShadowFarDistSq,
+        (void**)&sOrig_Light_getShadowFarDistSq);
 
     sInstalled = true;
     return true;

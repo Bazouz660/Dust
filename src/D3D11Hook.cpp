@@ -1431,6 +1431,8 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     {
         return;
     }
+    if (GeometryCapture::IsInGBufferPass())
+        POMState::BindPerDraw(pThis);
     oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 }
 
@@ -1465,6 +1467,8 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
 
     // Instanced terrain draws aren't typical (terrain isn't instanced), so
     // skip tessellation routing here for now.
+    if (GeometryCapture::IsInGBufferPass())
+        POMState::BindPerDraw(pThis);
     oDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
                           StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
 }

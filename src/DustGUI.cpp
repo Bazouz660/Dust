@@ -1384,6 +1384,8 @@ static void DrawEffectSection(size_t idx)
     }
 
     bool anyChanged = false;
+    bool sectionOpen = true;
+    bool inSection = false;
 
     for (uint32_t i = 0; i < le.desc.settingCount; i++)
     {
@@ -1395,17 +1397,20 @@ static void DrawEffectSection(size_t idx)
             || s.type == DUST_SETTING_HIDDEN_BOOL)
             continue;
 
-        // Section: visual-only group header, no value, no reset button
+        // Section: foldable sub-group with indent
         if (s.type == DUST_SETTING_SECTION)
         {
+            if (inSection) { ImGui::TreePop(); inSection = false; }
             ImGui::Spacing();
-            ImGui::Separator();
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.75f, 0.45f, 1.0f));
-            ImGui::TextUnformatted(s.name);
+            sectionOpen = ImGui::TreeNodeEx(s.name,
+                ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_Framed);
             ImGui::PopStyleColor();
-            ImGui::Separator();
+            inSection = sectionOpen;
             continue;
         }
+
+        if (!sectionOpen) continue;
 
         if (!s.valuePtr) continue;
 
@@ -1512,6 +1517,8 @@ static void DrawEffectSection(size_t idx)
         if (changed) anyChanged = true;
         ImGui::PopID();
     }
+
+    if (inSection) ImGui::TreePop();
 
     if (anyChanged && le.desc.OnSettingChanged)
         le.desc.OnSettingChanged();

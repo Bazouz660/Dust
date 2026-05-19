@@ -27,4 +27,10 @@ namespace POMState
     // HookedOMSetRenderTargets. Bind/unbind the cbuffer at PS slot 8.
     void OnGBufferEnter(ID3D11DeviceContext* ctx);
     void OnGBufferLeave(ID3D11DeviceContext* ctx);
+
+    // Re-bind the POM cbuffer at PS slot 8. Called per-draw during the
+    // GBuffer pass because Ogre's per-material state setup overwrites the
+    // slot with its own (zero-filled) buffer for the DustPOMParams cbuffer
+    // it discovered via shader reflection.
+    void BindPerDraw(ID3D11DeviceContext* ctx);
 }
