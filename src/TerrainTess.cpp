@@ -452,75 +452,44 @@ ID3D11RasterizerState*    gWireframeRs   = nullptr;
 ID3D11DepthStencilState*  gBloodDss      = nullptr;
 Controls                  gControls;
 
-// Per-frame timing for PrepareStripConversion (perf diagnostic).
-double gStripConvTotalMs = 0.0;
-int    gStripConvCalls   = 0;
-LARGE_INTEGER gQpcFreq = {};
+// GPU strip→list compute shader — converts TRIANGLESTRIP indices to
+// TRIANGLELIST directly on the GPU via a compute dispatch. Replaces the
+// CPU-side IB shadow + memcpy that was costing ~1.3ms/frame in
+// OnContextUnmap.ib + OnContextUnmap.staging. Now there is zero CPU-side
+// IB shadowing; the compute shader reads from the game's IB via
+// CopySubresourceRegion → typed SRV and writes to a UAV-enabled IB +
+// indirect draw args buffer. DrawIndexedInstancedIndirect consumes the
+// result with no CPU readback of the index count.
+static const char kStripToListCS[] = R"(
+cbuffer Params : register(b0) { uint stripCount; uint pad0, pad1, pad2; };
+Buffer<uint>        stripIB : register(t0);
+RWBuffer<uint>      listIB  : register(u0);
+RWByteAddressBuffer args    : register(u1);
+[numthreads(256, 1, 1)]
+void main(uint3 dtid : SV_DispatchThreadID) {
+    uint i = dtid.x;
+    if (i + 2 >= stripCount) return;
+    uint a = stripIB[i], b = stripIB[i+1], c = stripIB[i+2];
+    if (a == b || b == c || a == c) return;
+    if (i & 1) { uint t = a; a = b; b = t; }
+    uint base;
+    args.InterlockedAdd(0, 3u, base);
+    listIB[base] = a; listIB[base+1] = b; listIB[base+2] = c;
+}
+)";
 
-// IB content shadow. CopyResource+Map(READ) of the game's IB was costing
-// 3-5 ms/frame because the Map(READ) drains the GPU queue. Instead we
-// shadow the game's IB writes CPU-side and PrepareStripConversion reads
-// from memory — no GPU sync, no stall.
-//
-// Kenshi's actual IB write path is:
-//   Map(staging) → memcpy → Unmap → CopyResource(IB, staging) → Draw
-// So we shadow BOTH staging buffers (via Map/Unmap hook) and propagate
-// the data into the IB shadow at CopyResource time.
-std::unordered_set<ID3D11Buffer*>          gTrackedIbs;
-std::unordered_map<ID3D11Buffer*, std::vector<uint8_t>> gIbShadow;
-std::unordered_map<ID3D11Buffer*, void*>   gIbPendingMaps;
-
-// Staging buffers used as IB upload sources. Track and shadow content.
-std::unordered_set<ID3D11Buffer*>          gTrackedStaging;
-std::unordered_map<ID3D11Buffer*, std::vector<uint8_t>> gStagingShadow;
-std::unordered_map<ID3D11Buffer*, void*>   gStagingPendingMaps;
-// Subset of gTrackedStaging seen flowing CopyResource → tracked IB at least
-// once. Kenshi creates ~3000 staging buffers but only a handful actually feed
-// terrain IBs; shadowing the others on Unmap costs ~21µs each (a full multi-
-// KB memcpy of unrelated upload data). Limit shadow maintenance to active.
-std::unordered_set<ID3D11Buffer*>          gActiveStaging;
-// Last frame each tracked buffer was observed in a bloom hit. Stale entries
-// (not seen in many frames) get pruned periodically to keep the tracked
-// sets small — otherwise they grow unboundedly as the player explores and
-// inflate the bloom FPR back to saturation.
-std::unordered_map<ID3D11Buffer*, uint32_t> gLastUsedFrame;
-// Set of ByteWidth values seen for tracked terrain IBs. Used by the staging
-// Unmap path to skip per-call memcpy on stagings whose size matches NO IB:
-// those can't possibly be propagating IB content (the CopyResource src/dst
-// must match sizes), so shadowing them is pure waste. Reduces the dominant
-// OnContextUnmap.staging cost from ~2ms to ~0.5ms in worst-case scenes.
-std::unordered_set<UINT>                   gKnownIbSizes;
-
-struct StripConvTimer
-{
-    LARGE_INTEGER start;
-    StripConvTimer() { QueryPerformanceCounter(&start); }
-    ~StripConvTimer()
-    {
-        LARGE_INTEGER end;
-        QueryPerformanceCounter(&end);
-        if (gQpcFreq.QuadPart == 0) QueryPerformanceFrequency(&gQpcFreq);
-        gStripConvTotalMs += (end.QuadPart - start.QuadPart) * 1000.0 / (double)gQpcFreq.QuadPart;
-        gStripConvCalls++;
-    }
-};
-
-// Reusable buffers for strip→list IB conversion. The previous implementation
-// CreateBuffer'd a staging + immutable list IB on every terrain draw; with
-// hundreds of chunks per frame that was a meaningful CPU cost. Both buffers
-// grow geometrically on demand.
-//
-// Staging: we use CopySubresourceRegion to copy ONLY the strip sub-range we
-// need (stripIndexCount * indexSize bytes). CopyResource requires identical
-// ByteWidth on src/dst, but CopySubresourceRegion takes a source box — so a
-// pooled, larger-than-source staging buffer is fine. The first version of
-// this code used CopyResource and produced invisible terrain once the pool
-// grew past the source IB size (CopyResource silently failed → garbage data
-// → bad indices → off-screen triangles).
-ID3D11Buffer*             gIbStaging     = nullptr;
-UINT                      gIbStagingCap  = 0;
-ID3D11Buffer*             gIbList        = nullptr;
-UINT                      gIbListCap     = 0;
+ID3D11ComputeShader*         gStripCS       = nullptr;
+ID3D11Buffer*                gStripCB       = nullptr;
+ID3D11Buffer*                gStripSrc      = nullptr;
+UINT                         gStripSrcCap   = 0;
+ID3D11ShaderResourceView*    gStripSrcSRV   = nullptr;
+DXGI_FORMAT                  gStripSrcFmt   = DXGI_FORMAT_UNKNOWN;
+ID3D11Buffer*                gStripDst      = nullptr;
+UINT                         gStripDstCap   = 0;
+ID3D11UnorderedAccessView*   gStripDstUAV   = nullptr;
+DXGI_FORMAT                  gStripDstFmt   = DXGI_FORMAT_UNKNOWN;
+ID3D11Buffer*                gStripArgs     = nullptr;
+ID3D11UnorderedAccessView*   gStripArgsUAV  = nullptr;
 
 // Captured PS bytecode by PS pointer (kept for reflection logging on first
 // sighting of each unique PS — useful when debugging cb0 layout changes).
@@ -874,7 +843,7 @@ bool CompileShader(const char* src, const char* target, ID3DBlob** outBlob)
 Controls* GetControls() { return &gControls; }
 
 namespace detail { bool gEnabledFlag = true; }
-void SetEnabled(bool enabled) { detail::gEnabledFlag = enabled; }
+void SetEnabled(bool enabled) { detail::gEnabledFlag = enabled; D3D11Hook::RefreshContextHooks(); }
 
 namespace detail { bool gIsTerrainBoundFlag = false; }
 namespace detail { bool gIsBloodBoundFlag   = false; }
@@ -1001,60 +970,8 @@ void OnFrameEnd()
     // last frame (chunks that were tessellated then but skipped now).
     gFrameNumber++;
 
-    // Periodic LRU sweep — STAGING ONLY. IBs are typically "used" via Bind
-    // not Map (Kenshi uploads once at chunk load, then re-binds many times
-    // without re-mapping), so Map-based last-used tracking would falsely
-    // mark active IBs as stale. Same for CBs (small fixed set, all live).
-    // Stagings ARE Map+Unmap'd on every use, so Map-based liveness is
-    // accurate. Stagings also dominate the tracked-set size (~2570 vs
-    // ~2330 IBs / 5 CBs), so this is where the bloom-saturation savings
-    // are anyway.
-    constexpr uint32_t kSweepInterval = 600;   // ~10s at 60fps
-    constexpr uint32_t kStaleFrames   = 600;   // unused-for-this-many → drop
-    if ((gFrameNumber % kSweepInterval) == 0)
-    {
-        std::lock_guard<std::mutex> lock(gCbMutex);
-        const uint32_t cutoff = (gFrameNumber > kStaleFrames)
-                              ? gFrameNumber - kStaleFrames : 0;
-
-        size_t stgBefore = gTrackedStaging.size();
-        for (auto it = gTrackedStaging.begin(); it != gTrackedStaging.end();)
-        {
-            auto luIt = gLastUsedFrame.find(*it);
-            bool stale = (luIt == gLastUsedFrame.end() || luIt->second < cutoff);
-            if (stale) it = gTrackedStaging.erase(it); else ++it;
-        }
-
-        // Drop pending entries + shadows for stagings no longer tracked.
-        for (auto it = gStagingPendingMaps.begin(); it != gStagingPendingMaps.end();)
-            if (!gTrackedStaging.count(it->first)) it = gStagingPendingMaps.erase(it); else ++it;
-        for (auto it = gStagingShadow.begin(); it != gStagingShadow.end();)
-            if (!gTrackedStaging.count(it->first)) it = gStagingShadow.erase(it); else ++it;
-        for (auto it = gActiveStaging.begin(); it != gActiveStaging.end();)
-            if (!gTrackedStaging.count(*it)) it = gActiveStaging.erase(it); else ++it;
-
-        // Drop gLastUsedFrame entries for stagings no longer tracked
-        // (cb/ib entries stay — they're used for future sweep liveness if
-        //  we ever extend it, and the map is small overhead either way).
-        for (auto it = gLastUsedFrame.begin(); it != gLastUsedFrame.end();)
-        {
-            const bool isTracked = gTrackedCbs.count(it->first) ||
-                                    gTrackedIbs.count(it->first) ||
-                                    gTrackedStaging.count(it->first);
-            if (!isTracked) it = gLastUsedFrame.erase(it); else ++it;
-        }
-
-        // Rebuild bloom from survivors. Fresh zero, re-add each entry.
-        for (int i = 0; i < 1024; ++i)
-            detail::gTrackedBloom[i].store(0, std::memory_order_relaxed);
-        for (auto* b : gTrackedCbs)     BloomAdd(b);
-        for (auto* b : gTrackedIbs)     BloomAdd(b);
-        for (auto* b : gTrackedStaging) BloomAdd(b);
-
-        Log("TerrainTess: bloom sweep — staging %zu→%zu  (cb=%zu ib=%zu untouched)",
-            stgBefore, gTrackedStaging.size(),
-            gTrackedCbs.size(), gTrackedIbs.size());
-    }
+    // Bloom only contains CB pointers now (IB/staging shadow removed).
+    // CBs are a small fixed set (~5) that never goes stale, so no sweep needed.
 
     // Rotate the adaptive blood-capture flag: if blood drew this frame,
     // capture next frame too. If not, we'll skip capture entirely and
@@ -1067,9 +984,6 @@ void OnFrameEnd()
     // this many CopyResource+Map READs per frame; uncached VBs beyond
     // the budget fall through to full tess until later frames catch up.
     gVbCaptureBudget = kVbCaptureBudgetPerFrame;
-
-    gStripConvTotalMs = 0.0;
-    gStripConvCalls   = 0;
 
     ID3D11DeviceContext* ctx = D3D11Hook::gContext;
     if (!ctx) return;
@@ -1414,11 +1328,7 @@ void OnContextMap(ID3D11Resource* res, void* mappedPtr)
     if (FAILED(res->QueryInterface(__uuidof(ID3D11Buffer), (void**)&buf)) || !buf) return;
 
     std::lock_guard<std::mutex> lock(gCbMutex);
-    bool inAnySet = false;
-    if (gTrackedCbs.count(buf))     { gCbPending[buf]         = mappedPtr; inAnySet = true; }
-    if (gTrackedIbs.count(buf))     { gIbPendingMaps[buf]     = mappedPtr; inAnySet = true; }
-    if (gTrackedStaging.count(buf)) { gStagingPendingMaps[buf] = mappedPtr; inAnySet = true; }
-    if (inAnySet) gLastUsedFrame[buf] = gFrameNumber;
+    if (gTrackedCbs.count(buf)) { gCbPending[buf] = mappedPtr; }
     buf->Release();
 }
 
@@ -1430,103 +1340,10 @@ void OnVertexBufferCreated(ID3D11Buffer* vb, const void* initialData)
     gVbPosCache[vb] = VbPos{ p[0], p[1], p[2] };
 }
 
-void OnIndexBufferCreated(ID3D11Buffer* ib, const void* initialData, UINT size)
-{
-    if (!ib) return;
-    std::lock_guard<std::mutex> lock(gCbMutex);
-    if (gTrackedIbs.insert(ib).second) BloomAdd(ib);
-    if (size > 0) gKnownIbSizes.insert(size);
-    if (initialData && size > 0)
-    {
-        auto& shadow = gIbShadow[ib];
-        shadow.resize(size);
-        memcpy(shadow.data(), initialData, size);
-    }
-}
-
-void OnStagingBufferCreated(ID3D11Buffer* buf, UINT /*byteWidth*/)
-{
-    if (!buf) return;
-    std::lock_guard<std::mutex> lock(gCbMutex);
-    if (gTrackedStaging.insert(buf).second) BloomAdd(buf);
-}
-
-// Called from HookedCopyResource. If dst is a tracked IB AND src has a
-// shadow (staging or otherwise), propagate the content. This is how
-// Kenshi's strip data ends up in our IB shadow even though the engine
-// uses CopyResource for IB uploads instead of direct Map/Unmap on the IB.
-void OnCopyResource(ID3D11Resource* dst, ID3D11Resource* src)
-{
-    if (!dst || !src) return;
-    // Bloom-filter bailout: only proceed if either side is a buffer we track.
-    if (!BloomTest(dst) && !BloomTest(src)) return;
-    // QI verifies both pointers are real buffers — see OnContextMap.
-    ID3D11Buffer* dstBuf = nullptr;
-    if (FAILED(dst->QueryInterface(__uuidof(ID3D11Buffer), (void**)&dstBuf)) || !dstBuf) return;
-    ID3D11Buffer* srcBuf = nullptr;
-    if (FAILED(src->QueryInterface(__uuidof(ID3D11Buffer), (void**)&srcBuf)) || !srcBuf)
-    {
-        dstBuf->Release();
-        return;
-    }
-
-    std::lock_guard<std::mutex> lock(gCbMutex);
-    if (gTrackedIbs.count(dstBuf))
-    {
-        // Look for source content in any shadow we maintain.
-        const std::vector<uint8_t>* srcShadow = nullptr;
-        auto stagingIt = gStagingShadow.find(srcBuf);
-        if (stagingIt != gStagingShadow.end()) srcShadow = &stagingIt->second;
-        else
-        {
-            auto ibIt = gIbShadow.find(srcBuf);
-            if (ibIt != gIbShadow.end()) srcShadow = &ibIt->second;
-        }
-        if (srcShadow && !srcShadow->empty())
-        {
-            // CopyResource requires identical sizes, so just propagate.
-            auto& dstShadow = gIbShadow[dstBuf];
-            dstShadow = *srcShadow;
-        }
-    }
-    dstBuf->Release();
-    srcBuf->Release();
-}
-
-void OnIndexBufferUpdate(ID3D11Resource* res, const D3D11_BOX* box,
-                         const void* src, UINT /*srcRowPitch*/)
-{
-    if (!res || !src) return;
-    if (!BloomTest(res)) return;
-    // QI verifies buffer type — see OnContextMap.
-    ID3D11Buffer* buf = nullptr;
-    if (FAILED(res->QueryInterface(__uuidof(ID3D11Buffer), (void**)&buf)) || !buf) return;
-
-    std::lock_guard<std::mutex> lock(gCbMutex);
-    if (gTrackedIbs.count(buf))
-    {
-        // Determine where in the buffer this update lands and how big it
-        // is. For a full-buffer update, box is null; in that case we copy
-        // the whole buffer.
-        D3D11_BUFFER_DESC bd = {};
-        buf->GetDesc(&bd);
-
-        UINT dstStart = 0;
-        UINT updSize  = bd.ByteWidth;
-        if (box)
-        {
-            dstStart = box->left;
-            updSize  = box->right - box->left;
-        }
-        if (dstStart + updSize <= bd.ByteWidth)
-        {
-            auto& shadow = gIbShadow[buf];
-            if (shadow.size() < bd.ByteWidth) shadow.resize(bd.ByteWidth);
-            memcpy(shadow.data() + dstStart, src, updSize);
-        }
-    }
-    buf->Release();
-}
+// OnIndexBufferCreated, OnStagingBufferCreated, OnCopyResource, and
+// OnIndexBufferUpdate removed — the GPU strip→list compute shader reads
+// directly from the game's IB via CopySubresourceRegion at draw time,
+// eliminating the need for CPU-side IB shadow infrastructure.
 
 void OnContextUnmap(ID3D11Resource* res)
 {
@@ -1553,43 +1370,6 @@ void OnContextUnmap(ID3D11Resource* res)
         auto& shadow = gCbShadow[buf];
         shadow.resize(bd.ByteWidth);
         memcpy(shadow.data(), src, bd.ByteWidth);
-    }
-
-    auto ibIt = gIbPendingMaps.find(buf);
-    if (ibIt != gIbPendingMaps.end())
-    {
-        ZoneScopedN("OnContextUnmap.ib");
-        void* src = ibIt->second;
-        gIbPendingMaps.erase(ibIt);
-
-        D3D11_BUFFER_DESC bd = {};
-        buf->GetDesc(&bd);
-        auto& shadow = gIbShadow[buf];
-        shadow.resize(bd.ByteWidth);
-        memcpy(shadow.data(), src, bd.ByteWidth);
-    }
-
-    auto stgIt = gStagingPendingMaps.find(buf);
-    if (stgIt != gStagingPendingMaps.end())
-    {
-        ZoneScopedN("OnContextUnmap.staging");
-        void* src = stgIt->second;
-        gStagingPendingMaps.erase(stgIt);
-
-        D3D11_BUFFER_DESC bd = {};
-        buf->GetDesc(&bd);
-
-        // Only memcpy if this staging's size matches an IB we've seen —
-        // CopyResource requires matching sizes, so a staging that doesn't
-        // match any IB size can't possibly be propagating IB content. Skips
-        // the dominant per-Unmap memcpy for non-IB stagings (textures,
-        // misc uniform-style uploads of unrelated sizes).
-        if (gKnownIbSizes.count(bd.ByteWidth))
-        {
-            auto& shadow = gStagingShadow[buf];
-            shadow.resize(bd.ByteWidth);
-            memcpy(shadow.data(), src, bd.ByteWidth);
-        }
     }
     buf->Release();
 }
@@ -1742,7 +1522,25 @@ void Init(ID3D11Device* device)
         }
     }
 
-    Log("TerrainTess: HS+DS compiled and ready");
+    // Compile the strip→list compute shader for GPU-side IB conversion.
+    {
+        ID3DBlob* csBlob = nullptr;
+        if (CompileShader(kStripToListCS, "cs_5_0", &csBlob))
+        {
+            hr = device->CreateComputeShader(csBlob->GetBufferPointer(),
+                                             csBlob->GetBufferSize(),
+                                             nullptr, &gStripCS);
+            csBlob->Release();
+            if (FAILED(hr))
+            {
+                Log("TerrainTess: CreateComputeShader failed (0x%08X)", hr);
+                gStripCS = nullptr;
+            }
+        }
+    }
+
+    Log("TerrainTess: HS+DS compiled and ready (CS %s)",
+        gStripCS ? "ok" : "FAILED");
 }
 
 void Shutdown()
@@ -1752,20 +1550,17 @@ void Shutdown()
     if (gLinearWrap)  { gLinearWrap->Release();  gLinearWrap = nullptr; }
     if (gControlCb)   { gControlCb->Release();   gControlCb = nullptr; }
     if (gBloodDss)    { gBloodDss->Release();    gBloodDss = nullptr; }
-    if (gWireframeRs) { gWireframeRs->Release(); gWireframeRs = nullptr; }
-    if (gIbStaging)   { gIbStaging->Release();   gIbStaging = nullptr; }
-    if (gIbList)      { gIbList->Release();      gIbList = nullptr; }
-    gIbStagingCap = 0;
-    gIbListCap    = 0;
-    gTrackedIbs.clear();
-    gIbShadow.clear();
-    gIbPendingMaps.clear();
-    gKnownIbSizes.clear();
-    gTrackedStaging.clear();
-    gStagingShadow.clear();
-    gStagingPendingMaps.clear();
-    gActiveStaging.clear();
-    gLastUsedFrame.clear();
+    if (gWireframeRs)  { gWireframeRs->Release();  gWireframeRs = nullptr; }
+    if (gStripCS)      { gStripCS->Release();      gStripCS = nullptr; }
+    if (gStripCB)      { gStripCB->Release();      gStripCB = nullptr; }
+    if (gStripSrcSRV)  { gStripSrcSRV->Release();  gStripSrcSRV = nullptr; }
+    if (gStripSrc)     { gStripSrc->Release();     gStripSrc = nullptr; }
+    if (gStripDstUAV)  { gStripDstUAV->Release();  gStripDstUAV = nullptr; }
+    if (gStripDst)     { gStripDst->Release();     gStripDst = nullptr; }
+    if (gStripArgsUAV) { gStripArgsUAV->Release(); gStripArgsUAV = nullptr; }
+    if (gStripArgs)    { gStripArgs->Release();    gStripArgs = nullptr; }
+    gStripSrcCap = 0; gStripSrcFmt = DXGI_FORMAT_UNKNOWN;
+    gStripDstCap = 0; gStripDstFmt = DXGI_FORMAT_UNKNOWN;
     for (int f = 0; f < kTimerFrames; f++)
     {
         if (gTimerFrames[f].disjoint) { gTimerFrames[f].disjoint->Release(); gTimerFrames[f].disjoint = nullptr; }
@@ -1862,172 +1657,147 @@ static bool EnsurePooledBuffer(ID3D11Device* device,
     return true;
 }
 
-// Convert a TRIANGLESTRIP IB sub-range to TRIANGLELIST with alternating winding
-// + degenerate skip. The returned listIB is owned by TerrainTess (pooled);
-// the caller must NOT Release it.
-//
-// No caching by (IB,start,count): Kenshi reuses the same IB pointer with
-// MAP_DISCARD writes for different chunks per draw, so any such key returns
-// stale data when content changes between draws (visible as fan artifacts at
-// chunk seams in wireframe). We still re-convert every draw, but reuse the
-// staging + output IB allocations across draws.
-//
-// IMPORTANT: we use CopySubresourceRegion (not CopyResource) to pull only the
-// strip sub-range into staging. CopyResource demands identical ByteWidth on
-// src/dst — incompatible with a pooled staging buffer that's allowed to be
-// larger than the source IB. CopySubresourceRegion accepts a source box and
-// is happy with a larger destination.
-bool PrepareStripConversion(ID3D11DeviceContext* ctx,
-                            ID3D11Buffer* origIB, DXGI_FORMAT origFormat,
-                            UINT origByteOffset,
-                            UINT stripIndexCount, UINT stripStartIndex,
-                            ID3D11Buffer** outListIB, UINT* outListIndexCount)
+// GPU strip→list: copies the strip sub-range from the game IB to a
+// DEFAULT+SRV buffer, dispatches the compute shader, and outputs a
+// list IB + indirect draw args. Zero CPU memcpy, zero GPU readback.
+bool GpuStripToList(ID3D11DeviceContext* ctx,
+                    ID3D11Buffer* origIB, DXGI_FORMAT origFormat,
+                    UINT origByteOffset,
+                    UINT stripIndexCount, UINT stripStartIndex,
+                    INT baseVertex,
+                    ID3D11Buffer** outListIB, ID3D11Buffer** outIndirectArgs)
 {
-    StripConvTimer _t;
+    ZoneScopedN("Tess.GpuStripConvert");
 
-    if (!origIB || stripIndexCount < 3) return false;
+    if (!origIB || stripIndexCount < 3 || !gStripCS) return false;
     if (origFormat != DXGI_FORMAT_R16_UINT && origFormat != DXGI_FORMAT_R32_UINT)
         return false;
 
-    UINT indexSize = (origFormat == DXGI_FORMAT_R16_UINT) ? 2 : 4;
-    UINT stripBytes = stripIndexCount * indexSize;
+    UINT indexSize    = (origFormat == DXGI_FORMAT_R16_UINT) ? 2 : 4;
+    UINT stripBytes   = stripIndexCount * indexSize;
     UINT srcStartByte = origByteOffset + stripStartIndex * indexSize;
+    UINT triCount     = stripIndexCount - 2;
+    UINT dstBytes     = triCount * 3 * indexSize;
 
     ID3D11Device* device = nullptr;
     ctx->GetDevice(&device);
     if (!device) return false;
 
-    // Source for the strip data — preferred path is our CPU-side shadow
-    // (populated by OnIndexBufferCreated + Map/Unmap hooks). If the
-    // shadow isn't populated (Kenshi uses an unhooked write path like
-    // UpdateSubresource / CopyResource), fall back to the original
-    // CopyResource+Map(READ) staging-buffer path. The fallback stalls
-    // the CPU per call but at least keeps tess working.
-    static int sShadowHits = 0, sShadowMisses = 0;
-    std::vector<uint8_t> stripCopy;
-    bool gotShadow = false;
+    // --- source buffer (DEFAULT + SRV) ---
+    bool srcRealloced = (stripBytes > gStripSrcCap);
+    D3D11_BUFFER_DESC srcTmpl = {};
+    srcTmpl.Usage     = D3D11_USAGE_DEFAULT;
+    srcTmpl.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (srcRealloced && gStripSrcSRV) { gStripSrcSRV->Release(); gStripSrcSRV = nullptr; }
+    if (!EnsurePooledBuffer(device, &gStripSrc, &gStripSrcCap, stripBytes, srcTmpl))
+    { device->Release(); return false; }
+
+    if (!gStripSrcSRV || gStripSrcFmt != origFormat)
     {
-        std::lock_guard<std::mutex> lock(gCbMutex);
-        auto it = gIbShadow.find(origIB);
-        if (it != gIbShadow.end() &&
-            (UINT)it->second.size() >= srcStartByte + stripBytes)
-        {
-            stripCopy.assign(it->second.begin() + srcStartByte,
-                             it->second.begin() + srcStartByte + stripBytes);
-            gotShadow = true;
-        }
-    }
-    if (gotShadow) sShadowHits++; else sShadowMisses++;
-
-    // Shadow-miss fallback: do the original CopyResource+Map(READ) into
-    // a staging buffer, then copy the strip range into stripCopy.
-    if (!gotShadow)
-    {
-        D3D11_BUFFER_DESC stagingTmpl = {};
-        stagingTmpl.Usage          = D3D11_USAGE_STAGING;
-        stagingTmpl.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        if (!EnsurePooledBuffer(device, &gIbStaging, &gIbStagingCap,
-                                stripBytes, stagingTmpl))
-        {
-            device->Release();
-            return false;
-        }
-
-        D3D11_BOX srcBox = {};
-        srcBox.left   = srcStartByte;
-        srcBox.right  = srcStartByte + stripBytes;
-        srcBox.top    = 0; srcBox.bottom = 1;
-        srcBox.front  = 0; srcBox.back   = 1;
-        ctx->CopySubresourceRegion(gIbStaging, 0, 0, 0, 0, origIB, 0, &srcBox);
-
-        D3D11_MAPPED_SUBRESOURCE mapped = {};
-        if (FAILED(ctx->Map(gIbStaging, 0, D3D11_MAP_READ, 0, &mapped)))
-        {
-            device->Release();
-            return false;
-        }
-        stripCopy.assign((const uint8_t*)mapped.pData,
-                         (const uint8_t*)mapped.pData + stripBytes);
-        ctx->Unmap(gIbStaging, 0);
-
-        // Opportunistically populate the shadow so subsequent draws hit
-        // the fast path. Only safe to do if the shadow already has a
-        // (smaller) entry — otherwise we'd be guessing at the IB's full
-        // size. Hmm, actually safer: stash just this strip range scoped
-        // by start byte. For simplicity, skip and let the per-frame
-        // fallback continue; the hit rate log will tell us if we need
-        // to add an UpdateSubresource IB hook to populate this for real.
+        if (gStripSrcSRV) { gStripSrcSRV->Release(); gStripSrcSRV = nullptr; }
+        D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+        sd.Format              = origFormat;
+        sd.ViewDimension       = D3D11_SRV_DIMENSION_BUFFER;
+        sd.Buffer.NumElements  = gStripSrcCap / indexSize;
+        if (FAILED(device->CreateShaderResourceView(gStripSrc, &sd, &gStripSrcSRV)))
+        { device->Release(); return false; }
+        gStripSrcFmt = origFormat;
     }
 
-    UINT triCount       = stripIndexCount - 2;
-    UINT maxListIndices = triCount * 3;
-    UINT outBytesNeeded = maxListIndices * indexSize;
+    D3D11_BOX srcBox = {};
+    srcBox.left = srcStartByte; srcBox.right = srcStartByte + stripBytes;
+    srcBox.bottom = 1; srcBox.back = 1;
+    ctx->CopySubresourceRegion(gStripSrc, 0, 0, 0, 0, origIB, 0, &srcBox);
 
-    // (Re)allocate the dynamic list-IB pool. MAP_DISCARD lets the driver
-    // rename internally so the previous frame's reads of this buffer don't
-    // stall this frame's write.
+    // --- destination buffer (DEFAULT + IB + UAV) ---
+    if (dstBytes > gStripDstCap)
     {
-        D3D11_BUFFER_DESC listTmpl = {};
-        listTmpl.Usage          = D3D11_USAGE_DYNAMIC;
-        listTmpl.BindFlags      = D3D11_BIND_INDEX_BUFFER;
-        listTmpl.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-        if (!EnsurePooledBuffer(device, &gIbList, &gIbListCap,
-                                outBytesNeeded, listTmpl))
-        {
-            device->Release();
-            return false;
-        }
+        if (gStripDstUAV) { gStripDstUAV->Release(); gStripDstUAV = nullptr; }
+        if (gStripDst)    { gStripDst->Release();    gStripDst = nullptr; }
+        gStripDstFmt = DXGI_FORMAT_UNKNOWN;
+
+        UINT newCap = gStripDstCap ? gStripDstCap : 4096;
+        while (newCap < dstBytes) newCap *= 2;
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = newCap;
+        bd.Usage     = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_INDEX_BUFFER | D3D11_BIND_UNORDERED_ACCESS;
+        if (FAILED(device->CreateBuffer(&bd, nullptr, &gStripDst)))
+        { gStripDstCap = 0; device->Release(); return false; }
+        gStripDstCap = newCap;
     }
 
-    D3D11_MAPPED_SUBRESOURCE listMap = {};
-    if (FAILED(ctx->Map(gIbList, 0, D3D11_MAP_WRITE_DISCARD, 0, &listMap)))
+    if (!gStripDstUAV || gStripDstFmt != origFormat)
     {
-        device->Release();
-        return false;
+        if (gStripDstUAV) { gStripDstUAV->Release(); gStripDstUAV = nullptr; }
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
+        ud.Format             = origFormat;
+        ud.ViewDimension      = D3D11_UAV_DIMENSION_BUFFER;
+        ud.Buffer.NumElements = gStripDstCap / indexSize;
+        if (FAILED(device->CreateUnorderedAccessView(gStripDst, &ud, &gStripDstUAV)))
+        { device->Release(); return false; }
+        gStripDstFmt = origFormat;
     }
 
-    // Source data: from our CPU shadow copy of the strip sub-range.
-    const uint8_t* srcBase = stripCopy.data();
-
-    // Strip → list. Even triangles emit (v0,v1,v2); odd emit (v1,v0,v2) so the
-    // rasterizer sees consistent winding. Strips also use degenerate triangles
-    // (two coincident vertices) as row terminators — invisible in raster but
-    // tessellation breaks the degeneracy and produces long thin spikes. Skip
-    // any triangle where two indices match.
-    UINT dstTri = 0;
-    if (indexSize == 2)
+    // --- indirect args buffer (DEFAULT + UAV + DRAWINDIRECT_ARGS) ---
+    if (!gStripArgs)
     {
-        const uint16_t* src = (const uint16_t*)srcBase;
-        uint16_t* dst = (uint16_t*)listMap.pData;
-        for (UINT i = 0; i < triCount; i++)
-        {
-            uint16_t a = src[i], b = src[i+1], c = src[i+2];
-            if (a == b || b == c || a == c) continue;
-            if (i & 1) { dst[dstTri*3+0] = b; dst[dstTri*3+1] = a; dst[dstTri*3+2] = c; }
-            else       { dst[dstTri*3+0] = a; dst[dstTri*3+1] = b; dst[dstTri*3+2] = c; }
-            dstTri++;
-        }
-    }
-    else
-    {
-        const uint32_t* src = (const uint32_t*)srcBase;
-        uint32_t* dst = (uint32_t*)listMap.pData;
-        for (UINT i = 0; i < triCount; i++)
-        {
-            uint32_t a = src[i], b = src[i+1], c = src[i+2];
-            if (a == b || b == c || a == c) continue;
-            if (i & 1) { dst[dstTri*3+0] = b; dst[dstTri*3+1] = a; dst[dstTri*3+2] = c; }
-            else       { dst[dstTri*3+0] = a; dst[dstTri*3+1] = b; dst[dstTri*3+2] = c; }
-            dstTri++;
-        }
-    }
-    UINT listIndexCount = dstTri * 3;
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = 20;
+        bd.Usage     = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS |
+                       D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS;
+        if (FAILED(device->CreateBuffer(&bd, nullptr, &gStripArgs)))
+        { device->Release(); return false; }
 
-    ctx->Unmap(gIbList, 0);
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
+        ud.Format             = DXGI_FORMAT_R32_TYPELESS;
+        ud.ViewDimension      = D3D11_UAV_DIMENSION_BUFFER;
+        ud.Buffer.NumElements = 5;
+        ud.Buffer.Flags       = D3D11_BUFFER_UAV_FLAG_RAW;
+        if (FAILED(device->CreateUnorderedAccessView(gStripArgs, &ud, &gStripArgsUAV)))
+        { gStripArgs->Release(); gStripArgs = nullptr; device->Release(); return false; }
+    }
+
+    // --- constant buffer ---
+    if (!gStripCB)
+    {
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = 16;
+        bd.Usage     = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        if (FAILED(device->CreateBuffer(&bd, nullptr, &gStripCB)))
+        { device->Release(); return false; }
+    }
+
+    // Upload params + reset indirect args counter
+    UINT cbData[4] = { stripIndexCount, 0, 0, 0 };
+    ctx->UpdateSubresource(gStripCB, 0, nullptr, cbData, 0, 0);
+
+    struct { UINT ic; UINT inst; UINT si; INT bv; UINT sInst; }
+        argsInit = { 0, 1, 0, baseVertex, 0 };
+    ctx->UpdateSubresource(gStripArgs, 0, nullptr, &argsInit, 0, 0);
+
+    // --- dispatch ---
+    ctx->CSSetShader(gStripCS, nullptr, 0);
+    ctx->CSSetConstantBuffers(0, 1, &gStripCB);
+    ctx->CSSetShaderResources(0, 1, &gStripSrcSRV);
+    ID3D11UnorderedAccessView* uavs[2] = { gStripDstUAV, gStripArgsUAV };
+    UINT initCounts[2] = { (UINT)-1, (UINT)-1 };
+    ctx->CSSetUnorderedAccessViews(0, 2, uavs, initCounts);
+
+    ctx->Dispatch((triCount + 255) / 256, 1, 1);
+
+    // Unbind so the resources are available as IB / indirect args
+    ID3D11ShaderResourceView*  nullSRV  = nullptr;
+    ID3D11UnorderedAccessView* nullUAVs[2] = { nullptr, nullptr };
+    ctx->CSSetShaderResources(0, 1, &nullSRV);
+    ctx->CSSetUnorderedAccessViews(0, 2, nullUAVs, initCounts);
+
     device->Release();
-
-    *outListIB         = gIbList;
-    *outListIndexCount = listIndexCount;
+    *outListIB       = gStripDst;
+    *outIndirectArgs = gStripArgs;
     return true;
 }
 
@@ -2429,9 +2199,8 @@ bool TryDrawTessellatedBloodImpl(ID3D11DeviceContext* ctx,
     ID3D11VertexShader* savedVs = nullptr;
     ctx->VSGetShader(&savedVs, nullptr, nullptr);
 
-    UINT drawCount = indexCount;
-    UINT drawStart = startIndex;
     bool didStripConvert = false;
+    ID3D11Buffer* stripIndirectArgs = nullptr;
 
     if (savedTopo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP)
     {
@@ -2442,9 +2211,9 @@ bool TryDrawTessellatedBloodImpl(ID3D11DeviceContext* ctx,
             return false;
         }
         ID3D11Buffer* listIB = nullptr;
-        UINT          listIC = 0;
-        if (!PrepareStripConversion(ctx, savedIb, savedIbFmt, savedIbOff,
-                                     indexCount, startIndex, &listIB, &listIC))
+        if (!GpuStripToList(ctx, savedIb, savedIbFmt, savedIbOff,
+                            indexCount, startIndex, baseVertex,
+                            &listIB, &stripIndirectArgs))
         {
             if (savedIb) savedIb->Release();
             if (savedVs) savedVs->Release();
@@ -2452,8 +2221,6 @@ bool TryDrawTessellatedBloodImpl(ID3D11DeviceContext* ctx,
             return false;
         }
         ctx->IASetIndexBuffer(listIB, savedIbFmt, 0);
-        drawCount = listIC;
-        drawStart = 0;
         didStripConvert = true;
     }
     else if (savedTopo != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
@@ -2464,15 +2231,8 @@ bool TryDrawTessellatedBloodImpl(ID3D11DeviceContext* ctx,
         return false;
     }
 
-    // Swap VS to the TEXTURED variant (which has the output struct our HS
-    // input expects). Both VS share input signature (POSITION+NORMAL+BINORMAL),
-    // so the bound input layout stays compatible.
     ctx->VSSetShader(gTerrainMainVs, nullptr, 0);
 
-    // Upload the captured terrain-time VS cb0 content into our pooled buffer
-    // and bind it. The blood pass's Terrain_VP doesn't bind biomeData /
-    // overlayData, so without this the TEXTURED VS we just swapped to would
-    // read zeros → NaN in oTex1 → garbage DS samples.
     ID3D11Buffer* savedVsCb0 = nullptr;
     ID3D11Buffer* vsCb0Pool = UploadToPoolBuffer(ctx, &gBloodVsCb0Pool,
                                                   &gBloodVsCb0PoolSize,
@@ -2483,14 +2243,15 @@ bool TryDrawTessellatedBloodImpl(ID3D11DeviceContext* ctx,
         ctx->VSSetConstantBuffers(cached->vsCb0Slot, 1, &vsCb0Pool);
     }
 
-    // Save current depth-stencil state — BeginBlood swaps in our LESS_EQUAL
-    // variant to soak grazing-angle precision drift.
     ID3D11DepthStencilState* savedDss = nullptr;
     UINT                     savedStencilRef = 0;
     ctx->OMGetDepthStencilState(&savedDss, &savedStencilRef);
 
     BeginBlood(ctx, cached);
-    drawFn(ctx, drawCount, drawStart, baseVertex);
+    if (stripIndirectArgs)
+        ctx->DrawIndexedInstancedIndirect(stripIndirectArgs, 0);
+    else
+        drawFn(ctx, indexCount, startIndex, baseVertex);
     EndBlood(ctx);
     gBloodDrewThisFrame = true;
 
@@ -2561,6 +2322,7 @@ bool TryDrawTessellated(ID3D11DeviceContext* ctx,
     // large ≈ far. Skip when > skipDistance.
     if (gTerrainWvpOffset >= 0)
     {
+        ZoneScopedN("Tess.DistanceSkip");
         ID3D11Buffer* vb = nullptr;
         UINT vbStride = 0, vbBindOffset = 0;
         ctx->IAGetVertexBuffers(0, 1, &vb, &vbStride, &vbBindOffset);
@@ -2577,6 +2339,7 @@ bool TryDrawTessellated(ID3D11DeviceContext* ctx,
                 // CaptureTerrainVbCtx for byte-exact replay).
                 if (gFrameSkipDataFrame != gFrameNumber)
                 {
+                    ZoneScopedN("Tess.CbStaging");
                     gFrameSkipDataFrame = gFrameNumber;
                     gFrameHaveCam = gFrameHaveShift = false;
 
@@ -2760,10 +2523,11 @@ bool TryDrawTessellated(ID3D11DeviceContext* ctx,
         ctx->IAGetIndexBuffer(&origIB, &origFormat, &origOffset);
         if (!origIB) return false;
         ID3D11Buffer* listIB = nullptr;
-        UINT listIC = 0;
-        bool ok = PrepareStripConversion(ctx, origIB, origFormat, origOffset,
-                                         indexCount, startIndex, &listIB, &listIC);
-        if (!ok) { origIB->Release(); return false; }
+        ID3D11Buffer* indirectArgs = nullptr;
+        if (!GpuStripToList(ctx, origIB, origFormat, origOffset,
+                            indexCount, startIndex, baseVertex,
+                            &listIB, &indirectArgs))
+        { origIB->Release(); return false; }
         ID3D11RasterizerState* prevRs = nullptr;
         ctx->RSGetState(&prevRs);
         ID3D11HullShader*   prevHs = nullptr; ctx->HSGetShader(&prevHs, nullptr, nullptr);
@@ -2773,7 +2537,7 @@ bool TryDrawTessellated(ID3D11DeviceContext* ctx,
         ctx->DSSetShader(nullptr, nullptr, 0);
         ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx->IASetIndexBuffer(listIB, origFormat, 0);
-        drawFn(ctx, listIC, 0, baseVertex);
+        ctx->DrawIndexedInstancedIndirect(indirectArgs, 0);
         ctx->IASetIndexBuffer(origIB, origFormat, origOffset);
         ctx->IASetPrimitiveTopology(topo);
         ctx->HSSetShader(prevHs, nullptr, 0);
@@ -2782,7 +2546,6 @@ bool TryDrawTessellated(ID3D11DeviceContext* ctx,
         if (prevHs) prevHs->Release();
         if (prevDs) prevDs->Release();
         if (prevRs) prevRs->Release();
-        // listIB is the pooled gIbList — owned by TerrainTess, do not Release.
         origIB->Release();
         return true;
     }
@@ -2792,6 +2555,7 @@ bool TryDrawTessellated(ID3D11DeviceContext* ctx,
 
     if (topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
     {
+        ZoneScopedN("Tess.DrawList");
         bool timed = TimerBeginDraw(ctx);
         Begin(ctx);
         if (wfTess && gWireframeRs) ctx->RSSetState(gWireframeRs);
@@ -2803,6 +2567,7 @@ bool TryDrawTessellated(ID3D11DeviceContext* ctx,
 
     if (topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP)
     {
+        ZoneScopedN("Tess.DrawStrip");
         ID3D11Buffer* origIB = nullptr;
         DXGI_FORMAT   origFormat = DXGI_FORMAT_UNKNOWN;
         UINT          origOffset = 0;
@@ -2810,9 +2575,10 @@ bool TryDrawTessellated(ID3D11DeviceContext* ctx,
         if (!origIB) return false;
 
         ID3D11Buffer* listIB = nullptr;
-        UINT          listIC = 0;
-        if (!PrepareStripConversion(ctx, origIB, origFormat, origOffset,
-                                    indexCount, startIndex, &listIB, &listIC))
+        ID3D11Buffer* indirectArgs = nullptr;
+        if (!GpuStripToList(ctx, origIB, origFormat, origOffset,
+                            indexCount, startIndex, baseVertex,
+                            &listIB, &indirectArgs))
         {
             origIB->Release();
             return false;
@@ -2822,11 +2588,10 @@ bool TryDrawTessellated(ID3D11DeviceContext* ctx,
         bool timed = TimerBeginDraw(ctx);
         Begin(ctx);
         if (wfTess && gWireframeRs) ctx->RSSetState(gWireframeRs);
-        drawFn(ctx, listIC, 0, baseVertex);
+        ctx->DrawIndexedInstancedIndirect(indirectArgs, 0);
         End(ctx);
         TimerEndDraw(ctx, timed);
         ctx->IASetIndexBuffer(origIB, origFormat, origOffset);
-        // listIB is the pooled gIbList — owned by TerrainTess, do not Release.
         origIB->Release();
         return true;
     }

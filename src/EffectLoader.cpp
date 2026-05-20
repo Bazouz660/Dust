@@ -10,6 +10,7 @@
 #include "CSMCapture.h"
 #include "TerrainTess.h"
 #include "DustLog.h"
+#include <tracy/Tracy.hpp>
 #include <d3dcompiler.h>
 #include <cstring>
 #include <cstdlib>
@@ -1174,6 +1175,7 @@ bool EffectLoader::ReinitAll(ID3D11Device* device, uint32_t w, uint32_t h)
 
 void EffectLoader::DispatchPre(DustInjectionPoint point, const DustFrameContext* ctx)
 {
+    ZoneScopedN("EffectLoader.DispatchPre");
     for (auto& le : effects_)
     {
         if (!le.initialized || !le.desc.preExecute)
@@ -1204,6 +1206,7 @@ void EffectLoader::DispatchPre(DustInjectionPoint point, const DustFrameContext*
 
 void EffectLoader::DispatchPost(DustInjectionPoint point, const DustFrameContext* ctx)
 {
+    ZoneScopedN("EffectLoader.DispatchPost");
     for (auto& le : effects_)
     {
         if (!le.initialized || !le.desc.postExecute)

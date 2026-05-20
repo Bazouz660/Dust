@@ -15,6 +15,9 @@ namespace POMState
     // Release the cbuffer.
     void Shutdown();
 
+    // Getters
+    bool GetEnabled();
+
     // Setters — exposed to plugins via DustHostAPI v5.
     void SetEnabled(bool enabled);
     void SetHeightScale(float scale);

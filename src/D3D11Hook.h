@@ -40,6 +40,12 @@ namespace D3D11Hook
     void SetShadowAtlasResolution(UINT size);
     UINT GetShadowAtlasResolution();
 
+    // Re-evaluate whether VTable context hooks should be installed or removed.
+    // Call this whenever a feature that depends on context hooks is toggled
+    // (terrain tess, POM, shadow resize, survey, geometry capture, etc.).
+    // When all features are off, hooks are removed for zero overhead.
+    void RefreshContextHooks();
+
     // World-space camera position, refreshed once per frame via the staging-
     // buffer extraction path in ExtractCameraData (POST_LIGHTING). Stale until
     // first extraction completes; returns false then. Used by TerrainTess to

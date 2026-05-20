@@ -1,4 +1,5 @@
 #include "Survey.h"
+#include "D3D11Hook.h"
 #include "DustLog.h"
 #include <windows.h>
 #include <string>
@@ -155,6 +156,7 @@ void Start(int numFrames, int detailLevel, const char* label)
     if (f) fflush(f);
 
     sActive = true;
+    D3D11Hook::RefreshContextHooks();
     Log("SURVEY: Started capture (%d frames, detail level %d, label: '%s', output: %s)",
         sTotalFrames, sDetailLevel, sLabel.c_str(), sOutputDir.c_str());
 }
@@ -165,6 +167,7 @@ void Stop()
         return;
 
     sActive = false;
+    D3D11Hook::RefreshContextHooks();
     Log("SURVEY: Stopped at frame %d / %d", sCurrentFrame, sTotalFrames);
 }
 

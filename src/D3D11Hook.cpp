@@ -49,15 +49,36 @@ static uint64_t gFrameIndex = 0;
 static bool gDispatchedThisFrame = false;
 
 // Camera extraction from the game's deferred lighting CB
-// (staging CB is in gCameraStagingCB, declared near ExtractCameraData)
+// (staging CBs are in gCameraStagingCB[2], declared near ExtractCameraData)
 static DustCameraData gCameraData = {};
 static bool gCameraDataExtracted = false; // per-frame flag
 static bool gCameraDataEverValid  = false; // sticky once first extraction succeeds
 
-// VTable indices for swap chain methods (used by both Install() and deferred hooking)
+// VTable indices — swap chain
 static const int VTIDX_SC_Present        = 8;
 static const int VTIDX_SC_ResizeBuffers  = 13;
 static const int VTIDX_SC1_Present1      = 22;
+
+// VTable indices — device (used by Install() for Detours hooks)
+static const int VTIDX_DEVICE_CreateBuffer          = 3;
+static const int VTIDX_DEVICE_CreateTexture2D       = 5;
+static const int VTIDX_DEVICE_CreateVertexShader    = 12;
+static const int VTIDX_DEVICE_CreatePixelShader     = 15;
+
+// VTable indices — context (used by VTable hook infrastructure)
+static const int VTIDX_CTX_PSSetShaderResources     = 8;
+static const int VTIDX_CTX_PSSetShader              = 9;
+static const int VTIDX_CTX_VSSetShader              = 11;
+static const int VTIDX_CTX_DrawIndexed              = 12;
+static const int VTIDX_CTX_Draw                     = 13;
+static const int VTIDX_CTX_Map                      = 14;
+static const int VTIDX_CTX_Unmap                    = 15;
+static const int VTIDX_CTX_DrawIndexedInstanced     = 20;
+static const int VTIDX_CTX_OMSetRenderTargets       = 33;
+static const int VTIDX_CTX_OMSetRenderTargetsAndUAV = 34;
+static const int VTIDX_CTX_RSSetViewports           = 44;
+static const int VTIDX_CTX_CopyResource             = 47;
+static const int VTIDX_CTX_UpdateSubresource        = 48;
 
 // Deferred Present hooking: addresses saved from temp device, installed later
 static void* sSavedAddrPresent   = nullptr;
@@ -127,6 +148,7 @@ void SetShadowAtlasResolution(UINT size)
         gShadowResizeTarget = size;
         gShadowResizePending.store(true, std::memory_order_release);
     }
+    RefreshContextHooks();
 }
 
 // Shadow-pass profiling state. gShadowAtlasIdentity holds the IUnknown
@@ -192,6 +214,7 @@ void SignalGameAlive(const char* via)
 // (this function does NOT consume the ref).
 static int FindShadowEntry(ID3D11Resource* res)
 {
+    ZoneScopedN("FindShadowEntry");
     if (!res) return -1;
     IUnknown* unk = nullptr;
     res->QueryInterface(IID_IUnknown, (void**)&unk);
@@ -231,6 +254,7 @@ static void ApplyPendingShadowResize()
         gShadowSwapActive = false;
         gShadowViewportScale = 1.0f;
         Log("Shadow atlas resize: back to base %u — swap disabled", newSize);
+        RefreshContextHooks();
         return;
     }
 
@@ -317,6 +341,7 @@ static void ApplyPendingShadowResize()
     gShadowViewportScale = (float)newSize / (float)gShadowBaseSize;
     gShadowSwapActive = true;
     Log("Shadow atlas swap active, viewport scale = %.3f", gShadowViewportScale);
+    RefreshContextHooks();
 }
 
 static void ClearShadowReplacements()
@@ -354,12 +379,16 @@ void ResetFrameState()
 // Extract camera basis vectors from the game's deferred lighting PS constant buffer.
 // The inverse view matrix sits at register c8 (offset 128 bytes / 32 floats).
 // Camera axes are the COLUMNS of the inverse view matrix (= rows of the view matrix).
-// Single staging buffer: CopyResource + immediate Map. Trades a small GPU sync
-// stall for zero-frame-delay camera data — critical for temporal reprojection.
-static ID3D11Buffer* gCameraStagingCB = nullptr;
+// Double-buffered staging: CopyResource this frame, Map+read LAST frame's copy
+// with DO_NOT_WAIT (zero GPU stall). In practice the previous frame's copy is
+// always complete by the time we read it — one full frame of GPU work has passed.
+static ID3D11Buffer* gCameraStagingCB[2] = { nullptr, nullptr };
+static int           gCameraStagingIdx   = 0;
+static bool          gCameraStagingReady[2] = { false, false };
 
 static void ExtractCameraData(ID3D11DeviceContext* ctx)
 {
+    ZoneScopedN("ExtractCameraData");
     // Per-period instrumentation. Counts each failure mode + success so we
     // can see (from the log) why gCameraData isn't updating reliably.
     static uint32_t sCallCount         = 0;
@@ -408,37 +437,51 @@ static void ExtractCameraData(ID3D11DeviceContext* ctx)
     psCB->GetDesc(&cbDesc);
     if (cbDesc.ByteWidth < 192) { sSizeFailCount++; psCB->Release(); logIfTime(); return; }
 
-    if (gCameraStagingCB)
+    int writeIdx = gCameraStagingIdx;
+    int readIdx  = 1 - writeIdx;
+
+    // Ensure both staging buffers match the CB size
+    for (int i = 0; i < 2; i++)
     {
-        D3D11_BUFFER_DESC stagingDesc;
-        gCameraStagingCB->GetDesc(&stagingDesc);
-        if (stagingDesc.ByteWidth != cbDesc.ByteWidth)
+        if (gCameraStagingCB[i])
         {
-            gCameraStagingCB->Release();
-            gCameraStagingCB = nullptr;
+            D3D11_BUFFER_DESC sd;
+            gCameraStagingCB[i]->GetDesc(&sd);
+            if (sd.ByteWidth != cbDesc.ByteWidth)
+            {
+                gCameraStagingCB[i]->Release();
+                gCameraStagingCB[i] = nullptr;
+                gCameraStagingReady[i] = false;
+            }
+        }
+        if (!gCameraStagingCB[i])
+        {
+            D3D11_BUFFER_DESC sd = cbDesc;
+            sd.Usage = D3D11_USAGE_STAGING;
+            sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            sd.BindFlags = 0;
+            sd.MiscFlags = 0;
+            gDevice->CreateBuffer(&sd, nullptr, &gCameraStagingCB[i]);
+            gCameraStagingReady[i] = false;
         }
     }
-
-    if (!gCameraStagingCB)
-    {
-        D3D11_BUFFER_DESC sd = cbDesc;
-        sd.Usage = D3D11_USAGE_STAGING;
-        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        sd.BindFlags = 0;
-        sd.MiscFlags = 0;
-        gDevice->CreateBuffer(&sd, nullptr, &gCameraStagingCB);
-    }
-    if (!gCameraStagingCB)
+    if (!gCameraStagingCB[writeIdx])
     {
         sStagingCreateFail++; psCB->Release(); logIfTime(); return;
     }
 
-    ctx->CopyResource(gCameraStagingCB, psCB);
+    // Issue GPU copy for THIS frame (non-blocking)
+    ctx->CopyResource(gCameraStagingCB[writeIdx], psCB);
     psCB->Release();
+    gCameraStagingReady[writeIdx] = true;
+    gCameraStagingIdx = 1 - writeIdx;
 
+    // Read LAST frame's copy (should be complete — one full frame of GPU work has passed)
+    if (gCameraStagingReady[readIdx] && gCameraStagingCB[readIdx])
     {
         D3D11_MAPPED_SUBRESOURCE mapped;
-        if (SUCCEEDED(ctx->Map(gCameraStagingCB, 0, D3D11_MAP_READ, 0, &mapped)))
+        if (SUCCEEDED(ctx->Map(gCameraStagingCB[readIdx], 0, D3D11_MAP_READ,
+                               D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped)))
         {
             // One-shot CB audit on first successful map. Scans the whole CB
             // for matrices identifiable by mathematical properties — gives
@@ -448,7 +491,7 @@ static void ExtractCameraData(ID3D11DeviceContext* ctx)
             if (!sAuditDone)
             {
                 D3D11_BUFFER_DESC stagingDesc;
-                gCameraStagingCB->GetDesc(&stagingDesc);
+                gCameraStagingCB[readIdx]->GetDesc(&stagingDesc);
                 int numFloats = (int)(stagingDesc.ByteWidth / 4);
                 const float* cb = (const float*)mapped.pData;
                 Log("[CBAudit] === Begin one-shot CB scan: %d floats (%d bytes) ===",
@@ -543,7 +586,7 @@ static void ExtractCameraData(ID3D11DeviceContext* ctx)
             if (numFloats >= 136 + 16)
                 memcpy(proj, (float*)mapped.pData + 136, 64); // c34 offset (projection)
 
-            ctx->Unmap(gCameraStagingCB, 0);
+            ctx->Unmap(gCameraStagingCB[readIdx], 0);
 
             bool valid = true;
             for (int i = 0; i < 16; i++)
@@ -779,6 +822,140 @@ static bool VTableHook(void* pObject, int vtableIndex, void* detour, void** orig
     return true;
 }
 
+// ==================== Function pointer types for VTable-managed methods =====
+// Moved here from their original locations so the VTable infrastructure and
+// TryCaptureDevice can reference them. The hook implementations still live
+// further down in the file.
+
+typedef void (STDMETHODCALLTYPE* PFN_PSSetShader)(
+    ID3D11DeviceContext* pThis, ID3D11PixelShader* pPixelShader,
+    ID3D11ClassInstance* const* ppClassInstances, UINT NumClassInstances);
+typedef void (STDMETHODCALLTYPE* PFN_VSSetShader)(
+    ID3D11DeviceContext* pThis, ID3D11VertexShader* pVertexShader,
+    ID3D11ClassInstance* const* ppClassInstances, UINT NumClassInstances);
+typedef HRESULT (STDMETHODCALLTYPE* PFN_Map)(
+    ID3D11DeviceContext*, ID3D11Resource*, UINT,
+    D3D11_MAP, UINT, D3D11_MAPPED_SUBRESOURCE*);
+typedef void (STDMETHODCALLTYPE* PFN_Unmap)(
+    ID3D11DeviceContext*, ID3D11Resource*, UINT);
+typedef void (STDMETHODCALLTYPE* PFN_CopyResource)(
+    ID3D11DeviceContext* pThis, ID3D11Resource* pDstResource,
+    ID3D11Resource* pSrcResource);
+typedef void (STDMETHODCALLTYPE* PFN_UpdateSubresource)(
+    ID3D11DeviceContext*, ID3D11Resource*, UINT, const D3D11_BOX*,
+    const void*, UINT, UINT);
+
+static PFN_PSSetShader       oPSSetShader       = nullptr;
+static PFN_VSSetShader       oVSSetShader       = nullptr;
+static PFN_Map               oMap               = nullptr;
+static PFN_Unmap             oUnmap             = nullptr;
+static PFN_CopyResource      oCopyResource      = nullptr;
+static PFN_UpdateSubresource oUpdateSubresource = nullptr;
+
+// ==================== Context VTable hook infrastructure ====================
+//
+// Hot-path ID3D11DeviceContext methods (Map, Unmap, DrawIndexed, etc.) are
+// hooked via vtable pointer replacement instead of Detours.  Benefits:
+//   1. Zero trampoline overhead — vtable dispatch is the same mechanism D3D11
+//      already uses, so hooked calls cost the same as unhooked calls.
+//   2. Atomically removable — restoring the original pointer = zero overhead
+//      when no Dust feature needs interception.
+//
+// The o* function pointers (oMap, oUnmap, etc.) always hold the REAL original
+// function addresses (not trampolines).  They are set from the temp device in
+// Install() and overwritten with the real device's vtable entries in
+// TryCaptureDevice().
+
+static void**  gCtxVtable = nullptr;           // real context's vtable base
+static void*   gCtxOriginals[64] = {};          // saved original entries
+static bool    gVTableHooksActive = false;      // master install state
+
+struct CtxHookEntry {
+    int   vtableIndex;
+    void* hookFunc;
+};
+
+// Forward-declare hook functions (defined later in the file).
+static HRESULT STDMETHODCALLTYPE HookedMap(ID3D11DeviceContext*, ID3D11Resource*, UINT, D3D11_MAP, UINT, D3D11_MAPPED_SUBRESOURCE*);
+static void    STDMETHODCALLTYPE HookedUnmap(ID3D11DeviceContext*, ID3D11Resource*, UINT);
+static void    STDMETHODCALLTYPE HookedDrawIndexed(ID3D11DeviceContext*, UINT, UINT, INT);
+static void    STDMETHODCALLTYPE HookedDrawIndexedInstanced(ID3D11DeviceContext*, UINT, UINT, UINT, INT, UINT);
+static void    STDMETHODCALLTYPE HookedPSSetShader(ID3D11DeviceContext*, ID3D11PixelShader*, ID3D11ClassInstance* const*, UINT);
+static void    STDMETHODCALLTYPE HookedVSSetShader(ID3D11DeviceContext*, ID3D11VertexShader*, ID3D11ClassInstance* const*, UINT);
+static void    STDMETHODCALLTYPE HookedOMSetRenderTargets(ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*, ID3D11DepthStencilView*);
+static void    STDMETHODCALLTYPE HookedOMSetRenderTargetsAndUAV(ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*, ID3D11DepthStencilView*, UINT, UINT, ID3D11UnorderedAccessView* const*, const UINT*);
+static void    STDMETHODCALLTYPE HookedPSSetShaderResources(ID3D11DeviceContext*, UINT, UINT, ID3D11ShaderResourceView* const*);
+static void    STDMETHODCALLTYPE HookedRSSetViewports(ID3D11DeviceContext*, UINT, const D3D11_VIEWPORT*);
+static void    STDMETHODCALLTYPE HookedCopyResource(ID3D11DeviceContext*, ID3D11Resource*, ID3D11Resource*);
+static void    STDMETHODCALLTYPE HookedUpdateSubresource(ID3D11DeviceContext*, ID3D11Resource*, UINT, const D3D11_BOX*, const void*, UINT, UINT);
+
+static const CtxHookEntry kCtxHooks[] = {
+    { VTIDX_CTX_Map,                      (void*)HookedMap },
+    { VTIDX_CTX_Unmap,                    (void*)HookedUnmap },
+    { VTIDX_CTX_DrawIndexed,              (void*)HookedDrawIndexed },
+    { VTIDX_CTX_DrawIndexedInstanced,     (void*)HookedDrawIndexedInstanced },
+    { VTIDX_CTX_PSSetShader,              (void*)HookedPSSetShader },
+    { VTIDX_CTX_VSSetShader,              (void*)HookedVSSetShader },
+    { VTIDX_CTX_OMSetRenderTargets,       (void*)HookedOMSetRenderTargets },
+    { VTIDX_CTX_OMSetRenderTargetsAndUAV, (void*)HookedOMSetRenderTargetsAndUAV },
+    { VTIDX_CTX_PSSetShaderResources,     (void*)HookedPSSetShaderResources },
+    { VTIDX_CTX_RSSetViewports,           (void*)HookedRSSetViewports },
+    { VTIDX_CTX_CopyResource,             (void*)HookedCopyResource },
+    { VTIDX_CTX_UpdateSubresource,        (void*)HookedUpdateSubresource },
+};
+
+static void WriteCtxVTableEntry(int index, void* func)
+{
+    DWORD oldProtect;
+    if (VirtualProtect(&gCtxVtable[index], sizeof(void*), PAGE_READWRITE, &oldProtect))
+    {
+        gCtxVtable[index] = func;
+        VirtualProtect(&gCtxVtable[index], sizeof(void*), oldProtect, &oldProtect);
+    }
+}
+
+static void InstallContextHooks()
+{
+    if (gVTableHooksActive || !gCtxVtable) return;
+    for (const auto& h : kCtxHooks)
+        WriteCtxVTableEntry(h.vtableIndex, h.hookFunc);
+    gVTableHooksActive = true;
+    Log("Context VTable hooks INSTALLED (%zu methods)", std::size(kCtxHooks));
+}
+
+static void RemoveContextHooks()
+{
+    if (!gVTableHooksActive || !gCtxVtable) return;
+    for (const auto& h : kCtxHooks)
+    {
+        if (gCtxVtable[h.vtableIndex] == h.hookFunc)
+            WriteCtxVTableEntry(h.vtableIndex, gCtxOriginals[h.vtableIndex]);
+    }
+    gVTableHooksActive = false;
+    Log("Context VTable hooks REMOVED (zero overhead)");
+}
+
+static bool AnyFeatureNeedsHooks()
+{
+    if (TerrainTess::GetEnabled()) return true;
+    if (POMState::GetEnabled()) return true;
+    if (gShadowSwapActive) return true;
+    if (gShadowAtlasOverride != 0) return true;
+    if (Survey::IsActive()) return true;
+    if (GeometryCapture::detail::sCaptureFlags != 0) return true;
+    return false;
+}
+
+void RefreshContextHooks()
+{
+    if (!gCtxVtable) return;
+    bool needed = AnyFeatureNeedsHooks();
+    if (needed && !gVTableHooksActive)
+        InstallContextHooks();
+    else if (!needed && gVTableHooksActive)
+        RemoveContextHooks();
+}
+
 // The swap chain pointer we vtable-hooked — needed for recovery verification
 static IDXGISwapChain* gHookedSwapChain = nullptr;
 
@@ -898,6 +1075,28 @@ static void TryCaptureDevice(ID3D11Device* device)
 
     Log("Captured real D3D11 device=%p, context=%p", gDevice, gContext);
 
+    // Initialize VTable hook infrastructure: save originals from the real
+    // context's vtable and overwrite the o* pointers (which currently hold
+    // temp-device addresses from Install).
+    gCtxVtable = *reinterpret_cast<void***>(gContext);
+    for (const auto& h : kCtxHooks)
+        gCtxOriginals[h.vtableIndex] = gCtxVtable[h.vtableIndex];
+    oMap                      = (PFN_Map)gCtxOriginals[VTIDX_CTX_Map];
+    oUnmap                    = (PFN_Unmap)gCtxOriginals[VTIDX_CTX_Unmap];
+    oDrawIndexed              = (PFN_DrawIndexed)gCtxOriginals[VTIDX_CTX_DrawIndexed];
+    oDrawIndexedInstanced     = (PFN_DrawIndexedInstanced)gCtxOriginals[VTIDX_CTX_DrawIndexedInstanced];
+    oPSSetShader              = (PFN_PSSetShader)gCtxOriginals[VTIDX_CTX_PSSetShader];
+    oVSSetShader              = (PFN_VSSetShader)gCtxOriginals[VTIDX_CTX_VSSetShader];
+    oOMSetRenderTargets       = (PFN_OMSetRenderTargets)gCtxOriginals[VTIDX_CTX_OMSetRenderTargets];
+    oOMSetRenderTargetsAndUAV = (PFN_OMSetRenderTargetsAndUAV)gCtxOriginals[VTIDX_CTX_OMSetRenderTargetsAndUAV];
+    oPSSetShaderResources     = (PFN_PSSetShaderResources)gCtxOriginals[VTIDX_CTX_PSSetShaderResources];
+    oRSSetViewports           = (PFN_RSSetViewports)gCtxOriginals[VTIDX_CTX_RSSetViewports];
+    oCopyResource             = (PFN_CopyResource)gCtxOriginals[VTIDX_CTX_CopyResource];
+    oUpdateSubresource        = (PFN_UpdateSubresource)gCtxOriginals[VTIDX_CTX_UpdateSubresource];
+    Log("VTable originals saved from real context (12 methods)");
+
+    RefreshContextHooks();
+
 #ifdef TRACY_ENABLE
     // Tracy GPU profiling — must run after gContext is valid. The context
     // takes its own ref on device + immediate context; safe to leak at exit
@@ -1006,6 +1205,7 @@ static HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
     ID3D11Device* pThis, const D3D11_TEXTURE2D_DESC* pDesc,
     const D3D11_SUBRESOURCE_DATA* pInitialData, ID3D11Texture2D** ppTexture2D)
 {
+    ZoneScopedN("HookedCreateTexture2D");
     if (gShutdownSignaled) return oCreateTexture2D(pThis, pDesc, pInitialData, ppTexture2D);
 
     if (pDesc && pDesc->Width == pDesc->Height &&
@@ -1094,6 +1294,7 @@ static HRESULT STDMETHODCALLTYPE HookedCreatePixelShader(
     ID3D11Device* pThis, const void* pShaderBytecode, SIZE_T BytecodeLength,
     ID3D11ClassLinkage* pClassLinkage, ID3D11PixelShader** ppPixelShader)
 {
+    ZoneScopedN("HookedCreatePixelShader");
     if (gShutdownSignaled)
         return oCreatePixelShader(pThis, pShaderBytecode, BytecodeLength,
                                    pClassLinkage, ppPixelShader);
@@ -1152,6 +1353,7 @@ static HRESULT STDMETHODCALLTYPE HookedCreateVertexShader(
     ID3D11Device* pThis, const void* pShaderBytecode, SIZE_T BytecodeLength,
     ID3D11ClassLinkage* pClassLinkage, ID3D11VertexShader** ppVertexShader)
 {
+    ZoneScopedN("HookedCreateVertexShader");
     if (gShutdownSignaled)
         return oCreateVertexShader(pThis, pShaderBytecode, BytecodeLength,
                                     pClassLinkage, ppVertexShader);
@@ -1345,21 +1547,12 @@ static void STDMETHODCALLTYPE HookedDraw(
 // every non-terrain draw (UI, characters, props) eats two COM AddRef/Release
 // pairs + several map lookups just to confirm "not terrain".
 
-typedef void (STDMETHODCALLTYPE* PFN_PSSetShader)(
-    ID3D11DeviceContext* pThis, ID3D11PixelShader* pPixelShader,
-    ID3D11ClassInstance* const* ppClassInstances, UINT NumClassInstances);
-typedef void (STDMETHODCALLTYPE* PFN_VSSetShader)(
-    ID3D11DeviceContext* pThis, ID3D11VertexShader* pVertexShader,
-    ID3D11ClassInstance* const* ppClassInstances, UINT NumClassInstances);
-
-static PFN_PSSetShader oPSSetShader = nullptr;
-static PFN_VSSetShader oVSSetShader = nullptr;
+// PFN_PSSetShader/PFN_VSSetShader typedefs + o* declarations moved to VTable infrastructure section
 
 static void STDMETHODCALLTYPE HookedPSSetShader(
     ID3D11DeviceContext* pThis, ID3D11PixelShader* pPixelShader,
     ID3D11ClassInstance* const* ppClassInstances, UINT NumClassInstances)
 {
-    ZoneScoped;
     oPSSetShader(pThis, pPixelShader, ppClassInstances, NumClassInstances);
     // Flag deferred-lighting draws so the Draw hook can bracket them as
     // ShadowSample (PCSS + cascade-blend cost). Scan the captured set of
@@ -1384,7 +1577,6 @@ static void STDMETHODCALLTYPE HookedVSSetShader(
     ID3D11DeviceContext* pThis, ID3D11VertexShader* pVertexShader,
     ID3D11ClassInstance* const* ppClassInstances, UINT NumClassInstances)
 {
-    ZoneScoped;
     oVSSetShader(pThis, pVertexShader, ppClassInstances, NumClassInstances);
     if (!gShutdownSignaled && TerrainTess::GetEnabled())
         TerrainTess::OnVsBound(pVertexShader);
@@ -1394,11 +1586,12 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     ID3D11DeviceContext* pThis, UINT IndexCount, UINT StartIndexLocation,
     INT BaseVertexLocation)
 {
-    ZoneScoped;
     if (gShutdownSignaled) { oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation); return; }
 
-    // Label the CPU zone when this draw is part of the shadow caster pass.
-    // Cheap when gInShadowPass is false (the macro is a no-op then).
+    // CPU zone only for shadow passes (~5% of draws). The ~95% non-shadow
+    // draws skip the ~40ns zone overhead entirely; inner zones
+    // (TryDrawTessellated etc.) still capture tessellation work.
+    ZoneNamed(___tracy_scoped_zone, gInShadowPass || gInDeferredShadowPass);
     if (gInShadowPass) {
         ZoneName("ShadowCast", 10);
         gShadowDrawCount.fetch_add(1, std::memory_order_relaxed);
@@ -1407,8 +1600,6 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
         ZoneName("ShadowSample", 12);
     }
 #ifdef TRACY_ENABLE
-    // GPU zone only when in shadow pass — Tracy uses ID3D11Query timestamps,
-    // ~2 queries per zone. 64K query pool, so we can afford per-draw here.
     TracyD3D11NamedZone(gTracyGpuCtx, _gpuShadowZone, "ShadowCast", gInShadowPass);
     TracyD3D11NamedZone(gTracyGpuCtx, _gpuSampleZone, "ShadowSample", gInDeferredShadowPass);
 #endif
@@ -1440,9 +1631,9 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
     ID3D11DeviceContext* pThis, UINT IndexCountPerInstance, UINT InstanceCount,
     UINT StartIndexLocation, INT BaseVertexLocation, UINT StartInstanceLocation)
 {
-    ZoneScoped;
     if (gShutdownSignaled) { oDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation); return; }
 
+    ZoneNamed(___tracy_scoped_zone, gInShadowPass || gInDeferredShadowPass);
     if (gInShadowPass) {
         ZoneName("ShadowCast", 10);
         gShadowDrawCount.fetch_add(1, std::memory_order_relaxed);
@@ -1479,6 +1670,7 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
 // entries — so the cost is a couple virtual calls plus a tiny linear search.
 static bool ResolveIsShadowDsv(ID3D11DepthStencilView* dsv)
 {
+    ZoneScopedN("ResolveIsShadowDsv");
     if (!dsv) return false;
     size_t count = gShadowAtlasIdentityCount.load(std::memory_order_acquire);
     if (count == 0) return false;
@@ -1501,6 +1693,7 @@ static bool ResolveIsShadowDsv(ID3D11DepthStencilView* dsv)
 // replacement view, or the original if no swap is needed.
 static ID3D11DepthStencilView* MaybeSwapShadowDSV(ID3D11DepthStencilView* dsv)
 {
+    ZoneScopedN("MaybeSwapShadowDSV");
     if (!dsv) return dsv;
     ID3D11Resource* res = nullptr;
     dsv->GetResource(&res);
@@ -1513,6 +1706,7 @@ static ID3D11DepthStencilView* MaybeSwapShadowDSV(ID3D11DepthStencilView* dsv)
 
 static ID3D11RenderTargetView* MaybeSwapShadowRTV(ID3D11RenderTargetView* rtv)
 {
+    ZoneScopedN("MaybeSwapShadowRTV");
     if (!rtv) return rtv;
     ID3D11Resource* res = nullptr;
     rtv->GetResource(&res);
@@ -1528,7 +1722,6 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
     ID3D11RenderTargetView* const* ppRenderTargetViews,
     ID3D11DepthStencilView* pDepthStencilView)
 {
-    ZoneScoped;
     if (gShutdownSignaled) { oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView); return; }
 
     bool wasInGBuffer = GeometryCapture::IsInGBufferPass();
@@ -1604,7 +1797,6 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargetsAndUAV(
     ID3D11UnorderedAccessView* const* ppUnorderedAccessViews,
     const UINT* pUAVInitialCounts)
 {
-    ZoneScoped;
     if (gShutdownSignaled) {
         oOMSetRenderTargetsAndUAV(pThis, NumRTVs, ppRenderTargetViews,
             pDepthStencilView, UAVStartSlot, NumUAVs, ppUnorderedAccessViews,
@@ -1886,6 +2078,7 @@ static HRESULT STDMETHODCALLTYPE HookedResizeBuffers(
     IDXGISwapChain* pThis, UINT BufferCount, UINT Width, UINT Height,
     DXGI_FORMAT NewFormat, UINT SwapChainFlags)
 {
+    ZoneScopedN("HookedResizeBuffers");
     if (gShutdownSignaled) return oResizeBuffers(pThis, BufferCount, Width, Height, NewFormat, SwapChainFlags);
 
     // Block Render() while we tear down and recreate the back buffer
@@ -1927,10 +2120,18 @@ namespace CSMIntercept
     static std::unordered_set<ID3D11Buffer*>           sTracked;
     static std::unordered_map<ID3D11Buffer*, void*>    sMapped;  // resource -> mapped pointer
     static std::mutex                                  sMutex;
-    // Fast path: hot Map/Unmap/UpdateSubresource hooks early-out when no
-    // CSM cbuffer has been tracked yet (true for the entire game session
-    // unless the CSM intercept actually triggers). Avoids the mutex
-    // acquire on every per-draw cbuffer update.
+    // Lock-free fast path: linear scan of a small pointer array avoids
+    // the mutex + hash lookup on the ~14M Map/Unmap calls per capture
+    // that aren't CSM buffers. Only actual CSM buffer matches take the mutex.
+    static constexpr int kMaxFastPtrs = 8;
+    static void* sFastPtrs[kMaxFastPtrs] = {};
+    static std::atomic<int> sFastCount{0};
+    static bool FastCheck(void* p) {
+        int n = sFastCount.load(std::memory_order_acquire);
+        for (int i = 0; i < n && i < kMaxFastPtrs; i++)
+            if (sFastPtrs[i] == p) return true;
+        return false;
+    }
     static std::atomic<int>                            sTrackedSize{0};
     static std::atomic<int>                            sUpdateCounter{0};
     static std::atomic<int>                            sUnmapCounter{0};
@@ -2064,26 +2265,17 @@ namespace CSMIntercept
     }
 }
 
+// PFN_Map/PFN_Unmap/PFN_UpdateSubresource typedefs + o* declarations moved to VTable infrastructure section
+
 typedef HRESULT (STDMETHODCALLTYPE* PFN_CreateBuffer)(
     ID3D11Device*, const D3D11_BUFFER_DESC*, const D3D11_SUBRESOURCE_DATA*, ID3D11Buffer**);
-typedef void (STDMETHODCALLTYPE* PFN_UpdateSubresource)(
-    ID3D11DeviceContext*, ID3D11Resource*, UINT, const D3D11_BOX*,
-    const void*, UINT, UINT);
-typedef HRESULT (STDMETHODCALLTYPE* PFN_Map)(
-    ID3D11DeviceContext*, ID3D11Resource*, UINT,
-    D3D11_MAP, UINT, D3D11_MAPPED_SUBRESOURCE*);
-typedef void (STDMETHODCALLTYPE* PFN_Unmap)(
-    ID3D11DeviceContext*, ID3D11Resource*, UINT);
-
-static PFN_CreateBuffer       oCreateBuffer       = nullptr;
-static PFN_UpdateSubresource  oUpdateSubresource  = nullptr;
-static PFN_Map                oMap                = nullptr;
-static PFN_Unmap              oUnmap              = nullptr;
+static PFN_CreateBuffer oCreateBuffer = nullptr;
 
 static HRESULT STDMETHODCALLTYPE HookedCreateBuffer(
     ID3D11Device* pThis, const D3D11_BUFFER_DESC* pDesc,
     const D3D11_SUBRESOURCE_DATA* pInitialData, ID3D11Buffer** ppBuffer)
 {
+    ZoneScopedN("HookedCreateBuffer");
     if (gShutdownSignaled) return oCreateBuffer(pThis, pDesc, pInitialData, ppBuffer);
 
     HRESULT hr = oCreateBuffer(pThis, pDesc, pInitialData, ppBuffer);
@@ -2095,6 +2287,12 @@ static HRESULT STDMETHODCALLTYPE HookedCreateBuffer(
         CSMIntercept::sTracked.insert(*ppBuffer);
         CSMIntercept::sTrackedSize.store((int)CSMIntercept::sTracked.size(),
                                           std::memory_order_release);
+        int idx = CSMIntercept::sFastCount.load(std::memory_order_relaxed);
+        if (idx < CSMIntercept::kMaxFastPtrs)
+        {
+            CSMIntercept::sFastPtrs[idx] = *ppBuffer;
+            CSMIntercept::sFastCount.store(idx + 1, std::memory_order_release);
+        }
         Log("CSMIntercept: tracked cbuffer %p (size=%u)", *ppBuffer, pDesc->ByteWidth);
     }
 
@@ -2112,53 +2310,21 @@ static HRESULT STDMETHODCALLTYPE HookedCreateBuffer(
         TerrainTess::OnVertexBufferCreated(*ppBuffer, pInitialData->pSysMem);
     }
 
-    // Register IBs so the Map/Unmap hooks shadow their content. This
-    // replaces the CopyResource+Map(READ) stall in PrepareStripConversion.
-    if (SUCCEEDED(hr) && pDesc && ppBuffer && *ppBuffer &&
-        (pDesc->BindFlags & D3D11_BIND_INDEX_BUFFER))
-    {
-        TerrainTess::OnIndexBufferCreated(
-            *ppBuffer,
-            (pInitialData && pInitialData->pSysMem) ? pInitialData->pSysMem : nullptr,
-            pDesc->ByteWidth);
-    }
-
-    // Register staging buffers so we can shadow their writes — these are
-    // typically the source of CopyResource→IB uploads in Kenshi.
-    if (SUCCEEDED(hr) && pDesc && ppBuffer && *ppBuffer &&
-        pDesc->Usage == D3D11_USAGE_STAGING &&
-        (pDesc->CPUAccessFlags & D3D11_CPU_ACCESS_WRITE))
-    {
-        TerrainTess::OnStagingBufferCreated(*ppBuffer, pDesc->ByteWidth);
-    }
     return hr;
 }
 
 // ==================== CopyResource hook ====================
-typedef void (STDMETHODCALLTYPE* PFN_CopyResource)(
-    ID3D11DeviceContext* pThis, ID3D11Resource* pDstResource,
-    ID3D11Resource* pSrcResource);
-static PFN_CopyResource oCopyResource = nullptr;
+// PFN_CopyResource typedef + o* declaration moved to VTable infrastructure section
 
 static void STDMETHODCALLTYPE HookedCopyResource(
     ID3D11DeviceContext* pThis, ID3D11Resource* pDstResource,
     ID3D11Resource* pSrcResource)
 {
-    ZoneScoped;
     if (gShutdownSignaled)
     {
         oCopyResource(pThis, pDstResource, pSrcResource);
         return;
     }
-
-    // Propagate any tracked-buffer content from src to dst shadow before
-    // the actual GPU copy. This is how Kenshi's strip data flows into our
-    // IB shadow (engine pattern: Map staging → CopyResource(IB, staging)).
-    // Inline-bloom guard so non-tracked copies bail without a function call.
-    if (TerrainTess::GetEnabled() && pDstResource && pSrcResource &&
-        (TerrainTess::IsResourceTracked(pDstResource) ||
-         TerrainTess::IsResourceTracked(pSrcResource)))
-        TerrainTess::OnCopyResource(pDstResource, pSrcResource);
 
     oCopyResource(pThis, pDstResource, pSrcResource);
 }
@@ -2167,7 +2333,6 @@ static void STDMETHODCALLTYPE HookedUpdateSubresource(
     ID3D11DeviceContext* pThis, ID3D11Resource* pDstResource, UINT DstSubresource,
     const D3D11_BOX* pDstBox, const void* pSrcData, UINT SrcRowPitch, UINT SrcDepthPitch)
 {
-    ZoneScoped;
     if (gShutdownSignaled)
     {
         oUpdateSubresource(pThis, pDstResource, DstSubresource, pDstBox,
@@ -2177,14 +2342,10 @@ static void STDMETHODCALLTYPE HookedUpdateSubresource(
 
     bool tracked = false;
     if (pDstResource && pSrcData &&
-        CSMIntercept::sTrackedSize.load(std::memory_order_acquire) > 0)
+        CSMIntercept::sFastCount.load(std::memory_order_acquire) > 0 &&
+        CSMIntercept::FastCheck(pDstResource))
     {
-        // Cheap pointer-only check — UpdateSubresource is hot. Avoid QueryInterface
-        // by reinterpreting (cbuffers and other ID3D11Buffer share vtable layout
-        // with ID3D11Resource so the pointer compares directly).
-        std::lock_guard<std::mutex> lock(CSMIntercept::sMutex);
-        if (CSMIntercept::sTracked.count((ID3D11Buffer*)pDstResource))
-            tracked = true;
+        tracked = true;
     }
 
     if (tracked)
@@ -2200,12 +2361,6 @@ static void STDMETHODCALLTYPE HookedUpdateSubresource(
         }
     }
 
-    // TerrainTess: feed any IB writes via UpdateSubresource into the
-    // CPU shadow so PrepareStripConversion can skip the GPU readback.
-    if (pDstResource && pSrcData && TerrainTess::GetEnabled() &&
-        TerrainTess::IsResourceTracked(pDstResource))
-        TerrainTess::OnIndexBufferUpdate(pDstResource, pDstBox, pSrcData, SrcRowPitch);
-
     oUpdateSubresource(pThis, pDstResource, DstSubresource, pDstBox,
                        pSrcData, SrcRowPitch, SrcDepthPitch);
 }
@@ -2214,21 +2369,19 @@ static HRESULT STDMETHODCALLTYPE HookedMap(
     ID3D11DeviceContext* pThis, ID3D11Resource* pResource, UINT Subresource,
     D3D11_MAP MapType, UINT MapFlags, D3D11_MAPPED_SUBRESOURCE* pMappedResource)
 {
-    ZoneScoped;
     if (gShutdownSignaled)
         return oMap(pThis, pResource, Subresource, MapType, MapFlags, pMappedResource);
 
     HRESULT hr = oMap(pThis, pResource, Subresource, MapType, MapFlags, pMappedResource);
 
-    // Stash the mapped pointer so HookedUnmap can read/modify the data right
-    // before commit. Only track if the resource is in our cbuffer set.
+    // Lock-free pointer check skips the mutex for the ~99.99% of Map calls
+    // that aren't CSM buffers. Only actual matches take the lock.
     if (SUCCEEDED(hr) && pResource && pMappedResource && pMappedResource->pData &&
-        CSMIntercept::sTrackedSize.load(std::memory_order_acquire) > 0)
+        CSMIntercept::sFastCount.load(std::memory_order_acquire) > 0 &&
+        CSMIntercept::FastCheck(pResource))
     {
         std::lock_guard<std::mutex> lock(CSMIntercept::sMutex);
-        ID3D11Buffer* buf = (ID3D11Buffer*)pResource;
-        if (CSMIntercept::sTracked.count(buf))
-            CSMIntercept::sMapped[buf] = pMappedResource->pData;
+        CSMIntercept::sMapped[(ID3D11Buffer*)pResource] = pMappedResource->pData;
     }
 
     // Same idea for the terrain tessellation CPU-side far-skip — shadow the
@@ -2245,15 +2398,14 @@ static HRESULT STDMETHODCALLTYPE HookedMap(
 static void STDMETHODCALLTYPE HookedUnmap(
     ID3D11DeviceContext* pThis, ID3D11Resource* pResource, UINT Subresource)
 {
-    ZoneScoped;
     if (gShutdownSignaled) { oUnmap(pThis, pResource, Subresource); return; }
 
     void* mappedData = nullptr;
-    if (pResource && CSMIntercept::sTrackedSize.load(std::memory_order_acquire) > 0)
+    if (pResource && CSMIntercept::sFastCount.load(std::memory_order_acquire) > 0 &&
+        CSMIntercept::FastCheck(pResource))
     {
         std::lock_guard<std::mutex> lock(CSMIntercept::sMutex);
-        ID3D11Buffer* buf = (ID3D11Buffer*)pResource;
-        auto it = CSMIntercept::sMapped.find(buf);
+        auto it = CSMIntercept::sMapped.find((ID3D11Buffer*)pResource);
         if (it != CSMIntercept::sMapped.end())
         {
             mappedData = it->second;
@@ -2298,24 +2450,7 @@ static void STDMETHODCALLTYPE HookedUnmap(
 
 // ==================== Install ====================
 
-static const int VTIDX_DEVICE_CreateBuffer          = 3;
-static const int VTIDX_DEVICE_CreateTexture2D       = 5;
-static const int VTIDX_DEVICE_CreateVertexShader    = 12;
-static const int VTIDX_DEVICE_CreatePixelShader     = 15;
-static const int VTIDX_CTX_PSSetShader              = 9;
-static const int VTIDX_CTX_VSSetShader              = 11;
-static const int VTIDX_CTX_DrawIndexed              = 12;
-static const int VTIDX_CTX_Draw                     = 13;
-static const int VTIDX_CTX_Map                      = 14;
-static const int VTIDX_CTX_Unmap                    = 15;
-static const int VTIDX_CTX_DrawIndexedInstanced     = 20;
-static const int VTIDX_CTX_OMSetRenderTargets       = 33;
-static const int VTIDX_CTX_OMSetRenderTargetsAndUAV = 34;
-static const int VTIDX_CTX_RSSetViewports           = 44;
-static const int VTIDX_CTX_CopyResource             = 47;
-static const int VTIDX_CTX_UpdateSubresource        = 48;
-static const int VTIDX_CTX_PSSetShaderResources     = 8;
-// VTIDX_SC_* constants moved to top of file (needed by deferred hook code)
+// VTIDX_* constants moved to top of file (needed by VTable hook infrastructure)
 
 bool Install()
 {
@@ -2454,25 +2589,11 @@ bool Install()
         Survey::InitFromINI(ini.c_str());
     }
 
+    // --- Detours hooks: device methods + Draw (low frequency, needed before device capture) ---
+
     if (KenshiLib::AddHook(addrCreateBuffer, (void*)HookedCreateBuffer,
                            (void**)&oCreateBuffer) != KenshiLib::SUCCESS)
     { Log("WARNING: Failed to hook CreateBuffer (CSM cbuffer tracking disabled)"); }
-
-    if (KenshiLib::AddHook(addrUpdateSubres, (void*)HookedUpdateSubresource,
-                           (void**)&oUpdateSubresource) != KenshiLib::SUCCESS)
-    { Log("WARNING: Failed to hook UpdateSubresource (CSM cbuffer tracking disabled)"); }
-
-    if (KenshiLib::AddHook(addrCopyRes, (void*)HookedCopyResource,
-                           (void**)&oCopyResource) != KenshiLib::SUCCESS)
-    { Log("WARNING: Failed to hook CopyResource (TerrainTess IB shadow propagation disabled)"); }
-
-    if (KenshiLib::AddHook(addrMap, (void*)HookedMap,
-                           (void**)&oMap) != KenshiLib::SUCCESS)
-    { Log("WARNING: Failed to hook Map (CSM cbuffer tracking disabled)"); }
-
-    if (KenshiLib::AddHook(addrUnmap, (void*)HookedUnmap,
-                           (void**)&oUnmap) != KenshiLib::SUCCESS)
-    { Log("WARNING: Failed to hook Unmap (CSM cbuffer tracking disabled)"); }
 
     if (KenshiLib::AddHook(addrCreateTex2D, (void*)HookedCreateTexture2D,
                            (void**)&oCreateTexture2D) != KenshiLib::SUCCESS)
@@ -2486,41 +2607,26 @@ bool Install()
                            (void**)&oCreatePixelShader) != KenshiLib::SUCCESS)
     { Log("ERROR: Failed to hook CreatePixelShader"); ok = false; }
 
-    if (KenshiLib::AddHook(addrPSSetShader, (void*)HookedPSSetShader,
-                           (void**)&oPSSetShader) != KenshiLib::SUCCESS)
-    { Log("WARNING: Failed to hook PSSetShader (TerrainTess fast-path disabled)"); }
-
-    if (KenshiLib::AddHook(addrVSSetShader, (void*)HookedVSSetShader,
-                           (void**)&oVSSetShader) != KenshiLib::SUCCESS)
-    { Log("WARNING: Failed to hook VSSetShader (TerrainTess fast-path disabled)"); }
-
     if (KenshiLib::AddHook(addrDraw, (void*)HookedDraw,
                            (void**)&oDraw) != KenshiLib::SUCCESS)
     { Log("ERROR: Failed to hook Draw"); ok = false; }
 
-    if (KenshiLib::AddHook(addrDrawIndexed, (void*)HookedDrawIndexed,
-                           (void**)&oDrawIndexed) != KenshiLib::SUCCESS)
-    { Log("ERROR: Failed to hook DrawIndexed"); ok = false; }
-
-    if (KenshiLib::AddHook(addrDrawIdxInst, (void*)HookedDrawIndexedInstanced,
-                           (void**)&oDrawIndexedInstanced) != KenshiLib::SUCCESS)
-    { Log("ERROR: Failed to hook DrawIndexedInstanced"); ok = false; }
-
-    if (KenshiLib::AddHook(addrOMSetRT, (void*)HookedOMSetRenderTargets,
-                           (void**)&oOMSetRenderTargets) != KenshiLib::SUCCESS)
-    { Log("ERROR: Failed to hook OMSetRenderTargets"); ok = false; }
-
-    if (KenshiLib::AddHook(addrOMSetRTUAV, (void*)HookedOMSetRenderTargetsAndUAV,
-                           (void**)&oOMSetRenderTargetsAndUAV) != KenshiLib::SUCCESS)
-    { Log("ERROR: Failed to hook OMSetRenderTargetsAndUnorderedAccessViews"); ok = false; }
-
-    if (KenshiLib::AddHook(addrPSSetSRV, (void*)HookedPSSetShaderResources,
-                           (void**)&oPSSetShaderResources) != KenshiLib::SUCCESS)
-    { Log("WARNING: Failed to hook PSSetShaderResources (runtime shadow resize SRV swap disabled)"); }
-
-    if (KenshiLib::AddHook(addrRSSetVP, (void*)HookedRSSetViewports,
-                           (void**)&oRSSetViewports) != KenshiLib::SUCCESS)
-    { Log("WARNING: Failed to hook RSSetViewports (runtime shadow resize viewport scaling disabled)"); }
+    // --- VTable-managed context methods: set o* from temp device as defaults. ---
+    // The real originals are saved from the game device in TryCaptureDevice().
+    // Until then, these pointers are valid (same D3D11 runtime code).
+    oMap                     = (PFN_Map)addrMap;
+    oUnmap                   = (PFN_Unmap)addrUnmap;
+    oDrawIndexed             = (PFN_DrawIndexed)addrDrawIndexed;
+    oDrawIndexedInstanced    = (PFN_DrawIndexedInstanced)addrDrawIdxInst;
+    oPSSetShader             = (PFN_PSSetShader)addrPSSetShader;
+    oVSSetShader             = (PFN_VSSetShader)addrVSSetShader;
+    oOMSetRenderTargets      = (PFN_OMSetRenderTargets)addrOMSetRT;
+    oOMSetRenderTargetsAndUAV = (PFN_OMSetRenderTargetsAndUAV)addrOMSetRTUAV;
+    oPSSetShaderResources    = (PFN_PSSetShaderResources)addrPSSetSRV;
+    oRSSetViewports          = (PFN_RSSetViewports)addrRSSetVP;
+    oCopyResource            = (PFN_CopyResource)addrCopyRes;
+    oUpdateSubresource       = (PFN_UpdateSubresource)addrUpdateSubres;
+    Log("  12 context methods set for VTable hooking (deferred to device capture)");
 
     // Present/Present1/ResizeBuffers hooks are DEFERRED until the first Draw call.
     // This avoids a race with overlay DLLs (Steam, Discord, ReShade) that also hook
@@ -2533,7 +2639,7 @@ bool Install()
         addrPresent, addrPresent1, addrResizeBuf);
 
     if (ok)
-        Log("Device/Context hooks installed, swap chain hooks deferred to first Draw");
+        Log("Detours hooks installed, VTable context hooks + swap chain hooks deferred");
 
     return ok;
 }

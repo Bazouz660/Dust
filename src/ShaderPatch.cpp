@@ -5,6 +5,7 @@
 #include "D3D11Hook.h"
 #include "TerrainTess.h"
 
+#include <tracy/Tracy.hpp>
 #include <d3d11shader.h>
 #include <d3dcompiler.h>
 #include <string>
@@ -969,6 +970,7 @@ HRESULT WINAPI HookedD3DCompile(
     UINT Flags1, UINT Flags2,
     ID3DBlob** ppCode, ID3DBlob** ppErrorMsgs)
 {
+    ZoneScopedN("HookedD3DCompile");
     if (D3D11Hook::IsShutdownSignaled())
         return oD3DCompile(pSrcData, SrcDataSize, pSourceName,
                             pDefines, pInclude, pEntrypoint, pTarget,

@@ -1,5 +1,7 @@
 #include "POMState.h"
+#include "D3D11Hook.h"
 #include "DustLog.h"
+#include <tracy/Tracy.hpp>
 #include <cstring>
 
 namespace POMState
@@ -52,7 +54,8 @@ void Shutdown()
     gDevice = nullptr;
 }
 
-void SetEnabled(bool enabled)        { gData.cfg[0] = enabled ? 1.0f : 0.0f; gDirty = true; }
+bool GetEnabled()                    { return gData.cfg[0] != 0.0f; }
+void SetEnabled(bool enabled)        { gData.cfg[0] = enabled ? 1.0f : 0.0f; gDirty = true; D3D11Hook::RefreshContextHooks(); }
 void SetHeightScale(float scale)     { gData.cfg[1] = scale;                 gDirty = true; }
 void SetThreshold(float threshold)   { gData.cfg[2] = threshold;             gDirty = true; }
 void SetThresholdWidth(float width)  { gData.cfg[3] = width;                 gDirty = true; }
@@ -61,6 +64,7 @@ void SetMaxSamples(int n)            { gData.samples[1] = (float)n;          gDi
 
 void OnGBufferEnter(ID3D11DeviceContext* ctx)
 {
+    ZoneScopedN("POM.GBufferEnter");
     if (!ctx) return;
     EnsureBuffer();
     if (!gCB) return;
@@ -81,6 +85,7 @@ void OnGBufferEnter(ID3D11DeviceContext* ctx)
 
 void OnGBufferLeave(ID3D11DeviceContext* ctx)
 {
+    ZoneScopedN("POM.GBufferLeave");
     if (!ctx) return;
     ID3D11Buffer* nullCB = nullptr;
     ctx->PSSetConstantBuffers(8, 1, &nullCB);
@@ -88,6 +93,7 @@ void OnGBufferLeave(ID3D11DeviceContext* ctx)
 
 void BindPerDraw(ID3D11DeviceContext* ctx)
 {
+    ZoneScopedN("POM.BindPerDraw");
     if (!ctx || !gCB) return;
     ctx->PSSetConstantBuffers(8, 1, &gCB);
 }

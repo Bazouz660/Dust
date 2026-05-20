@@ -1,6 +1,8 @@
 #include "GeometryCapture.h"
+#include "D3D11Hook.h"
 #include "DustAPI.h"
 #include "DustLog.h"
+#include <tracy/Tracy.hpp>
 #include <vector>
 
 namespace GeometryCapture
@@ -116,6 +118,7 @@ static bool IsGBufferConfig(UINT numViews,
                             ID3D11RenderTargetView* const* ppRTVs,
                             ID3D11DepthStencilView* pDSV)
 {
+    ZoneScopedN("GeoCapture.IsGBufferConfig");
     if (numViews != 3 || !ppRTVs || !pDSV)
         return false;
 
@@ -358,6 +361,7 @@ void SetResolution(UINT width, UINT height)
 void SetCaptureFlags(uint32_t flags)
 {
     sCaptureFlags = flags;
+    D3D11Hook::RefreshContextHooks();
 }
 
 uint32_t GetCaptureFlags()

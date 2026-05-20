@@ -241,29 +241,6 @@ namespace TerrainTess
     // a CopyResource+Map(READ) at draw time.
     void OnVertexBufferCreated(ID3D11Buffer* vb, const void* initialData);
 
-    // Called from HookedCreateBuffer for any IB. We register it so the
-    // Map/Unmap hooks shadow its content CPU-side; PrepareStripConversion
-    // then reads strip indices from memory instead of doing a per-draw
-    // CopyResource+Map(READ) (which was costing 3-5 ms/frame).
-    void OnIndexBufferCreated(ID3D11Buffer* ib, const void* initialData, UINT size);
-
-    // Called from HookedUpdateSubresource for any buffer write. If the
-    // target is a tracked IB, snapshot the source bytes into the shadow.
-    void OnIndexBufferUpdate(ID3D11Resource* res, const D3D11_BOX* box,
-                             const void* src, UINT srcRowPitch);
-
-    // Called from HookedCreateBuffer for USAGE_STAGING + CPU_ACCESS_WRITE
-    // buffers. Kenshi's IB upload path is:
-    //   CreateBuffer(staging) → Map/Unmap → CopyResource(IB, staging).
-    // Tracking staging buffers lets the Map/Unmap hook shadow their
-    // content, and the CopyResource hook propagates that content into
-    // the IB shadow — closing the loop without any GPU readback.
-    void OnStagingBufferCreated(ID3D11Buffer* buf, UINT byteWidth);
-
-    // Called from HookedCopyResource. Propagates source-buffer content
-    // (if shadowed) into destination IB's shadow.
-    void OnCopyResource(ID3D11Resource* dst, ID3D11Resource* src);
-
     // Called from the D3DCompile hook for each successful main_fs / mapfeature_fs
     // compile. Captures BLEND1/2/3 #define values (channel indices for blendMap,
     // 0..3) keyed by bytecode hash. OnPixelShaderCreated then moves the entry

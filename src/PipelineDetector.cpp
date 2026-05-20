@@ -1,6 +1,7 @@
 #include "PipelineDetector.h"
 #include "ResourceRegistry.h"
 #include "DustLog.h"
+#include <tracy/Tracy.hpp>
 #include <dxgi.h>
 
 PipelineDetector gPipelineDetector;
@@ -9,6 +10,7 @@ static bool sFirstDetectLogged = false;
 
 PipelineDetector::DetectionResult PipelineDetector::OnFullscreenDraw(ID3D11DeviceContext* ctx)
 {
+    ZoneScopedN("PipelineDetector.OnFullscreenDraw");
     DetectionResult result;
 
     // Detect passes in pipeline order
@@ -66,6 +68,7 @@ void PipelineDetector::ResetFrame()
 //   3. SRV slot 0 is bound (GBuffer albedo)
 bool PipelineDetector::IsLightingPass(ID3D11DeviceContext* ctx)
 {
+    ZoneScopedN("PipelineDetector.IsLightingPass");
     // Check RT format
     ID3D11RenderTargetView* rt = nullptr;
     ctx->OMGetRenderTargets(1, &rt, nullptr);
@@ -170,6 +173,7 @@ void PipelineDetector::CaptureLightingResources(ID3D11DeviceContext* ctx)
 // This runs after lighting + water/forward objects.
 bool PipelineDetector::IsFogPass(ID3D11DeviceContext* ctx)
 {
+    ZoneScopedN("PipelineDetector.IsFogPass");
     // Check RT format is R11G11B10_FLOAT (HDR)
     ID3D11RenderTargetView* rt = nullptr;
     ctx->OMGetRenderTargets(1, &rt, nullptr);
@@ -232,6 +236,7 @@ bool PipelineDetector::IsFogPass(ID3D11DeviceContext* ctx)
 // or directly to the R8G8B8A8 swap chain backbuffer (when they're all disabled).
 bool PipelineDetector::IsTonemapPass(ID3D11DeviceContext* ctx)
 {
+    ZoneScopedN("PipelineDetector.IsTonemapPass");
     ID3D11RenderTargetView* rt = nullptr;
     ctx->OMGetRenderTargets(1, &rt, nullptr);
     if (!rt)
