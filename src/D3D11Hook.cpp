@@ -1196,8 +1196,7 @@ static bool IsShadowAtlasDesc(const D3D11_TEXTURE2D_DESC* d)
     bool hasDSV = (d->BindFlags & D3D11_BIND_DEPTH_STENCIL) != 0;
 
     if (d->Format == DXGI_FORMAT_R32_FLOAT && hasRTV && hasSRV) return true;
-    if ((d->Format == DXGI_FORMAT_D32_FLOAT ||
-         d->Format == DXGI_FORMAT_R32_TYPELESS) && hasDSV) return true;
+    if (d->Format == DXGI_FORMAT_R32_TYPELESS && hasDSV && hasSRV) return true;
     return false;
 }
 
@@ -1704,6 +1703,24 @@ static ID3D11DepthStencilView* MaybeSwapShadowDSV(ID3D11DepthStencilView* dsv)
     return dsv;
 }
 
+static bool AnyRtvIsShadow(UINT NumViews, ID3D11RenderTargetView* const* ppRTVs,
+                           bool& outAnyBound)
+{
+    outAnyBound = false;
+    if (!ppRTVs) return false;
+    for (UINT i = 0; i < NumViews; i++)
+    {
+        if (!ppRTVs[i]) continue;
+        outAnyBound = true;
+        ID3D11Resource* res = nullptr;
+        ppRTVs[i]->GetResource(&res);
+        int idx = FindShadowEntry(res);
+        if (res) res->Release();
+        if (idx >= 0) return true;
+    }
+    return false;
+}
+
 static ID3D11RenderTargetView* MaybeSwapShadowRTV(ID3D11RenderTargetView* rtv)
 {
     ZoneScopedN("MaybeSwapShadowRTV");
@@ -1727,10 +1744,20 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
     bool wasInGBuffer = GeometryCapture::IsInGBufferPass();
     bool isGBuffer    = GeometryCapture::CheckGBufferConfig(NumViews, ppRenderTargetViews, pDepthStencilView);
 
-    bool nowInShadowPass = ResolveIsShadowDsv(pDepthStencilView);
+    // Shadow pass = DSV matches AND (RTV matches OR depth-only bind).
+    // DSV-only match is not enough: OGRE's depth buffer pool can share the
+    // shadow atlas depth texture with unrelated render targets (portraits, etc.).
+    bool dsvIsShadow = ResolveIsShadowDsv(pDepthStencilView);
+    bool nowInShadowPass = false;
+    if (dsvIsShadow)
+    {
+        bool anyRtvBound = false;
+        bool rtvIsShadow = AnyRtvIsShadow(NumViews, ppRenderTargetViews, anyRtvBound);
+        nowInShadowPass = rtvIsShadow || !anyRtvBound;
+    }
     if (nowInShadowPass) gShadowMatchCount.fetch_add(1, std::memory_order_relaxed);
 
-    if (gShadowSwapActive)
+    if (gShadowSwapActive && nowInShadowPass)
     {
         ID3D11DepthStencilView* swapDSV = MaybeSwapShadowDSV(pDepthStencilView);
         ID3D11RenderTargetView* swapRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
@@ -1745,14 +1772,12 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
             }
             if (anyRTVSwapped) finalRTVs = swapRTVs;
         }
-        if (swapDSV != pDepthStencilView || anyRTVSwapped)
-            nowInShadowPass = true;
         oOMSetRenderTargets(pThis, NumViews, finalRTVs, swapDSV);
 
         // OGRE sets RSSetViewports BEFORE OMSetRenderTargets, so the viewport
         // hook (gated on gInShadowPass) misses it. On shadow-pass entry, query
         // the already-set viewport and scale it to match the replacement atlas.
-        if (nowInShadowPass && !gInShadowPass)
+        if (!gInShadowPass)
         {
             UINT nVP = 0;
             pThis->RSGetViewports(&nVP, nullptr);
@@ -1804,10 +1829,17 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargetsAndUAV(
         return;
     }
 
-    bool nowInShadowPass = ResolveIsShadowDsv(pDepthStencilView);
+    bool dsvIsShadow = ResolveIsShadowDsv(pDepthStencilView);
+    bool nowInShadowPass = false;
+    if (dsvIsShadow)
+    {
+        bool anyRtvBound = false;
+        bool rtvIsShadow = AnyRtvIsShadow(NumRTVs, ppRenderTargetViews, anyRtvBound);
+        nowInShadowPass = rtvIsShadow || !anyRtvBound;
+    }
     if (nowInShadowPass) gShadowMatchCount.fetch_add(1, std::memory_order_relaxed);
 
-    if (gShadowSwapActive)
+    if (gShadowSwapActive && nowInShadowPass)
     {
         ID3D11DepthStencilView* swapDSV = MaybeSwapShadowDSV(pDepthStencilView);
         ID3D11RenderTargetView* swapRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
@@ -1822,13 +1854,11 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargetsAndUAV(
             }
             if (anyRTVSwapped) finalRTVs = swapRTVs;
         }
-        if (swapDSV != pDepthStencilView || anyRTVSwapped)
-            nowInShadowPass = true;
         oOMSetRenderTargetsAndUAV(pThis, NumRTVs, finalRTVs,
             swapDSV, UAVStartSlot, NumUAVs, ppUnorderedAccessViews,
             pUAVInitialCounts);
 
-        if (nowInShadowPass && !gInShadowPass)
+        if (!gInShadowPass)
         {
             UINT nVP = 0;
             pThis->RSGetViewports(&nVP, nullptr);
