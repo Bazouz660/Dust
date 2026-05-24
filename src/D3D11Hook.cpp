@@ -146,9 +146,11 @@ UINT GetShadowBaseResolution()           { return gShadowVanillaSize; }
 void SetShadowAtlasResolution(UINT size)
 {
     gShadowAtlasOverride = size;
-    if (gShadowEntryCount.load(std::memory_order_acquire) > 0 && size != 0 &&
-        size != gShadowResizeTarget)
+    size_t entries = gShadowEntryCount.load(std::memory_order_acquire);
+    if (entries > 0 && size != 0 && size != gShadowResizeTarget)
     {
+        Log("Shadow atlas resize queued: %u -> %u (base=%u, entries=%zu)",
+            gShadowResizeTarget, size, gShadowBaseSize, entries);
         gShadowResizeTarget = size;
         gShadowResizePending.store(true, std::memory_order_release);
     }
@@ -255,6 +257,7 @@ static void ResetShadowTracking()
     gShadowSwapActive = false;
     gShadowViewportScale = 1.0f;
     gShadowResizeTarget = 0;
+    gShadowResizePending.store(false, std::memory_order_relaxed);
     Log("Shadow tracking reset (workspace recreate, frame %llu)", (unsigned long long)gFrameIndex);
 }
 
@@ -266,7 +269,7 @@ static void ApplyPendingShadowResize()
 
     UINT newSize = gShadowResizeTarget;
     size_t count = gShadowEntryCount.load(std::memory_order_acquire);
-    if (count == 0 || !gDevice) return;
+    if (count == 0 || !gDevice || newSize == 0) return;
 
     // If matching base size, disable swapping (original textures are correct)
     if (newSize == gShadowBaseSize)
@@ -1219,7 +1222,6 @@ static bool IsShadowAtlasDesc(const D3D11_TEXTURE2D_DESC* d)
 
     if (d->Format == DXGI_FORMAT_R32_FLOAT && hasRTV && hasSRV) return true;
     if (d->Format == DXGI_FORMAT_R32_TYPELESS && hasDSV && hasSRV) return true;
-    if (d->Format == DXGI_FORMAT_D32_FLOAT && hasDSV) return true;
     return false;
 }
 
