@@ -679,6 +679,7 @@ void EffectLoader::BuildHostAPI()
 
     // v9 additions
     hostAPI_.SetShadowRange             = HostSetShadowRange;
+    hostAPI_.GetShadowBaseResolution    = D3D11Hook::GetShadowBaseResolution;
 }
 
 // ==================== v3: Config I/O ====================

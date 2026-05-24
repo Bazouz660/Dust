@@ -133,12 +133,15 @@ struct ShadowAtlasEntry {
 };
 static ShadowAtlasEntry gShadowEntries[kMaxShadowIdentities] = {};
 static std::atomic<size_t> gShadowEntryCount{0};
-static UINT  gShadowBaseSize = 0;              // size OGRE thinks the atlas is
+static UINT  gShadowBaseSize = 0;              // actual size of original textures (may be overridden at creation)
+static UINT  gShadowVanillaSize = 0;           // what Kenshi requested before our override
 static bool  gShadowSwapActive = false;        // fast-path flag
 static float gShadowViewportScale = 1.0f;      // newSize / baseSize
 static std::atomic<bool> gShadowResizePending{false};
 static UINT  gShadowResizeTarget = 0;
 static uint64_t gShadowCreationFrame = UINT64_MAX;
+
+UINT GetShadowBaseResolution()           { return gShadowVanillaSize; }
 
 void SetShadowAtlasResolution(UINT size)
 {
@@ -248,6 +251,7 @@ static void ResetShadowTracking()
     gShadowEntryCount.store(0, std::memory_order_release);
     gShadowAtlasIdentityCount.store(0, std::memory_order_release);
     gShadowBaseSize = 0;
+    gShadowVanillaSize = 0;
     gShadowSwapActive = false;
     gShadowViewportScale = 1.0f;
     gShadowResizeTarget = 0;
@@ -1215,6 +1219,7 @@ static bool IsShadowAtlasDesc(const D3D11_TEXTURE2D_DESC* d)
 
     if (d->Format == DXGI_FORMAT_R32_FLOAT && hasRTV && hasSRV) return true;
     if (d->Format == DXGI_FORMAT_R32_TYPELESS && hasDSV && hasSRV) return true;
+    if (d->Format == DXGI_FORMAT_D32_FLOAT && hasDSV) return true;
     return false;
 }
 
@@ -1300,6 +1305,8 @@ static HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
                 e.isDepth = isDepth;
                 if (gShadowBaseSize == 0)
                     gShadowBaseSize = finalDesc->Width;
+                if (gShadowVanillaSize == 0)
+                    gShadowVanillaSize = pDesc->Width;
                 gShadowEntryCount.store(eidx + 1, std::memory_order_release);
             }
             unk->Release();

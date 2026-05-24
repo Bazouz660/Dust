@@ -603,12 +603,33 @@ static void ApplyDustTheme(const std::string& name)
     style.ItemSpacing   = ImVec2(8, 5);
 }
 
-// Section-heading accent color, theme-aware.
+// Semantic accent colors, theme-aware.
 static ImVec4 DustHeadingColor()
 {
     if (gFwConfig.theme == "dark")
         return ImVec4(0.70f, 0.85f, 1.00f, 1.00f);
     return ImVec4(0.82f, 0.70f, 0.40f, 1.00f);
+}
+
+static ImVec4 DustSuccessColor()
+{
+    if (gFwConfig.theme == "dark")
+        return ImVec4(0.40f, 0.85f, 0.40f, 1.00f);
+    return ImVec4(0.58f, 0.72f, 0.36f, 1.00f);
+}
+
+static ImVec4 DustWarningColor()
+{
+    if (gFwConfig.theme == "dark")
+        return ImVec4(1.00f, 0.85f, 0.35f, 1.00f);
+    return ImVec4(0.85f, 0.72f, 0.40f, 1.00f);
+}
+
+static ImVec4 DustErrorColor()
+{
+    if (gFwConfig.theme == "dark")
+        return ImVec4(1.00f, 0.45f, 0.35f, 1.00f);
+    return ImVec4(0.78f, 0.40f, 0.28f, 1.00f);
 }
 
 // ==================== Framework config ====================
@@ -797,7 +818,10 @@ static void DrawFrameworkSection()
     bool dirty = IsFrameworkDirty();
 
     if (dirty)
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.2f, 1.0f));
+    {
+        ImVec4 c = DustSuccessColor();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(c.x * 0.5f, c.y * 0.7f, c.z * 0.5f, 1.0f));
+    }
     if (ImGui::Button("Save##fw", ImVec2(80, 0)) && dirty)
         SaveFrameworkConfig();
     if (dirty)
@@ -816,7 +840,7 @@ static void DrawFrameworkSection()
         ImGui::Separator();
         ImGui::Spacing();
 
-        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Pipeline Survey");
+        ImGui::TextColored(DustWarningColor(), "Pipeline Survey");
 
         if (Survey::IsActive())
         {
@@ -1090,24 +1114,24 @@ static void DrawPresetSection()
     // Show warnings for outdated presets
     if (currentPreset >= 0 && !presets[currentPreset].warnings.empty())
     {
-        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "[!] Preset is outdated");
+        ImGui::TextColored(DustWarningColor(), "[!] Preset is outdated");
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("%s", presets[currentPreset].warnings.c_str());
     }
 
     // Picker-busy banner (so the user knows the dialog is open somewhere)
     if (FilePicker::IsBusy())
-        ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "Waiting for folder picker...");
+        ImGui::TextColored(DustHeadingColor(), "Waiting for folder picker...");
 
     // Transient info / error
     if (gPickerInfoFrames > 0 && !gPickerInfo.empty())
     {
-        ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "%s", gPickerInfo.c_str());
+        ImGui::TextColored(DustSuccessColor(), "%s", gPickerInfo.c_str());
         gPickerInfoFrames--;
     }
     if (!gPickerError.empty())
     {
-        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.4f, 1.0f), "%s", gPickerError.c_str());
+        ImGui::TextColored(DustErrorColor(), "%s", gPickerError.c_str());
         ImGui::SameLine();
         if (ImGui::SmallButton("Dismiss##PickerErr")) gPickerError.clear();
     }
@@ -1214,7 +1238,10 @@ static void DrawPresetSection()
                 : "Edit author / description metadata");
 
         ImGui::SameLine();
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.15f, 0.15f, 1.0f));
+    {
+        ImVec4 e = DustErrorColor();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(e.x * 0.7f, e.y * 0.4f, e.z * 0.4f, 1.0f));
+    }
         PushVisualDisabled(readOnly);
         if (ImGui::Button("Delete") && !readOnly)
             ImGui::OpenPopup("##ConfirmDeletePreset");
@@ -1329,7 +1356,7 @@ static void DrawResetButton(size_t effectIdx, uint32_t settingIdx)
     ImGui::PushID((int)settingIdx + 10000);
     if (dirty)
     {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.8f, 0.3f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_Text, DustWarningColor());
         if (ImGui::SmallButton("R"))
         {
             SetValue(s, state.diskValues[settingIdx]);
@@ -1403,7 +1430,7 @@ static void DrawEffectSection(size_t idx)
             if (inSection) { ImGui::TreePop(); inSection = false; }
             ImGui::Spacing();
             ImGui::Separator();
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.75f, 0.45f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_Text, DustHeadingColor());
             sectionOpen = ImGui::TreeNodeEx(s.name, ImGuiTreeNodeFlags_DefaultOpen);
             ImGui::PopStyleColor();
             inSection = sectionOpen;
@@ -1493,11 +1520,11 @@ static void DrawEffectSection(size_t idx)
                 break;
             case DUST_PERF_MEDIUM:
                 perfLabel = "Medium";
-                perfColor = ImVec4(1.00f, 0.60f, 0.20f, 1.00f);
+                perfColor = DustWarningColor();
                 break;
             case DUST_PERF_HIGH:
                 perfLabel = "High";
-                perfColor = ImVec4(1.00f, 0.30f, 0.25f, 1.00f);
+                perfColor = DustErrorColor();
                 break;
             default:
                 break;
@@ -1598,9 +1625,9 @@ static void DrawPerformanceSection()
 
         totalEffectMs += gpuMs;
 
-        ImVec4 color = ImVec4(0.4f, 1.0f, 0.4f, 1.0f);
-        if (gpuMs > 2.0f) color = ImVec4(1.0f, 1.0f, 0.4f, 1.0f);
-        if (gpuMs > 5.0f) color = ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
+        ImVec4 color = DustSuccessColor();
+        if (gpuMs > 2.0f) color = DustWarningColor();
+        if (gpuMs > 5.0f) color = DustErrorColor();
 
         if (hasTiming)
         {
@@ -1634,7 +1661,7 @@ static void DrawPerformanceSection()
         ImGui::Separator();
         ImGui::Spacing();
 
-        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.4f, 1.0f), "Geometry Capture");
+        ImGui::TextColored(DustHeadingColor(), "Geometry Capture");
         ImGui::Spacing();
 
         ImGui::Text("  GBuffer Draws: %u", captureCount);
@@ -1680,7 +1707,7 @@ static void RenderToast()
     ImGui::SameLine();
     ImGui::TextDisabled("(%s)", DUST_VERSION_STR);
     if (gNewVersionInstalled)
-        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "New version installed!");
+        ImGui::TextColored(DustSuccessColor(), "New version installed!");
     ImGui::Text("Press %s to open settings", VKKeyName(gFwConfig.toggleKey));
     if (!gNewVersionInstalled)
         ImGui::TextDisabled("(disable this message in settings)");

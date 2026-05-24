@@ -39,6 +39,7 @@ namespace D3D11Hook
     // At runtime, creates replacement textures and swaps views at bind time.
     void SetShadowAtlasResolution(UINT size);
     UINT GetShadowAtlasResolution();
+    UINT GetShadowBaseResolution();
 
     // Re-evaluate whether VTable context hooks should be installed or removed.
     // Call this whenever a feature that depends on context hooks is toggled

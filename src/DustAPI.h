@@ -351,6 +351,10 @@ typedef struct DustHostAPI {
     // Plugins should still write the user-facing value to settings.cfg if
     // they want it to persist across restarts.
     int (*SetShadowRange)(float farDistance);
+
+    // Return the vanilla shadow atlas resolution (the size Kenshi created
+    // before any Dust override). 0 if the atlas hasn't been created yet.
+    uint32_t (*GetShadowBaseResolution)(void);
 } DustHostAPI;
 
 // Performance impact hint for a single setting (API v3.2+).

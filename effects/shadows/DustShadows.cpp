@@ -55,6 +55,8 @@ static ShadowConfig gConfig;
 static ID3D11Buffer* gCB = nullptr;
 static const DustHostAPI* gHost = nullptr;
 static int gLastWrittenShadowRange = INT_MIN;  // debounce slider-drag disk writes
+static int gVanillaShadowRange = -1;
+static bool gWasEnabled = true;
 
 static const uint32_t kShadowResolutions[] = { 1024, 2048, 4096, 6144, 8192, 12288, 16384 };
 static const char* const kShadowResolutionLabels[] = {
@@ -375,26 +377,56 @@ static void ShadowPostExecute(const DustFrameContext* ctx, const DustHostAPI* ho
     ctx->context->PSSetConstantBuffers(7, 1, &nullCB);
 }
 
-static int ShadowIsEnabled() { return 1; }
+static int ShadowIsEnabled() { return gConfig.enabled ? 1 : 0; }
 
-static void ShadowOnSettingChanged()
+static void RestoreVanillaShadows()
 {
-    if (gHost && gHost->SetShadowAtlasResolution)
+    if (!gHost) return;
+    if (gHost->GetShadowBaseResolution && gHost->SetShadowAtlasResolution)
+    {
+        uint32_t base = gHost->GetShadowBaseResolution();
+        if (base > 0)
+            gHost->SetShadowAtlasResolution(base);
+    }
+    if (gHost->SetShadowRange && gVanillaShadowRange > 0)
+        gHost->SetShadowRange((float)gVanillaShadowRange);
+    if (gHost->SetCascadeLambda)
+        gHost->SetCascadeLambda(0.95f);
+    if (gHost->SetCascadeFilterScale)
+        for (int i = 0; i < 4; i++)
+            gHost->SetCascadeFilterScale(i, 1.0f);
+}
+
+static void ApplyDustShadows()
+{
+    if (!gHost) return;
+    if (gHost->SetShadowAtlasResolution)
         gHost->SetShadowAtlasResolution(GetSelectedShadowResolution());
-    if (gHost && gHost->SetCascadeLambda)
+    if (gHost->SetCascadeLambda)
         gHost->SetCascadeLambda(gConfig.pssmLambda);
-    if (gHost && gHost->SetCascadeFilterScale)
+    if (gHost->SetCascadeFilterScale)
     {
         gHost->SetCascadeFilterScale(0, gConfig.cascade0Filter);
         gHost->SetCascadeFilterScale(1, gConfig.cascade1Filter);
         gHost->SetCascadeFilterScale(2, gConfig.cascade2Filter);
         gHost->SetCascadeFilterScale(3, gConfig.cascade3Filter);
     }
-    // Live runtime push to Kenshi's engine far; complements the settings.cfg
-    // write below which only takes effect on next launch.
-    if (gHost && gHost->SetShadowRange)
+    if (gHost->SetShadowRange)
         gHost->SetShadowRange((float)gConfig.shadowRange);
-    PushShadowRangeToGame();
+}
+
+static void ShadowOnSettingChanged()
+{
+    if (gConfig.enabled)
+    {
+        ApplyDustShadows();
+        PushShadowRangeToGame();
+    }
+    else if (gWasEnabled)
+    {
+        RestoreVanillaShadows();
+    }
+    gWasEnabled = gConfig.enabled;
 }
 
 static DustSettingDesc gSettings[] = {
@@ -449,6 +481,8 @@ extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
     // reads the file at startup. Writing later (Init or OnSettingChanged) is
     // futile — Kenshi caches the value early and stomps the file on exit.
     int currentGame = ReadSettingsCfgInt("Shadow Range", -1);
+    if (currentGame > 0)
+        gVanillaShadowRange = currentGame;
     int resolved = ResolveUserShadowRange(currentGame > 0 ? currentGame : gConfig.shadowRange);
     gConfig.shadowRange = resolved;
     PushShadowRangeToGame();
