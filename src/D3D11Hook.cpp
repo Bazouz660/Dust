@@ -124,12 +124,14 @@ UINT GetShadowAtlasResolution()          { return gShadowAtlasOverride; }
 struct ShadowAtlasEntry {
     ID3D11Texture2D*          tex;          // AddRef'd original
     IUnknown*                 identity;     // QI(IID_IUnknown) for matching
-    D3D11_TEXTURE2D_DESC      desc;         // post-override desc (actual size OGRE sees)
+    D3D11_TEXTURE2D_DESC      desc;         // original desc (vanilla size)
     bool                      isDepth;      // DSV-bound depth vs RTV+SRV color
     ID3D11Texture2D*          newTex;       // replacement (null if no resize active)
     ID3D11DepthStencilView*   newDSV;
     ID3D11RenderTargetView*   newRTV;
     ID3D11ShaderResourceView* newSRV;
+    ID3D11Texture2D*          companionDepthTex;  // standalone depth for color-only entries
+    ID3D11DepthStencilView*   companionDSV;       // DSV for companion depth
 };
 static ShadowAtlasEntry gShadowEntries[kMaxShadowIdentities] = {};
 static std::atomic<size_t> gShadowEntryCount{0};
@@ -236,6 +238,8 @@ static int FindShadowEntry(ID3D11Resource* res)
 
 static void ReleaseShadowReplacement(ShadowAtlasEntry& e)
 {
+    if (e.companionDSV)      { e.companionDSV->Release();      e.companionDSV = nullptr; }
+    if (e.companionDepthTex) { e.companionDepthTex->Release();  e.companionDepthTex = nullptr; }
     if (e.newDSV)  { e.newDSV->Release();  e.newDSV = nullptr; }
     if (e.newRTV)  { e.newRTV->Release();  e.newRTV = nullptr; }
     if (e.newSRV)  { e.newSRV->Release();  e.newSRV = nullptr; }
@@ -363,6 +367,39 @@ static void ApplyPendingShadowResize()
             e.newTex, e.newDSV, e.newRTV, e.newSRV);
     }
 
+    // If no depth entry was tracked (OGRE reused a pooled depth buffer),
+    // create a companion depth texture for color entries so the RTV+DSV
+    // dimensions match during shadow rendering.
+    bool hasDepth = false;
+    for (size_t i = 0; i < count; i++)
+        if (gShadowEntries[i].isDepth) { hasDepth = true; break; }
+    if (!hasDepth)
+    {
+        for (size_t i = 0; i < count; i++)
+        {
+            ShadowAtlasEntry& e = gShadowEntries[i];
+            if (e.isDepth || !e.newTex) continue;
+            D3D11_TEXTURE2D_DESC dd = {};
+            dd.Width = newSize;
+            dd.Height = newSize;
+            dd.MipLevels = 1;
+            dd.ArraySize = 1;
+            dd.Format = DXGI_FORMAT_D32_FLOAT;
+            dd.SampleDesc.Count = 1;
+            dd.Usage = D3D11_USAGE_DEFAULT;
+            dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+            HRESULT hr = oCreateTexture2D(gDevice, &dd, nullptr, &e.companionDepthTex);
+            if (SUCCEEDED(hr) && e.companionDepthTex)
+            {
+                hr = gDevice->CreateDepthStencilView(e.companionDepthTex, nullptr, &e.companionDSV);
+                if (FAILED(hr))
+                    Log("  companion DSV creation FAILED (0x%08X)", hr);
+                else
+                    Log("  companion DSV created for color entry %zu (%ux%u)", i, newSize, newSize);
+            }
+        }
+    }
+
     gShadowViewportScale = (float)newSize / (float)gShadowBaseSize;
     gShadowSwapActive = true;
     Log("Shadow atlas swap active, viewport scale = %.3f", gShadowViewportScale);
@@ -383,6 +420,8 @@ static void ClearShadowReplacements()
             float clear[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
             gContext->ClearRenderTargetView(e.newRTV, clear);
         }
+        if (e.companionDSV)
+            gContext->ClearDepthStencilView(e.companionDSV, D3D11_CLEAR_DEPTH, 1.0f, 0);
     }
 }
 
@@ -1248,22 +1287,7 @@ static HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
         }
     }
 
-    UINT override = gShadowAtlasOverride;
-    const D3D11_TEXTURE2D_DESC* finalDesc = pDesc;
-    D3D11_TEXTURE2D_DESC modDesc;
-    if (override != 0 && IsShadowAtlasDesc(pDesc) && pDesc->Width != override)
-    {
-        modDesc = *pDesc;
-        modDesc.Width  = override;
-        modDesc.Height = override;
-        Log("Shadow atlas override: %ux%u %s -> %ux%u",
-            pDesc->Width, pDesc->Height,
-            FormatName(pDesc->Format) ? FormatName(pDesc->Format) : "?",
-            override, override);
-        finalDesc = &modDesc;
-    }
-
-    HRESULT hr = oCreateTexture2D(pThis, finalDesc, pInitialData, ppTexture2D);
+    HRESULT hr = oCreateTexture2D(pThis, pDesc, pInitialData, ppTexture2D);
 
     // Track every shadow-atlas-matching Texture2D (color AND depth) for
     // runtime resize and shadow-pass detection.
@@ -1303,20 +1327,28 @@ static HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
                 e.tex = *ppTexture2D;
                 e.tex->AddRef();
                 e.identity = unk;  // weak ref (matches gShadowAtlasIdentities convention)
-                e.desc = *finalDesc;
+                e.desc = *pDesc;
                 e.isDepth = isDepth;
                 if (gShadowBaseSize == 0)
-                    gShadowBaseSize = finalDesc->Width;
+                    gShadowBaseSize = pDesc->Width;
                 if (gShadowVanillaSize == 0)
                     gShadowVanillaSize = pDesc->Width;
                 gShadowEntryCount.store(eidx + 1, std::memory_order_release);
+
+                UINT wanted = gShadowAtlasOverride;
+                if (wanted != 0 && wanted != pDesc->Width &&
+                    !gShadowResizePending.load(std::memory_order_relaxed))
+                {
+                    gShadowResizeTarget = wanted;
+                    gShadowResizePending.store(true, std::memory_order_release);
+                }
             }
             unk->Release();
         }
 
         Log("Shadow atlas %s texture captured: tex=%p identity=%p (%ux%u) entry=%zu",
             isDepth ? "DSV" : "color", *ppTexture2D, unk,
-            finalDesc->Width, finalDesc->Height,
+            pDesc->Width, pDesc->Height,
             gShadowEntryCount.load(std::memory_order_relaxed) - 1);
     }
 
@@ -1778,22 +1810,31 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
     bool wasInGBuffer = GeometryCapture::IsInGBufferPass();
     bool isGBuffer    = GeometryCapture::CheckGBufferConfig(NumViews, ppRenderTargetViews, pDepthStencilView);
 
-    // Shadow pass = DSV matches AND (RTV matches OR depth-only bind).
-    // DSV-only match is not enough: OGRE's depth buffer pool can share the
-    // shadow atlas depth texture with unrelated render targets (portraits, etc.).
+    // Shadow pass detection: DSV match + (RTV match or depth-only), OR
+    // RTV match alone (when OGRE reuses a pooled depth buffer we didn't track).
     bool dsvIsShadow = ResolveIsShadowDsv(pDepthStencilView);
+    bool anyRtvBound = false;
+    bool rtvIsShadow = AnyRtvIsShadow(NumViews, ppRenderTargetViews, anyRtvBound);
     bool nowInShadowPass = false;
     if (dsvIsShadow)
-    {
-        bool anyRtvBound = false;
-        bool rtvIsShadow = AnyRtvIsShadow(NumViews, ppRenderTargetViews, anyRtvBound);
         nowInShadowPass = rtvIsShadow || !anyRtvBound;
-    }
+    else if (rtvIsShadow)
+        nowInShadowPass = true;
     if (nowInShadowPass) gShadowMatchCount.fetch_add(1, std::memory_order_relaxed);
 
     if (gShadowSwapActive && nowInShadowPass)
     {
         ID3D11DepthStencilView* swapDSV = MaybeSwapShadowDSV(pDepthStencilView);
+        // If DSV wasn't tracked, use companion DSV from the color entry
+        if (swapDSV == pDepthStencilView && !dsvIsShadow)
+        {
+            size_t cnt = gShadowEntryCount.load(std::memory_order_acquire);
+            for (size_t i = 0; i < cnt; i++)
+            {
+                if (!gShadowEntries[i].isDepth && gShadowEntries[i].companionDSV)
+                    { swapDSV = gShadowEntries[i].companionDSV; break; }
+            }
+        }
         ID3D11RenderTargetView* swapRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
         ID3D11RenderTargetView* const* finalRTVs = ppRenderTargetViews;
         bool anyRTVSwapped = false;
@@ -1864,18 +1905,27 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargetsAndUAV(
     }
 
     bool dsvIsShadow = ResolveIsShadowDsv(pDepthStencilView);
+    bool anyRtvBound = false;
+    bool rtvIsShadow = AnyRtvIsShadow(NumRTVs, ppRenderTargetViews, anyRtvBound);
     bool nowInShadowPass = false;
     if (dsvIsShadow)
-    {
-        bool anyRtvBound = false;
-        bool rtvIsShadow = AnyRtvIsShadow(NumRTVs, ppRenderTargetViews, anyRtvBound);
         nowInShadowPass = rtvIsShadow || !anyRtvBound;
-    }
+    else if (rtvIsShadow)
+        nowInShadowPass = true;
     if (nowInShadowPass) gShadowMatchCount.fetch_add(1, std::memory_order_relaxed);
 
     if (gShadowSwapActive && nowInShadowPass)
     {
         ID3D11DepthStencilView* swapDSV = MaybeSwapShadowDSV(pDepthStencilView);
+        if (swapDSV == pDepthStencilView && !dsvIsShadow)
+        {
+            size_t cnt = gShadowEntryCount.load(std::memory_order_acquire);
+            for (size_t i = 0; i < cnt; i++)
+            {
+                if (!gShadowEntries[i].isDepth && gShadowEntries[i].companionDSV)
+                    { swapDSV = gShadowEntries[i].companionDSV; break; }
+            }
+        }
         ID3D11RenderTargetView* swapRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
         ID3D11RenderTargetView* const* finalRTVs = ppRenderTargetViews;
         bool anyRTVSwapped = false;

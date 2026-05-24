@@ -17,6 +17,11 @@ namespace ShaderPatch
 
 PFN_D3DCompileHook oD3DCompile = nullptr;
 
+static char gCompileError[512] = {};
+
+const char* GetLastCompileError() { return gCompileError[0] ? gCompileError : nullptr; }
+void        ClearCompileError()   { gCompileError[0] = '\0'; }
+
 // Patch vanilla deferred.hlsl source to add AO support and improved shadow filtering.
 // Returns the modified source, or the original if patterns weren't found.
 static std::string PatchDeferredShader(const std::string& src)
@@ -33,7 +38,11 @@ static std::string PatchDeferredShader(const std::string& src)
     // both main_fs and light_fs.
     const char* aoGlobalAnchor = "void main_vs (";
     size_t aoGlobalPos = result.find(aoGlobalAnchor);
-    if (aoGlobalPos != std::string::npos)
+    if (aoGlobalPos == std::string::npos)
+    {
+        Log("ShaderPatch: anchor 'main_vs' not found, AO + shadow injection skipped");
+        return src;
+    }
     {
         std::string aoGlobals =
             "// [Dust] AO textures — explicit t-register to prevent compiler remapping\n"
@@ -115,6 +124,7 @@ static std::string PatchDeferredShader(const std::string& src)
             "\tfloat dustCsmPcssEnabled;\n"
             "\tfloat dustCsmBlendEnabled;\n"
             "\tfloat dustCsmBlendWidth;\n"
+            "\tfloat dustRtwQuality;\n"
             "};\n\n"
             // The warp map is 513x2 R32_FLOAT, sampled by vanilla GetOffsetLocationS
             // with tex2Dlod. The warp sampler is point-filtered, so adjacent screen
@@ -140,6 +150,10 @@ static std::string PatchDeferredShader(const std::string& src)
             "\tts.y += DustWarp1D(wMap, ts.y, 0.75);\n"
             "\treturn ts;\n"
             "}\n\n"
+            "// [Dust] tex2Dlod-based shadow compare (safe inside [branch])\n"
+            "float DustShadowCmp(sampler2D sm, float2 uv, float d, float bias) {\n"
+            "\treturn tex2Dlod(sm, float4(uv, 0, 0)).x >= d - bias ? 1.0 : 0.0;\n"
+            "}\n\n"
             "// [Dust] Improved RTWSM shadow filtering (post-warp offsets)\n"
             "float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,\n"
             "                     float3 worldPos, float b, float edgeBias, float2 screenPos,\n"
@@ -147,18 +161,13 @@ static std::string PatchDeferredShader(const std::string& src)
             "\tfloat3 ld = normalize(shadowMatrix[2].xyz);\n"
             "\tfloat NdotL = abs(dot(normal, ld));\n"
             "\n"
-            "\t// Normal offset: shift lookup along surface normal to prevent self-shadowing.\n"
-            "\t// Scales with grazing angle — flat surfaces facing the light need no offset.\n"
             "\tfloat3 lookupPos = worldPos + normal * (dustRtwNormalBias * (1.0 - NdotL));\n"
             "\tfloat4 sc = mul(shadowMatrix, float4(lookupPos, 1));\n"
             "\tfloat2 center = DustGetOffsetLocationS(wMap, sc.xy);\n"
             "\tfloat2 edge = saturate(abs(center - 0.5) * 20 - 9);\n"
             "\tb += edgeBias * (edge.x + edge.y);\n"
-            "\t// Depth comparison uses the original (non-offset) position to stay accurate.\n"
             "\tfloat sd = saturate(mul(shadowMatrix, float4(worldPos, 1)).z);\n"
             "\n"
-            "\t// Slope bias: extra depth tolerance at grazing angles where depth\n"
-            "\t// changes rapidly across a single shadow texel.\n"
             "\tfloat sinSlope = sqrt(1.0 - NdotL * NdotL);\n"
             "\tb += dustRtwSlopeBias * sinSlope / max(NdotL, 0.01);\n"
             "\n"
@@ -195,20 +204,29 @@ static std::string PatchDeferredShader(const std::string& src)
             "\tfloat ls = dustRtwLightSize;\n"
             "\tb += fr * dustRtwBiasScale;\n"
             "\n"
+            // Early-out: most pixels are fully lit. 3 taps catches them.
+            "\tfloat centerD = tex2Dlod(sMap, float4(center, 0, 0)).x;\n"
+            "\t[branch] if (centerD >= sd - b) {\n"
+            "\t\tfloat d0 = tex2Dlod(sMap, float4(center + mul(rot, pd[0]) * fr, 0, 0)).x;\n"
+            "\t\tfloat d6 = tex2Dlod(sMap, float4(center + mul(rot, pd[6]) * fr, 0, 0)).x;\n"
+            "\t\tif (d0 >= sd - b && d6 >= sd - b) return 1.0;\n"
+            "\t}\n"
+            "\n"
+            // PCSS blocker search with 4-tap probe early-exit
             "\tif (dustRtwPcssEnabled > 0.5) {\n"
             "\t\tfloat bSum = 0;\n"
             "\t\tfloat bCnt = 0;\n"
             "\t\t[unroll]\n"
-            "\t\tfor (int j = 0; j < 12; j++) {\n"
-            "\t\t\tfloat2 off = mul(rot, pd[j]) * ls;\n"
-            "\t\t\tfloat2 suv = center + off;\n"
-            "\t\t\tfloat dd = tex2Dlod(sMap, float4(suv, 0, 0)).x;\n"
-            "\t\t\tif (dd < sd - b) {\n"
-            "\t\t\t\tbSum += dd;\n"
-            "\t\t\t\tbCnt += 1.0;\n"
-            "\t\t\t}\n"
+            "\t\tfor (int j = 0; j < 4; j++) {\n"
+            "\t\t\tfloat dd = tex2Dlod(sMap, float4(center + mul(rot, pd[j]) * ls, 0, 0)).x;\n"
+            "\t\t\tif (dd < sd - b) { bSum += dd; bCnt += 1.0; }\n"
             "\t\t}\n"
-            "\t\tif (bCnt > 0) {\n"
+            "\t\t[branch] if (bCnt > 0) {\n"
+            "\t\t\t[unroll]\n"
+            "\t\t\tfor (int j = 4; j < 12; j++) {\n"
+            "\t\t\t\tfloat dd = tex2Dlod(sMap, float4(center + mul(rot, pd[j]) * ls, 0, 0)).x;\n"
+            "\t\t\t\tif (dd < sd - b) { bSum += dd; bCnt += 1.0; }\n"
+            "\t\t\t}\n"
             "\t\t\tfloat avgB = bSum / bCnt;\n"
             "\t\t\tfloat pen = (sd - avgB) * ls / max(avgB, 0.001);\n"
             "\t\t\tfr = clamp(pen, fr * 0.5, fr * 3.0);\n"
@@ -217,14 +235,22 @@ static std::string PatchDeferredShader(const std::string& src)
             "\n"
             "\tfr *= max(sqrt(NdotL), 0.15);\n"
             "\n"
+            // Resolution-tiered PCF: 4/8/12 taps via uniform branches.
             "\tfloat shadow = 0;\n"
-            "\t[unroll]\n"
-            "\tfor (int i = 0; i < 12; i++) {\n"
-            "\t\tfloat2 off = mul(rot, pd[i]) * fr;\n"
-            "\t\tfloat2 suv = center + off;\n"
-            "\t\tshadow += ShadowMap(sMap, suv, sd, b, 0);\n"
+            "\t[unroll] for (int i = 0; i < 4; i++)\n"
+            "\t\tshadow += DustShadowCmp(sMap, center + mul(rot, pd[i]) * fr, sd, b);\n"
+            "\tfloat sCount = 4.0;\n"
+            "\t[branch] if (dustRtwQuality > 4.5) {\n"
+            "\t\t[unroll] for (int i = 4; i < 8; i++)\n"
+            "\t\t\tshadow += DustShadowCmp(sMap, center + mul(rot, pd[i]) * fr, sd, b);\n"
+            "\t\tsCount = 8.0;\n"
+            "\t\t[branch] if (dustRtwQuality > 8.5) {\n"
+            "\t\t\t[unroll] for (int i = 8; i < 12; i++)\n"
+            "\t\t\t\tshadow += DustShadowCmp(sMap, center + mul(rot, pd[i]) * fr, sd, b);\n"
+            "\t\t\tsCount = 12.0;\n"
+            "\t\t}\n"
             "\t}\n"
-            "\tshadow /= 12.0;\n"
+            "\tshadow /= sCount;\n"
             "\treturn shadow;\n"
             "}\n\n"
             // CSM Poisson disk for blocker search + PCF. Reuse the same 12-tap
@@ -1160,9 +1186,18 @@ HRESULT WINAPI HookedD3DCompile(
                 Log("ShaderPatch: patched shader failed to compile, falling back to original");
                 if (ppErrorMsgs && *ppErrorMsgs)
                 {
-                    Log("ShaderPatch: error: %s", (const char*)(*ppErrorMsgs)->GetBufferPointer());
+                    const char* msg = (const char*)(*ppErrorMsgs)->GetBufferPointer();
+                    Log("ShaderPatch: error: %s", msg);
+                    snprintf(gCompileError, sizeof(gCompileError), "deferred main_fs: %s", msg);
                     (*ppErrorMsgs)->Release();
                     *ppErrorMsgs = nullptr;
+                }
+                {
+                    std::string dumpPath = DustLogDir() + "logs\\patched_deferred_fail.hlsl";
+                    FILE* df = nullptr;
+                    fopen_s(&df, dumpPath.c_str(), "w");
+                    if (df) { fwrite(patched.c_str(), 1, patched.size(), df); fclose(df); }
+                    Log("ShaderPatch: dumped patched source to %s", dumpPath.c_str());
                 }
                 // Fall through to compile original below
             }
@@ -1199,7 +1234,9 @@ HRESULT WINAPI HookedD3DCompile(
                 Log("ShaderPatch: patched light_fs failed to compile, falling back to original");
                 if (ppErrorMsgs && *ppErrorMsgs)
                 {
-                    Log("ShaderPatch: error: %s", (const char*)(*ppErrorMsgs)->GetBufferPointer());
+                    const char* msg = (const char*)(*ppErrorMsgs)->GetBufferPointer();
+                    Log("ShaderPatch: error: %s", msg);
+                    snprintf(gCompileError, sizeof(gCompileError), "deferred light_fs: %s", msg);
                     (*ppErrorMsgs)->Release();
                     *ppErrorMsgs = nullptr;
                 }
@@ -1249,7 +1286,9 @@ HRESULT WINAPI HookedD3DCompile(
                 Log("ShaderPatch: patched objects shader failed to compile, falling back");
                 if (ppErrorMsgs && *ppErrorMsgs)
                 {
-                    Log("ShaderPatch: error: %s", (const char*)(*ppErrorMsgs)->GetBufferPointer());
+                    const char* msg = (const char*)(*ppErrorMsgs)->GetBufferPointer();
+                    Log("ShaderPatch: error: %s", msg);
+                    snprintf(gCompileError, sizeof(gCompileError), "objects shader: %s", msg);
                     (*ppErrorMsgs)->Release();
                     *ppErrorMsgs = nullptr;
                 }

@@ -20,4 +20,7 @@ namespace ShaderPatch
         LPCSTR pEntrypoint, LPCSTR pTarget,
         UINT Flags1, UINT Flags2,
         ID3DBlob** ppCode, ID3DBlob** ppErrorMsgs);
+
+    const char* GetLastCompileError();
+    void        ClearCompileError();
 }

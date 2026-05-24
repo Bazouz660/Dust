@@ -6,6 +6,7 @@
 #include "GeometryCapture.h"
 #include "ShaderMetadata.h"
 #include "Survey.h"
+#include "ShaderPatch.h"
 #include "SurveyRecorder.h"
 #include "imgui/imgui.h"
 #include "imgui/backends/imgui_impl_win32.h"
@@ -740,6 +741,17 @@ static void DrawFrameworkSection()
     ImGui::TextColored(DustHeadingColor(), "Dust");
     ImGui::SameLine();
     ImGui::TextDisabled("(%s)", DUST_VERSION_STR);
+
+    if (const char* err = ShaderPatch::GetLastCompileError())
+    {
+        ImGui::Spacing();
+        ImGui::TextColored(DustErrorColor(), "Shader compile error:");
+        ImGui::TextWrapped("%s", err);
+        if (ImGui::SmallButton("Dismiss##ShaderErr"))
+            ShaderPatch::ClearCompileError();
+        ImGui::Spacing();
+    }
+
     ImGui::Separator();
     ImGui::Spacing();
 

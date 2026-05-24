@@ -267,8 +267,7 @@ static void PushShadowRangeToGame()
 }
 
 // b7 cbuffer layout — must match the HLSL declaration injected by
-// ShaderPatch::PatchDeferredShader. 12 floats, no explicit padding required
-// because HLSL packs floats tightly within 16-byte rows.
+// ShaderPatch::PatchDeferredShader. Floats pack tightly within 16-byte rows.
 struct alignas(16) ShadowCBData {
     // Shared
     float enabled;
@@ -287,6 +286,8 @@ struct alignas(16) ShadowCBData {
     float csmPcssEnabled;
     float csmBlendEnabled;
     float csmBlendWidth;
+    // Quality
+    float rtwQuality;
 };
 
 static int ShadowInit(ID3D11Device* device, uint32_t w, uint32_t h, const DustHostAPI* host)
@@ -364,6 +365,11 @@ static void ShadowPreExecute(const DustFrameContext* ctx, const DustHostAPI* hos
     data.csmPcssEnabled      = gConfig.csmPcssEnabled ? 1.0f : 0.0f;
     data.csmBlendEnabled     = gConfig.csmBlendEnabled ? 1.0f : 0.0f;
     data.csmBlendWidth       = gConfig.csmBlendWidth;
+
+    float atlasRes = (float)GetSelectedShadowResolution();
+    if      (atlasRes >= 12288.0f) data.rtwQuality = 4.0f;
+    else if (atlasRes >=  8192.0f) data.rtwQuality = 8.0f;
+    else                           data.rtwQuality = 12.0f;
 
     host->UpdateConstantBuffer(ctx->context, gCB, &data, sizeof(data));
     // Bind to b7: b2 collides with CSM's auto-allocated $Globals cbuffer
