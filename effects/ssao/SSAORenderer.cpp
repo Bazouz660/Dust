@@ -104,6 +104,7 @@ struct AOPassCB
     int   deinterleaveHigh;
     uint32_t frameCount;
     float debugView;
+
 };
 static ID3D11Buffer* gPassCB = nullptr;
 
@@ -446,7 +447,6 @@ float GetLastGpuTimeMs() { return 0.0f; }
 
 ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
                                     ID3D11ShaderResourceView* depthSRV,
-                                    ID3D11ShaderResourceView* /*normalsSRV*/,
                                     const DustCameraData* camera)
 {
     if (!gInitialized || !ctx || !depthSRV || !gHost)
@@ -530,7 +530,7 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
     vp.MaxDepth = 1.0f;
     ctx->RSSetViewports(1, &vp);
 
-    ID3D11ShaderResourceView* nullSRVs[3] = { nullptr, nullptr, nullptr };
+    ID3D11ShaderResourceView* nullSRVs[4] = { nullptr, nullptr, nullptr, nullptr };
 
     // Pass 1: deinterleave depth -> ZSrc
     {

@@ -39,7 +39,7 @@ cbuffer AOPassData : register(b0)
     int    DeinterleaveTileCount;
     int    DeinterleaveHigh;
     uint   FrameCount;
-    float  DebugView;           // bool-as-float (unused for AO logic, host overlays raw)
+    float  DebugView;
 
 };
 

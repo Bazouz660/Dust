@@ -138,6 +138,7 @@ static bool  gShadowSwapActive = false;        // fast-path flag
 static float gShadowViewportScale = 1.0f;      // newSize / baseSize
 static std::atomic<bool> gShadowResizePending{false};
 static UINT  gShadowResizeTarget = 0;
+static uint64_t gShadowCreationFrame = UINT64_MAX;
 
 void SetShadowAtlasResolution(UINT size)
 {
@@ -234,6 +235,23 @@ static void ReleaseShadowReplacement(ShadowAtlasEntry& e)
     if (e.newRTV)  { e.newRTV->Release();  e.newRTV = nullptr; }
     if (e.newSRV)  { e.newSRV->Release();  e.newSRV = nullptr; }
     if (e.newTex)  { e.newTex->Release();  e.newTex = nullptr; }
+}
+
+static void ResetShadowTracking()
+{
+    size_t count = gShadowEntryCount.load(std::memory_order_acquire);
+    for (size_t i = 0; i < count; i++)
+    {
+        ReleaseShadowReplacement(gShadowEntries[i]);
+        if (gShadowEntries[i].tex) { gShadowEntries[i].tex->Release(); gShadowEntries[i].tex = nullptr; }
+    }
+    gShadowEntryCount.store(0, std::memory_order_release);
+    gShadowAtlasIdentityCount.store(0, std::memory_order_release);
+    gShadowBaseSize = 0;
+    gShadowSwapActive = false;
+    gShadowViewportScale = 1.0f;
+    gShadowResizeTarget = 0;
+    Log("Shadow tracking reset (workspace recreate, frame %llu)", (unsigned long long)gFrameIndex);
 }
 
 static void ApplyPendingShadowResize()
@@ -1245,6 +1263,13 @@ static HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
     if (SUCCEEDED(hr) && pDesc && ppTexture2D && *ppTexture2D &&
         IsShadowAtlasDesc(pDesc))
     {
+        if (gShadowEntryCount.load(std::memory_order_relaxed) > 0 &&
+            gFrameIndex != gShadowCreationFrame)
+        {
+            ResetShadowTracking();
+        }
+        gShadowCreationFrame = gFrameIndex;
+
         bool isDepth = (pDesc->BindFlags & D3D11_BIND_DEPTH_STENCIL) != 0;
         IUnknown* unk = nullptr;
         (*ppTexture2D)->QueryInterface(IID_IUnknown, (void**)&unk);

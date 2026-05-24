@@ -1397,14 +1397,14 @@ static void DrawEffectSection(size_t idx)
             || s.type == DUST_SETTING_HIDDEN_BOOL)
             continue;
 
-        // Section: foldable sub-group with indent
+        // Section: foldable sub-group (unframed to distinguish from effect headers)
         if (s.type == DUST_SETTING_SECTION)
         {
             if (inSection) { ImGui::TreePop(); inSection = false; }
             ImGui::Spacing();
+            ImGui::Separator();
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.75f, 0.45f, 1.0f));
-            sectionOpen = ImGui::TreeNodeEx(s.name,
-                ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_Framed);
+            sectionOpen = ImGui::TreeNodeEx(s.name, ImGuiTreeNodeFlags_DefaultOpen);
             ImGui::PopStyleColor();
             inSection = sectionOpen;
             continue;

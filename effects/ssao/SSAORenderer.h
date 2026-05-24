@@ -12,7 +12,6 @@ namespace SSAORenderer
     // Returns the AO SRV (R8_UNORM, white=unoccluded, dark=occluded).
     ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
                                         ID3D11ShaderResourceView* depthSRV,
-                                        ID3D11ShaderResourceView* normalsSRV,
                                         const DustCameraData* camera);
 
     // Render debug overlay onto HDR target. Called after the lighting draw.

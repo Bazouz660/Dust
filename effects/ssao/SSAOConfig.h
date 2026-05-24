@@ -60,6 +60,7 @@ struct SSAOConfig
     // How much AO affects directly lit areas (0 = ambient only, 1 = full).
     // Bound at slot 9 for the deferred shader to consume.
     float directLightOcclusion = 0.3f;
+
 };
 
 extern SSAOConfig gSSAOConfig;
