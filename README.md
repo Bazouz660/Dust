@@ -702,4 +702,4 @@ GPU costs are measured via D3D11 timestamp queries and displayed in the in-game 
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is licensed under the [GPLv3 License](LICENSE).
