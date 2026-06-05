@@ -23,10 +23,11 @@ jobs:
 
       # Init submodules WITHOUT smudging LFS. KenshiLib_Examples_deps stores
       # KenshiLib.lib + Ogre/MyGUI .libs + boost.zip in upstream LFS, but that
-      # account's budget is exhausted intermittently. Dust only actually links
-      # against KenshiLib.lib (Ogre/MyGUI .libs are unused) and only needs Boost
-      # at the header level, so we skip LFS entirely and fetch what we need
-      # from public mirrors below.
+      # account's budget is exhausted intermittently. Dust links against
+      # KenshiLib.lib (fetched from KenshiReclaimer's release below) and
+      # OgreMain_x64.lib (vendored at external/prebuilt/, since it isn't in any
+      # release); MyGUI is unused and Boost is only needed at the header level.
+      # So we skip LFS entirely and fetch/vendor what we need.
       - name: Init submodules without LFS smudge
         shell: bash
         env:

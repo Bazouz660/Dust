@@ -61,3 +61,9 @@ Desktop.ini
 external/*
 !external/KenshiLib
 !external/KenshiLib_Examples_deps
+
+# Vendored Kenshi Ogre import lib. Dust links against OgreMain_x64.lib, but it
+# ships only in KenshiLib_Examples_deps' LFS (intermittently unavailable), so we
+# commit it here. These negations override both `*.lib` and `external/*` above.
+!external/prebuilt
+!external/prebuilt/OgreMain_x64.lib
