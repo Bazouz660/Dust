@@ -12,6 +12,17 @@ jobs:
   build:
     uses: ./.github/workflows/build.yml
 
+  # Stable releases publish to Nexus as the Main file (archiving the prior one)
+  nexus:
+    needs: build
+    uses: ./.github/workflows/nexus.yml
+    with:
+      file_group_id: "7502708"  # Main files update group
+      file_category: main
+      archive_existing_file: true
+    secrets:
+      NEXUSMODS_API_KEY: ${{ secrets.NEXUSMODS_API_KEY }}
+
   # Verify Steam credentials and workshop item before doing anything
   verify-workshop:
     runs-on: ubuntu-latest

@@ -1,0 +1,75 @@
+name: Nexus Deploy
+
+# Reusable Nexus Mods upload, called by release.yml (stable) and beta.yml.
+# Uses the official Nexus upload API (open beta). Requirements:
+#   - secret  NEXUSMODS_API_KEY : personal API key from your Nexus account settings
+#   - the caller passes file_group_id: the Nexus "file update group" id for the
+#     target section (each section/lineage has its own id, from Files tab -> "API Info").
+#   - the Dust Nexus page must already exist with >= 1 file in that group; the API
+#     adds a new version to an existing group, it cannot create the page or group.
+
+on:
+  workflow_call:
+    inputs:
+      file_group_id:
+        description: Nexus file update group id to add the new version to
+        required: true
+        type: string
+      file_category:
+        description: Nexus file category (e.g. main, optional)
+        required: false
+        type: string
+        default: main
+      archive_existing_file:
+        description: Archive the previous file in this category on upload
+        required: false
+        type: boolean
+        default: false
+      description:
+        description: Description / changelog shown on the Nexus file
+        required: false
+        type: string
+        default: ""
+    secrets:
+      NEXUSMODS_API_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  nexus:
+    runs-on: ubuntu-latest
+    steps:
+      # Resolve label (artifact + zip name) and version from the pushed tag.
+      # v0.8.0 -> label v0.8.0, version 0.8.0 ; beta-0.8.0 -> label beta-0.8.0, version beta-0.8.0
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "label=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: Dust-${{ steps.version.outputs.label }}
+          path: release/Dust
+
+      - name: Create zip
+        run: |
+          cd release
+          zip -r ../Dust-${{ steps.version.outputs.label }}.zip Dust
+
+      - name: Upload to Nexus Mods
+        uses: Nexus-Mods/upload-action@v1.0.0-beta.7
+        with:
+          api_key: ${{ secrets.NEXUSMODS_API_KEY }}
+          file_group_id: ${{ inputs.file_group_id }}
+          filename: Dust-${{ steps.version.outputs.label }}.zip
+          version: ${{ steps.version.outputs.version }}
+          display_name: Dust ${{ steps.version.outputs.label }}
+          description: ${{ inputs.description }}
+          file_category: ${{ inputs.file_category }}
+          archive_existing_file: ${{ inputs.archive_existing_file }}

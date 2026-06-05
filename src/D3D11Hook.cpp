@@ -999,6 +999,160 @@ static void RemoveContextHooks()
     Log("Context VTable hooks REMOVED (zero overhead)");
 }
 
+// ==================== Shadow CB Reconnaissance ====================
+namespace ShadowCBRecon {
+
+static std::atomic<bool> sArmed{false};
+static int   sFramesToCapture = 0;
+static int   sFramesLeft      = 0;
+static int   sDrawsThisFrame  = 0;
+static int   sTotalDraws      = 0;
+static bool  sSkipFirstEnd    = false;
+static FILE* sLogFile         = nullptr;
+static constexpr int kMaxDrawsPerFrame = 50;
+
+void Arm(int numFrames)
+{
+    if (sArmed.load(std::memory_order_relaxed)) return;
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char filename[128];
+    snprintf(filename, sizeof(filename),
+             "shadow_cb_recon_%04d-%02d-%02d_%02d-%02d-%02d.log",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+
+    std::string path = DustLogDir() + "logs\\" + filename;
+    fopen_s(&sLogFile, path.c_str(), "w");
+    if (!sLogFile) { Log("ShadowCBRecon: failed to open %s", path.c_str()); return; }
+
+    sFramesToCapture = numFrames;
+    sFramesLeft      = numFrames;
+    sDrawsThisFrame  = 0;
+    sTotalDraws      = 0;
+
+    size_t entryCount = gShadowEntryCount.load(std::memory_order_acquire);
+    fprintf(sLogFile, "=== Shadow CB Recon ===\n");
+    fprintf(sLogFile, "Atlas override: %u  Base: %u  Entries: %zu\n",
+            gShadowAtlasOverride, gShadowBaseSize, entryCount);
+    for (size_t i = 0; i < entryCount; i++)
+    {
+        const auto& e = gShadowEntries[i];
+        fprintf(sLogFile, "  Entry %zu: %s %ux%u fmt=%u replacement=%s\n",
+                i, e.isDepth ? "depth" : "color",
+                e.desc.Width, e.desc.Height, (unsigned)e.desc.Format,
+                e.newTex ? "yes" : "no");
+    }
+    fprintf(sLogFile, "\n");
+
+    sSkipFirstEnd = true;
+    Log("ShadowCBRecon: armed for %d frames -> %s", numFrames, filename);
+    sArmed.store(true, std::memory_order_release);
+    D3D11Hook::RefreshContextHooks();
+}
+
+bool IsArmed()     { return sArmed.load(std::memory_order_relaxed); }
+bool IsCapturing() { return sArmed.load(std::memory_order_relaxed) && sFramesLeft > 0; }
+
+static void DumpCBSlots(ID3D11DeviceContext* ctx, bool isVS)
+{
+    ID3D11Buffer* cbs[4] = {};
+    if (isVS)
+        ctx->VSGetConstantBuffers(0, 4, cbs);
+    else
+        ctx->PSGetConstantBuffers(0, 4, cbs);
+
+    const char* tag = isVS ? "VS" : "PS";
+
+    for (int slot = 0; slot < 4; slot++)
+    {
+        if (!cbs[slot]) continue;
+
+        D3D11_BUFFER_DESC desc;
+        cbs[slot]->GetDesc(&desc);
+
+        D3D11_BUFFER_DESC stagingDesc = {};
+        stagingDesc.ByteWidth      = desc.ByteWidth;
+        stagingDesc.Usage          = D3D11_USAGE_STAGING;
+        stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+        ID3D11Buffer* staging = nullptr;
+        HRESULT hr = gDevice->CreateBuffer(&stagingDesc, nullptr, &staging);
+        if (FAILED(hr)) { cbs[slot]->Release(); continue; }
+
+        oCopyResource(ctx, staging, cbs[slot]);
+
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        hr = oMap(ctx, staging, 0, D3D11_MAP_READ, 0, &mapped);
+        if (SUCCEEDED(hr))
+        {
+            UINT rows = desc.ByteWidth / (4 * sizeof(float));
+            const float* d = (const float*)mapped.pData;
+
+            fprintf(sLogFile, "  %s[%d]: %u bytes (%u rows)\n", tag, slot, desc.ByteWidth, rows);
+            for (UINT r = 0; r < rows; r++)
+                fprintf(sLogFile, "    [%2u] %12.6f %12.6f %12.6f %12.6f\n",
+                        r, d[r*4], d[r*4+1], d[r*4+2], d[r*4+3]);
+
+            oUnmap(ctx, staging, 0);
+        }
+
+        staging->Release();
+        cbs[slot]->Release();
+    }
+}
+
+void OnShadowDraw(ID3D11DeviceContext* ctx, UINT indexCount, UINT startIndex, INT baseVertex)
+{
+    if (!IsCapturing() || !sLogFile) return;
+    if (sDrawsThisFrame >= kMaxDrawsPerFrame) return;
+
+    int drawIdx  = sDrawsThisFrame++;
+    int frameIdx = sFramesToCapture - sFramesLeft;
+
+    fprintf(sLogFile, "=== Frame %d, Draw %d (indices=%u start=%u base=%d) ===\n",
+            frameIdx, drawIdx, indexCount, startIndex, baseVertex);
+
+    UINT numVP = 1;
+    D3D11_VIEWPORT vp = {};
+    ctx->RSGetViewports(&numVP, &vp);
+    fprintf(sLogFile, "  Viewport: %.0f,%.0f %.0fx%.0f depth=[%.3f,%.3f]\n",
+            vp.TopLeftX, vp.TopLeftY, vp.Width, vp.Height, vp.MinDepth, vp.MaxDepth);
+
+    DumpCBSlots(ctx, true);
+    DumpCBSlots(ctx, false);
+
+    fprintf(sLogFile, "\n");
+    sTotalDraws++;
+}
+
+void OnFrameEnd()
+{
+    if (!IsCapturing()) return;
+    if (sSkipFirstEnd) { sSkipFirstEnd = false; return; }
+
+    int frameIdx = sFramesToCapture - sFramesLeft;
+    fprintf(sLogFile, "--- End Frame %d: %d shadow draws ---\n\n", frameIdx, sDrawsThisFrame);
+    fflush(sLogFile);
+
+    sDrawsThisFrame = 0;
+    sFramesLeft--;
+
+    if (sFramesLeft <= 0)
+    {
+        fprintf(sLogFile, "=== Capture complete: %d frames, %d total draws ===\n",
+                sFramesToCapture, sTotalDraws);
+        fclose(sLogFile);
+        sLogFile = nullptr;
+        sArmed.store(false, std::memory_order_release);
+        Log("ShadowCBRecon: done (%d frames, %d draws) -> logs/shadow_cb_recon.log",
+            sFramesToCapture, sTotalDraws);
+        D3D11Hook::RefreshContextHooks();
+    }
+}
+
+} // namespace ShadowCBRecon
+
 static bool AnyFeatureNeedsHooks()
 {
     if (TerrainTess::GetEnabled()) return true;
@@ -1007,6 +1161,7 @@ static bool AnyFeatureNeedsHooks()
     if (gShadowAtlasOverride != 0) return true;
     if (Survey::IsActive()) return true;
     if (GeometryCapture::detail::sCaptureFlags != 0) return true;
+    if (ShadowCBRecon::IsArmed()) return true;
     return false;
 }
 
@@ -1660,6 +1815,7 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     if (gInShadowPass) {
         ZoneName("ShadowCast", 10);
         gShadowDrawCount.fetch_add(1, std::memory_order_relaxed);
+        ShadowCBRecon::OnShadowDraw(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
     }
     else if (gInDeferredShadowPass) {
         ZoneName("ShadowSample", 12);
@@ -1702,6 +1858,7 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
     if (gInShadowPass) {
         ZoneName("ShadowCast", 10);
         gShadowDrawCount.fetch_add(1, std::memory_order_relaxed);
+        ShadowCBRecon::OnShadowDraw(pThis, IndexCountPerInstance, StartIndexLocation, BaseVertexLocation);
     }
     else if (gInDeferredShadowPass) {
         ZoneName("ShadowSample", 12);
@@ -2169,6 +2326,7 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(
         sPrevMatches = m;
         sPrevDraws   = d;
     }
+    ShadowCBRecon::OnFrameEnd();
     HRESULT hr = oPresent(pThis, SyncInterval, Flags);
     FrameMark;
     return hr;

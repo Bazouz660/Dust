@@ -95,6 +95,30 @@ jobs:
           rm -rf external/KenshiLib_Examples_deps/boost_1_60_0/boost
           mv /tmp/boost-extract/boost_1_60_0/boost external/KenshiLib_Examples_deps/boost_1_60_0/boost
 
+      # Tracy lives at external/tracy (gitignored, not a submodule). The projects
+      # include <tracy/Tracy.hpp> unconditionally (it no-ops without TRACY_ENABLE)
+      # and compile public/TracyClient.cpp, so the public/ subtree must be present.
+      # Fetch just that subtree from the pinned release instead of vendoring it.
+      - name: Cache Tracy public headers
+        id: tracy_cache
+        uses: actions/cache@v4
+        with:
+          path: external/tracy/public
+          key: tracy-0.11.1-public-v1
+
+      - name: Fetch Tracy public sources
+        if: steps.tracy_cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -eu
+          curl -fL --ssl-no-revoke -o /tmp/tracy.tar.gz \
+            "https://github.com/wolfpld/tracy/archive/refs/tags/v0.11.1.tar.gz"
+          mkdir -p /tmp/tracy-extract
+          tar -xzf /tmp/tracy.tar.gz -C /tmp/tracy-extract tracy-0.11.1/public
+          mkdir -p external/tracy
+          rm -rf external/tracy/public
+          mv /tmp/tracy-extract/tracy-0.11.1/public external/tracy/public
+
       - name: Resolve version
         id: version
         shell: bash
@@ -102,6 +126,10 @@ jobs:
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             TAG="${GITHUB_REF#refs/tags/}"
             echo "value=${TAG#v}" >> "$GITHUB_OUTPUT"
+            echo "label=$TAG" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_REF" == refs/tags/beta-* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            echo "value=${TAG#beta-}" >> "$GITHUB_OUTPUT"
             echo "label=$TAG" >> "$GITHUB_OUTPUT"
           else
             SHORT_SHA="${GITHUB_SHA::7}"
@@ -222,7 +250,7 @@ jobs:
           /p:Platform=x64
 
       - name: Package release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/beta-')
         run: |
           mkdir release\Dust\effects
           mkdir release\Dust\effects\shaders
@@ -264,7 +292,7 @@ jobs:
           copy mod\RE_Kenshi.json release\Dust\
 
       - name: Upload artifact
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/beta-')
         uses: actions/upload-artifact@v5
         with:
           name: Dust-${{ steps.version.outputs.label }}

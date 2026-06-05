@@ -52,4 +52,11 @@ namespace D3D11Hook
     // first extraction completes; returns false then. Used by TerrainTess to
     // avoid per-draw constant-buffer shadowing for the chunk-skip metric.
     bool GetCameraWorldPos(float outXYZ[3]);
+
+    namespace ShadowCBRecon
+    {
+        void Arm(int numFrames);
+        bool IsArmed();
+        bool IsCapturing();
+    }
 }

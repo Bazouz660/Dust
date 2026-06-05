@@ -334,33 +334,33 @@ static const char* const kDebugViewLabels[] = {
     nullptr
 };
 
+// Labels and grouping are display-only; the iniKey (6th field) is unchanged for
+// every setting so existing presets and saved configs keep loading.
 static DustSettingDesc gSettingsArray[] = {
     { "Enabled",          DUST_SETTING_BOOL,  &gSSAOConfig.enabled,             0.0f, 1.0f,  "Enabled",     nullptr,             "Enable or disable ambient occlusion.",                                                 DUST_PERF_MEDIUM },
 
-    // --- Global ---
-    { "Sample Quality",   DUST_SETTING_ENUM,  &gSSAOConfig.sampleQualityPreset, 0.0f, 6.0f,  "SampleQuality", kQualityLabels,    "Global quality control, main performance knob. Higher radii might require higher quality.", DUST_PERF_HIGH },
+    { "Quality",          DUST_SETTING_SECTION, nullptr,                        0.0f, 0.0f,  nullptr,         nullptr,           nullptr,                                                                                DUST_PERF_NONE },
+    { "Detail Level",     DUST_SETTING_ENUM,  &gSSAOConfig.sampleQualityPreset, 0.0f, 6.0f,  "SampleQuality", kQualityLabels,    "Global quality control, main performance knob. Higher radii might require higher quality.", DUST_PERF_HIGH },
     { "Shading Rate",     DUST_SETTING_ENUM,  &gSSAOConfig.shadingRate,         0.0f, 2.0f,  "ShadingRate",   kShadingRateLabels,"0: render all pixels each frame\n1: render only 50% of pixels each frame\n2: render only 25% of pixels each frame", DUST_PERF_HIGH },
-    { "Sample Radius",    DUST_SETTING_FLOAT, &gSSAOConfig.sampleRadius,        0.5f, 10.0f, "SampleRadius",  nullptr,           "AO sample radius, higher means more large-scale occlusion with less fine-scale details.", DUST_PERF_NONE },
-    { "Increase Radius with Distance", DUST_SETTING_BOOL, &gSSAOConfig.worldspaceEnable, 0.0f, 1.0f, "WorldspaceEnable", nullptr, "When enabled, AO radius scales with depth instead of staying world-space-fixed.", DUST_PERF_NONE },
+    { "Smoothing",        DUST_SETTING_INT,   &gSSAOConfig.filterSize,          0.0f, 2.0f,  "FilterSize",    nullptr,           "Number of bilateral filter iterations (0–2).", DUST_PERF_LOW },
 
-    // --- Blending ---
-    { "Ambient Occlusion Amount", DUST_SETTING_FLOAT, &gSSAOConfig.ssaoAmount,  0.0f, 1.0f,  "SsaoAmount",    nullptr,           "Intensity of AO effect. Can cause pitch black clipping if set too high.", DUST_PERF_NONE },
-    { "Fade Out Distance", DUST_SETTING_FLOAT, &gSSAOConfig.fadeDepth,          0.0f, 1.0f,  "FadeDepth",     nullptr,           "Distance at which AO fades out. Higher values extend AO visibility.", DUST_PERF_NONE },
-    { "Filter Quality",   DUST_SETTING_INT,   &gSSAOConfig.filterSize,          0.0f, 2.0f,  "FilterSize",    nullptr,           "Number of bilateral filter iterations (0–2).", DUST_PERF_LOW },
+    { "Occlusion",        DUST_SETTING_SECTION, nullptr,                        0.0f, 0.0f,  nullptr,         nullptr,           nullptr,                                                                                DUST_PERF_NONE },
+    { "Strength",         DUST_SETTING_FLOAT, &gSSAOConfig.ssaoAmount,          0.0f, 1.0f,  "SsaoAmount",    nullptr,           "Intensity of AO effect. Can cause pitch black clipping if set too high.", DUST_PERF_NONE },
+    { "Range",            DUST_SETTING_FLOAT, &gSSAOConfig.sampleRadius,        0.5f, 10.0f, "SampleRadius",  nullptr,           "AO sample radius, higher means more large-scale occlusion with less fine-scale details.", DUST_PERF_NONE },
+    { "Scale Range with Distance", DUST_SETTING_BOOL, &gSSAOConfig.worldspaceEnable, 0.0f, 1.0f, "WorldspaceEnable", nullptr,    "When enabled, AO radius scales with depth instead of staying world-space-fixed.", DUST_PERF_NONE },
+    { "Algorithm",        DUST_SETTING_ENUM,  &gSSAOConfig.aoType,              0.0f, 3.0f,  "AoType",        kAoTypeLabels,     "0: GTAO (high contrast, fast)\n1: Solid Angle (smoother, fastest)\n2: Visibility Bitmask (highest quality)\n3: Bitmask + Solid Angle (smoother bitmask)", DUST_PERF_LOW },
+    { "Distance Falloff", DUST_SETTING_FLOAT, &gSSAOConfig.fadeDepth,           0.0f, 1.0f,  "FadeDepth",     nullptr,           "Distance at which AO fades out. Higher values extend AO visibility.", DUST_PERF_NONE },
 
-    // --- Algorithm variant ---
-    { "AO Type",          DUST_SETTING_ENUM,  &gSSAOConfig.aoType,              0.0f, 3.0f,  "AoType",        kAoTypeLabels,     "0: GTAO (high contrast, fast)\n1: Solid Angle (smoother, fastest)\n2: Visibility Bitmask (highest quality)\n3: Bitmask + Solid Angle (smoother bitmask)", DUST_PERF_LOW },
-
-    // --- Debug ---
-    { "Debug View",       DUST_SETTING_ENUM,  &gSSAOConfig.debugViewMode,       0.0f, 7.0f, "DebugViewMode", kDebugViewLabels,  "Diagnostic visualizations for each pipeline stage.", DUST_PERF_NONE },
-
-    // --- Dust-specific (lighting integration) ---
+    { "Lighting",         DUST_SETTING_SECTION, nullptr,                        0.0f, 0.0f,  nullptr,         nullptr,           nullptr,                                                                                DUST_PERF_NONE },
     { "Direct Light AO",  DUST_SETTING_FLOAT, &gSSAOConfig.directLightOcclusion, 0.0f, 1.0f, "DirectLightAO", nullptr,           "How much AO affects directly lit areas (0 = ambient only, 1 = full).", DUST_PERF_NONE },
 
-    // FOV is now hardcoded to 0.4142 (45° vertical), measured from Kenshi's
-    // projection matrix. Hidden again — not user-tunable.
+    { "Advanced",         DUST_SETTING_SECTION, nullptr,                        0.0f, 0.0f,  nullptr,         nullptr,           nullptr,                                                                                DUST_PERF_NONE },
+    { "Far Plane",        DUST_SETTING_FLOAT, &gSSAOConfig.farPlane,            1.0f, 10000.0f, "FarPlane",    nullptr,           "Depth scale: z = depth * FarPlane + 1. High values cause halo artifacts at geometry/sky boundaries. Default 1000.", DUST_PERF_NONE },
+    { "Debug View",       DUST_SETTING_ENUM,  &gSSAOConfig.debugViewMode,       0.0f, 7.0f,  "DebugViewMode", kDebugViewLabels,  "Diagnostic visualizations for each pipeline stage.", DUST_PERF_NONE },
+
+    // FOV is hardcoded to 0.4142 (45° vertical), measured from Kenshi's projection
+    // matrix. Persisted but hidden — not user-tunable.
     { "Tan Half FOV",     DUST_SETTING_HIDDEN_FLOAT, &gSSAOConfig.tanHalfFov,   0.1f, 2.0f,  "TanHalfFov" },
-    { "Far Plane",        DUST_SETTING_FLOAT, &gSSAOConfig.farPlane,            1.0f, 10000.0f, "FarPlane", nullptr, "Depth scale: z = depth * FarPlane + 1. High values cause halo artifacts at geometry/sky boundaries. Default 1000.", DUST_PERF_NONE },
 };
 
 // No OnSettingChanged needed — values are read live each frame by SSAORenderer

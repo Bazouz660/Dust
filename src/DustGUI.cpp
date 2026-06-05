@@ -3,6 +3,7 @@
 #include "DustLog.h"
 #include "EffectLoader.h"
 #include "FilePicker.h"
+#include "D3D11Hook.h"
 #include "GeometryCapture.h"
 #include "ShaderMetadata.h"
 #include "Survey.h"
@@ -881,6 +882,26 @@ static void DrawFrameworkSection()
                 Survey::Start(surveyFrames, surveyDetail,
                               surveyLabel[0] ? surveyLabel : nullptr);
             }
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        ImGui::TextColored(DustWarningColor(), "Shadow CB Recon");
+
+        if (D3D11Hook::ShadowCBRecon::IsCapturing())
+        {
+            ImGui::TextWrapped("Capturing shadow CBs...");
+        }
+        else
+        {
+            static int reconFrames = 1;
+            ImGui::SliderInt("Frames##recon", &reconFrames, 1, 5);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Number of frames to capture shadow-pass constant buffers");
+            if (ImGui::Button("Capture Shadow CBs", ImVec2(ImGui::GetContentRegionAvail().x, 0)))
+                D3D11Hook::ShadowCBRecon::Arm(reconFrames);
         }
     }
 }
