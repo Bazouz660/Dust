@@ -61,7 +61,7 @@
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>false</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;_CONSOLE;BOOST_USE_WINDOWS_H;BOOST_ALL_NO_LIB;BOOST_ERROR_CODE_HEADER_ONLY;BOOST_SYSTEM_NO_DEPRECATED;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;BOOST_USE_WINDOWS_H;BOOST_ALL_NO_LIB;BOOST_ERROR_CODE_HEADER_ONLY;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>false</ConformanceMode>
       <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
     </ClCompile>
@@ -83,7 +83,7 @@
            to msbuild (or set the env-var ExtraDefines). All ZoneScoped /
            FrameMark calls in our code become no-ops when TRACY_ENABLE is
            undefined, so nothing else has to change. -->
-      <PreprocessorDefinitions>NDEBUG;_CONSOLE;BOOST_USE_WINDOWS_H;BOOST_ALL_NO_LIB;BOOST_ERROR_CODE_HEADER_ONLY;BOOST_SYSTEM_NO_DEPRECATED;$(ExtraDefines);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;BOOST_USE_WINDOWS_H;BOOST_ALL_NO_LIB;BOOST_ERROR_CODE_HEADER_ONLY;$(ExtraDefines);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>false</ConformanceMode>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
     </ClCompile>
