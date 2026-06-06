@@ -48,7 +48,10 @@ static std::string PatchDeferredShader(const std::string& src)
             "// [Dust] AO textures — explicit t-register to prevent compiler remapping\n"
             "Texture2D<float> dustAoTex    : register(t8);\n"
             "Texture2D<float> dustAoParams : register(t9);\n"
-            "SamplerState     dustAoSamp   : register(s8);\n\n";
+            "SamplerState     dustAoSamp   : register(s8);\n"
+            "// [Dust] Back-face depth for contact-shadow thickness (bound by Shadows plugin)\n"
+            "Texture2D<float> dustBackDepth : register(t10);\n"
+            "SamplerState     dustBackSamp  : register(s10);\n\n";
         result.insert(aoGlobalPos, aoGlobals);
     }
 
@@ -125,6 +128,18 @@ static std::string PatchDeferredShader(const std::string& src)
             "\tfloat dustCsmBlendEnabled;\n"
             "\tfloat dustCsmBlendWidth;\n"
             "\tfloat dustRtwQuality;\n"
+            // [Dust] Screen-space contact shadows for point/spot lights (read in light_fs)
+            "\tfloat dustContactEnabled;\n"
+            "\tfloat dustContactIntensity;\n"
+            "\tfloat dustContactSteps;\n"
+            "\tfloat dustContactRange;\n"
+            "\tfloat dustContactThickness;\n"
+            "\tfloat dustContactBias;\n"
+            "\tfloat dustContactDebug;\n"
+            "\tfloat dustContactBackface;\n"
+            "\tfloat dustContactSoftness;\n"
+            "\tfloat dustContactStepLength;\n"
+            "\tfloat dustContactLightRadius;\n"
             "};\n\n"
             // The warp map is 513x2 R32_FLOAT, sampled by vanilla GetOffsetLocationS
             // with tex2Dlod. The warp sampler is point-filtered, so adjacent screen
@@ -537,9 +552,110 @@ static std::string PatchDeferredShader(const std::string& src)
             "\t\tfloat _ao = dustAoTex.SampleLevel(dustAoSamp, texCoord, 0);\n"
             "\t\tfloat _dAO = dustAoParams.SampleLevel(dustAoSamp, texCoord, 0);\n"
             "\t\tcolor *= lerp(1.0, _ao, _dAO);\n"
+            "\t}\n"
+            // [Dust] Screen-space contact shadows (ENB particle-light style).
+            // March the GBuffer depth (gBuf2 @ s2, already bound for this draw)
+            // from the lit surface toward the light. If an on-screen occluder
+            // lies between, the pixel is in shadow. View-space march: rotate the
+            // world-space lightDir into view space via viewMatrix's rows
+            // (viewMatrix is view->world here, same as main_fs's inverseView),
+            // then project each step with proj (projection_matrix auto-param).
+            // Perf: skip the whole march where the light barely lights this pixel.
+            // The contact shadow would be invisible there, and attenuation falloff
+            // makes that the majority of every light volume's pixels -> big win.
+            "\t[branch] if (dustContactEnabled > 0.5 && dot(color, float3(0.2126, 0.7152, 0.0722)) > 0.02) {\n"
+            // View-space light dir and surface normal (rotate world vectors via
+            // viewMatrix rows — viewMatrix is view->world here).
+            "\t\tfloat3 _dir = float3(dot(lightDir, viewMatrix[0].xyz),\n"
+            "\t\t                     dot(lightDir, viewMatrix[1].xyz),\n"
+            "\t\t                     dot(lightDir, viewMatrix[2].xyz));\n"
+            "\t\tfloat3 _vn  = float3(dot(normal, viewMatrix[0].xyz),\n"
+            "\t\t                     dot(normal, viewMatrix[1].xyz),\n"
+            "\t\t                     dot(normal, viewMatrix[2].xyz));\n"
+            // Start the ray lifted off the surface along the normal so bumpy
+            // geometry doesn't self-shadow (the dominant artifact otherwise).
+            "\t\tfloat3 _P0 = viewPos.xyz + _vn * dustContactBias;\n"
+            // Tangent basis perpendicular to the march direction, for the
+            // soft-edge cone (parallel rays offset laterally within a disk).
+            "\t\tfloat3 _up = abs(_dir.z) < 0.99 ? float3(0,0,1) : float3(1,0,0);\n"
+            "\t\tfloat3 _tx = normalize(cross(_up, _dir));\n"
+            "\t\tfloat3 _ty = cross(_dir, _tx);\n"
+            "\t\tfloat _march = min(distance, dustContactRange);\n"
+            "\t\tint   _steps = max(1, (int)dustContactSteps);\n"
+            // Step length: explicit slider if set, else auto (range / steps).
+            "\t\tfloat _stepLen = (dustContactStepLength > 0.001) ? dustContactStepLength : (_march / _steps);\n"
+            "\t\tfloat _ign = frac(52.9829189 * frac(dot(pixel.xy, float2(0.06711056, 0.00583715))));\n"
+            // Uniform soft edge: average several rays offset laterally within a
+            // disk of radius dustContactSoftness (world units). 1 ray when ~0.
+            "\t\tint   _rays = dustContactSoftness > 0.01 ? 7 : 1;\n"
+            "\t\tfloat _rot  = _ign * 6.28318530718;\n"
+            "\t\tfloat _occ = 0.0;\n"
+            "\t\t[loop] for (int _r = 0; _r < _rays; _r++) {\n"
+            "\t\t\tfloat3 _Pr = _P0;\n"
+            "\t\t\tfloat _jit = _ign;\n"
+            "\t\t\tif (_rays > 1) {\n"
+            "\t\t\t\tfloat _fr  = ((float)_r + 0.5) / _rays;\n"
+            "\t\t\t\tfloat _ang = _rot + (float)_r * 2.39996323;\n"          // golden angle
+            "\t\t\t\tfloat _rad = sqrt(_fr) * dustContactSoftness;\n"        // even disk coverage
+            "\t\t\t\t_Pr += (_tx * cos(_ang) + _ty * sin(_ang)) * _rad;\n"
+            "\t\t\t\t_jit = frac(_ign + (float)_r * 0.61803399);\n"          // decorrelate per ray
+            "\t\t\t}\n"
+            "\t\t\tfloat _occR = 0.0;\n"
+            "\t\t\t[loop] for (int _i = 0; _i < _steps; _i++) {\n"
+            // Linear steps, jittered, always > 0 so the surface itself is never
+            // sampled.
+            "\t\t\t\tfloat _t = _stepLen * ((float)_i + _jit + 0.5);\n"
+            "\t\t\t\tif (_t > _march) break;\n"   // explicit step length may end the ray before all steps
+            "\t\t\t\tfloat3 _sp = _Pr + _dir * _t;\n"
+            "\t\t\t\tfloat4 _c = mul(proj, float4(_sp, 1.0));\n"
+            "\t\t\t\t[branch] if (_c.w > 1e-4) {\n"
+            "\t\t\t\t\tfloat2 _uv = (_c.xy / _c.w) * float2(0.5, -0.5) + 0.5;\n"
+            "\t\t\t\t\t[branch] if (_uv.x > 0.0 && _uv.x < 1.0 && _uv.y > 0.0 && _uv.y < 1.0) {\n"
+            "\t\t\t\t\t\tfloat _frontE = tex2Dlod(gBuf2, float4(_uv, 0, 0)).r * farClip;\n"
+            "\t\t\t\t\t\tfloat _d = length(_sp) - _frontE;\n"   // >0: sample behind the scene surface
+            // Perf: only resolve thickness (and sample the back-depth) once a
+            // sample is actually behind the front surface; early steps are in
+            // front (_d<=0) and skip it entirely.
+            "\t\t\t\t\t\t[branch] if (_d > 0.0) {\n"
+            // Occluder thickness along the ray. With back-face depth it's the
+            // real object extent (back - front, both raw euclidean); otherwise
+            // the flat Thickness slider. Window must be at least ~1.5 step-lengths
+            // wide, else the shell is thinner than the sample spacing and the
+            // per-pixel jitter makes adjacent pixels hit/miss -> stippled umbra.
+            "\t\t\t\t\t\t\tfloat _minThick = _stepLen * 1.5;\n"
+            "\t\t\t\t\t\t\tfloat _thick = max(dustContactThickness, _minThick);\n"
+            "\t\t\t\t\t\t\t[branch] if (dustContactBackface > 0.5) {\n"
+            "\t\t\t\t\t\t\t\tfloat _bN = dustBackDepth.SampleLevel(dustBackSamp, _uv, 0);\n"
+            "\t\t\t\t\t\t\t\tif (_bN > 1e-6) _thick = max(_bN - _frontE, _minThick);\n"
+            "\t\t\t\t\t\t\t}\n"
+            // Occluded if the sample sits inside the occluder, AND the hit is far
+            // enough from the light. The light-radius reject ignores the light's
+            // own fixture mesh (point light embedded in/above its model), which
+            // would otherwise shadow the floor beneath a ceiling lamp.
+            "\t\t\t\t\t\t\tif (_d < _thick && (distance - _t) > dustContactLightRadius) {\n"
+            "\t\t\t\t\t\t\t\t_occR = 1.0 - saturate((_t / _march - 0.7) / 0.3);\n"
+            "\t\t\t\t\t\t\t\tbreak;\n"
+            "\t\t\t\t\t\t\t}\n"
+            "\t\t\t\t\t\t}\n"
+            "\t\t\t\t\t}\n"
+            "\t\t\t\t}\n"
+            "\t\t\t}\n"
+            "\t\t\t_occ += _occR;\n"
+            "\t\t}\n"
+            "\t\t_occ /= (float)_rays;\n"
+            // Debug: red = occlusion; green = back-face depth data present at this
+            // pixel (lets us see whether the back-face pass actually wrote anything).
+            "\t\tif (dustContactDebug > 0.5) {\n"
+            "\t\t\tfloat _dbgG = 0.0;\n"
+            "\t\t\t[branch] if (dustContactBackface > 0.5) {\n"
+            "\t\t\t\tfloat _dbgB = dustBackDepth.SampleLevel(dustBackSamp, texCoord, 0);\n"
+            "\t\t\t\t_dbgG = _dbgB > 1e-6 ? 1.0 : 0.0;\n"
+            "\t\t\t}\n"
+            "\t\t\tcolor = float3(_occ, _dbgG, 0.0);\n"
+            "\t\t} else color *= 1.0 - _occ * dustContactIntensity;\n"
             "\t}\n";
         result.insert(insertPos, lightAO);
-        Log("ShaderPatch: injected AO into light_fs");
+        Log("ShaderPatch: injected AO + contact shadows into light_fs");
     }
     else
     {

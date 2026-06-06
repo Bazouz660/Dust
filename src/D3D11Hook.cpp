@@ -1828,6 +1828,18 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     if (Survey::IsActive())
         SurveyRecorder::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 
+    // [Dust diag] Back-face capture investigation: of all DrawIndexed calls,
+    // how many land during the detected GBuffer pass and have capture active?
+    if (GeometryCapture::detail::sCaptureFlags != 0)
+    {
+        static uint64_t sTot = 0, sGB = 0, sCap = 0;
+        sTot++;
+        if (GeometryCapture::IsInGBufferPass()) sGB++;
+        if (GeometryCapture::HasActiveCapture()) sCap++;
+        if ((sTot % 20000) == 0)
+            Log("DrawIndexed diag: total=%llu inGBuffer=%llu activeCapture=%llu", sTot, sGB, sCap);
+    }
+
     // Inline early-out: skip the call entirely when no capture session is
     // active. Saves the function-call overhead on ~2000 draws/frame.
     if (GeometryCapture::HasActiveCapture())
