@@ -9,6 +9,7 @@
 #include "ShaderPatch.h"
 #include "OgreSwapHook.h"
 #include "ShadowProbe.h"
+#include "SceneAccess.h"
 #include "PssmDetour.h"
 #include "ShaderMetadata.h"
 #include "ShaderDatabase.h"
@@ -1745,6 +1746,10 @@ static void STDMETHODCALLTYPE HookedDraw(
         // Extract camera data at POST_LIGHTING (deferred CB is bound)
         if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
             ExtractCameraData(pThis);
+
+        // One-shot diagnostic dump of the captured scene light set.
+        if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
+            SceneAccess::DebugDumpOnce();
 
         DustFrameContext fctx = {};
         fctx.device = gDevice;

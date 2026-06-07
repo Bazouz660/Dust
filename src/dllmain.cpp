@@ -9,6 +9,7 @@
 // Dust framework
 #include "DustLog.h"
 #include "D3D11Hook.h"
+#include "SceneAccess.h"
 #include "DustGUI.h"
 #include "EffectLoader.h"
 #include "PssmDetour.h"
@@ -249,6 +250,11 @@ __declspec(dllexport) void startPlugin()
     // shadow node init, which is when this function is called. Late-stage
     // installs (post-gGameAlive) miss the call.
     PssmDetour::TryInstall();
+
+    // Capture the live scene light set from startup (createLight/destroyLight
+    // hooks) so we also get lights created during world load. The master key
+    // for multi-light shadows. Safe to call before OGRE is loaded.
+    SceneAccess::EnsureHooks();
 
 
 
