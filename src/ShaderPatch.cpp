@@ -585,9 +585,10 @@ static std::string PatchDeferredShader(const std::string& src)
             // Step length: explicit slider if set, else auto (range / steps).
             "\t\tfloat _stepLen = (dustContactStepLength > 0.001) ? dustContactStepLength : (_march / _steps);\n"
             "\t\tfloat _ign = frac(52.9829189 * frac(dot(pixel.xy, float2(0.06711056, 0.00583715))));\n"
-            // Uniform soft edge: average several rays offset laterally within a
-            // disk of radius dustContactSoftness (world units). 1 ray when ~0.
-            "\t\tint   _rays = dustContactSoftness > 0.01 ? 7 : 1;\n"
+            // [Dust] Cone dropped — was a 7-ray lateral cone for soft edges (~7x the
+            // march cost). Single ray now; soft edges will come from a separate
+            // blurred occlusion buffer (prototype), not a per-pixel cone.
+            "\t\tint   _rays = 1;\n"
             "\t\tfloat _rot  = _ign * 6.28318530718;\n"
             "\t\tfloat _occ = 0.0;\n"
             "\t\t[loop] for (int _r = 0; _r < _rays; _r++) {\n"
