@@ -1,5 +1,6 @@
 #include "GeometryReplay.h"
 #include "GeometryCapture.h"
+#include "ShaderDatabase.h"
 #include "DustLog.h"
 #include <cstring>
 
@@ -117,6 +118,20 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
     {
         if (!draw.vsMetadata || draw.vsMetadata->transformType == VSTransformType::UNKNOWN)
             continue;
+
+        // Replay ONLY static solid geometry. Terrain (vertex-texture fetch),
+        // foliage, and skinned meshes run VS variants that read resources the
+        // replay never rebinds (heightmap / bone buffers / vertex SRVs), which
+        // GPU-faults the back-face pass. OBJECTS / DISTANT_TOWN / TRIPLANAR are
+        // the safe solid occluders back-face thickness actually needs.
+        {
+            DustShaderCategory cat = ShaderDatabase::GetVertexShaderCategory(draw.vs);
+            if (cat != DUST_SHADER_OBJECTS &&
+                cat != DUST_SHADER_DISTANT_TOWN &&
+                cat != DUST_SHADER_TRIPLANAR)
+                continue;
+        }
+
         if (!draw.cbStagingCopy)
             continue;
 

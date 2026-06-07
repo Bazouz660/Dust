@@ -5,6 +5,7 @@
 #include "FilePicker.h"
 #include "D3D11Hook.h"
 #include "GeometryCapture.h"
+#include "FrameProfiler.h"
 #include "ShaderMetadata.h"
 #include "Survey.h"
 #include "ShaderPatch.h"
@@ -1586,6 +1587,108 @@ static void DrawEffectSection(size_t idx)
 
 // ==================== Drawing: Performance ====================
 
+static char gProfilerSaveMsg[256] = {};
+
+// Dump one setting's live value (read from its valuePtr) to the file.
+static void WriteSettingValue(FILE* f, const DustSettingDesc& d)
+{
+    if (!d.valuePtr || d.type == DUST_SETTING_SECTION) return;
+    const char* key = d.name ? d.name : (d.iniKey ? d.iniKey : "?");
+    switch (d.type)
+    {
+    case DUST_SETTING_BOOL:
+    case DUST_SETTING_HIDDEN_BOOL:
+        fprintf(f, "    %-22s %s\n", key, (*(bool*)d.valuePtr) ? "true" : "false");
+        break;
+    case DUST_SETTING_INT:
+    case DUST_SETTING_HIDDEN_INT:
+        fprintf(f, "    %-22s %d\n", key, *(int*)d.valuePtr);
+        break;
+    case DUST_SETTING_FLOAT:
+    case DUST_SETTING_HIDDEN_FLOAT:
+        fprintf(f, "    %-22s %.4g\n", key, *(float*)d.valuePtr);
+        break;
+    case DUST_SETTING_ENUM:
+    {
+        int idx = *(int*)d.valuePtr;
+        const char* lbl = nullptr;
+        if (d.enumLabels && idx >= 0)
+        {
+            int n = 0; while (d.enumLabels[n]) n++;
+            if (idx < n) lbl = d.enumLabels[idx];
+        }
+        if (lbl) fprintf(f, "    %-22s %d (%s)\n", key, idx, lbl);
+        else     fprintf(f, "    %-22s %d\n", key, idx);
+        break;
+    }
+    case DUST_SETTING_COLOR3:
+    {
+        float* c = (float*)d.valuePtr;
+        fprintf(f, "    %-22s %.3f, %.3f, %.3f\n", key, c[0], c[1], c[2]);
+        break;
+    }
+    default: break;
+    }
+}
+
+// Write the current frame's GPU breakdown + full effect config to a timestamped
+// text file, so A/B samples can be captured and compared with exact settings.
+static void SaveProfilerSample()
+{
+    SYSTEMTIME st; GetLocalTime(&st);
+    char ts[32];
+    snprintf(ts, sizeof(ts), "%04d-%02d-%02d_%02d-%02d-%02d",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    std::string path = DustLogDir() + "gpu_profiler_sample_" + ts + ".txt";
+
+    FILE* f = nullptr;
+    fopen_s(&f, path.c_str(), "w");
+    if (!f)
+    {
+        snprintf(gProfilerSaveMsg, sizeof(gProfilerSaveMsg), "Save failed: %s", path.c_str());
+        return;
+    }
+
+    ImGuiIO& io = ImGui::GetIO();
+    fprintf(f, "Dust GPU Profiler Sample %s\n", ts);
+    fprintf(f, "Resolution: %.0fx%.0f\n", io.DisplaySize.x, io.DisplaySize.y);
+    fprintf(f, "FPS: %.1f   CPU frame time: %.2f ms\n\n", gDisplayFps, io.DeltaTime * 1000.0f);
+
+    fprintf(f, "Frame GPU breakdown (per-pass timestamps):\n");
+    for (int s = 0; s < FrameProfiler::SEG_COUNT; s++)
+        fprintf(f, "  %-12s %.3f ms\n",
+                FrameProfiler::GetSegmentName((FrameProfiler::Segment)s),
+                FrameProfiler::GetSegmentMs((FrameProfiler::Segment)s));
+    fprintf(f, "  %-12s %.3f ms (sum of passes = GPU busy)\n", "GPU total", FrameProfiler::GetFrameMs());
+    {
+        float gpuMs  = FrameProfiler::GetFrameMs();
+        float wallMs = (gDisplayFps > 1.0f) ? (1000.0f / gDisplayFps) : (io.DeltaTime * 1000.0f);
+        float pct    = (gpuMs > 0.0f && wallMs > 0.0f) ? gpuMs / wallMs * 100.0f : 0.0f;
+        fprintf(f, "  %-12s %.0f%% (GPU busy / %.2f ms frame)\n\n", "GPU usage", pct, wallMs);
+    }
+
+    fprintf(f, "Effects & settings:\n");
+    size_t count = gEffectLoader.Count();
+    for (size_t i = 0; i < count; i++)
+    {
+        const LoadedEffect& le = gEffectLoader.GetEffect(i);
+        if (!le.initialized) continue;
+        const char* nm = le.desc.name ? le.desc.name : "Unnamed";
+        bool en = IsEffectEnabled(le);
+        bool hasTiming = (le.desc.apiVersion >= 3 && (le.desc.flags & DUST_FLAG_FRAMEWORK_TIMING))
+                      || le.desc.gpuTimeMsPtr;
+        if (en && hasTiming)
+            fprintf(f, "[%s] %s  (%.3f ms)\n", "ON ", nm, gEffectLoader.GetEffectGpuTime(i));
+        else
+            fprintf(f, "[%s] %s\n", en ? "ON " : "off", nm);
+
+        for (uint32_t s = 0; s < le.desc.settingCount; s++)
+            WriteSettingValue(f, le.desc.settings[s]);
+    }
+    fclose(f);
+    snprintf(gProfilerSaveMsg, sizeof(gProfilerSaveMsg), "Saved: %s", path.c_str());
+}
+
 static void DrawPerformanceSection()
 {
     ImGuiIO& io = ImGui::GetIO();
@@ -1682,6 +1785,57 @@ static void DrawPerformanceSection()
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
+
+    // Frame GPU breakdown — per-pass timestamps. Sees costs injected into the
+    // game's own draws (tessellation, geometry capture, CSM/RTWSM, contact
+    // shadows) that the per-effect callback timer can't.
+    {
+        bool prof = FrameProfiler::IsEnabled();
+        if (ImGui::Checkbox("Frame GPU Profiler", &prof))
+            FrameProfiler::SetEnabled(prof);
+        if (prof)
+        {
+            // Snapshot the (EMA-smoothed) values every 0.5s so the digits are
+            // stable enough to read instead of updating every frame.
+            static float dSeg[FrameProfiler::SEG_COUNT] = {};
+            static float dGpu = 0.0f, dPct = 0.0f, dAcc = 1.0f;
+            dAcc += io.DeltaTime;
+            if (dAcc >= 0.5f)
+            {
+                dAcc = 0.0f;
+                for (int s = 0; s < FrameProfiler::SEG_COUNT; s++)
+                    dSeg[s] = FrameProfiler::GetSegmentMs((FrameProfiler::Segment)s);
+                dGpu = FrameProfiler::GetFrameMs();
+                float wallMs = (gDisplayFps > 1.0f) ? (1000.0f / gDisplayFps) : (io.DeltaTime * 1000.0f);
+                dPct = (dGpu > 0.0f && wallMs > 0.0f) ? dGpu / wallMs * 100.0f : 0.0f;
+            }
+            ImGui::Spacing();
+            for (int s = 0; s < FrameProfiler::SEG_COUNT; s++)
+            {
+                float ms = dSeg[s];
+                ImVec4 c = DustSuccessColor();
+                if (ms > 2.0f) c = DustWarningColor();
+                if (ms > 5.0f) c = DustErrorColor();
+                ImGui::TextColored(c, "  %-11s %.2f ms", FrameProfiler::GetSegmentName((FrameProfiler::Segment)s), ms);
+            }
+            ImGui::Text("  %-11s %.2f ms", "GPU total", dGpu);
+            // GPU usage = GPU busy / wall frame time (saturation / headroom).
+            {
+                ImVec4 c = DustSuccessColor();
+                if (dPct > 80.0f) c = DustWarningColor();
+                if (dPct > 95.0f) c = DustErrorColor();
+                ImGui::TextColored(c, "  %-11s %.0f%%", "GPU usage", dPct);
+            }
+            ImGui::Spacing();
+            if (ImGui::Button("Save Sample"))
+                SaveProfilerSample();
+            if (gProfilerSaveMsg[0])
+                ImGui::TextDisabled("%s", gProfilerSaveMsg);
+        }
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+    }
 
     // Resolution info
     ImGui::Text("Display: %.0fx%.0f", io.DisplaySize.x, io.DisplaySize.y);
