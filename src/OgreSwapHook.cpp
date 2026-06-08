@@ -2,6 +2,7 @@
 #include "DustLog.h"
 #include "DustGUI.h"
 #include "D3D11Hook.h"
+#include "PointShadowsOgre.h"
 
 #include <ogre/OgreRoot.h>
 #include <ogre/OgreRenderSystem.h>
@@ -70,6 +71,11 @@ static int FindSwapBuffersSlot()
 // list works as the detour.
 static void HookedSwapBuffers(Ogre::RenderTarget* self)
 {
+    // Frame boundary: Kenshi's scene render is done and the cull worker threads are
+    // idle, so this is the safe point to render our OGRE light-shadow depth.
+    if (!D3D11Hook::IsShutdownSignaled())
+        PointShadowsOgre::RenderPendingAtFrameBoundary();
+
     // Render the GUI on top of the back buffer before the original commits
     // it to the screen.
     if (!D3D11Hook::IsShutdownSignaled())

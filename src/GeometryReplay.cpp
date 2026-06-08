@@ -112,11 +112,14 @@ struct ReplayStateBlock
 };
 
 uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
-                const float* replacementVP)
+                const float* replacementVP,
+                const float* cullCenter, float cullRadius)
 {
     const auto& captures = GeometryCapture::GetCaptures();
     if (captures.empty())
         return 0;
+
+    const float cullR2 = cullRadius * cullRadius;
 
     ReplayStateBlock saved;
     saved.Capture(ctx);
@@ -166,22 +169,26 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
         bool useWorldFromCB = (meta.transformType == VSTransformType::STATIC &&
                                draw.instanceCount <= 1);
 
-        if (useWorldFromCB)
+        if (useWorldFromCB &&
+            meta.worldMatrixOffset + 64 <= draw.cbStagingSize &&
+            meta.worldMatrixSize >= 64)
         {
-            if (meta.worldMatrixOffset + 64 <= draw.cbStagingSize &&
-                meta.worldMatrixSize >= 64)
+            const float* world = reinterpret_cast<const float*>(
+                cbDataBuf.data() + meta.worldMatrixOffset);
+            // Per-light cull: skip static occluders outside this light's reach.
+            if (cullCenter)
             {
-                const float* world = reinterpret_cast<const float*>(
-                    cbDataBuf.data() + meta.worldMatrixOffset);
-                MatMul4x4(clipDst, world, replacementVP);
+                float dx = world[12]-cullCenter[0];
+                float dy = world[13]-cullCenter[1];
+                float dz = world[14]-cullCenter[2];
+                if (dx*dx + dy*dy + dz*dz > cullR2) continue;
             }
-            else
-            {
-                memcpy(clipDst, replacementVP, 64);
-            }
+            MatMul4x4(clipDst, world, replacementVP);
         }
         else
         {
+            // Instanced / world-less draws: can't cull by CB world (their transform is
+            // in the instance buffer), so always include them.
             memcpy(clipDst, replacementVP, 64);
         }
 

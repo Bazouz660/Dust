@@ -120,6 +120,7 @@
     <ClCompile Include="ShadowProbe.cpp" />
     <ClCompile Include="SceneAccess.cpp" />
     <ClCompile Include="PointShadows.cpp" />
+    <ClCompile Include="PointShadowsOgre.cpp" />
     <ClCompile Include="PssmDetour.cpp" />
     <ClCompile Include="imgui\imgui.cpp" />
     <ClCompile Include="imgui\imgui_draw.cpp" />

@@ -20,8 +20,14 @@ namespace GeometryReplay
     //                light's View*Projection matrix.
     //
     // Returns the number of draws actually replayed (skips unclassified draws).
+    //
+    // cullCenter/cullRadius (optional): when cullCenter != nullptr, STATIC draws whose
+    // world-matrix translation is farther than cullRadius from cullCenter are skipped.
+    // Lets a small point light replay only its nearby occluders (huge perf win, enables
+    // many shadow cubes). Instanced / world-less draws are never culled.
     uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
-                    const float* replacementVP);
+                    const float* replacementVP,
+                    const float* cullCenter = nullptr, float cullRadius = 0.0f);
 
     void Shutdown();
 }

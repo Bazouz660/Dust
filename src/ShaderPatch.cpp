@@ -51,7 +51,20 @@ static std::string PatchDeferredShader(const std::string& src)
             "SamplerState     dustAoSamp   : register(s8);\n"
             "// [Dust] Back-face depth for contact-shadow thickness (bound by Shadows plugin)\n"
             "Texture2D<float> dustBackDepth : register(t10);\n"
-            "SamplerState     dustBackSamp  : register(s10);\n\n";
+            "SamplerState     dustBackSamp  : register(s10);\n"
+            // [Dust] Point-light shadow cubes (N nearest lights, bound by PointShadows
+            // after its cube render; left bound through the light-volume draws).
+            // Each cube stores hardware projective depth from a per-face PerspLH at the
+            // light (zn=dustPtMeta.x, zf=dustPtMeta.y). Sampled in light_fs only.
+            "TextureCubeArray<float> dustPtCubes : register(t11);\n"
+            "SamplerState       dustPtSamp  : register(s11);\n"
+            "cbuffer DustPointShadowParams : register(b8) {\n"
+            "\tfloat4 dustPtPosRadius[16];  // xyz = light world pos, w = radius\n"
+            "\tfloat4 dustPtMeta;           // x=faceNear y=faceFar z=count w=debug\n"
+            "};\n"
+            "float DustSamplePtCube(int idx, float3 dir) {\n"
+            "\treturn dustPtCubes.SampleLevel(dustPtSamp, float4(dir, (float)idx), 0);\n"
+            "}\n\n";
         result.insert(aoGlobalPos, aoGlobals);
     }
 
@@ -656,7 +669,57 @@ static std::string PatchDeferredShader(const std::string& src)
             "\t\t} else color *= 1.0 - _occ * dustContactIntensity;\n"
             "\t}\n";
         result.insert(insertPos, lightAO);
-        Log("ShaderPatch: injected AO + contact shadows into light_fs");
+
+        // [Dust] Point-light cube shadow. Inserted at the SAME anchor position so it
+        // lands between the anchor and the AO/contact block above -> the cube multiply
+        // runs first, leaving the contact-shadow debug overwrite (if any) last.
+        // In scope (deferred.hlsl light_fs): position (light world pos), worldPos
+        // (surface world pos), distance (radial surface->light), color (this light's
+        // contribution). Match this draw's light to one of the N bound cubes by world
+        // position, then a dominant-axis projective-depth compare (cube stores the
+        // hardware depth from a per-face PerspLH at the light).
+        std::string ptCube =
+            "\n\t// [Dust] Point-light cube shadow (hard, dominant-axis compare)\n"
+            "\t[branch] if (dustPtMeta.z > 0.5 && distance > 1.0) {\n"
+            "\t\tint _bi = -1; float _bd = 1e30; int _cnt = (int)dustPtMeta.z;\n"
+            "\t\t[loop] for (int _k = 0; _k < 16; _k++) {\n"
+            "\t\t\tif (_k < _cnt) {\n"
+            "\t\t\t\tfloat3 _dp = dustPtPosRadius[_k].xyz - position;\n"
+            "\t\t\t\tfloat _d2 = dot(_dp, _dp);\n"
+            "\t\t\t\tif (_d2 < _bd) { _bd = _d2; _bi = _k; }\n"
+            "\t\t\t}\n"
+            "\t\t}\n"
+            "\t\t[branch] if (_bi >= 0) {\n"
+            "\t\t\tfloat3 _f2l = worldPos - position;   // light -> surface (world)\n"
+            "\t\t\tfloat3 _a = abs(_f2l);\n"
+            "\t\t\tfloat _surfZ = max(_a.x, max(_a.y, _a.z));\n"
+            "\t\t\tfloat _stored = DustSamplePtCube(_bi, _f2l);\n"
+            "\t\t\t// OGRE shadow-caster writes LINEAR view-axis distance (world units).\n"
+            "\t\t\t// Treat <=1 (cleared-black/at-light) or huge (cleared-far) as no occluder.\n"
+            "\t\t\tfloat _casterZ = (_stored <= 1.0 || _stored >= 1.0e7) ? 1e30 : _stored;\n"
+            "\t\t\tfloat _bias = max(_surfZ * 0.02, 1.0);\n"
+            "\t\t\tbool _shadowed = (_surfZ - _bias) > _casterZ;\n"
+            // matched: light pos within 5 world units of a bound cube center.
+            "\t\t\tbool _matched = (_bd < 100.0);\n"
+            "\t\t\t[branch] if (dustPtMeta.w > 0.5) {\n"
+            // DEBUG viz: matched (<10u) green=lit / red=shadowed; near-miss (<200u)
+            // orange (small offset); far/mismatch -> left as normal lighting (no tint).
+            "\t\t\t\tbool _empty = (_stored <= 1.0 || _stored >= 1.0e7);\n"
+            "\t\t\t\tif (_bd < 100.0) {\n"
+            "\t\t\t\t\tif (_empty) color = float3(0,0,1);\n"                          // blue: cube empty
+            "\t\t\t\t\telse if (_stored < _surfZ - 5.0) color = float3(1,0,0);\n"     // red: cube closer (occluder)
+            "\t\t\t\t\telse if (_stored < _surfZ + 5.0) color = float3(0,1,0);\n"     // green: cube ~= surface
+            "\t\t\t\t\telse color = float3(1,1,0);\n"                                  // yellow: cube FARTHER than surface
+            "\t\t\t\t}\n"
+            "\t\t\t\telse if (_bd < 40000.0) color = float3(1.0,0.4,0.0);\n"
+            "\t\t\t} else {\n"
+            "\t\t\t\tif (_matched && _shadowed) color *= 0.0;\n"
+            "\t\t\t}\n"
+            "\t\t}\n"
+            "\t}\n";
+        result.insert(insertPos, ptCube);
+
+        Log("ShaderPatch: injected AO + contact + point-cube shadows into light_fs");
     }
     else
     {
@@ -1269,6 +1332,12 @@ HRESULT WINAPI HookedD3DCompile(
         }
     }
 
+    // [Dust] Kenshi compiles the deferred main_fs/light_fs as ps_4_0, which predates
+    // TextureCubeArray (needed by the point-light shadow injection). Bump 4_0 -> 4_1
+    // (FL11 hardware, backward-compatible) so the cube-array sample compiles. Used for
+    // both deferred compile calls below.
+    const char* defTarget = (pTarget && strncmp(pTarget, "ps_4_0", 6) == 0) ? "ps_4_1" : pTarget;
+
     // Detect the deferred lighting pixel shader: entry point is "main_fs"
     // and source contains deferred-specific identifiers.
     if (pEntrypoint && pSrcData && SrcDataSize > 0 &&
@@ -1284,7 +1353,7 @@ HRESULT WINAPI HookedD3DCompile(
                 Log("ShaderPatch: patched deferred main_fs (%zu -> %zu bytes)",
                     src.size(), patched.size());
                 HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
-                                          pDefines, pInclude, pEntrypoint, pTarget,
+                                          pDefines, pInclude, pEntrypoint, defTarget,
                                           Flags1, Flags2, ppCode, ppErrorMsgs);
                 if (SUCCEEDED(hr))
                 {
@@ -1337,7 +1406,7 @@ HRESULT WINAPI HookedD3DCompile(
                 Log("ShaderPatch: patched deferred light_fs (%zu -> %zu bytes)",
                     src.size(), patched.size());
                 HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
-                                          pDefines, pInclude, pEntrypoint, pTarget,
+                                          pDefines, pInclude, pEntrypoint, defTarget,
                                           Flags1, Flags2, ppCode, ppErrorMsgs);
                 if (SUCCEEDED(hr))
                 {

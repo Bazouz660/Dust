@@ -11,6 +11,7 @@
 #include "ShadowProbe.h"
 #include "SceneAccess.h"
 #include "PointShadows.h"
+#include "PointShadowsOgre.h"
 #include "PssmDetour.h"
 #include "ShaderMetadata.h"
 #include "ShaderDatabase.h"
@@ -55,6 +56,16 @@ static bool gDispatchedThisFrame = false;
 // (staging CBs are in gCameraStagingCB[2], declared near ExtractCameraData)
 static DustCameraData gCameraData = {};
 static bool gCameraDataExtracted = false; // per-frame flag
+
+// Render-world camera position (extracted from the light_fs CB view matrix). Needed to
+// reconcile the OGRE frame with Kenshi's render-world (docs DERIVED FIX).
+static float gRenderCamPos[3]  = {0,0,0};
+static bool  gRenderCamPosValid = false;
+
+// OGRE->shader-space translation for point-light matching (set by ProbeLightCB,
+// consumed by PointShadows). See ProbeLightCB for the derivation.
+static float gLightSpaceR[3]   = {0,0,0};
+static bool  gLightSpaceRValid = false;
 static bool gCameraDataEverValid  = false; // sticky once first extraction succeeds
 
 // VTable indices — swap chain
@@ -1752,9 +1763,12 @@ static void STDMETHODCALLTYPE HookedDraw(
         if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
             SceneAccess::DebugDumpOnce();
 
-        // Stage 1: render the nearest point light's depth from its POV.
+        // Stage 1: render the N nearest point lights' depth cubes from their POV.
         if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING) && gCameraData.valid)
+        {
+            PointShadows::SetLightSpaceR(gLightSpaceR, gLightSpaceRValid);
             PointShadows::RenderFrame(pThis, gDevice, gCameraData.camPosition);
+        }
 
         DustFrameContext fctx = {};
         fctx.device = gDevice;
@@ -1775,6 +1789,13 @@ static void STDMETHODCALLTYPE HookedDraw(
         // POST: effects that operate after the draw
         fctx.timing = DUST_TIMING_POST;
         gEffectLoader.DispatchPost(dip, &fctx);
+
+        // Bind the point-light shadow cubes (rendered above by RenderFrame) for the
+        // additive light-volume (light_fs) draws that follow this POST_LIGHTING
+        // dispatch. Done AFTER DispatchPost so no effect's Save/Restore clobbers the
+        // high slots (t11-t14 / s11 / b8) before the volumes read them.
+        if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
+            PointShadows::BindForLightFs(pThis);
     }
     else
     {
@@ -1823,6 +1844,178 @@ static void STDMETHODCALLTYPE HookedVSSetShader(
         TerrainTess::OnVsBound(pVertexShader);
 }
 
+// [Dust diag] One-shot probe to discover the coordinate space of light_fs's
+// `position` uniform. During a light-volume draw, copy each bound PS constant
+// buffer to staging and scan every float3 for a value near a known SceneAccess
+// light. Logs the matching CB slot/offset + delta — or, after enough misses,
+// dumps raw CB0 triples + camera/light so we can tell camera-relative from a
+// fixed offset from "SceneAccess is missing the drawn lights".
+// OGRE->shader-space translation R = OGRE_lightPos - light_fs `position`.
+// light_fs `position` (CB0 float-offset [12]) is in a rebased world space; SceneAccess
+// positions are OGRE world. Under a pure-translation rebase R is the same for the
+// correct pairing, so it wins a vote; wrong pairings scatter. Recomputed continuously
+// (throttled) so it tracks tile rebases as the player moves. Consumed by PointShadows
+// to map its cube centers into shader space for the in-shader light->cube match.
+static void ProbeLightCB(ID3D11DeviceContext* ctx)
+{
+    if (!gDevice) return;
+
+    static std::unordered_map<long long, int> votes;
+    static unsigned long long lastFrame = 0;
+    static int logThrottle = 0;
+    static int reads = 0;        // CB reads sampled this frame
+    static bool finalized = false;
+
+    // New frame: reset accumulation.
+    if (gFrameIndex != lastFrame)
+    {
+        votes.clear();
+        reads = 0;
+        finalized = false;
+        lastFrame = gFrameIndex;
+    }
+    if (finalized) return;       // R already locked for this frame
+
+    // Extract the render-world camera position from the light_fs CB view matrix (offset 36).
+    // Two candidates (row- vs column-major); log both to confirm which == the capture's
+    // cameraPos (5.2,1803.8,-828.3), then we use it to reconcile OGRE <-> render-world.
+    {
+        ID3D11Buffer* cb = nullptr;
+        ctx->PSGetConstantBuffers(0, 1, &cb);
+        if (cb)
+        {
+            D3D11_BUFFER_DESC bd; cb->GetDesc(&bd);
+            int nf = (int)(bd.ByteWidth / 4);
+            if (nf >= 64 && nf <= 70)   // POINT light_fs only (68 floats); spots (72) have a different layout
+            {
+                D3D11_BUFFER_DESC sd = bd; sd.Usage = D3D11_USAGE_STAGING;
+                sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.BindFlags = 0; sd.MiscFlags = 0;
+                ID3D11Buffer* stg = nullptr;
+                if (SUCCEEDED(gDevice->CreateBuffer(&sd, nullptr, &stg)) && stg)
+                {
+                    ctx->CopyResource(stg, cb);
+                    D3D11_MAPPED_SUBRESOURCE mm;
+                    if (SUCCEEDED(ctx->Map(stg, 0, D3D11_MAP_READ, 0, &mm)))
+                    {
+                        const float* f = (const float*)mm.pData;
+                        if (f[11] > 1.0f && f[11] < 20000.0f)   // sane radius -> point light_fs
+                        {
+                            const float* V = f + 36;   // viewMatrix[36..51], col-major: cameraPos = -R^T*t
+                            float bx = -(V[0]*V[12] + V[1]*V[13] + V[2]*V[14]);
+                            float by = -(V[4]*V[12] + V[5]*V[13] + V[6]*V[14]);
+                            float bz = -(V[8]*V[12] + V[9]*V[13] + V[10]*V[14]);
+                            if (isfinite(bx) && isfinite(by) && isfinite(bz) && fabsf(bx) < 1e6f && fabsf(by) < 1e6f && fabsf(bz) < 1e6f)
+                            {
+                                gRenderCamPos[0]=bx; gRenderCamPos[1]=by; gRenderCamPos[2]=bz;
+                                gRenderCamPosValid = true;
+                                PointShadows::SetRenderCamPos(gRenderCamPos, true);
+                                static int tlog = 0;
+                                if ((tlog++ % 60) == 0) Log("RenderCamPos=(%.1f,%.1f,%.1f)", bx,by,bz);
+                            }
+                        }
+                        ctx->Unmap(stg, 0);
+                    }
+                    stg->Release();
+                }
+            }
+            cb->Release();
+        }
+    }
+
+    // Preferred: R = Kenshi's main camera world position (verified == the rebase R). It is
+    // available every frame regardless of how many lights are drawn, fixing the match that
+    // the vote below only achieved with >=8 lights in view. The vote is the fallback.
+    {
+        float camR[3];
+        if (PointShadowsOgre::GetKenshiRebaseR(camR))
+        {
+            gLightSpaceR[0] = camR[0]; gLightSpaceR[1] = camR[1]; gLightSpaceR[2] = camR[2];
+            gLightSpaceRValid = true;
+            PointShadows::SetLightSpaceR(gLightSpaceR, true);
+            PointShadows::UpdateLightTableCB(ctx);
+            finalized = true;
+            return;
+        }
+    }
+
+    static SceneAccess::Light lbuf[256];
+    int n = SceneAccess::GetLights(lbuf, 256);
+    if (n < 2) return;
+
+    // Read CB0; require a light_fs-shaped buffer (60..96 floats, sane radius at [11]).
+    ID3D11Buffer* cb0 = nullptr;
+    ctx->PSGetConstantBuffers(0, 1, &cb0);
+    if (!cb0) return;
+    float D[3] = {0,0,0}; bool gotD = false;
+    {
+        D3D11_BUFFER_DESC bd; cb0->GetDesc(&bd);
+        int nf = (int)(bd.ByteWidth / 4);
+        if (nf >= 60 && nf <= 96)
+        {
+            D3D11_BUFFER_DESC sd = bd;
+            sd.Usage = D3D11_USAGE_STAGING; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            sd.BindFlags = 0; sd.MiscFlags = 0;
+            ID3D11Buffer* stg = nullptr;
+            if (SUCCEEDED(gDevice->CreateBuffer(&sd, nullptr, &stg)) && stg)
+            {
+                ctx->CopyResource(stg, cb0);
+                D3D11_MAPPED_SUBRESOURCE m;
+                if (SUCCEEDED(ctx->Map(stg, 0, D3D11_MAP_READ, 0, &m)))
+                {
+                    const float* f = (const float*)m.pData;
+                    float radius = f[11];
+                    if (radius > 1.0f && radius < 20000.0f && isfinite(f[12]) && isfinite(f[13]) && isfinite(f[14]))
+                    {
+                        D[0]=f[12]; D[1]=f[13]; D[2]=f[14]; gotD = true;
+                    }
+                    ctx->Unmap(stg, 0);
+                }
+                stg->Release();
+            }
+        }
+    }
+    cb0->Release();
+    if (!gotD) return;
+    reads++;
+
+    for (int i = 0; i < n; ++i)
+    {
+        if (lbuf[i].intensity > 50000.0f) continue;
+        if ((fabsf(lbuf[i].pos[0]) + fabsf(lbuf[i].pos[1]) + fabsf(lbuf[i].pos[2])) <= 10.0f) continue;
+        long long qx = (long long)floorf((lbuf[i].pos[0]-D[0]) / 8.0f);
+        long long qy = (long long)floorf((lbuf[i].pos[1]-D[1]) / 8.0f);
+        long long qz = (long long)floorf((lbuf[i].pos[2]-D[2]) / 8.0f);
+        long long key = (qx & 0xFFFFF) | ((qy & 0xFFFFF) << 20) | ((qz & 0xFFFFF) << 40);
+        votes[key]++;
+    }
+
+    // Lock R for THIS frame once we have enough correspondences, and push it into the
+    // cube-match CB immediately so the light volumes drawn after this point use the
+    // current frame's R (no 1-frame lag, no drift mismatch).
+    if (reads >= 8)
+    {
+        long long bestKey = 0; int bestCount = 0;
+        for (std::unordered_map<long long,int>::iterator it = votes.begin(); it != votes.end(); ++it)
+            if (it->second > bestCount) { bestCount = it->second; bestKey = it->first; }
+        auto sext = [](long long v) -> long long { v &= 0xFFFFF; if (v & 0x80000) v |= ~0xFFFFFLL; return v; };
+        float Rx = sext(bestKey) * 8.0f + 4.0f;
+        float Ry = sext(bestKey >> 20) * 8.0f + 4.0f;
+        float Rz = sext(bestKey >> 40) * 8.0f + 4.0f;
+        if (bestCount >= 4)
+        {
+            gLightSpaceR[0] = Rx; gLightSpaceR[1] = Ry; gLightSpaceR[2] = Rz;
+            gLightSpaceRValid = true;
+            PointShadows::SetLightSpaceR(gLightSpaceR, true);
+            PointShadows::UpdateLightTableCB(ctx);   // refresh match CB with this frame's R
+        }
+        if ((logThrottle++ % 30) == 0)
+            Log("LightSpaceR=(%.0f,%.0f,%.0f) top=%d/%d cam=(%.1f,%.1f,%.1f)",
+                Rx, Ry, Rz, bestCount, reads,
+                gCameraData.camPosition[0], gCameraData.camPosition[1], gCameraData.camPosition[2]);
+        finalized = true;
+    }
+}
+
 static void STDMETHODCALLTYPE HookedDrawIndexed(
     ID3D11DeviceContext* pThis, UINT IndexCount, UINT StartIndexLocation,
     INT BaseVertexLocation)
@@ -1840,6 +2033,7 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     }
     else if (gInDeferredShadowPass) {
         ZoneName("ShadowSample", 12);
+        ProbeLightCB(pThis);   // [Dust diag] one-shot light-position space probe
     }
 #ifdef TRACY_ENABLE
     TracyD3D11NamedZone(gTracyGpuCtx, _gpuShadowZone, "ShadowCast", gInShadowPass);
@@ -1895,6 +2089,7 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
     }
     else if (gInDeferredShadowPass) {
         ZoneName("ShadowSample", 12);
+        ProbeLightCB(pThis);   // [Dust diag] one-shot light-position space probe
     }
 #ifdef TRACY_ENABLE
     TracyD3D11NamedZone(gTracyGpuCtx, _gpuShadowZone, "ShadowCast", gInShadowPass);
