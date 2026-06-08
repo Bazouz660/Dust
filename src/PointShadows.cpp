@@ -10,6 +10,9 @@
 #include <d3d11.h>
 #include <math.h>
 #include <vector>
+#include <unordered_map>
+#include <fstream>
+#include <cstdint>
 
 namespace PointShadows
 {
@@ -37,7 +40,7 @@ static bool sFailed = false;
 
 // Debug: tint point-light-lit pixels (green=lit, red=shadowed, blue=no matching
 // cube) so we can see whether the in-shader light->cube match works in-scene.
-static bool  sDebugViz    = true;    // green/red/yellow/blue debug tint while validating the camera-relative fix
+static bool  sDebugViz    = false;   // green/red/yellow/blue debug tint (off: real hard shadows via color*=0)
 
 // Active light snapshot — filled by RenderFrame, consumed when building the CB.
 static int   sActiveCount = 0;
@@ -71,6 +74,29 @@ void SetRenderCamPos(const float* p3, bool valid)
 {
     if (p3) { sRenderCamPos[0]=p3[0]; sRenderCamPos[1]=p3[1]; sRenderCamPos[2]=p3[2]; }
     sRenderCamPosValid = valid;
+}
+
+static float sDrawnLights[256][3] = {};
+static int   sDrawnCount = 0;
+static float sDrawnCamPos[3] = {0,0,0};
+static bool  sDrawnCamPosValid = false;
+
+void SetDrawnLights(const float (*positions)[3], int count, const float* renderCamPos)
+{
+    if (count > 256) count = 256;
+    if (count < 0)   count = 0;
+    for (int i = 0; i < count; ++i)
+    {
+        sDrawnLights[i][0] = positions[i][0];
+        sDrawnLights[i][1] = positions[i][1];
+        sDrawnLights[i][2] = positions[i][2];
+    }
+    sDrawnCount = count;
+    if (renderCamPos)
+    {
+        sDrawnCamPos[0]=renderCamPos[0]; sDrawnCamPos[1]=renderCamPos[1]; sDrawnCamPos[2]=renderCamPos[2];
+        sDrawnCamPosValid = true;
+    }
 }
 
 // Rebuild the b8 match CB: posRadius[kNumLights] (cube centers mapped into the
@@ -264,34 +290,20 @@ void RenderFrame(ID3D11DeviceContext* ctx, ID3D11Device* device, const float* ca
 
     DumpCapturesOnce(ctx, camPos3);
 
-    static std::vector<SceneAccess::Light> lights;
-    int count = SceneAccess::GetLightCount();
-    if (count <= 0) return;
-    lights.resize(count);
-    int n = SceneAccess::GetLights(&lights[0], count);
-
-    // Select the kNumLights nearest point lights to the camera, in OGRE world space.
-    // R is now the OGRE camera world position (== Kenshi's rebase origin), so the camera's
-    // OGRE position IS R. (camPos3 is a different camera-space value, NOT the rebased
-    // origin, so adding it threw the selection center off by ~2km — wrong lamps picked.)
-    // Selection center = player position in the SceneAccess (sActivePos) frame = R + cameraPos
-    // (near-player lights have sActivePos ~= cameraPos + R). See docs DERIVED FIX.
-    bool haveFrame = sLightSpaceRValid && sRenderCamPosValid;
-    float ogreCam[3] = {
-        haveFrame ? sLightSpaceR[0] + sRenderCamPos[0] : (sLightSpaceRValid ? sLightSpaceR[0] : camPos3[0]),
-        haveFrame ? sLightSpaceR[1] + sRenderCamPos[1] : (sLightSpaceRValid ? sLightSpaceR[1] : camPos3[1]),
-        haveFrame ? sLightSpaceR[2] + sRenderCamPos[2] : (sLightSpaceRValid ? sLightSpaceR[2] : camPos3[2]),
-    };
+    // Drive the cubes from the point lights the DEFERRED PASS actually drew this frame, in
+    // RENDER-WORLD space (light_fs position[12..14]) — the same frame as the GBuffer geometry.
+    // No R, no SceneAccess, no conversion: cube center, replay POV, and the light_fs match all
+    // use these exact positions. Select the kNumLights nearest to the render-world camera.
+    if (sDrawnCount <= 0) return;
     struct Cand { float d; int i; };
     static std::vector<Cand> cand;
     cand.clear();
-    for (int i = 0; i < n; ++i)
+    for (int i = 0; i < sDrawnCount; ++i)
     {
-        if (lights[i].type != SceneAccess::LIGHT_POINT) continue;
-        if (lights[i].intensity > 50000.0f) continue;
-        float dx = lights[i].pos[0]-ogreCam[0], dy = lights[i].pos[1]-ogreCam[1], dz = lights[i].pos[2]-ogreCam[2];
-        Cand c = { dx*dx + dy*dy + dz*dz, i };
-        cand.push_back(c);
+        float dx = sDrawnLights[i][0]-sDrawnCamPos[0];
+        float dy = sDrawnLights[i][1]-sDrawnCamPos[1];
+        float dz = sDrawnLights[i][2]-sDrawnCamPos[2];
+        cand.push_back({ dx*dx + dy*dy + dz*dz, i });
     }
     int sel = (int)cand.size(); if (sel > kNumLights) sel = kNumLights;
     for (int a = 0; a < sel; ++a)
@@ -299,27 +311,68 @@ void RenderFrame(ID3D11DeviceContext* ctx, ID3D11Device* device, const float* ca
         int m = a;
         for (int b = a+1; b < (int)cand.size(); ++b) if (cand[b].d < cand[m].d) m = b;
         Cand t = cand[a]; cand[a] = cand[m]; cand[m] = t;
-        const SceneAccess::Light& L = lights[cand[a].i];
-        sActivePos[a][0] = L.pos[0]; sActivePos[a][1] = L.pos[1]; sActivePos[a][2] = L.pos[2];
-        sActiveRadius[a] = L.range;
-        sActiveLight[a]  = L.ogreLight;
+        sActivePos[a][0] = sDrawnLights[cand[a].i][0];
+        sActivePos[a][1] = sDrawnLights[cand[a].i][1];
+        sActivePos[a][2] = sDrawnLights[cand[a].i][2];
     }
     sActiveCount = sel;
     if (sel <= 0) return;
 
-    // The OGRE depth renderer (PointShadowsOgre) renders these lights' 6 cube faces into
-    // our cube array at the swapBuffers frame boundary (cull threads idle) — replacing
-    // GeometryReplay's camera-GBuffer occluders (incomplete: no characters/instanced) with
-    // the full scene depth, camera-independent. 1-frame latency on cube content (fine when
-    // the light selection is stable).
-    PointShadowsOgre::SetPendingLights(sActiveLight, sActivePos, sRenderCamPos, sActiveCount);
+    // sActivePos is ALREADY render-world -> the cube CENTER (match) stays render-world.
+    sLightSpaceR[0] = sLightSpaceR[1] = sLightSpaceR[2] = 0.0f;
+    sLightSpaceRValid = false;
+
+    // The replayed GBuffer geometry is in OGRE-ABSOLUTE frame (objects.hlsl: oPosition =
+    // worldViewProjMatrix * position, world matrix absolute), while the deferred light_fs
+    // (sActivePos = light position[12..14]) is REBASED (render-world). They differ by a constant
+    // worldOffset = (absolute) - (rebased), which OGRE camera-relative rendering makes equal to
+    // the render-world camera position (confirmed: the SceneAccess-vs-deferred vote == RenderCamPos).
+    // So lp_absolute = sActivePos + cameraPos, while the match center stays rebased (sActivePos).
+    // Use the stable view-matrix camera position (sDrawnCamPos), not the noisy vote.
+    float worldOffset[3] = { sDrawnCamPos[0], sDrawnCamPos[1], sDrawnCamPos[2] };
+
+    // Render each light's 6 cube faces by replaying the captured GBuffer draws from the
+    // light's POV (GeometryReplay) with our depth-only output. CRITICAL: the GBuffer geometry
+    // is in RENDER-WORLD (worldViewProj uses worldMatrix=identity), so the replay light POV
+    // must also be render-world = sActivePos - R (== light_fs `position`, the match center).
+    // The old path used sActivePos (wrong frame) -> misplacement; this is the fix.
+    float proj[16];
+    PerspLH(proj, 1.5708f, 1.0f, kFaceNear, kFaceFar);   // 90 deg per face
+
+    sStateBlock.Capture(ctx);
+    ID3D11RenderTargetView* nullRTV[1] = { nullptr };
+    D3D11_VIEWPORT port = {}; port.Width = (float)kSize; port.Height = (float)kSize; port.MaxDepth = 1.0f;
+    ctx->RSSetViewports(1, &port);
+    ctx->RSSetState(sRasterState);
+    ctx->OMSetDepthStencilState(sDepthState, 0);
+    ctx->PSSetShader(nullptr, nullptr, 0);
+
+    uint32_t totalReplayed = 0;
+    for (int c = 0; c < sel; ++c)
+    {
+        // Replay POV in OGRE-ABSOLUTE frame = rebased light + worldOffset (= the SceneAccess
+        // absolute light position). The match center (UpdateLightTableCB) stays rebased.
+        float lp[3] = { sActivePos[c][0]+worldOffset[0], sActivePos[c][1]+worldOffset[1], sActivePos[c][2]+worldOffset[2] };
+        for (int f = 0; f < 6; ++f)
+        {
+            float target[3] = { lp[0]+kFaceDir[f][0], lp[1]+kFaceDir[f][1], lp[2]+kFaceDir[f][2] };
+            float view[16], vp[16];
+            LookAtLH(view, lp, target, kFaceUp[f]);
+            Mul(vp, view, proj);
+            ctx->OMSetRenderTargets(1, nullRTV, sFaceDSV[c*6+f]);
+            ctx->ClearDepthStencilView(sFaceDSV[c*6+f], D3D11_CLEAR_DEPTH, 1.0f, 0);
+            totalReplayed += GeometryReplay::Replay(ctx, device, vp, lp, kCullRadius);
+        }
+    }
+    sStateBlock.Restore(ctx);
 
     UpdateLightTableCB(ctx);
 
     static int frame = 0;
     if (((frame++) % 120) == 0)
-        Log("PointShadows: nLights=%d light0=(%.0f,%.0f,%.0f) -> OGRE depth render",
-            sActiveCount, sActivePos[0][0], sActivePos[0][1], sActivePos[0][2]);
+        Log("PointShadows: nLights=%d rebasedL0=(%.0f,%.0f,%.0f) worldOffset=(%.0f,%.0f,%.0f) replayed %u",
+            sActiveCount, sActivePos[0][0], sActivePos[0][1], sActivePos[0][2],
+            worldOffset[0], worldOffset[1], worldOffset[2], totalReplayed);
 }
 
 int GetMaxCubes() { return kNumLights; }

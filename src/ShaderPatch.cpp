@@ -694,9 +694,10 @@ static std::string PatchDeferredShader(const std::string& src)
             "\t\t\tfloat3 _a = abs(_f2l);\n"
             "\t\t\tfloat _surfZ = max(_a.x, max(_a.y, _a.z));\n"
             "\t\t\tfloat _stored = DustSamplePtCube(_bi, _f2l);\n"
-            "\t\t\t// OGRE shadow-caster writes LINEAR view-axis distance (world units).\n"
-            "\t\t\t// Treat <=1 (cleared-black/at-light) or huge (cleared-far) as no occluder.\n"
-            "\t\t\tfloat _casterZ = (_stored <= 1.0 || _stored >= 1.0e7) ? 1e30 : _stored;\n"
+            "\t\t\t// GeometryReplay writes PerspLH projective depth (0..1); reconstruct the\n"
+            "\t\t\t// linear view-axis distance. zn=dustPtMeta.x, zf=dustPtMeta.y.\n"
+            "\t\t\tfloat _zn = dustPtMeta.x; float _zf = dustPtMeta.y;\n"
+            "\t\t\tfloat _casterZ = (_stored >= 0.999999) ? 1e30 : (_zn*_zf) / (_zf - _stored*(_zf - _zn));\n"
             "\t\t\tfloat _bias = max(_surfZ * 0.02, 1.0);\n"
             "\t\t\tbool _shadowed = (_surfZ - _bias) > _casterZ;\n"
             // matched: light pos within 5 world units of a bound cube center.
@@ -704,12 +705,12 @@ static std::string PatchDeferredShader(const std::string& src)
             "\t\t\t[branch] if (dustPtMeta.w > 0.5) {\n"
             // DEBUG viz: matched (<10u) green=lit / red=shadowed; near-miss (<200u)
             // orange (small offset); far/mismatch -> left as normal lighting (no tint).
-            "\t\t\t\tbool _empty = (_stored <= 1.0 || _stored >= 1.0e7);\n"
+            "\t\t\t\tbool _empty = (_casterZ >= 1.0e29);\n"
             "\t\t\t\tif (_bd < 100.0) {\n"
-            "\t\t\t\t\tif (_empty) color = float3(0,0,1);\n"                          // blue: cube empty
-            "\t\t\t\t\telse if (_stored < _surfZ - 5.0) color = float3(1,0,0);\n"     // red: cube closer (occluder)
-            "\t\t\t\t\telse if (_stored < _surfZ + 5.0) color = float3(0,1,0);\n"     // green: cube ~= surface
-            "\t\t\t\t\telse color = float3(1,1,0);\n"                                  // yellow: cube FARTHER than surface
+            "\t\t\t\t\tif (_empty) color = float3(0,0,1);\n"                          // blue: no occluder in cube
+            "\t\t\t\t\telse if (_casterZ < _surfZ - _bias) color = float3(1,0,0);\n"  // red: occluder closer -> SHADOW
+            "\t\t\t\t\telse if (_casterZ < _surfZ + _bias) color = float3(0,1,0);\n"  // green: cube ~= surface (lit)
+            "\t\t\t\t\telse color = float3(1,1,0);\n"                                  // yellow: cube farther than surface
             "\t\t\t\t}\n"
             "\t\t\t\telse if (_bd < 40000.0) color = float3(1.0,0.4,0.0);\n"
             "\t\t\t} else {\n"

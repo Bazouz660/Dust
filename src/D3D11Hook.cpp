@@ -62,6 +62,12 @@ static bool gCameraDataExtracted = false; // per-frame flag
 static float gRenderCamPos[3]  = {0,0,0};
 static bool  gRenderCamPosValid = false;
 
+// Render-world positions of the point lights the deferred pass actually draws this frame
+// (from light_fs CB position[12..14]). The ground-truth light positions for the cubes:
+// no R, no SceneAccess, no frame conversion. Reset each frame in ProbeLightCB.
+static float gDrawnLights[256][3] = {};
+static int   gDrawnCount = 0;
+
 // OGRE->shader-space translation for point-light matching (set by ProbeLightCB,
 // consumed by PointShadows). See ProbeLightCB for the derivation.
 static float gLightSpaceR[3]   = {0,0,0};
@@ -1767,6 +1773,7 @@ static void STDMETHODCALLTYPE HookedDraw(
         if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING) && gCameraData.valid)
         {
             PointShadows::SetLightSpaceR(gLightSpaceR, gLightSpaceRValid);
+            PointShadows::SetDrawnLights(gDrawnLights, gDrawnCount, gRenderCamPos);
             PointShadows::RenderFrame(pThis, gDevice, gCameraData.camPosition);
         }
 
@@ -1871,10 +1878,12 @@ static void ProbeLightCB(ID3D11DeviceContext* ctx)
     {
         votes.clear();
         reads = 0;
+        gDrawnCount = 0;
         finalized = false;
         lastFrame = gFrameIndex;
     }
-    if (finalized) return;       // R already locked for this frame
+    // NOTE: no early return here — we collect every drawn light's render-world position
+    // below (capped), accumulating across the frame's light draws.
 
     // Extract the render-world camera position from the light_fs CB view matrix (offset 36).
     // Two candidates (row- vs column-major); log both to confirm which == the capture's
@@ -1886,7 +1895,7 @@ static void ProbeLightCB(ID3D11DeviceContext* ctx)
         {
             D3D11_BUFFER_DESC bd; cb->GetDesc(&bd);
             int nf = (int)(bd.ByteWidth / 4);
-            if (nf >= 64 && nf <= 70)   // POINT light_fs only (68 floats); spots (72) have a different layout
+            if (nf >= 64 && nf <= 70 && gDrawnCount < 256)   // POINT light_fs only (68 floats); cap reads/frame
             {
                 D3D11_BUFFER_DESC sd = bd; sd.Usage = D3D11_USAGE_STAGING;
                 sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.BindFlags = 0; sd.MiscFlags = 0;
@@ -1912,6 +1921,15 @@ static void ProbeLightCB(ID3D11DeviceContext* ctx)
                                 static int tlog = 0;
                                 if ((tlog++ % 60) == 0) Log("RenderCamPos=(%.1f,%.1f,%.1f)", bx,by,bz);
                             }
+                            // Collect this light's render-world position (position[12..14]) —
+                            // the ground-truth cube light position. No R, no SceneAccess.
+                            if (gDrawnCount < 256)
+                            {
+                                gDrawnLights[gDrawnCount][0] = f[12];
+                                gDrawnLights[gDrawnCount][1] = f[13];
+                                gDrawnLights[gDrawnCount][2] = f[14];
+                                gDrawnCount++;
+                            }
                         }
                         ctx->Unmap(stg, 0);
                     }
@@ -1921,7 +1939,12 @@ static void ProbeLightCB(ID3D11DeviceContext* ctx)
             cb->Release();
         }
     }
+    // Render-world light positions are now collected directly above; the R/vote path below
+    // is obsolete (PointShadows uses sDrawnLights with no R conversion).
+    (void)finalized; (void)logThrottle; (void)votes; (void)reads;
+    return;
 
+#if 0
     // Preferred: R = Kenshi's main camera world position (verified == the rebase R). It is
     // available every frame regardless of how many lights are drawn, fixing the match that
     // the vote below only achieved with >=8 lights in view. The vote is the fallback.
@@ -2014,6 +2037,7 @@ static void ProbeLightCB(ID3D11DeviceContext* ctx)
                 gCameraData.camPosition[0], gCameraData.camPosition[1], gCameraData.camPosition[2]);
         finalized = true;
     }
+#endif
 }
 
 static void STDMETHODCALLTYPE HookedDrawIndexed(

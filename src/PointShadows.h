@@ -26,6 +26,11 @@ namespace PointShadows
     // reconcile the OGRE frame with Kenshi's render-world for selection + cube placement.
     void SetRenderCamPos(const float* p3, bool valid);
 
+    // The point lights the deferred pass actually drew this frame, in RENDER-WORLD space
+    // (light_fs position[12..14]). These are the ground-truth cube light positions — used
+    // directly for cube center + replay POV + the light_fs match, with no R conversion.
+    void SetDrawnLights(const float (*positions)[3], int count, const float* renderCamPos);
+
     // Rebuild the b8 light-table CB from the current active lights + R. Called mid
     // light-volume pass (from the probe) with the current frame's R to remove lag.
     void UpdateLightTableCB(ID3D11DeviceContext* ctx);

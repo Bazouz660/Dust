@@ -350,11 +350,14 @@ void RenderPendingAtFrameBoundary()
 
     gSpikeActive = true;   // arm the crash VEH (logs faulting addr+callstack on AV)
     int faces = 0, rendered = 0;
-    // LOD camera = Kenshi's MAIN camera (getCameraInProgress); grab it + cache R now,
-    // BEFORE our cull below sets mCameraInProgress to sCam.
+    // LOD camera = Kenshi's MAIN camera (getCameraInProgress); grab it BEFORE our cull
+    // overwrites mCameraInProgress. R = the main-camera position captured by D3D11Hook
+    // DURING the deferred light pass (getCameraInProgress at swapBuffers is a different,
+    // non-main camera -> the ground-truth test showed it 882u from the geometry).
     Ogre::Camera* lodCam = GetKenshiLodCamera();
     float R[3] = {0, 0, 0};
-    GetKenshiRebaseR(R);
+    bool rValid = false;
+    PointShadows::GetLightSpaceR(R, &rValid);
 
     // Diagnostic: does Kenshi's rebase R == its camera world position?
     {
@@ -379,12 +382,11 @@ void RenderPendingAtFrameBoundary()
             float dz = sLights[c][2] - sRenderedPos[c][2];
             if (!kForceRenderForCapture && sRenderedValid[c] && (dx*dx + dy*dy + dz*dz) < 1.0f) continue;
 
-            // OGRE frame == Kenshi render-world (GBuffer worldMatrix=identity), so the light's
-            // OGRE position = its render-world position = light_fs = sActivePos - R. (cameraPos
-            // is only used for the SELECTION center R+cameraPos, not here.) Node (-worldOffset)
-            // corrected below so derived == tgt.
-            float tgt[3] = { sLights[c][0] - R[0], sLights[c][1] - R[1], sLights[c][2] - R[2] };
-            (void)sCamPos;
+            // GROUND-TRUTH TEST: render the cube from R (the main camera's OGRE position).
+            // The player camera is among the geometry, so the dump MUST show geometry only a
+            // few units away (min ~tens). If min is ~1000+, R is NOT in the geometry frame.
+            float tgt[3] = { R[0], R[1], R[2] };
+            (void)sCamPos; (void)sLights;
             sCam->setPosition(Ogre::Vector3(tgt[0], tgt[1], tgt[2]));
             sSM->updateAllTransforms();
             if (pGetDerivedPos)
