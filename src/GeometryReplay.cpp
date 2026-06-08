@@ -67,6 +67,8 @@ struct ReplayStateBlock
     UINT                     ibOffset   = 0;
     ID3D11VertexShader*      vs         = nullptr;
     ID3D11Buffer*            vsCBs[CapturedDraw::MAX_VS_CBS] = {};
+    ID3D11ShaderResourceView* vsSRVs[CapturedDraw::MAX_VS_SRVS] = {};
+    ID3D11SamplerState*      vsSamplers[CapturedDraw::MAX_VS_SAMPLERS] = {};
 
     void Capture(ID3D11DeviceContext* ctx)
     {
@@ -76,6 +78,8 @@ struct ReplayStateBlock
         ctx->IAGetIndexBuffer(&ib, &ibFormat, &ibOffset);
         ctx->VSGetShader(&vs, nullptr, nullptr);
         ctx->VSGetConstantBuffers(0, CapturedDraw::MAX_VS_CBS, vsCBs);
+        ctx->VSGetShaderResources(0, CapturedDraw::MAX_VS_SRVS, vsSRVs);
+        ctx->VSGetSamplers(0, CapturedDraw::MAX_VS_SAMPLERS, vsSamplers);
     }
 
     void Restore(ID3D11DeviceContext* ctx)
@@ -86,6 +90,8 @@ struct ReplayStateBlock
         ctx->IASetIndexBuffer(ib, ibFormat, ibOffset);
         ctx->VSSetShader(vs, nullptr, 0);
         ctx->VSSetConstantBuffers(0, CapturedDraw::MAX_VS_CBS, vsCBs);
+        ctx->VSSetShaderResources(0, CapturedDraw::MAX_VS_SRVS, vsSRVs);
+        ctx->VSSetSamplers(0, CapturedDraw::MAX_VS_SAMPLERS, vsSamplers);
         Release();
     }
 
@@ -98,6 +104,10 @@ struct ReplayStateBlock
         if (vs) { vs->Release(); vs = nullptr; }
         for (UINT i = 0; i < CapturedDraw::MAX_VS_CBS; i++)
             if (vsCBs[i]) { vsCBs[i]->Release(); vsCBs[i] = nullptr; }
+        for (UINT i = 0; i < CapturedDraw::MAX_VS_SRVS; i++)
+            if (vsSRVs[i]) { vsSRVs[i]->Release(); vsSRVs[i] = nullptr; }
+        for (UINT i = 0; i < CapturedDraw::MAX_VS_SAMPLERS; i++)
+            if (vsSamplers[i]) { vsSamplers[i]->Release(); vsSamplers[i] = nullptr; }
     }
 };
 
@@ -128,7 +138,8 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
             DustShaderCategory cat = ShaderDatabase::GetVertexShaderCategory(draw.vs);
             if (cat != DUST_SHADER_OBJECTS &&
                 cat != DUST_SHADER_DISTANT_TOWN &&
-                cat != DUST_SHADER_TRIPLANAR)
+                cat != DUST_SHADER_TRIPLANAR &&
+                cat != DUST_SHADER_SKIN)
                 continue;
         }
 
@@ -196,6 +207,10 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
             else if (draw.vsCBs[i])
                 ctx->VSSetConstantBuffers(i, 1, &draw.vsCBs[i]);
         }
+        // Rebind VS-stage resources so skin/terrain VS fetches (bone palette,
+        // heightmap, vertex-fetch) don't read unbound SRVs and GPU-fault.
+        ctx->VSSetShaderResources(0, CapturedDraw::MAX_VS_SRVS, draw.vsSRVs);
+        ctx->VSSetSamplers(0, CapturedDraw::MAX_VS_SAMPLERS, draw.vsSamplers);
 
         if (draw.instanceCount > 1)
         {

@@ -78,6 +78,14 @@ static void ReleaseCaptures()
         {
             if (draw.vsCBs[i]) { draw.vsCBs[i]->Release(); draw.vsCBs[i] = nullptr; }
         }
+        for (UINT i = 0; i < CapturedDraw::MAX_VS_SRVS; i++)
+        {
+            if (draw.vsSRVs[i]) { draw.vsSRVs[i]->Release(); draw.vsSRVs[i] = nullptr; }
+        }
+        for (UINT i = 0; i < CapturedDraw::MAX_VS_SAMPLERS; i++)
+        {
+            if (draw.vsSamplers[i]) { draw.vsSamplers[i]->Release(); draw.vsSamplers[i] = nullptr; }
+        }
         if (draw.ps) { draw.ps->Release(); draw.ps = nullptr; }
         for (UINT i = 0; i < CapturedDraw::MAX_PS_CBS; i++)
         {
@@ -224,6 +232,10 @@ static void CaptureDrawState(ID3D11DeviceContext* ctx, CapturedDraw& draw)
     // VS
     ctx->VSGetShader(&draw.vs, nullptr, nullptr);
     ctx->VSGetConstantBuffers(0, CapturedDraw::MAX_VS_CBS, draw.vsCBs);
+    // VS-stage resources (bone palette / heightmap / vertex-fetch) so terrain
+    // and skinned casters can be replayed without GPU-faulting on unbound SRVs.
+    ctx->VSGetShaderResources(0, CapturedDraw::MAX_VS_SRVS, draw.vsSRVs);
+    ctx->VSGetSamplers(0, CapturedDraw::MAX_VS_SAMPLERS, draw.vsSamplers);
 
     // PS pointer (always — cheap, enables shader identification)
     ctx->PSGetShader(&draw.ps, nullptr, nullptr);

@@ -36,6 +36,12 @@ struct CapturedDraw
     ID3D11VertexShader*         vs            = nullptr;
     static const UINT           MAX_VS_CBS    = 4;
     ID3D11Buffer*               vsCBs[MAX_VS_CBS] = {};
+    // VS-stage resources — needed to replay terrain/skin/foliage whose vertex
+    // shaders fetch from SRVs (heightmap, bone palette, vertex-fetch skinning).
+    static const UINT           MAX_VS_SRVS   = 8;
+    ID3D11ShaderResourceView*   vsSRVs[MAX_VS_SRVS] = {};
+    static const UINT           MAX_VS_SAMPLERS = 4;
+    ID3D11SamplerState*         vsSamplers[MAX_VS_SAMPLERS] = {};
 
     // Pixel Shader
     ID3D11PixelShader*          ps            = nullptr;

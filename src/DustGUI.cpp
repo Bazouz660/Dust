@@ -5,6 +5,7 @@
 #include "FilePicker.h"
 #include "D3D11Hook.h"
 #include "GeometryCapture.h"
+#include "PointShadows.h"
 #include "FrameProfiler.h"
 #include "ShaderMetadata.h"
 #include "Survey.h"
@@ -1863,6 +1864,19 @@ static void DrawPerformanceSection()
                      captureCount > 0 ? classified * 100.0f / captureCount : 0.0f);
         ImGui::Text("  Shaders:       %u tracked, %u classified",
                      ShaderMetadata::GetTrackedCount(), ShaderMetadata::GetClassifiedCount());
+    }
+
+    // Custom point-light shadow depth preview (Stage 1 debug). The nearest
+    // point light's depth, rendered from its POV by replaying captured geometry.
+    void* shadowSRV = PointShadows::GetDebugDepthSRV();
+    if (shadowSRV)
+    {
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        ImGui::TextColored(DustHeadingColor(), "Point Shadow Depth (nearest light)");
+        ImGui::Text("  near=black .. far=red. Should show the scene from the lamp.");
+        ImGui::Image((ImTextureID)shadowSRV, ImVec2(256.0f, 256.0f));
     }
 }
 

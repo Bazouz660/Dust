@@ -10,6 +10,7 @@
 #include "DustLog.h"
 #include "D3D11Hook.h"
 #include "SceneAccess.h"
+#include "PointShadows.h"
 #include "DustGUI.h"
 #include "EffectLoader.h"
 #include "PssmDetour.h"
@@ -256,6 +257,9 @@ __declspec(dllexport) void startPlugin()
     // for multi-light shadows. Safe to call before OGRE is loaded.
     SceneAccess::EnsureHooks();
 
+    // Enable geometry capture for the custom point-light shadow renderer.
+    PointShadows::Init();
+
 
 
     // Hook TitleScreen::show — earliest reliable "game is past splash" signal,
@@ -316,6 +320,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
         POMState::Shutdown();
         TerrainTess::Shutdown();
         GeometryReplay::Shutdown();
+        PointShadows::Shutdown();
         GeometryCapture::Shutdown();
         FrameProfiler::Shutdown();
         ShaderDatabase::Shutdown();

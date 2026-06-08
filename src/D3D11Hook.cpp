@@ -10,6 +10,7 @@
 #include "OgreSwapHook.h"
 #include "ShadowProbe.h"
 #include "SceneAccess.h"
+#include "PointShadows.h"
 #include "PssmDetour.h"
 #include "ShaderMetadata.h"
 #include "ShaderDatabase.h"
@@ -1750,6 +1751,10 @@ static void STDMETHODCALLTYPE HookedDraw(
         // One-shot diagnostic dump of the captured scene light set.
         if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
             SceneAccess::DebugDumpOnce();
+
+        // Stage 1: render the nearest point light's depth from its POV.
+        if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING) && gCameraData.valid)
+            PointShadows::RenderFrame(pThis, gDevice, gCameraData.camPosition);
 
         DustFrameContext fctx = {};
         fctx.device = gDevice;
