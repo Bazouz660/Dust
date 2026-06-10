@@ -229,6 +229,14 @@ bool GetCameraWorldPos(float outXYZ[3])
     return true;
 }
 
+bool GetCameraMatrices(float outInverseView[16], float outProj[16])
+{
+    if (!gCameraDataEverValid || !outInverseView || !outProj) return false;
+    memcpy(outInverseView, gCameraData.inverseView, 64);
+    memcpy(outProj, gCameraData.projMatrix, 64);
+    return true;
+}
+
 void SignalGameAlive(const char* via)
 {
     if (!gGameAlive)

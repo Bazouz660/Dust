@@ -7,6 +7,7 @@
 #include "ShaderDatabase.h"
 #include "TerrainTess.h"
 #include "D3D11StateBlock.h"
+#include "D3D11Hook.h"
 
 #include <d3d11.h>
 #include <math.h>
@@ -258,123 +259,93 @@ static void PerspLH(float* m, float fovY, float aspect, float zn, float zf)
 static const float kFaceDir[6][3] = { {1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}, {0,0,1}, {0,0,-1} };
 static const float kFaceUp [6][3] = { {0,1,0}, {0,1,0}, {0,0,-1}, {0,0,1}, {0,1,0}, {0,1,0} };
 
-// One-shot diagnostic: what's captured, and where is it in world space?
-// Category ints: see ShaderDatabase (OBJECTS/TERRAIN/FOLIAGE/SKIN/TRIPLANAR/DISTANT_TOWN/UNKNOWN).
+// Format 16 floats as bit-exact hex words (8 chars each) for offline numpy reconstruction.
+static void HexMat16(char* out, size_t outSize, const float* f)
+{
+    int p = 0;
+    for (int k = 0; k < 16; ++k)
+    {
+        uint32_t bits; memcpy(&bits, &f[k], 4);
+        p += snprintf(out + p, outSize - p, "%s%08x", k ? " " : "", bits);
+    }
+}
+
+// One-shot OFFLINE-GATE dump (step 1 of the cameraVP-oracle plan). Emits, bit-exact:
+//   PTDUMP CAM iv=<16 hex> proj=<16 hex>     — the frame's deferred inverseView + proj
+//   PTDUMP DRAW idx cat vy=<vtx0.y> clip=<16 hex>  — each replayed draw's captured wVP
+// The numpy harness then brute-forces the row/col-major conventions to find the one where
+// cameraVP = inverse(inverseView) x proj makes M = wVP x cameraVP^-1 == I for buildings
+// (vy in the town band) and a clean rigid transform for cliffs (vy out-of-band). If NO
+// convention satisfies that, the GBuffer projection differs from the deferred proj and the
+// whole oracle is impossible — decided here with ZERO behavioral builds.
 static void DumpCapturesOnce(ID3D11DeviceContext* ctx, const float* camPos3)
 {
     static bool done = false;
     if (done) return;
     const auto& caps = GeometryCapture::GetCaptures();
     if (caps.size() < 100) return;   // wait for a representative (loaded) scene
+
+    float iv[16], pj[16];
+    if (!D3D11Hook::GetCameraMatrices(iv, pj)) return;   // need the paired camera matrices
     done = true;
 
-    int hist[8] = {0};
-    for (size_t i = 0; i < caps.size(); ++i)
-    {
-        int ci = (int)ShaderDatabase::GetVertexShaderCategory(caps[i].vs);
-        if (ci < 0 || ci > 7) ci = 7;
-        hist[ci]++;
-    }
-    Log("PointShadows DIAG: cam=(%.0f,%.0f,%.0f)  %u captures  cat[0..6,oth]=%d,%d,%d,%d,%d,%d,%d,%d",
-        camPos3[0], camPos3[1], camPos3[2], (unsigned)caps.size(),
-        hist[0],hist[1],hist[2],hist[3],hist[4],hist[5],hist[6],hist[7]);
+    char hiv[160], hpj[160];
+    HexMat16(hiv, sizeof(hiv), iv);
+    HexMat16(hpj, sizeof(hpj), pj);
+    Log("PTDUMP CAM cam=(%.2f,%.2f,%.2f) iv=%s proj=%s", camPos3[0], camPos3[1], camPos3[2], hiv, hpj);
 
-    int logged = 0;
-    for (size_t i = 0; i < caps.size() && logged < 12; ++i)
+    ID3D11Device* dev = nullptr;
+    ctx->GetDevice(&dev);
+    ID3D11Buffer* stg = nullptr;
+    if (dev)
+    {
+        D3D11_BUFFER_DESC sd = {};
+        sd.ByteWidth = 16; sd.Usage = D3D11_USAGE_STAGING; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        dev->CreateBuffer(&sd, nullptr, &stg);
+    }
+
+    int dumped = 0;
+    for (size_t i = 0; i < caps.size() && dumped < 80; ++i)
     {
         const CapturedDraw& d = caps[i];
         if (!d.vsMetadata || d.vsMetadata->transformType == VSTransformType::UNKNOWN) continue;
+        // Only the categories we actually replay (same filter as GeometryReplay).
         int cat = (int)ShaderDatabase::GetVertexShaderCategory(d.vs);
-        float wx = 0, wy = 0, wz = 0; bool gotW = false;
-        if (d.cbStagingCopy && d.vsMetadata->worldMatrixOffset + 64 <= d.cbStagingSize)
-        {
-            D3D11_MAPPED_SUBRESOURCE m;
-            if (SUCCEEDED(ctx->Map(d.cbStagingCopy, 0, D3D11_MAP_READ, 0, &m)))
-            {
-                const float* w = (const float*)((const char*)m.pData + d.vsMetadata->worldMatrixOffset);
-                wx = w[12]; wy = w[13]; wz = w[14]; gotW = true;
-                ctx->Unmap(d.cbStagingCopy, 0);
-            }
-        }
-        Log("  cap[%u] cat=%d inst=%u world=(%.0f,%.0f,%.0f)%s",
-            (unsigned)i, cat, d.instanceCount, wx, wy, wz, gotW ? "" : " (noCB)");
-        ++logged;
-    }
+        if (cat != (int)DUST_SHADER_OBJECTS && cat != (int)DUST_SHADER_TRIPLANAR &&
+            cat != (int)DUST_SHADER_DISTANT_TOWN) continue;
+        if (!d.cbStagingCopy || d.vsMetadata->clipMatrixOffset + 64 > d.cbStagingSize) continue;
 
-    // [Dust diag] vtx0-of-draw-range readback: cluster captured geometry by raw VB coords.
-    // Hypothesis: the phantom occluders are draws whose VB region is NOT absolute-frame
-    // (pooled/local meshes) — they should cluster in a different Y band than the town (~180).
-    {
-        ID3D11Device* dev = nullptr;
-        ctx->GetDevice(&dev);
-        ID3D11Buffer* stg = nullptr;
-        if (dev)
+        // vtx0 tag (building vs cliff): read the first vertex of the draw range.
+        float vy = 1e30f, vx = 0, vz = 0;
+        if (stg && d.vertexBuffers[0] && d.vbStrides[0] >= 12)
         {
-            D3D11_BUFFER_DESC sd = {};
-            sd.ByteWidth = 16; sd.Usage = D3D11_USAGE_STAGING; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-            dev->CreateBuffer(&sd, nullptr, &stg);
-        }
-        if (stg)
-        {
-            int histY[4] = {0,0,0,0}; // y<100, 100-150, 150-250, >250
-            int lines = 0;
-            for (size_t i = 0; i < caps.size(); ++i)
+            D3D11_BUFFER_DESC vbd; d.vertexBuffers[0]->GetDesc(&vbd);
+            INT base = d.baseVertexLocation; if (base < 0) base = 0;
+            UINT off = d.vbOffsets[0] + (UINT)base * d.vbStrides[0];
+            if (off + 12 <= vbd.ByteWidth)
             {
-                const CapturedDraw& d = caps[i];
-                if (!d.vsMetadata || d.vsMetadata->transformType == VSTransformType::UNKNOWN) continue;
-                if (!d.vertexBuffers[0] || d.vbStrides[0] < 12) continue;
-                D3D11_BUFFER_DESC vbd; d.vertexBuffers[0]->GetDesc(&vbd);
-                INT base = d.baseVertexLocation; if (base < 0) base = 0;
-                UINT off = d.vbOffsets[0] + (UINT)base * d.vbStrides[0];
-                if (off + 12 > vbd.ByteWidth) continue;
                 D3D11_BOX box = { off, 0, 0, off + 12, 1, 1 };
                 ctx->CopySubresourceRegion(stg, 0, 0, 0, 0, d.vertexBuffers[0], 0, &box);
                 D3D11_MAPPED_SUBRESOURCE m;
-                if (FAILED(ctx->Map(stg, 0, D3D11_MAP_READ, 0, &m))) continue;
-                float v[3]; memcpy(v, m.pData, 12);
-                ctx->Unmap(stg, 0);
-                int b = v[1] < 100.f ? 0 : v[1] < 150.f ? 1 : v[1] < 250.f ? 2 : 3;
-                histY[b]++;
-                // Log the first few of everything + every out-of-town-band draw.
-                if (lines < 15 || (b != 2 && lines < 40))
-                {
-                    int cat = (int)ShaderDatabase::GetVertexShaderCategory(d.vs);
-                    Log("  vtx0[%u] cat=%d idx=%u inst=%u base=%d v=(%.0f,%.0f,%.0f)",
-                        (unsigned)i, cat, d.indexCount, d.instanceCount, d.baseVertexLocation,
-                        v[0], v[1], v[2]);
-                    // Raw CB dump for the first dozen — find where the REAL matrices live
-                    // (the reflected worldMatrix offset previously read as zero, which can't
-                    // be true for a visible draw whose depth = length(world*pos - cameraPos)).
-                    if (lines < 12 && d.cbStagingCopy)
-                    {
-                        const VSConstantBufferInfo& mi = *d.vsMetadata;
-                        Log("    meta slot=%u clipOff=%u worldOff=%u(%uB) cbTotal=%u type=%d",
-                            mi.cbSlot, mi.clipMatrixOffset, mi.worldMatrixOffset,
-                            mi.worldMatrixSize, mi.cbTotalSize, (int)mi.transformType);
-                        D3D11_MAPPED_SUBRESOURCE mm;
-                        if (SUCCEEDED(ctx->Map(d.cbStagingCopy, 0, D3D11_MAP_READ, 0, &mm)))
-                        {
-                            const float* f = (const float*)mm.pData;
-                            uint32_t nf = d.cbStagingSize / 4; if (nf > 40) nf = 40;
-                            for (uint32_t r = 0; r < nf; r += 8)
-                            {
-                                char buf[256]; int p = 0;
-                                for (uint32_t k = r; k < r + 8 && k < nf; ++k)
-                                    p += snprintf(buf + p, sizeof(buf) - p, " %.3g", f[k]);
-                                Log("    cb[%2u..]%s", r, buf);
-                            }
-                            ctx->Unmap(d.cbStagingCopy, 0);
-                        }
-                    }
-                    ++lines;
-                }
+                if (SUCCEEDED(ctx->Map(stg, 0, D3D11_MAP_READ, 0, &m)))
+                { float v[3]; memcpy(v, m.pData, 12); vx=v[0]; vy=v[1]; vz=v[2]; ctx->Unmap(stg, 0); }
             }
-            Log("PointShadows DIAG vtx0 Y-hist: <100:%d 100-150:%d 150-250:%d >250:%d",
-                histY[0], histY[1], histY[2], histY[3]);
-            stg->Release();
         }
-        if (dev) dev->Release();
+
+        D3D11_MAPPED_SUBRESOURCE mm;
+        if (FAILED(ctx->Map(d.cbStagingCopy, 0, D3D11_MAP_READ, 0, &mm))) continue;
+        const float* clip = (const float*)((const char*)mm.pData + d.vsMetadata->clipMatrixOffset);
+        char hclip[160]; HexMat16(hclip, sizeof(hclip), clip);
+        ctx->Unmap(d.cbStagingCopy, 0);
+
+        Log("PTDUMP DRAW idx=%u cat=%d vtx0=(%.1f,%.1f,%.1f) clip=%s",
+            (unsigned)i, cat, vx, vy, vz, hclip);
+        ++dumped;
     }
+    Log("PTDUMP END dumped=%d", dumped);
+
+    if (stg) stg->Release();
+    if (dev) dev->Release();
 }
 
 void RenderFrame(ID3D11DeviceContext* ctx, ID3D11Device* device, const float* camPos3)
