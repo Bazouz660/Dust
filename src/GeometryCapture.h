@@ -61,6 +61,17 @@ struct CapturedDraw
     // Null for unclassified draws (UNKNOWN transform type).
     ID3D11Buffer* cbStagingCopy = nullptr;
     uint32_t      cbStagingSize = 0;
+
+    // Bindable per-slot snapshots of the OTHER VS CBs, populated only for SKINNED draws.
+    // The bone-palette CB is Map_WRITE_DISCARDed by OGRE every skinned draw, so its live
+    // pointer holds the LAST draw's pose by replay time; the replay rebinds these copies.
+    ID3D11Buffer* cbCopies[MAX_VS_CBS] = {};
+
+    // Bindable snapshot of the per-instance transform vertex buffer (slot 1), populated only
+    // for instanced draws. OGRE recycles the HW-instance buffer per batch, so the live pointer
+    // holds the LAST batch's transforms by replay time -> instanced geometry collapses. The
+    // replay rebinds this copy at slot 1.
+    ID3D11Buffer* instVBCopy = nullptr;
 };
 
 namespace GeometryCapture
@@ -119,6 +130,15 @@ namespace GeometryCapture
 
     // Cache the device pointer (called once from TryCaptureDevice)
     void SetDevice(ID3D11Device* device);
+
+    // Reflect a created PS for a `cameraPos` cbuffer uniform (the GBuffer shaders —
+    // objects/terrain/skin — declare one; it holds the GBuffer-frame camera used in
+    // depth = length(worldPos - cameraPos)). Called from HookedCreatePixelShader.
+    void OnPixelShaderCreated(const void* bytecode, size_t size, ID3D11PixelShader* ps);
+
+    // GBuffer-frame camera position, staging-copied from the first captured draw whose
+    // PS declares cameraPos. Valid from end of GBuffer pass until ResetFrame.
+    bool GetGBufferCamPos(ID3D11DeviceContext* ctx, float outXYZ[3]);
 
     // Capture flags — controls what per-draw state is captured.
     // Default 0 = lean (IA + VS + PS pointer). DUST_CAPTURE_PS_RESOURCES = full PS state.

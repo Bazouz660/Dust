@@ -28,6 +28,7 @@ static DustShaderCategory ClassifySourceName(const char* name)
     if (strstr(name, "distant_town"))  return DUST_SHADER_DISTANT_TOWN;
     if (strstr(name, "objects"))       return DUST_SHADER_OBJECTS;
     if (strstr(name, "object"))        return DUST_SHADER_OBJECTS;
+    if (strstr(name, "mapfeature"))    return DUST_SHADER_OBJECTS;   // buildings/cliff features: plain WVP, same as objects
 
     return DUST_SHADER_UNKNOWN;
 }

@@ -66,6 +66,7 @@ static bool  gRenderCamPosValid = false;
 // (from light_fs CB position[12..14]). The ground-truth light positions for the cubes:
 // no R, no SceneAccess, no frame conversion. Reset each frame in ProbeLightCB.
 static float gDrawnLights[256][3] = {};
+static float gDrawnRadius[256] = {};   // per-light falloff radius (light_fs CB float 11) for the cull
 static int   gDrawnCount = 0;
 
 // OGRE->shader-space translation for point-light matching (set by ProbeLightCB,
@@ -1552,6 +1553,7 @@ static HRESULT STDMETHODCALLTYPE HookedCreatePixelShader(
         SurveyRecorder::OnPixelShaderCreated(pShaderBytecode, BytecodeLength, *ppPixelShader);
         ShaderDatabase::OnPixelShaderCreated(*ppPixelShader);
         TerrainTess::OnPixelShaderCreated(pShaderBytecode, BytecodeLength, *ppPixelShader);
+        GeometryCapture::OnPixelShaderCreated(pShaderBytecode, BytecodeLength, *ppPixelShader);
 
         // Detect the patched deferred main_fs by the b7 cbuffer name our
         // shader patch injects. DXBC stores cbuffer names in the RDEF chunk
@@ -1773,7 +1775,7 @@ static void STDMETHODCALLTYPE HookedDraw(
         if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING) && gCameraData.valid)
         {
             PointShadows::SetLightSpaceR(gLightSpaceR, gLightSpaceRValid);
-            PointShadows::SetDrawnLights(gDrawnLights, gDrawnCount, gRenderCamPos);
+            PointShadows::SetDrawnLights(gDrawnLights, gDrawnRadius, gDrawnCount, gRenderCamPos);
             PointShadows::RenderFrame(pThis, gDevice, gCameraData.camPosition);
         }
 
@@ -1921,6 +1923,20 @@ static void ProbeLightCB(ID3D11DeviceContext* ctx)
                                 static int tlog = 0;
                                 if ((tlog++ % 60) == 0) Log("RenderCamPos=(%.1f,%.1f,%.1f)", bx,by,bz);
                             }
+                            // Effective translation of the reconstruction: light_fs does
+                            // worldPos = mul(viewPos, viewMatrix) with column-major-stored
+                            // matrices, so the translation the GPU adds is V[3],V[7],V[11]
+                            // (= the camera position in the light_fs output frame).
+                            {
+                                float tl[3] = { V[3], V[7], V[11] };
+                                if (isfinite(tl[0]) && isfinite(tl[1]) && isfinite(tl[2]) &&
+                                    fabsf(tl[0]) < 1e6f && fabsf(tl[1]) < 1e6f && fabsf(tl[2]) < 1e6f)
+                                {
+                                    PointShadows::SetLightFsT(tl, true);
+                                    static int tlog2 = 0;
+                                    if ((tlog2++ % 60) == 0) Log("LightFsT=(%.1f,%.1f,%.1f)", tl[0],tl[1],tl[2]);
+                                }
+                            }
                             // Collect this light's render-world position (position[12..14]) —
                             // the ground-truth cube light position. No R, no SceneAccess.
                             if (gDrawnCount < 256)
@@ -1928,6 +1944,7 @@ static void ProbeLightCB(ID3D11DeviceContext* ctx)
                                 gDrawnLights[gDrawnCount][0] = f[12];
                                 gDrawnLights[gDrawnCount][1] = f[13];
                                 gDrawnLights[gDrawnCount][2] = f[14];
+                                gDrawnRadius[gDrawnCount]    = f[11];   // falloff.w = light radius
                                 gDrawnCount++;
                             }
                         }

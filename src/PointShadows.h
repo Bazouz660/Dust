@@ -26,10 +26,16 @@ namespace PointShadows
     // reconcile the OGRE frame with Kenshi's render-world for selection + cube placement.
     void SetRenderCamPos(const float* p3, bool valid);
 
+    // Effective translation of the light_fs reconstruction matrix (viewMatrix uniform,
+    // column-major stored: floats 39/43/47 of the light_fs CB) — the camera position in
+    // the light_fs output frame. With the GBuffer PS cameraPos (cG) this reprojects the
+    // light into the geometry frame: lp = lightPos - tL + cG.
+    void SetLightFsT(const float* t3, bool valid);
+
     // The point lights the deferred pass actually drew this frame, in RENDER-WORLD space
     // (light_fs position[12..14]). These are the ground-truth cube light positions — used
     // directly for cube center + replay POV + the light_fs match, with no R conversion.
-    void SetDrawnLights(const float (*positions)[3], int count, const float* renderCamPos);
+    void SetDrawnLights(const float (*positions)[3], const float* radii, int count, const float* renderCamPos);
 
     // Rebuild the b8 light-table CB from the current active lights + R. Called mid
     // light-volume pass (from the probe) with the current frame's R to remove lag.

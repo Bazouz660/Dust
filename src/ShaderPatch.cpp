@@ -698,7 +698,10 @@ static std::string PatchDeferredShader(const std::string& src)
             "\t\t\t// linear view-axis distance. zn=dustPtMeta.x, zf=dustPtMeta.y.\n"
             "\t\t\tfloat _zn = dustPtMeta.x; float _zf = dustPtMeta.y;\n"
             "\t\t\tfloat _casterZ = (_stored >= 0.999999) ? 1e30 : (_zn*_zf) / (_zf - _stored*(_zf - _zn));\n"
-            "\t\t\tfloat _bias = max(_surfZ * 0.02, 1.0);\n"
+            "\t\t\t// The light's own fixture is excluded geometrically by the cube near plane\n"
+            "\t\t\t// (kFaceNear=3u), NOT by nulling near casters here — that also erased valid\n"
+            "\t\t\t// shadows that overlapped the fixture's direction. Bias handles residual acne.\n"
+            "\t\t\tfloat _bias = max(_surfZ * 0.03, 2.0);\n"
             "\t\t\tbool _shadowed = (_surfZ - _bias) > _casterZ;\n"
             // matched: light pos within 5 world units of a bound cube center.
             "\t\t\tbool _matched = (_bd < 100.0);\n"

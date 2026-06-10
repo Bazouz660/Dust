@@ -3,7 +3,10 @@
 #include "DustAPI.h"
 #include "DustLog.h"
 #include <tracy/Tracy.hpp>
+#include <d3dcompiler.h>
 #include <vector>
+#include <unordered_map>
+#include <mutex>
 
 namespace GeometryCapture
 {
@@ -63,6 +66,147 @@ static ID3D11Buffer* AcquireStagingBuffer(ID3D11Device* device, uint32_t require
     return sStagingPool[sStagingPoolUsed++].buffer;
 }
 
+// Bindable (DEFAULT + CONSTANT_BUFFER) snapshot pool — for CBs that must be RE-BOUND at replay
+// (the skinned bone palette). Unlike the staging pool above, these can be set on the VS stage.
+static std::vector<StagingEntry> sCBCopyPool;
+static uint32_t sCBCopyPoolUsed = 0;
+
+static ID3D11Buffer* AcquireCBCopy(ID3D11Device* device, uint32_t requiredSize)
+{
+    for (uint32_t i = sCBCopyPoolUsed; i < (uint32_t)sCBCopyPool.size(); i++)
+    {
+        if (sCBCopyPool[i].size == requiredSize)
+        {
+            if (i != sCBCopyPoolUsed) std::swap(sCBCopyPool[i], sCBCopyPool[sCBCopyPoolUsed]);
+            return sCBCopyPool[sCBCopyPoolUsed++].buffer;
+        }
+    }
+    D3D11_BUFFER_DESC desc = {};
+    desc.ByteWidth = requiredSize;
+    desc.Usage     = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    ID3D11Buffer* buf = nullptr;
+    if (FAILED(device->CreateBuffer(&desc, nullptr, &buf)) || !buf)
+        return nullptr;
+    sCBCopyPool.push_back({ buf, requiredSize });
+    if (sCBCopyPool.size() - 1 != sCBCopyPoolUsed)
+        std::swap(sCBCopyPool.back(), sCBCopyPool[sCBCopyPoolUsed]);
+    return sCBCopyPool[sCBCopyPoolUsed++].buffer;
+}
+
+// Bindable (DEFAULT + VERTEX_BUFFER) snapshot pool — for the per-instance transform VB, which
+// OGRE recycles per HW-instance batch so the live pointer is stale by replay time.
+static std::vector<StagingEntry> sVBCopyPool;
+static uint32_t sVBCopyPoolUsed = 0;
+
+static ID3D11Buffer* AcquireVBCopy(ID3D11Device* device, uint32_t requiredSize)
+{
+    for (uint32_t i = sVBCopyPoolUsed; i < (uint32_t)sVBCopyPool.size(); i++)
+    {
+        if (sVBCopyPool[i].size == requiredSize)
+        {
+            if (i != sVBCopyPoolUsed) std::swap(sVBCopyPool[i], sVBCopyPool[sVBCopyPoolUsed]);
+            return sVBCopyPool[sVBCopyPoolUsed++].buffer;
+        }
+    }
+    D3D11_BUFFER_DESC desc = {};
+    desc.ByteWidth = requiredSize;
+    desc.Usage     = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    ID3D11Buffer* buf = nullptr;
+    if (FAILED(device->CreateBuffer(&desc, nullptr, &buf)) || !buf)
+        return nullptr;
+    sVBCopyPool.push_back({ buf, requiredSize });
+    if (sVBCopyPool.size() - 1 != sVBCopyPoolUsed)
+        std::swap(sVBCopyPool.back(), sVBCopyPool[sVBCopyPoolUsed]);
+    return sVBCopyPool[sVBCopyPoolUsed++].buffer;
+}
+
+// ---- GBuffer-frame camera (PS `cameraPos` uniform) ----------------------------------
+// The GBuffer shaders write depth = length(worldPos - cameraPos): that `cameraPos` IS the
+// camera of the frame the captured geometry lives in. We reflect every created PS once and
+// remember where the uniform sits; at capture time the first matching draw's PS CB is
+// staging-copied (the live CB is Map_WRITE_DISCARDed between passes, so the pointer's
+// content is stale by POST_LIGHTING — same reason as the VS clip-matrix copy above).
+struct PsCamPosInfo { uint32_t slot; uint32_t offset; };
+static std::unordered_map<ID3D11PixelShader*, PsCamPosInfo> sPsCamPos;
+static std::mutex sPsCamPosMutex;
+static ID3D11Buffer* sGCamStaging = nullptr;   // pool-owned; reset with the staging pool
+static uint32_t      sGCamOffset  = 0;
+
+void OnPixelShaderCreated(const void* bytecode, size_t size, ID3D11PixelShader* ps)
+{
+    if (!bytecode || !size || !ps) return;
+    ID3D11ShaderReflection* refl = nullptr;
+    if (FAILED(D3DReflect(bytecode, size, IID_ID3D11ShaderReflection, (void**)&refl)) || !refl)
+        return;
+    D3D11_SHADER_DESC sd = {};
+    refl->GetDesc(&sd);
+    for (UINT i = 0; i < sd.ConstantBuffers; i++)
+    {
+        ID3D11ShaderReflectionConstantBuffer* cb = refl->GetConstantBufferByIndex(i);
+        D3D11_SHADER_BUFFER_DESC bd = {};
+        if (FAILED(cb->GetDesc(&bd))) continue;
+        for (UINT v = 0; v < bd.Variables; v++)
+        {
+            D3D11_SHADER_VARIABLE_DESC vd = {};
+            cb->GetVariableByIndex(v)->GetDesc(&vd);
+            if (!vd.Name || strcmp(vd.Name, "cameraPos") != 0 || !(vd.uFlags & D3D_SVF_USED))
+                continue;
+            // Find the cbuffer's bind slot
+            D3D11_SHADER_INPUT_BIND_DESC ibd = {};
+            if (SUCCEEDED(refl->GetResourceBindingDescByName(bd.Name, &ibd)) &&
+                ibd.Type == D3D_SIT_CBUFFER)
+            {
+                std::lock_guard<std::mutex> lock(sPsCamPosMutex);
+                sPsCamPos[ps] = { ibd.BindPoint, vd.StartOffset };
+            }
+            break;
+        }
+    }
+    refl->Release();
+}
+
+// One snapshot per frame, taken at the first captured draw whose PS has cameraPos.
+static void TrySnapshotGBufferCamPos(ID3D11DeviceContext* ctx, ID3D11PixelShader* ps)
+{
+    if (sGCamStaging || !ps || !sCachedDevice) return;
+    PsCamPosInfo info;
+    {
+        std::lock_guard<std::mutex> lock(sPsCamPosMutex);
+        auto it = sPsCamPos.find(ps);
+        if (it == sPsCamPos.end()) return;
+        info = it->second;
+    }
+    ID3D11Buffer* cb = nullptr;
+    ctx->PSGetConstantBuffers(info.slot, 1, &cb);
+    if (!cb) return;
+    D3D11_BUFFER_DESC bd = {};
+    cb->GetDesc(&bd);
+    if (info.offset + 12 <= bd.ByteWidth)
+    {
+        ID3D11Buffer* staging = AcquireStagingBuffer(sCachedDevice, bd.ByteWidth);
+        if (staging)
+        {
+            ctx->CopyResource(staging, cb);
+            sGCamStaging = staging;
+            sGCamOffset  = info.offset;
+        }
+    }
+    cb->Release();
+}
+
+bool GetGBufferCamPos(ID3D11DeviceContext* ctx, float outXYZ[3])
+{
+    if (!sGCamStaging) return false;
+    D3D11_MAPPED_SUBRESOURCE mr = {};
+    if (FAILED(ctx->Map(sGCamStaging, 0, D3D11_MAP_READ, 0, &mr)))
+        return false;
+    memcpy(outXYZ, (const uint8_t*)mr.pData + sGCamOffset, 12);
+    ctx->Unmap(sGCamStaging, 0);
+    return true;
+}
+
 static void ReleaseCaptures()
 {
     for (auto& draw : sCaptures)
@@ -100,9 +244,14 @@ static void ReleaseCaptures()
             if (draw.psSamplers[i]) { draw.psSamplers[i]->Release(); draw.psSamplers[i] = nullptr; }
         }
         draw.cbStagingCopy = nullptr;
+        for (UINT i = 0; i < CapturedDraw::MAX_VS_CBS; i++) draw.cbCopies[i] = nullptr; // pool-owned
+        draw.instVBCopy = nullptr; // pool-owned
     }
     sCaptures.clear();
     sStagingPoolUsed = 0;
+    sCBCopyPoolUsed  = 0;
+    sVBCopyPoolUsed  = 0;
+    sGCamStaging     = nullptr; // pool-owned, invalidated with the staging pool
 }
 
 // Multi-entry classification cache. Caching ONLY the GBuffer config (one
@@ -240,6 +389,9 @@ static void CaptureDrawState(ID3D11DeviceContext* ctx, CapturedDraw& draw)
     // PS pointer (always — cheap, enables shader identification)
     ctx->PSGetShader(&draw.ps, nullptr, nullptr);
 
+    // Once per frame: snapshot the GBuffer-frame camera from this draw's PS CB.
+    TrySnapshotGBufferCamPos(ctx, draw.ps);
+
     // PS resources (opt-in — adds ~0.4ms/frame for 200 draws)
     if (sCaptureFlags & DUST_CAPTURE_PS_RESOURCES)
     {
@@ -268,6 +420,45 @@ static void CaptureDrawState(ID3D11DeviceContext* ctx, CapturedDraw& draw)
                 draw.cbStagingSize = cbSize;
             }
         }
+
+        // SKINNED draws: snapshot the OTHER bound VS CBs (the bone palette) to bindable copies,
+        // because OGRE Map_WRITE_DISCARDs the palette every skinned draw -> the live pointer is
+        // stale (last draw's pose) by replay time. The replay rebinds these per-draw copies.
+        if (draw.vsMetadata->transformType == VSTransformType::SKINNED)
+        {
+            static int sklog = 0;
+            if (sklog < 3)
+            {
+                sklog++;
+                D3D11_BUFFER_DESC bd[4] = {};
+                for (int s = 0; s < 4; s++) if (draw.vsCBs[s]) draw.vsCBs[s]->GetDesc(&bd[s]);
+                Log("SKIN draw: cbSlot=%u clipOff=%u cbTotal=%u instCount=%u | cbSizes[%u,%u,%u,%u]",
+                    draw.vsMetadata->cbSlot, draw.vsMetadata->clipMatrixOffset, draw.vsMetadata->cbTotalSize,
+                    draw.instanceCount, bd[0].ByteWidth, bd[1].ByteWidth, bd[2].ByteWidth, bd[3].ByteWidth);
+            }
+            uint32_t clipSlot = draw.vsMetadata->cbSlot;
+            for (uint32_t i = 0; i < CapturedDraw::MAX_VS_CBS; i++)
+            {
+                if (i == clipSlot || !draw.vsCBs[i]) continue;
+                D3D11_BUFFER_DESC bd; draw.vsCBs[i]->GetDesc(&bd);
+                ID3D11Buffer* copy = AcquireCBCopy(sCachedDevice, bd.ByteWidth);
+                if (copy)
+                {
+                    ctx->CopyResource(copy, draw.vsCBs[i]);
+                    draw.cbCopies[i] = copy;
+                }
+            }
+        }
+    }
+
+    // Instanced draws: snapshot the per-instance transform VB (slot 1) to a bindable copy,
+    // because OGRE recycles the HW-instance buffer per batch -> the live pointer holds the last
+    // batch's transforms by replay time. The replay rebinds this copy at slot 1.
+    if (draw.instanceCount > 1 && draw.vertexBuffers[1] && sCachedDevice)
+    {
+        D3D11_BUFFER_DESC bd; draw.vertexBuffers[1]->GetDesc(&bd);
+        ID3D11Buffer* copy = AcquireVBCopy(sCachedDevice, bd.ByteWidth);
+        if (copy) { ctx->CopyResource(copy, draw.vertexBuffers[1]); draw.instVBCopy = copy; }
     }
 }
 
@@ -388,6 +579,14 @@ void Shutdown()
         if (entry.buffer) entry.buffer->Release();
     sStagingPool.clear();
     sStagingPoolUsed = 0;
+    for (auto& entry : sCBCopyPool)
+        if (entry.buffer) entry.buffer->Release();
+    sCBCopyPool.clear();
+    sCBCopyPoolUsed = 0;
+    for (auto& entry : sVBCopyPool)
+        if (entry.buffer) entry.buffer->Release();
+    sVBCopyPool.clear();
+    sVBCopyPoolUsed = 0;
 }
 
 } // namespace GeometryCapture

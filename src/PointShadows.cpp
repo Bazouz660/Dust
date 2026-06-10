@@ -5,6 +5,7 @@
 #include "GeometryReplay.h"
 #include "GeometryCapture.h"
 #include "ShaderDatabase.h"
+#include "TerrainTess.h"
 #include "D3D11StateBlock.h"
 
 #include <d3d11.h>
@@ -20,7 +21,12 @@ namespace PointShadows
 static const UINT  kSize      = 512;
 static const int   kNumLights = 16;      // N nearest point lights to shadow each frame
 static const int   kDbgFace   = 3;       // -Y (down): the face that usually sees ground/buildings
-static const float kFaceNear  = 1.0f;    // must match the PerspLH below + the light_fs reconstruct
+// Near plane doubles as the light's own-fixture exclusion: geometry within kFaceNear of the
+// light (the lamp/torch mesh hugging the flame) is clipped out of the cube, so the cube records
+// the NEXT occluder (a wall) instead. This lets a wall's shadow survive behind the fixture —
+// the old shader-side "null the ray if caster<3u" suppressed the fixture but also erased any
+// valid shadow that overlapped the fixture's direction. Must match PerspLH + the light_fs reconstruct.
+static const float kFaceNear  = 3.0f;
 static const float kFaceFar   = 8000.0f;
 static const float kCullRadius = 100000.0f; // per-light occluder cull radius (BRUTE FORCE: off)
 
@@ -40,7 +46,7 @@ static bool sFailed = false;
 
 // Debug: tint point-light-lit pixels (green=lit, red=shadowed, blue=no matching
 // cube) so we can see whether the in-shader light->cube match works in-scene.
-static bool  sDebugViz    = false;   // green/red/yellow/blue debug tint (off: real hard shadows via color*=0)
+static bool  sDebugViz    = true;    // TEMP: verify lp=sActivePos removes wedge artifacts
 
 // Active light snapshot — filled by RenderFrame, consumed when building the CB.
 static int   sActiveCount = 0;
@@ -76,12 +82,24 @@ void SetRenderCamPos(const float* p3, bool valid)
     sRenderCamPosValid = valid;
 }
 
+// Camera position in the light_fs OUTPUT frame (the matrix translation actually added by
+// mul(viewPos, viewMatrix)). With the GBuffer PS cameraPos cG: lp = light - tL + cG.
+static float sLightFsT[3]   = {0,0,0};
+static bool  sLightFsTValid = false;
+
+void SetLightFsT(const float* t3, bool valid)
+{
+    if (t3) { sLightFsT[0]=t3[0]; sLightFsT[1]=t3[1]; sLightFsT[2]=t3[2]; }
+    sLightFsTValid = valid;
+}
+
 static float sDrawnLights[256][3] = {};
+static float sDrawnRadius[256] = {};
 static int   sDrawnCount = 0;
 static float sDrawnCamPos[3] = {0,0,0};
 static bool  sDrawnCamPosValid = false;
 
-void SetDrawnLights(const float (*positions)[3], int count, const float* renderCamPos)
+void SetDrawnLights(const float (*positions)[3], const float* radii, int count, const float* renderCamPos)
 {
     if (count > 256) count = 256;
     if (count < 0)   count = 0;
@@ -90,6 +108,7 @@ void SetDrawnLights(const float (*positions)[3], int count, const float* renderC
         sDrawnLights[i][0] = positions[i][0];
         sDrawnLights[i][1] = positions[i][1];
         sDrawnLights[i][2] = positions[i][2];
+        sDrawnRadius[i]    = radii ? radii[i] : 0.0f;
     }
     sDrawnCount = count;
     if (renderCamPos)
@@ -281,12 +300,98 @@ static void DumpCapturesOnce(ID3D11DeviceContext* ctx, const float* camPos3)
             (unsigned)i, cat, d.instanceCount, wx, wy, wz, gotW ? "" : " (noCB)");
         ++logged;
     }
+
+    // [Dust diag] vtx0-of-draw-range readback: cluster captured geometry by raw VB coords.
+    // Hypothesis: the phantom occluders are draws whose VB region is NOT absolute-frame
+    // (pooled/local meshes) — they should cluster in a different Y band than the town (~180).
+    {
+        ID3D11Device* dev = nullptr;
+        ctx->GetDevice(&dev);
+        ID3D11Buffer* stg = nullptr;
+        if (dev)
+        {
+            D3D11_BUFFER_DESC sd = {};
+            sd.ByteWidth = 16; sd.Usage = D3D11_USAGE_STAGING; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            dev->CreateBuffer(&sd, nullptr, &stg);
+        }
+        if (stg)
+        {
+            int histY[4] = {0,0,0,0}; // y<100, 100-150, 150-250, >250
+            int lines = 0;
+            for (size_t i = 0; i < caps.size(); ++i)
+            {
+                const CapturedDraw& d = caps[i];
+                if (!d.vsMetadata || d.vsMetadata->transformType == VSTransformType::UNKNOWN) continue;
+                if (!d.vertexBuffers[0] || d.vbStrides[0] < 12) continue;
+                D3D11_BUFFER_DESC vbd; d.vertexBuffers[0]->GetDesc(&vbd);
+                INT base = d.baseVertexLocation; if (base < 0) base = 0;
+                UINT off = d.vbOffsets[0] + (UINT)base * d.vbStrides[0];
+                if (off + 12 > vbd.ByteWidth) continue;
+                D3D11_BOX box = { off, 0, 0, off + 12, 1, 1 };
+                ctx->CopySubresourceRegion(stg, 0, 0, 0, 0, d.vertexBuffers[0], 0, &box);
+                D3D11_MAPPED_SUBRESOURCE m;
+                if (FAILED(ctx->Map(stg, 0, D3D11_MAP_READ, 0, &m))) continue;
+                float v[3]; memcpy(v, m.pData, 12);
+                ctx->Unmap(stg, 0);
+                int b = v[1] < 100.f ? 0 : v[1] < 150.f ? 1 : v[1] < 250.f ? 2 : 3;
+                histY[b]++;
+                // Log the first few of everything + every out-of-town-band draw.
+                if (lines < 15 || (b != 2 && lines < 40))
+                {
+                    int cat = (int)ShaderDatabase::GetVertexShaderCategory(d.vs);
+                    Log("  vtx0[%u] cat=%d idx=%u inst=%u base=%d v=(%.0f,%.0f,%.0f)",
+                        (unsigned)i, cat, d.indexCount, d.instanceCount, d.baseVertexLocation,
+                        v[0], v[1], v[2]);
+                    // Raw CB dump for the first dozen — find where the REAL matrices live
+                    // (the reflected worldMatrix offset previously read as zero, which can't
+                    // be true for a visible draw whose depth = length(world*pos - cameraPos)).
+                    if (lines < 12 && d.cbStagingCopy)
+                    {
+                        const VSConstantBufferInfo& mi = *d.vsMetadata;
+                        Log("    meta slot=%u clipOff=%u worldOff=%u(%uB) cbTotal=%u type=%d",
+                            mi.cbSlot, mi.clipMatrixOffset, mi.worldMatrixOffset,
+                            mi.worldMatrixSize, mi.cbTotalSize, (int)mi.transformType);
+                        D3D11_MAPPED_SUBRESOURCE mm;
+                        if (SUCCEEDED(ctx->Map(d.cbStagingCopy, 0, D3D11_MAP_READ, 0, &mm)))
+                        {
+                            const float* f = (const float*)mm.pData;
+                            uint32_t nf = d.cbStagingSize / 4; if (nf > 40) nf = 40;
+                            for (uint32_t r = 0; r < nf; r += 8)
+                            {
+                                char buf[256]; int p = 0;
+                                for (uint32_t k = r; k < r + 8 && k < nf; ++k)
+                                    p += snprintf(buf + p, sizeof(buf) - p, " %.3g", f[k]);
+                                Log("    cb[%2u..]%s", r, buf);
+                            }
+                            ctx->Unmap(d.cbStagingCopy, 0);
+                        }
+                    }
+                    ++lines;
+                }
+            }
+            Log("PointShadows DIAG vtx0 Y-hist: <100:%d 100-150:%d 150-250:%d >250:%d",
+                histY[0], histY[1], histY[2], histY[3]);
+            stg->Release();
+        }
+        if (dev) dev->Release();
+    }
 }
 
 void RenderFrame(ID3D11DeviceContext* ctx, ID3D11Device* device, const float* camPos3)
 {
     if (!ctx || !device || !camPos3) return;
     if (!EnsureResources(device)) return;
+
+    // No captures (GBuffer pass empty/not yet seen at this firing): keep last frame's
+    // cubes and table. Proceeding would CLEAR every cube DSV with nothing to replay,
+    // blanking all point shadows for the frame (observed: "replayed 0" sessions).
+    if (GeometryCapture::GetCaptureCount() == 0)
+    {
+        static int sEmptyLog = 0;
+        if ((sEmptyLog++ % 300) == 0)
+            Log("PointShadows: no captures at POST_LIGHTING (firing skipped, count=%d)", sEmptyLog);
+        return;
+    }
 
     DumpCapturesOnce(ctx, camPos3);
 
@@ -314,6 +419,7 @@ void RenderFrame(ID3D11DeviceContext* ctx, ID3D11Device* device, const float* ca
         sActivePos[a][0] = sDrawnLights[cand[a].i][0];
         sActivePos[a][1] = sDrawnLights[cand[a].i][1];
         sActivePos[a][2] = sDrawnLights[cand[a].i][2];
+        sActiveRadius[a] = sDrawnRadius[cand[a].i];
     }
     sActiveCount = sel;
     if (sel <= 0) return;
@@ -322,13 +428,14 @@ void RenderFrame(ID3D11DeviceContext* ctx, ID3D11Device* device, const float* ca
     sLightSpaceR[0] = sLightSpaceR[1] = sLightSpaceR[2] = 0.0f;
     sLightSpaceRValid = false;
 
-    // The replayed GBuffer geometry is in OGRE-ABSOLUTE frame (objects.hlsl: oPosition =
-    // worldViewProjMatrix * position, world matrix absolute), while the deferred light_fs
-    // (sActivePos = light position[12..14]) is REBASED (render-world). They differ by a constant
-    // worldOffset = (absolute) - (rebased), which OGRE camera-relative rendering makes equal to
-    // the render-world camera position (confirmed: the SceneAccess-vs-deferred vote == RenderCamPos).
-    // So lp_absolute = sActivePos + cameraPos, while the match center stays rebased (sActivePos).
-    // Use the stable view-matrix camera position (sDrawnCamPos), not the noisy vote.
+    // FRAME MODEL (measured 2026-06-09, all from CB/vertex dumps):
+    //   GBuffer:  depth = length(P_geo - cG)        cG = PS cameraPos uniform
+    //   light_fs: worldPos = tL + R*(dir*dist)      tL = viewMatrix translation == (0,0,0)
+    // => light_fs is a camera-at-origin frame and the cube POV is lp = sActivePos + camera.
+    // The camera MUST come from the same pass that consumes the cubes (sDrawnCamPos, probed
+    // from the light_fs CB): the GBuffer-pass snapshot (GetGBufferCamPos) reads a value one
+    // camera-delta behind while the camera moves -> lagging shadows (user-visible). Do not
+    // swap this source again.
     float worldOffset[3] = { sDrawnCamPos[0], sDrawnCamPos[1], sDrawnCamPos[2] };
 
     // Render each light's 6 cube faces by replaying the captured GBuffer draws from the
@@ -338,6 +445,10 @@ void RenderFrame(ID3D11DeviceContext* ctx, ID3D11Device* device, const float* ca
     // The old path used sActivePos (wrong frame) -> misplacement; this is the fix.
     float proj[16];
     PerspLH(proj, 1.5708f, 1.0f, kFaceNear, kFaceFar);   // 90 deg per face
+
+    // Compute per-draw placement decisions once for this frame's captures
+    // (majority cameraVP + PRE/COMPOSE/SKIP) — Replay() consults the cache per face.
+    GeometryReplay::BeginFrame(ctx);
 
     sStateBlock.Capture(ctx);
     ID3D11RenderTargetView* nullRTV[1] = { nullptr };
@@ -350,18 +461,21 @@ void RenderFrame(ID3D11DeviceContext* ctx, ID3D11Device* device, const float* ca
     uint32_t totalReplayed = 0;
     for (int c = 0; c < sel; ++c)
     {
-        // Replay POV in OGRE-ABSOLUTE frame = rebased light + worldOffset (= the SceneAccess
-        // absolute light position). The match center (UpdateLightTableCB) stays rebased.
-        float lp[3] = { sActivePos[c][0]+worldOffset[0], sActivePos[c][1]+worldOffset[1], sActivePos[c][2]+worldOffset[2] };
+        // POV = light reprojected into the GBuffer geometry frame (see worldOffset above).
+        // The match center (UpdateLightTableCB) stays rebased (sActivePos).
+        float lp[3]     = { sActivePos[c][0]+worldOffset[0], sActivePos[c][1]+worldOffset[1], sActivePos[c][2]+worldOffset[2] };
+        // Cull DISABLED: the captured world-matrix translation (world[12..14]) is ~0 for this
+        // camera-relative geometry (position is in the vertices), so a per-light origin cull
+        // wrongly drops nearly everything. Pass no cull center -> replay all occluders. A proper
+        // cull needs the real geometry position; revisit for perf (replays all geometry x lights).
         for (int f = 0; f < 6; ++f)
         {
             float target[3] = { lp[0]+kFaceDir[f][0], lp[1]+kFaceDir[f][1], lp[2]+kFaceDir[f][2] };
             float view[16], vp[16];
-            LookAtLH(view, lp, target, kFaceUp[f]);
-            Mul(vp, view, proj);
+            LookAtLH(view, lp, target, kFaceUp[f]); Mul(vp, view, proj);
             ctx->OMSetRenderTargets(1, nullRTV, sFaceDSV[c*6+f]);
             ctx->ClearDepthStencilView(sFaceDSV[c*6+f], D3D11_CLEAR_DEPTH, 1.0f, 0);
-            totalReplayed += GeometryReplay::Replay(ctx, device, vp, lp, kCullRadius);
+            totalReplayed += GeometryReplay::Replay(ctx, device, vp, nullptr, nullptr, 0.0f);
         }
     }
     sStateBlock.Restore(ctx);

@@ -3,25 +3,20 @@
 #include "ShaderDatabase.h"
 #include "DustLog.h"
 #include <cstring>
+#include <cmath>
 
 namespace GeometryReplay
 {
 
 static uint32_t sReplaysIssued = 0;
 
-static void MatMul4x4(float* out, const float* a, const float* b)
+void BeginFrame(ID3D11DeviceContext* ctx)
 {
-    for (int r = 0; r < 4; r++)
-    {
-        for (int c = 0; c < 4; c++)
-        {
-            out[r * 4 + c] =
-                a[r * 4 + 0] * b[0 * 4 + c] +
-                a[r * 4 + 1] * b[1 * 4 + c] +
-                a[r * 4 + 2] * b[2 * 4 + c] +
-                a[r * 4 + 3] * b[3 * 4 + c];
-        }
-    }
+    // Reverted to the baseline (replay everything with replacementVP). Kept as a no-op so
+    // callers stay stable; per-draw placement classification was abandoned — the captured
+    // clip matrices form ~20 distinct clusters per scene (no shared cameraVP to verify
+    // against), so captured-CB forensics cannot recover world placement in general.
+    (void)ctx;
 }
 
 struct ScratchCBEntry
@@ -113,19 +108,26 @@ struct ReplayStateBlock
 
 uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
                 const float* replacementVP,
+                const float* replacementVPSkin,
                 const float* cullCenter, float cullRadius)
 {
     const auto& captures = GeometryCapture::GetCaptures();
     if (captures.empty())
         return 0;
+    if (!replacementVPSkin) replacementVPSkin = replacementVP;
 
-    const float cullR2 = cullRadius * cullRadius;
+    (void)cullCenter; (void)cullRadius;
 
     ReplayStateBlock saved;
     saved.Capture(ctx);
 
     uint32_t replayed = 0;
     static std::vector<uint8_t> cbDataBuf;
+
+    // [Dust diag] per-category seen/drawn histogram, logged once per ~120 Replay calls.
+    static int dbgCall = 0;
+    bool dbgLog = ((dbgCall++ % 120) == 0);
+    int hSeen[8] = {0}, hDrawn[8] = {0}, culled = 0, instDrawn = 0;
 
     for (const auto& draw : captures)
     {
@@ -137,12 +139,17 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
         // replay never rebinds (heightmap / bone buffers / vertex SRVs), which
         // GPU-faults the back-face pass. OBJECTS / DISTANT_TOWN / TRIPLANAR are
         // the safe solid occluders back-face thickness actually needs.
+        DustShaderCategory cat = ShaderDatabase::GetVertexShaderCategory(draw.vs);
+        int ci = ((int)cat >= 0 && (int)cat <= 7) ? (int)cat : 0;
+        if (dbgLog) hSeen[ci]++;
         {
-            DustShaderCategory cat = ShaderDatabase::GetVertexShaderCategory(draw.vs);
+            // SKIN disabled: bones/frame/clip-offset all verified correct, but the replayed
+            // skinned geometry still doesn't land in the cube (suspected vertex-input/layout
+            // issue) -> it smears and pollutes every cube. Re-enable after a RenderDoc capture
+            // of a replayed skin draw pins the input bug. Static geometry casts fine.
             if (cat != DUST_SHADER_OBJECTS &&
                 cat != DUST_SHADER_DISTANT_TOWN &&
-                cat != DUST_SHADER_TRIPLANAR &&
-                cat != DUST_SHADER_SKIN)
+                cat != DUST_SHADER_TRIPLANAR)
                 continue;
         }
 
@@ -166,31 +173,14 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
 
         float* clipDst = reinterpret_cast<float*>(cbDataBuf.data() + meta.clipMatrixOffset);
 
-        bool useWorldFromCB = (meta.transformType == VSTransformType::STATIC &&
-                               draw.instanceCount <= 1);
-
-        if (useWorldFromCB &&
-            meta.worldMatrixOffset + 64 <= draw.cbStagingSize &&
-            meta.worldMatrixSize >= 64)
-        {
-            const float* world = reinterpret_cast<const float*>(
-                cbDataBuf.data() + meta.worldMatrixOffset);
-            // Per-light cull: skip static occluders outside this light's reach.
-            if (cullCenter)
-            {
-                float dx = world[12]-cullCenter[0];
-                float dy = world[13]-cullCenter[1];
-                float dz = world[14]-cullCenter[2];
-                if (dx*dx + dy*dy + dz*dz > cullR2) continue;
-            }
-            MatMul4x4(clipDst, world, replacementVP);
-        }
-        else
-        {
-            // Instanced / world-less draws: can't cull by CB world (their transform is
-            // in the instance buffer), so always include them.
-            memcpy(clipDst, replacementVP, 64);
-        }
+        // BASELINE (known-best state): replay every draw with the light view-proj directly.
+        // Correct for pre-transformed geometry (buildings/props near the light cast right);
+        // world-placed meshes (clip baked per-draw, ~20 distinct clip clusters measured per
+        // scene) replay at wrong positions -> the known "phantom shadow" junk. Recovering
+        // their placement from captured CBs is NOT generally possible (world uniform is
+        // zero/junk for most of them) — the structural fix is the OGRE re-render occluder
+        // source (docs/point_shadow_ogre_rerender_plan.md).
+        memcpy(clipDst, replacementVP, 64);
 
         ID3D11Buffer* scratchCB = GetScratchCB(device, draw.cbStagingSize);
         if (!scratchCB)
@@ -201,7 +191,12 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
         // Set IA state (both VB slots — slot 1 has instance data for instanced draws)
         ctx->IASetInputLayout(draw.inputLayout);
         ctx->IASetPrimitiveTopology(draw.topology);
-        ctx->IASetVertexBuffers(0, CapturedDraw::MAX_VB_SLOTS, draw.vertexBuffers,
+        // Slot 1 = per-instance transforms; use the per-draw snapshot (the live buffer is
+        // recycled and stale by replay time for instanced draws).
+        ID3D11Buffer* vbs[CapturedDraw::MAX_VB_SLOTS] = {
+            draw.vertexBuffers[0],
+            draw.instVBCopy ? draw.instVBCopy : draw.vertexBuffers[1] };
+        ctx->IASetVertexBuffers(0, CapturedDraw::MAX_VB_SLOTS, vbs,
                                 draw.vbStrides, draw.vbOffsets);
         ctx->IASetIndexBuffer(draw.indexBuffer, draw.indexFormat, draw.ibOffset);
 
@@ -211,8 +206,13 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
         {
             if (i == meta.cbSlot)
                 ctx->VSSetConstantBuffers(i, 1, &scratchCB);
-            else if (draw.vsCBs[i])
-                ctx->VSSetConstantBuffers(i, 1, &draw.vsCBs[i]);
+            else
+            {
+                // Prefer the per-draw bindable snapshot (skinned bone palette); the live
+                // vsCBs pointer is stale by replay time for skinned draws.
+                ID3D11Buffer* cb = draw.cbCopies[i] ? draw.cbCopies[i] : draw.vsCBs[i];
+                if (cb) ctx->VSSetConstantBuffers(i, 1, &cb);
+            }
         }
         // Rebind VS-stage resources so skin/terrain VS fetches (bone palette,
         // heightmap, vertex-fetch) don't read unbound SRVs and GPU-fault.
@@ -232,9 +232,16 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
         }
 
         replayed++;
+        if (dbgLog) { hDrawn[ci]++; if (draw.instanceCount > 1) instDrawn++; }
     }
 
     saved.Restore(ctx);
+
+    if (dbgLog)
+        Log("GeoReplay seen[OBJ=%d SKIN=%d TERR=%d FOL=%d TRI=%d DT=%d UNK=%d] drawn[OBJ=%d SKIN=%d TRI=%d DT=%d] culled=%d caps=%d",
+            hSeen[1],hSeen[4],hSeen[2],hSeen[3],hSeen[5],hSeen[6],hSeen[0],
+            hDrawn[1],hDrawn[4],hDrawn[5],hDrawn[6], culled, (int)captures.size());
+    if (dbgLog) Log("GeoReplay instanced-drawn=%d", instDrawn);
 
     if (sReplaysIssued < 3 && replayed > 0)
     {
