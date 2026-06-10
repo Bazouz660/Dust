@@ -183,7 +183,11 @@ static bool EnsureInit()
         // do NOT attachObject (it throws "already attached"). Position via the camera.
         sCam = sSM->createCamera("dustPtOgreCam");
         sCam->setNearClipDistance(1.0f);
-        sCam->setFarClipDistance(8000.0f);
+        // DIAGNOSTIC far plane = 200000 (was 8000): Kenshi's floating origin puts scene geometry
+        // at huge absolute coords (~48000); if buildings/characters appear at large depth with this
+        // far plane, they DO have OGRE shadow casters (frame/placement issue, fixable). If still
+        // only terrain, they have no caster in this pass (coverage dead-end for Path 2).
+        sCam->setFarClipDistance(200000.0f);
         sCam->setAspectRatio(1.0f);
         sCam->setFOVy(Ogre::Radian(1.5708f));     // 90 deg
     }
@@ -355,9 +359,27 @@ void RenderPendingAtFrameBoundary()
     // DURING the deferred light pass (getCameraInProgress at swapBuffers is a different,
     // non-main camera -> the ground-truth test showed it 882u from the geometry).
     Ogre::Camera* lodCam = GetKenshiLodCamera();
+    // STEP-1 GATE: render from R = Kenshi's main-camera OGRE position (among the geometry), so the
+    // cube faces show the scene around the player INCLUDING characters + grass via Kenshi's native
+    // shadow-caster pass. This proves OGRE gives us the casters Path 1 can't. Light-relative
+    // placement is Step 2. GetKenshiRebaseR is reliable every frame (GetLightSpaceR is unset now).
     float R[3] = {0, 0, 0};
-    bool rValid = false;
-    PointShadows::GetLightSpaceR(R, &rValid);
+    bool rValid = GetKenshiRebaseR(R);
+
+    // Measure Kenshi's floating-origin worldOffset once: setPosition(0,0,0) -> derived = -worldOffset
+    // (the auto-created camera node carries the floating origin). The scene's OBJECTS (buildings/
+    // characters/grass) are placed at ABSOLUTE coords (~worldOffset magnitude), while terrain pages
+    // camera-relative — so to be AMONG the objects we must aim the camera at R + worldOffset.
+    static float sWorldOffset[3] = {0,0,0};
+    static bool  sWOMeasured = false;
+    if (!sWOMeasured && pGetDerivedPos && sCam)
+    {
+        sCam->setPosition(Ogre::Vector3(0,0,0));
+        sSM->updateAllTransforms();
+        const Ogre::Vector3* d = pGetDerivedPos(sCam);
+        if (d) { sWorldOffset[0]=-d->x; sWorldOffset[1]=-d->y; sWorldOffset[2]=-d->z; sWOMeasured=true;
+                 Log("PSOgre: measured worldOffset=(%.0f,%.0f,%.0f)", sWorldOffset[0],sWorldOffset[1],sWorldOffset[2]); }
+    }
 
     // Diagnostic: does Kenshi's rebase R == its camera world position?
     {
@@ -374,18 +396,20 @@ void RenderPendingAtFrameBoundary()
     {
         for (int c = 0; c < sLightCount; ++c)
         {
-            // Dirty-cache: skip a slot whose light hasn't moved (cube still valid).
-            // TEMP: forced off for the RenderDoc capture so cube draws are in every frame.
-            static const bool kForceRenderForCapture = true;
+            // Dirty-cache: skip a slot whose light hasn't moved (cube still valid). Off-force is
+            // for RenderDoc capture; leave it CACHED so the OGRE render fires once per static
+            // light and doesn't continuously thrash Kenshi's terrain LOD/streaming.
+            static const bool kForceRenderForCapture = false;
             float dx = sLights[c][0] - sRenderedPos[c][0];
             float dy = sLights[c][1] - sRenderedPos[c][1];
             float dz = sLights[c][2] - sRenderedPos[c][2];
             if (!kForceRenderForCapture && sRenderedValid[c] && (dx*dx + dy*dy + dz*dz) < 1.0f) continue;
 
-            // GROUND-TRUTH TEST: render the cube from R (the main camera's OGRE position).
-            // The player camera is among the geometry, so the dump MUST show geometry only a
-            // few units away (min ~tens). If min is ~1000+, R is NOT in the geometry frame.
-            float tgt[3] = { R[0], R[1], R[2] };
+            // FRAME TEST: aim the camera at the player's ABSOLUTE position (R + worldOffset) so it
+            // sits among the absolute-coord OBJECTS (buildings/characters/grass). If they now render
+            // NEAR (dump min ~tens, coherent silhouettes) -> frame cracked, Path 2 viable. The node
+            // correction below forces derived == tgt.
+            float tgt[3] = { R[0]+sWorldOffset[0], R[1]+sWorldOffset[1], R[2]+sWorldOffset[2] };
             (void)sCamPos; (void)sLights;
             sCam->setPosition(Ogre::Vector3(tgt[0], tgt[1], tgt[2]));
             sSM->updateAllTransforms();

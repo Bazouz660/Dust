@@ -21,8 +21,11 @@ struct CapturedDraw
     UINT instanceCount         = 1;
     UINT startInstanceLocation = 0;
 
-    // Input Assembler — slot 0 is geometry, slot 1 is instance data (if instanced)
-    static const UINT           MAX_VB_SLOTS  = 2;
+    // Input Assembler vertex-buffer slots. SKINNED meshes split their streams across 4 slots
+    // (RenderDoc-verified): 0=pos/normal, 1=uv/tangent/binormal, 2=BLENDINDICES/BLENDWEIGHT,
+    // 3=uv2. Capturing only 2 dropped the skinning streams -> garbage bones -> collapsed skin.
+    // Slot 1 doubles as instance data for instanced static draws.
+    static const UINT           MAX_VB_SLOTS  = 4;
     ID3D11Buffer*               vertexBuffers[MAX_VB_SLOTS] = {};
     UINT                        vbStrides[MAX_VB_SLOTS]     = {};
     UINT                        vbOffsets[MAX_VB_SLOTS]     = {};

@@ -11,6 +11,20 @@ namespace GeometryReplay
 
 static uint32_t sReplaysIssued = 0;
 
+// DIAGNOSTIC (characters): replay skinned draws into the cube. Counts skin draws replayed
+// this frame (reset in BeginFrame) so PointShadows can dump a cube face only when a character
+// was actually rendered into it.
+// Characters (skinned draws): ROOT CAUSE found via RenderDoc (2026-06-10) — skin meshes split
+// vertex streams across 4 VB slots (BLENDINDICES/BLENDWEIGHT in slot 2); we only captured 2, so
+// the skinning data was unbound -> garbage bones -> collapsed/empty. Fixed by MAX_VB_SLOTS=4.
+// Re-enabled for verification (skin-only dump, proper rebased clip).
+static bool sSkinEnabled       = true;    // characters cast (4 VB slots + transposed light VP)
+static bool sSkinOnly          = false;   // combined: skin + static together
+static bool sSkinKeepOrigClip  = false;
+static int  sSkinReplayedLast  = 0;
+void SetSkinEnabled(bool on)   { sSkinEnabled = on; }
+int  GetLastSkinReplayed()     { return sSkinReplayedLast; }
+
 // ---- cameraVP oracle (placement recovery) ------------------------------------------
 // Row-major 4x4 multiply: out = a x b (out[r][c] = sum_k a[r][k]*b[k][c]).
 static void MatMul(float* out, const float* a, const float* b)
@@ -68,9 +82,11 @@ static bool Inverse4x4(float* out, const float* m)
 // pre-transformed batch isn't in view this frame).
 static bool  sCamVPValid = false;
 static float sCamVPInv[16];
+static float sCamVP[16];     // the forward cameraVP (for the skin-frame diagnostic)
 
 void BeginFrame(ID3D11DeviceContext* ctx)
 {
+    sSkinReplayedLast = 0;   // reset per-frame skin-draw counter (this frame's cube fill)
     sCamVPValid = false;
     float iv[16], pj[16];
     if (!D3D11Hook::GetCameraMatrices(iv, pj)) return;
@@ -99,6 +115,7 @@ void BeginFrame(ID3D11DeviceContext* ctx)
     // anchor; placement still correct, just with the minor 1-frame skew.
     if (bestDist >= 100.0f) memcpy(camVP, anchor, 64);
 
+    memcpy(sCamVP, camVP, 64);
     sCamVPValid = Inverse4x4(sCamVPInv, camVP);
 }
 
@@ -253,14 +270,15 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
         int ci = ((int)cat >= 0 && (int)cat <= 7) ? (int)cat : 0;
         if (dbgLog) hSeen[ci]++;
         {
-            // SKIN disabled: bones/frame/clip-offset all verified correct, but the replayed
-            // skinned geometry still doesn't land in the cube (suspected vertex-input/layout
-            // issue) -> it smears and pollutes every cube. Re-enable after a RenderDoc capture
-            // of a replayed skin draw pins the input bug. Static geometry casts fine.
-            if (cat != DUST_SHADER_OBJECTS &&
-                cat != DUST_SHADER_DISTANT_TOWN &&
-                cat != DUST_SHADER_TRIPLANAR)
-                continue;
+            // OBJECTS/DISTANT_TOWN/TRIPLANAR = static solid occluders (always on).
+            // SKIN (characters) gated by sSkinEnabled — DIAGNOSTIC: replay skinned draws with
+            // the REBASED light V*P (bones place verts) and dump the cube to settle whether the
+            // old smear was a frame bug (coherent-but-displaced) or an input bug (radial garbage).
+            bool isSkin = (cat == DUST_SHADER_SKIN);
+            bool allow = sSkinOnly ? (isSkin && sSkinEnabled)
+                                   : (cat == DUST_SHADER_OBJECTS || cat == DUST_SHADER_DISTANT_TOWN ||
+                                      cat == DUST_SHADER_TRIPLANAR || (isSkin && sSkinEnabled));
+            if (!allow) continue;
         }
 
         if (!draw.cbStagingCopy)
@@ -283,23 +301,66 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
 
         float* clipDst = reinterpret_cast<float*>(cbDataBuf.data() + meta.clipMatrixOffset);
 
-        // Placement via the cameraVP oracle (BeginFrame). PRE-TRANSFORMED draws keep the bare
-        // light view-proj; WORLD-PLACED draws (today's phantoms) compose their recovered world
-        // matrix with it so they replay at the right spot. Anything that doesn't classify as a
-        // clean rotation falls back to PRE (never a wild placement).
-        float worldM[16];
-        int place = ClassifyPlacement(clipDst, worldM);
-        if (place == 1)
+        // [Skin diag] one-shot dump of the captured bone palette (worldMatrix3x4Array @ +48, per
+        // RenderDoc) + the captured viewProjectionMatrix translation row, for the first skin draw.
+        // Sane bone[0] (finite ~unit-scale rotation, plausible translation) => bones captured OK
+        // (so the empty cube is a FRAME issue); zero/garbage => bone capture is stale/broken.
+        if (cat == DUST_SHADER_SKIN)
         {
-            float wvp[16];
-            MatMul(wvp, worldM, replacementVP);   // local -> world -> light clip
-            memcpy(clipDst, wvp, 64);
-            if (dbgLog) hWorld++;
+            static int sBoneDiag = 0;
+            if (sBoneDiag < 1 && meta.clipMatrixOffset + 64 <= draw.cbStagingSize && sCamVPValid)
+            {
+                // Hex-dump the skin's captured viewProjectionMatrix and our cameraVP so the exact
+                // skin->camera frame transform can be solved offline (like the static oracle).
+                const float* svp = reinterpret_cast<const float*>(cbDataBuf.data() + meta.clipMatrixOffset);
+                char hs[160], hc[160]; int ps = 0, pc = 0;
+                for (int k = 0; k < 16; ++k) {
+                    uint32_t a, b; memcpy(&a, &svp[k], 4); memcpy(&b, &sCamVP[k], 4);
+                    ps += snprintf(hs+ps, sizeof(hs)-ps, "%s%08x", k?" ":"", a);
+                    pc += snprintf(hc+pc, sizeof(hc)-pc, "%s%08x", k?" ":"", b);
+                }
+                Log("SkinFrameDiag skinVP=%s", hs);
+                Log("SkinFrameDiag cameraVP=%s", hc);
+                sBoneDiag++;
+            }
+        }
+
+        if (cat == DUST_SHADER_SKIN)
+        {
+            // SKINNED: clip = viewProjectionMatrix (no world); the bone palette in this same CB
+            // transforms local verts -> world (same frame as static). The skin VS stores its VP
+            // TRANSPOSED vs the objects VS (measured: skinVP == cameraVP^T), so write the light
+            // VP's TRANSPOSE here. DIAGNOSTIC: sSkinKeepOrigClip leaves the captured clip.
+            if (!sSkinKeepOrigClip)
+            {
+                float vpT[16];
+                for (int r = 0; r < 4; ++r)
+                    for (int c = 0; c < 4; ++c)
+                        vpT[r*4+c] = replacementVPSkin[c*4+r];
+                memcpy(clipDst, vpT, 64);
+            }
+            sSkinReplayedLast++;
         }
         else
         {
-            memcpy(clipDst, replacementVP, 64);
-            if (dbgLog) hPre++;
+            // Placement via the cameraVP oracle (BeginFrame). PRE-TRANSFORMED draws keep the bare
+            // light view-proj; WORLD-PLACED draws (else phantoms) compose their recovered world
+            // matrix with it so they replay at the right spot. Anything that doesn't classify as a
+            // clean rotation falls back to PRE (never a wild placement).
+            float worldM[16];
+            int place = ClassifyPlacement(clipDst, worldM);
+            if (place == 1)
+            {
+                float wvp[16];
+                MatMul(wvp, worldM, replacementVP);   // local -> world -> light clip
+                memcpy(clipDst, wvp, 64);
+                if (dbgLog) hWorld++;
+            }
+            else
+            {
+                memcpy(clipDst, replacementVP, 64);
+                if (dbgLog) hPre++;
+            }
         }
 
         ID3D11Buffer* scratchCB = GetScratchCB(device, draw.cbStagingSize);
@@ -311,11 +372,12 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
         // Set IA state (both VB slots — slot 1 has instance data for instanced draws)
         ctx->IASetInputLayout(draw.inputLayout);
         ctx->IASetPrimitiveTopology(draw.topology);
-        // Slot 1 = per-instance transforms; use the per-draw snapshot (the live buffer is
-        // recycled and stale by replay time for instanced draws).
-        ID3D11Buffer* vbs[CapturedDraw::MAX_VB_SLOTS] = {
-            draw.vertexBuffers[0],
-            draw.instVBCopy ? draw.instVBCopy : draw.vertexBuffers[1] };
+        // Bind ALL captured VB slots (skin uses 4: pos/normal, uv/tangent, BLENDINDICES/WEIGHT,
+        // uv2). Slot 1 is per-instance transforms for instanced static draws -> use the per-draw
+        // snapshot there (the live buffer is recycled/stale by replay time).
+        ID3D11Buffer* vbs[CapturedDraw::MAX_VB_SLOTS];
+        for (UINT s = 0; s < CapturedDraw::MAX_VB_SLOTS; ++s) vbs[s] = draw.vertexBuffers[s];
+        if (draw.instVBCopy) vbs[1] = draw.instVBCopy;
         ctx->IASetVertexBuffers(0, CapturedDraw::MAX_VB_SLOTS, vbs,
                                 draw.vbStrides, draw.vbOffsets);
         ctx->IASetIndexBuffer(draw.indexBuffer, draw.indexFormat, draw.ibOffset);
