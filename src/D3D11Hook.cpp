@@ -1561,7 +1561,6 @@ static HRESULT STDMETHODCALLTYPE HookedCreatePixelShader(
         SurveyRecorder::OnPixelShaderCreated(pShaderBytecode, BytecodeLength, *ppPixelShader);
         ShaderDatabase::OnPixelShaderCreated(*ppPixelShader);
         TerrainTess::OnPixelShaderCreated(pShaderBytecode, BytecodeLength, *ppPixelShader);
-        GeometryCapture::OnPixelShaderCreated(pShaderBytecode, BytecodeLength, *ppPixelShader);
 
         // Detect the patched deferred main_fs by the b7 cbuffer name our
         // shader patch injects. DXBC stores cbuffer names in the RDEF chunk
@@ -1930,20 +1929,6 @@ static void ProbeLightCB(ID3D11DeviceContext* ctx)
                                 PointShadows::SetRenderCamPos(gRenderCamPos, true);
                                 static int tlog = 0;
                                 if ((tlog++ % 60) == 0) Log("RenderCamPos=(%.1f,%.1f,%.1f)", bx,by,bz);
-                            }
-                            // Effective translation of the reconstruction: light_fs does
-                            // worldPos = mul(viewPos, viewMatrix) with column-major-stored
-                            // matrices, so the translation the GPU adds is V[3],V[7],V[11]
-                            // (= the camera position in the light_fs output frame).
-                            {
-                                float tl[3] = { V[3], V[7], V[11] };
-                                if (isfinite(tl[0]) && isfinite(tl[1]) && isfinite(tl[2]) &&
-                                    fabsf(tl[0]) < 1e6f && fabsf(tl[1]) < 1e6f && fabsf(tl[2]) < 1e6f)
-                                {
-                                    PointShadows::SetLightFsT(tl, true);
-                                    static int tlog2 = 0;
-                                    if ((tlog2++ % 60) == 0) Log("LightFsT=(%.1f,%.1f,%.1f)", tl[0],tl[1],tl[2]);
-                                }
                             }
                             // Collect this light's render-world position (position[12..14]) —
                             // the ground-truth cube light position. No R, no SceneAccess.

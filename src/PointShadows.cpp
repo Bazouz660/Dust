@@ -7,7 +7,6 @@
 #include "ShaderDatabase.h"
 #include "TerrainTess.h"
 #include "D3D11StateBlock.h"
-#include "D3D11Hook.h"
 
 #include <d3d11.h>
 #include <math.h>
@@ -47,7 +46,7 @@ static bool sFailed = false;
 
 // Debug: tint point-light-lit pixels (green=lit, red=shadowed, blue=no matching
 // cube) so we can see whether the in-shader light->cube match works in-scene.
-static bool  sDebugViz    = true;    // TEMP: verify lp=sActivePos removes wedge artifacts
+static bool  sDebugViz    = false;   // 4-way tint (blue/green/yellow/red) for diagnosis; off = real shadows
 
 // Active light snapshot — filled by RenderFrame, consumed when building the CB.
 static int   sActiveCount = 0;
@@ -81,17 +80,6 @@ void SetRenderCamPos(const float* p3, bool valid)
 {
     if (p3) { sRenderCamPos[0]=p3[0]; sRenderCamPos[1]=p3[1]; sRenderCamPos[2]=p3[2]; }
     sRenderCamPosValid = valid;
-}
-
-// Camera position in the light_fs OUTPUT frame (the matrix translation actually added by
-// mul(viewPos, viewMatrix)). With the GBuffer PS cameraPos cG: lp = light - tL + cG.
-static float sLightFsT[3]   = {0,0,0};
-static bool  sLightFsTValid = false;
-
-void SetLightFsT(const float* t3, bool valid)
-{
-    if (t3) { sLightFsT[0]=t3[0]; sLightFsT[1]=t3[1]; sLightFsT[2]=t3[2]; }
-    sLightFsTValid = valid;
 }
 
 static float sDrawnLights[256][3] = {};
@@ -259,95 +247,6 @@ static void PerspLH(float* m, float fovY, float aspect, float zn, float zf)
 static const float kFaceDir[6][3] = { {1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}, {0,0,1}, {0,0,-1} };
 static const float kFaceUp [6][3] = { {0,1,0}, {0,1,0}, {0,0,-1}, {0,0,1}, {0,1,0}, {0,1,0} };
 
-// Format 16 floats as bit-exact hex words (8 chars each) for offline numpy reconstruction.
-static void HexMat16(char* out, size_t outSize, const float* f)
-{
-    int p = 0;
-    for (int k = 0; k < 16; ++k)
-    {
-        uint32_t bits; memcpy(&bits, &f[k], 4);
-        p += snprintf(out + p, outSize - p, "%s%08x", k ? " " : "", bits);
-    }
-}
-
-// One-shot OFFLINE-GATE dump (step 1 of the cameraVP-oracle plan). Emits, bit-exact:
-//   PTDUMP CAM iv=<16 hex> proj=<16 hex>     — the frame's deferred inverseView + proj
-//   PTDUMP DRAW idx cat vy=<vtx0.y> clip=<16 hex>  — each replayed draw's captured wVP
-// The numpy harness then brute-forces the row/col-major conventions to find the one where
-// cameraVP = inverse(inverseView) x proj makes M = wVP x cameraVP^-1 == I for buildings
-// (vy in the town band) and a clean rigid transform for cliffs (vy out-of-band). If NO
-// convention satisfies that, the GBuffer projection differs from the deferred proj and the
-// whole oracle is impossible — decided here with ZERO behavioral builds.
-static void DumpCapturesOnce(ID3D11DeviceContext* ctx, const float* camPos3)
-{
-    static bool done = false;
-    if (done) return;
-    const auto& caps = GeometryCapture::GetCaptures();
-    if (caps.size() < 100) return;   // wait for a representative (loaded) scene
-
-    float iv[16], pj[16];
-    if (!D3D11Hook::GetCameraMatrices(iv, pj)) return;   // need the paired camera matrices
-    done = true;
-
-    char hiv[160], hpj[160];
-    HexMat16(hiv, sizeof(hiv), iv);
-    HexMat16(hpj, sizeof(hpj), pj);
-    Log("PTDUMP CAM cam=(%.2f,%.2f,%.2f) iv=%s proj=%s", camPos3[0], camPos3[1], camPos3[2], hiv, hpj);
-
-    ID3D11Device* dev = nullptr;
-    ctx->GetDevice(&dev);
-    ID3D11Buffer* stg = nullptr;
-    if (dev)
-    {
-        D3D11_BUFFER_DESC sd = {};
-        sd.ByteWidth = 16; sd.Usage = D3D11_USAGE_STAGING; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        dev->CreateBuffer(&sd, nullptr, &stg);
-    }
-
-    int dumped = 0;
-    for (size_t i = 0; i < caps.size() && dumped < 80; ++i)
-    {
-        const CapturedDraw& d = caps[i];
-        if (!d.vsMetadata || d.vsMetadata->transformType == VSTransformType::UNKNOWN) continue;
-        // Only the categories we actually replay (same filter as GeometryReplay).
-        int cat = (int)ShaderDatabase::GetVertexShaderCategory(d.vs);
-        if (cat != (int)DUST_SHADER_OBJECTS && cat != (int)DUST_SHADER_TRIPLANAR &&
-            cat != (int)DUST_SHADER_DISTANT_TOWN) continue;
-        if (!d.cbStagingCopy || d.vsMetadata->clipMatrixOffset + 64 > d.cbStagingSize) continue;
-
-        // vtx0 tag (building vs cliff): read the first vertex of the draw range.
-        float vy = 1e30f, vx = 0, vz = 0;
-        if (stg && d.vertexBuffers[0] && d.vbStrides[0] >= 12)
-        {
-            D3D11_BUFFER_DESC vbd; d.vertexBuffers[0]->GetDesc(&vbd);
-            INT base = d.baseVertexLocation; if (base < 0) base = 0;
-            UINT off = d.vbOffsets[0] + (UINT)base * d.vbStrides[0];
-            if (off + 12 <= vbd.ByteWidth)
-            {
-                D3D11_BOX box = { off, 0, 0, off + 12, 1, 1 };
-                ctx->CopySubresourceRegion(stg, 0, 0, 0, 0, d.vertexBuffers[0], 0, &box);
-                D3D11_MAPPED_SUBRESOURCE m;
-                if (SUCCEEDED(ctx->Map(stg, 0, D3D11_MAP_READ, 0, &m)))
-                { float v[3]; memcpy(v, m.pData, 12); vx=v[0]; vy=v[1]; vz=v[2]; ctx->Unmap(stg, 0); }
-            }
-        }
-
-        D3D11_MAPPED_SUBRESOURCE mm;
-        if (FAILED(ctx->Map(d.cbStagingCopy, 0, D3D11_MAP_READ, 0, &mm))) continue;
-        const float* clip = (const float*)((const char*)mm.pData + d.vsMetadata->clipMatrixOffset);
-        char hclip[160]; HexMat16(hclip, sizeof(hclip), clip);
-        ctx->Unmap(d.cbStagingCopy, 0);
-
-        Log("PTDUMP DRAW idx=%u cat=%d vtx0=(%.1f,%.1f,%.1f) clip=%s",
-            (unsigned)i, cat, vx, vy, vz, hclip);
-        ++dumped;
-    }
-    Log("PTDUMP END dumped=%d", dumped);
-
-    if (stg) stg->Release();
-    if (dev) dev->Release();
-}
-
 void RenderFrame(ID3D11DeviceContext* ctx, ID3D11Device* device, const float* camPos3)
 {
     if (!ctx || !device || !camPos3) return;
@@ -363,8 +262,6 @@ void RenderFrame(ID3D11DeviceContext* ctx, ID3D11Device* device, const float* ca
             Log("PointShadows: no captures at POST_LIGHTING (firing skipped, count=%d)", sEmptyLog);
         return;
     }
-
-    DumpCapturesOnce(ctx, camPos3);
 
     // Drive the cubes from the point lights the DEFERRED PASS actually drew this frame, in
     // RENDER-WORLD space (light_fs position[12..14]) — the same frame as the GBuffer geometry.
@@ -404,9 +301,8 @@ void RenderFrame(ID3D11DeviceContext* ctx, ID3D11Device* device, const float* ca
     //   light_fs: worldPos = tL + R*(dir*dist)      tL = viewMatrix translation == (0,0,0)
     // => light_fs is a camera-at-origin frame and the cube POV is lp = sActivePos + camera.
     // The camera MUST come from the same pass that consumes the cubes (sDrawnCamPos, probed
-    // from the light_fs CB): the GBuffer-pass snapshot (GetGBufferCamPos) reads a value one
-    // camera-delta behind while the camera moves -> lagging shadows (user-visible). Do not
-    // swap this source again.
+    // from the light_fs CB). The GBuffer-pass camera reads one camera-delta behind while the
+    // camera moves -> lagging shadows (user-visible); do not swap this source again.
     float worldOffset[3] = { sDrawnCamPos[0], sDrawnCamPos[1], sDrawnCamPos[2] };
 
     // Render each light's 6 cube faces by replaying the captured GBuffer draws from the

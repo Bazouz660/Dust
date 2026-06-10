@@ -3,10 +3,7 @@
 #include "DustAPI.h"
 #include "DustLog.h"
 #include <tracy/Tracy.hpp>
-#include <d3dcompiler.h>
 #include <vector>
-#include <unordered_map>
-#include <mutex>
 
 namespace GeometryCapture
 {
@@ -122,91 +119,6 @@ static ID3D11Buffer* AcquireVBCopy(ID3D11Device* device, uint32_t requiredSize)
     return sVBCopyPool[sVBCopyPoolUsed++].buffer;
 }
 
-// ---- GBuffer-frame camera (PS `cameraPos` uniform) ----------------------------------
-// The GBuffer shaders write depth = length(worldPos - cameraPos): that `cameraPos` IS the
-// camera of the frame the captured geometry lives in. We reflect every created PS once and
-// remember where the uniform sits; at capture time the first matching draw's PS CB is
-// staging-copied (the live CB is Map_WRITE_DISCARDed between passes, so the pointer's
-// content is stale by POST_LIGHTING — same reason as the VS clip-matrix copy above).
-struct PsCamPosInfo { uint32_t slot; uint32_t offset; };
-static std::unordered_map<ID3D11PixelShader*, PsCamPosInfo> sPsCamPos;
-static std::mutex sPsCamPosMutex;
-static ID3D11Buffer* sGCamStaging = nullptr;   // pool-owned; reset with the staging pool
-static uint32_t      sGCamOffset  = 0;
-
-void OnPixelShaderCreated(const void* bytecode, size_t size, ID3D11PixelShader* ps)
-{
-    if (!bytecode || !size || !ps) return;
-    ID3D11ShaderReflection* refl = nullptr;
-    if (FAILED(D3DReflect(bytecode, size, IID_ID3D11ShaderReflection, (void**)&refl)) || !refl)
-        return;
-    D3D11_SHADER_DESC sd = {};
-    refl->GetDesc(&sd);
-    for (UINT i = 0; i < sd.ConstantBuffers; i++)
-    {
-        ID3D11ShaderReflectionConstantBuffer* cb = refl->GetConstantBufferByIndex(i);
-        D3D11_SHADER_BUFFER_DESC bd = {};
-        if (FAILED(cb->GetDesc(&bd))) continue;
-        for (UINT v = 0; v < bd.Variables; v++)
-        {
-            D3D11_SHADER_VARIABLE_DESC vd = {};
-            cb->GetVariableByIndex(v)->GetDesc(&vd);
-            if (!vd.Name || strcmp(vd.Name, "cameraPos") != 0 || !(vd.uFlags & D3D_SVF_USED))
-                continue;
-            // Find the cbuffer's bind slot
-            D3D11_SHADER_INPUT_BIND_DESC ibd = {};
-            if (SUCCEEDED(refl->GetResourceBindingDescByName(bd.Name, &ibd)) &&
-                ibd.Type == D3D_SIT_CBUFFER)
-            {
-                std::lock_guard<std::mutex> lock(sPsCamPosMutex);
-                sPsCamPos[ps] = { ibd.BindPoint, vd.StartOffset };
-            }
-            break;
-        }
-    }
-    refl->Release();
-}
-
-// One snapshot per frame, taken at the first captured draw whose PS has cameraPos.
-static void TrySnapshotGBufferCamPos(ID3D11DeviceContext* ctx, ID3D11PixelShader* ps)
-{
-    if (sGCamStaging || !ps || !sCachedDevice) return;
-    PsCamPosInfo info;
-    {
-        std::lock_guard<std::mutex> lock(sPsCamPosMutex);
-        auto it = sPsCamPos.find(ps);
-        if (it == sPsCamPos.end()) return;
-        info = it->second;
-    }
-    ID3D11Buffer* cb = nullptr;
-    ctx->PSGetConstantBuffers(info.slot, 1, &cb);
-    if (!cb) return;
-    D3D11_BUFFER_DESC bd = {};
-    cb->GetDesc(&bd);
-    if (info.offset + 12 <= bd.ByteWidth)
-    {
-        ID3D11Buffer* staging = AcquireStagingBuffer(sCachedDevice, bd.ByteWidth);
-        if (staging)
-        {
-            ctx->CopyResource(staging, cb);
-            sGCamStaging = staging;
-            sGCamOffset  = info.offset;
-        }
-    }
-    cb->Release();
-}
-
-bool GetGBufferCamPos(ID3D11DeviceContext* ctx, float outXYZ[3])
-{
-    if (!sGCamStaging) return false;
-    D3D11_MAPPED_SUBRESOURCE mr = {};
-    if (FAILED(ctx->Map(sGCamStaging, 0, D3D11_MAP_READ, 0, &mr)))
-        return false;
-    memcpy(outXYZ, (const uint8_t*)mr.pData + sGCamOffset, 12);
-    ctx->Unmap(sGCamStaging, 0);
-    return true;
-}
-
 static void ReleaseCaptures()
 {
     for (auto& draw : sCaptures)
@@ -251,7 +163,6 @@ static void ReleaseCaptures()
     sStagingPoolUsed = 0;
     sCBCopyPoolUsed  = 0;
     sVBCopyPoolUsed  = 0;
-    sGCamStaging     = nullptr; // pool-owned, invalidated with the staging pool
 }
 
 // Multi-entry classification cache. Caching ONLY the GBuffer config (one
@@ -388,9 +299,6 @@ static void CaptureDrawState(ID3D11DeviceContext* ctx, CapturedDraw& draw)
 
     // PS pointer (always — cheap, enables shader identification)
     ctx->PSGetShader(&draw.ps, nullptr, nullptr);
-
-    // Once per frame: snapshot the GBuffer-frame camera from this draw's PS CB.
-    TrySnapshotGBufferCamPos(ctx, draw.ps);
 
     // PS resources (opt-in — adds ~0.4ms/frame for 200 draws)
     if (sCaptureFlags & DUST_CAPTURE_PS_RESOURCES)

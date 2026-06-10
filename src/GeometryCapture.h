@@ -131,15 +131,6 @@ namespace GeometryCapture
     // Cache the device pointer (called once from TryCaptureDevice)
     void SetDevice(ID3D11Device* device);
 
-    // Reflect a created PS for a `cameraPos` cbuffer uniform (the GBuffer shaders —
-    // objects/terrain/skin — declare one; it holds the GBuffer-frame camera used in
-    // depth = length(worldPos - cameraPos)). Called from HookedCreatePixelShader.
-    void OnPixelShaderCreated(const void* bytecode, size_t size, ID3D11PixelShader* ps);
-
-    // GBuffer-frame camera position, staging-copied from the first captured draw whose
-    // PS declares cameraPos. Valid from end of GBuffer pass until ResetFrame.
-    bool GetGBufferCamPos(ID3D11DeviceContext* ctx, float outXYZ[3]);
-
     // Capture flags — controls what per-draw state is captured.
     // Default 0 = lean (IA + VS + PS pointer). DUST_CAPTURE_PS_RESOURCES = full PS state.
     void SetCaptureFlags(uint32_t flags);
