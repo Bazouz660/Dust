@@ -5,25 +5,19 @@
 #include "D3D11Hook.h"
 #include <cstring>
 #include <cmath>
+#include <d3dcompiler.h>
 
 namespace GeometryReplay
 {
 
 static uint32_t sReplaysIssued = 0;
 
-// DIAGNOSTIC (characters): replay skinned draws into the cube. Counts skin draws replayed
-// this frame (reset in BeginFrame) so PointShadows can dump a cube face only when a character
-// was actually rendered into it.
-// Characters (skinned draws): ROOT CAUSE found via RenderDoc (2026-06-10) — skin meshes split
-// vertex streams across 4 VB slots (BLENDINDICES/BLENDWEIGHT in slot 2); we only captured 2, so
-// the skinning data was unbound -> garbage bones -> collapsed/empty. Fixed by MAX_VB_SLOTS=4.
-// Re-enabled for verification (skin-only dump, proper rebased clip).
-static bool sSkinEnabled       = true;    // characters cast (4 VB slots + transposed light VP)
-static bool sSkinOnly          = false;   // combined: skin + static together
-static bool sSkinKeepOrigClip  = false;
-static int  sSkinReplayedLast  = 0;
-void SetSkinEnabled(bool on)   { sSkinEnabled = on; }
-int  GetLastSkinReplayed()     { return sSkinReplayedLast; }
+// Characters (SKIN) cast via the captured GBuffer draws — needs 4 VB slots (BLENDINDICES/
+// BLENDWEIGHT live in slot 2) and the light VP written TRANSPOSED (the skin VS stores its
+// view-proj transposed vs objects). Grass (FOLIAGE) casts via the cameraVP oracle + an alpha
+// clip PS + double-sided raster. Both verified 2026-06-11.
+static const bool sSkinEnabled    = true;
+static const bool sFoliageEnabled = true;
 
 // ---- cameraVP oracle (placement recovery) ------------------------------------------
 // Row-major 4x4 multiply: out = a x b (out[r][c] = sum_k a[r][k]*b[k][c]).
@@ -82,11 +76,9 @@ static bool Inverse4x4(float* out, const float* m)
 // pre-transformed batch isn't in view this frame).
 static bool  sCamVPValid = false;
 static float sCamVPInv[16];
-static float sCamVP[16];     // the forward cameraVP (for the skin-frame diagnostic)
 
 void BeginFrame(ID3D11DeviceContext* ctx)
 {
-    sSkinReplayedLast = 0;   // reset per-frame skin-draw counter (this frame's cube fill)
     sCamVPValid = false;
     float iv[16], pj[16];
     if (!D3D11Hook::GetCameraMatrices(iv, pj)) return;
@@ -115,7 +107,6 @@ void BeginFrame(ID3D11DeviceContext* ctx)
     // anchor; placement still correct, just with the minor 1-frame skew.
     if (bestDist >= 100.0f) memcpy(camVP, anchor, 64);
 
-    memcpy(sCamVP, camVP, 64);
     sCamVPValid = Inverse4x4(sCamVPInv, camVP);
 }
 
@@ -143,6 +134,49 @@ static int ClassifyPlacement(const float* clip, float worldOut[16])
     }
     memcpy(worldOut, M, 64);
     return 1;   // WORLD-PLACED
+}
+
+// Alpha-clip PS for FOLIAGE (grass) shadows: samples the grass diffuse (t1) and clips below the
+// alpha threshold so leaves cast leaf-shaped depth instead of solid quads. Input signature matches
+// grass_vs output (SV_Position/COLOR/TEXCOORD0/TEXCOORD1). Uses an own linear-wrap sampler (s0).
+static ID3D11PixelShader*  sAlphaPS    = nullptr;
+static ID3D11SamplerState* sAlphaSamp  = nullptr;
+static ID3D11RasterizerState* sNoCullRS = nullptr;  // double-sided for grass cards (both faces cast)
+static bool                sAlphaFailed = false;
+
+static bool EnsureAlphaPS(ID3D11Device* device)
+{
+    if (sAlphaPS && sAlphaSamp && sNoCullRS) return true;
+    if (sAlphaFailed || !device) return false;
+    static const char* kSrc =
+        "Texture2D gDiffuse : register(t1);\n"
+        "SamplerState gSamp : register(s0);\n"
+        "void main(float4 fragCoord : SV_Position, float4 color : COLOR,\n"
+        "          float2 texCoord : TEXCOORD0, float4 worldPos : TEXCOORD1) {\n"
+        "    clip(gDiffuse.Sample(gSamp, texCoord).a - 0.5);\n"
+        "}\n";
+    ID3DBlob* blob = nullptr; ID3DBlob* err = nullptr;
+    HRESULT hr = D3DCompile(kSrc, strlen(kSrc), "DustGrassAlphaPS", nullptr, nullptr,
+                            "main", "ps_5_0", 0, 0, &blob, &err);
+    if (FAILED(hr) || !blob)
+    {
+        if (err) { Log("GrassAlphaPS compile error: %s", (const char*)err->GetBufferPointer()); err->Release(); }
+        sAlphaFailed = true; return false;
+    }
+    if (err) err->Release();
+    hr = device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &sAlphaPS);
+    blob->Release();
+    if (FAILED(hr)) { sAlphaFailed = true; return false; }
+    D3D11_SAMPLER_DESC sd = {};
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    if (FAILED(device->CreateSamplerState(&sd, &sAlphaSamp))) { sAlphaFailed = true; return false; }
+    D3D11_RASTERIZER_DESC rdsc = {};
+    rdsc.FillMode = D3D11_FILL_SOLID; rdsc.CullMode = D3D11_CULL_NONE; rdsc.DepthClipEnable = TRUE;
+    if (FAILED(device->CreateRasterizerState(&rdsc, &sNoCullRS))) { sAlphaFailed = true; return false; }
+    Log("GrassAlphaPS: compiled foliage alpha-clip shadow PS + double-sided raster state");
+    return true;
 }
 
 struct ScratchCBEntry
@@ -246,6 +280,9 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
 
     ReplayStateBlock saved;
     saved.Capture(ctx);
+    // The caller's rasterizer state (cull-back) — restore it for non-foliage draws and at the end.
+    ID3D11RasterizerState* savedRS = nullptr;
+    ctx->RSGetState(&savedRS);
 
     uint32_t replayed = 0;
     static std::vector<uint8_t> cbDataBuf;
@@ -261,23 +298,16 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
         if (!draw.vsMetadata || draw.vsMetadata->transformType == VSTransformType::UNKNOWN)
             continue;
 
-        // Replay ONLY static solid geometry. Terrain (vertex-texture fetch),
-        // foliage, and skinned meshes run VS variants that read resources the
-        // replay never rebinds (heightmap / bone buffers / vertex SRVs), which
-        // GPU-faults the back-face pass. OBJECTS / DISTANT_TOWN / TRIPLANAR are
-        // the safe solid occluders back-face thickness actually needs.
         DustShaderCategory cat = ShaderDatabase::GetVertexShaderCategory(draw.vs);
         int ci = ((int)cat >= 0 && (int)cat <= 7) ? (int)cat : 0;
         if (dbgLog) hSeen[ci]++;
         {
-            // OBJECTS/DISTANT_TOWN/TRIPLANAR = static solid occluders (always on).
-            // SKIN (characters) gated by sSkinEnabled — DIAGNOSTIC: replay skinned draws with
-            // the REBASED light V*P (bones place verts) and dump the cube to settle whether the
-            // old smear was a frame bug (coherent-but-displaced) or an input bug (radial garbage).
-            bool isSkin = (cat == DUST_SHADER_SKIN);
-            bool allow = sSkinOnly ? (isSkin && sSkinEnabled)
-                                   : (cat == DUST_SHADER_OBJECTS || cat == DUST_SHADER_DISTANT_TOWN ||
-                                      cat == DUST_SHADER_TRIPLANAR || (isSkin && sSkinEnabled));
+            // OBJECTS/DISTANT_TOWN/TRIPLANAR = static solid occluders. SKIN = characters,
+            // FOLIAGE = grass. TERRAIN excluded (vertex-texture fetch; open ground lacks occluders).
+            bool allow = cat == DUST_SHADER_OBJECTS || cat == DUST_SHADER_DISTANT_TOWN ||
+                         cat == DUST_SHADER_TRIPLANAR ||
+                         (cat == DUST_SHADER_SKIN && sSkinEnabled) ||
+                         (cat == DUST_SHADER_FOLIAGE && sFoliageEnabled);
             if (!allow) continue;
         }
 
@@ -301,45 +331,17 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
 
         float* clipDst = reinterpret_cast<float*>(cbDataBuf.data() + meta.clipMatrixOffset);
 
-        // [Skin diag] one-shot dump of the captured bone palette (worldMatrix3x4Array @ +48, per
-        // RenderDoc) + the captured viewProjectionMatrix translation row, for the first skin draw.
-        // Sane bone[0] (finite ~unit-scale rotation, plausible translation) => bones captured OK
-        // (so the empty cube is a FRAME issue); zero/garbage => bone capture is stale/broken.
-        if (cat == DUST_SHADER_SKIN)
-        {
-            static int sBoneDiag = 0;
-            if (sBoneDiag < 1 && meta.clipMatrixOffset + 64 <= draw.cbStagingSize && sCamVPValid)
-            {
-                // Hex-dump the skin's captured viewProjectionMatrix and our cameraVP so the exact
-                // skin->camera frame transform can be solved offline (like the static oracle).
-                const float* svp = reinterpret_cast<const float*>(cbDataBuf.data() + meta.clipMatrixOffset);
-                char hs[160], hc[160]; int ps = 0, pc = 0;
-                for (int k = 0; k < 16; ++k) {
-                    uint32_t a, b; memcpy(&a, &svp[k], 4); memcpy(&b, &sCamVP[k], 4);
-                    ps += snprintf(hs+ps, sizeof(hs)-ps, "%s%08x", k?" ":"", a);
-                    pc += snprintf(hc+pc, sizeof(hc)-pc, "%s%08x", k?" ":"", b);
-                }
-                Log("SkinFrameDiag skinVP=%s", hs);
-                Log("SkinFrameDiag cameraVP=%s", hc);
-                sBoneDiag++;
-            }
-        }
-
         if (cat == DUST_SHADER_SKIN)
         {
             // SKINNED: clip = viewProjectionMatrix (no world); the bone palette in this same CB
             // transforms local verts -> world (same frame as static). The skin VS stores its VP
             // TRANSPOSED vs the objects VS (measured: skinVP == cameraVP^T), so write the light
-            // VP's TRANSPOSE here. DIAGNOSTIC: sSkinKeepOrigClip leaves the captured clip.
-            if (!sSkinKeepOrigClip)
-            {
-                float vpT[16];
-                for (int r = 0; r < 4; ++r)
-                    for (int c = 0; c < 4; ++c)
-                        vpT[r*4+c] = replacementVPSkin[c*4+r];
-                memcpy(clipDst, vpT, 64);
-            }
-            sSkinReplayedLast++;
+            // VP's TRANSPOSE into the clip slot.
+            float vpT[16];
+            for (int r = 0; r < 4; ++r)
+                for (int c = 0; c < 4; ++c)
+                    vpT[r*4+c] = replacementVPSkin[c*4+r];
+            memcpy(clipDst, vpT, 64);
         }
         else
         {
@@ -401,6 +403,27 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
         ctx->VSSetShaderResources(0, CapturedDraw::MAX_VS_SRVS, draw.vsSRVs);
         ctx->VSSetSamplers(0, CapturedDraw::MAX_VS_SAMPLERS, draw.vsSamplers);
 
+        // FOLIAGE: alpha-clip PS (grass diffuse @ t1) so leaves cast leaf-shaped depth, and render
+        // DOUBLE-SIDED so grass cards facing away from the light still cast. All other draws stay
+        // depth-only (null PS) with the caller's cull-back state.
+        if (cat == DUST_SHADER_FOLIAGE && EnsureAlphaPS(device))
+        {
+            if (draw.psSRVs[1])
+            {
+                ctx->PSSetShader(sAlphaPS, nullptr, 0);
+                ctx->PSSetShaderResources(1, 1, &draw.psSRVs[1]);
+                ctx->PSSetSamplers(0, 1, &sAlphaSamp);
+            }
+            else
+                ctx->PSSetShader(nullptr, nullptr, 0);
+            ctx->RSSetState(sNoCullRS);
+        }
+        else
+        {
+            ctx->PSSetShader(nullptr, nullptr, 0);
+            ctx->RSSetState(savedRS);
+        }
+
         if (draw.instanceCount > 1)
         {
             ctx->DrawIndexedInstanced(draw.indexCount, draw.instanceCount,
@@ -416,6 +439,14 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
         replayed++;
         if (dbgLog) { hDrawn[ci]++; if (draw.instanceCount > 1) instDrawn++; }
     }
+
+    // Reset the PS + the foliage diffuse SRV we bound (depth-only default), so the alpha PS and
+    // grass texture don't leak into the game's subsequent rendering. Restore the raster state too.
+    ctx->PSSetShader(nullptr, nullptr, 0);
+    ID3D11ShaderResourceView* nullSRV[1] = { nullptr };
+    ctx->PSSetShaderResources(1, 1, nullSRV);
+    ctx->RSSetState(savedRS);
+    if (savedRS) savedRS->Release();
 
     saved.Restore(ctx);
 
@@ -440,6 +471,9 @@ void Shutdown()
     for (auto& entry : sScratchCBs)
         if (entry.buffer) entry.buffer->Release();
     sScratchCBs.clear();
+    if (sAlphaPS)   { sAlphaPS->Release();   sAlphaPS = nullptr; }
+    if (sAlphaSamp) { sAlphaSamp->Release(); sAlphaSamp = nullptr; }
+    if (sNoCullRS)  { sNoCullRS->Release();  sNoCullRS = nullptr; }
 }
 
 } // namespace GeometryReplay

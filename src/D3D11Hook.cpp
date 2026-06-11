@@ -1904,8 +1904,12 @@ static void ProbeLightCB(ID3D11DeviceContext* ctx)
         {
             D3D11_BUFFER_DESC bd; cb->GetDesc(&bd);
             int nf = (int)(bd.ByteWidth / 4);
-            if (nf >= 64 && nf <= 70 && gDrawnCount < 256)   // POINT light_fs only (68 floats); cap reads/frame
+            // POINT light_fs = 68 floats; SPOT light_fs = 72 (inserts direction[3]+spot[3] after
+            // power, shifting viewMatrix 36->40). radius(falloff.w)@11 and position@12..14 are
+            // BEFORE the insert, so they're unchanged for both.
+            if (nf >= 64 && nf <= 74 && gDrawnCount < 256)
             {
+                bool isSpot = (nf > 70);
                 D3D11_BUFFER_DESC sd = bd; sd.Usage = D3D11_USAGE_STAGING;
                 sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.BindFlags = 0; sd.MiscFlags = 0;
                 ID3D11Buffer* stg = nullptr;
@@ -1916,9 +1920,9 @@ static void ProbeLightCB(ID3D11DeviceContext* ctx)
                     if (SUCCEEDED(ctx->Map(stg, 0, D3D11_MAP_READ, 0, &mm)))
                     {
                         const float* f = (const float*)mm.pData;
-                        if (f[11] > 1.0f && f[11] < 20000.0f)   // sane radius -> point light_fs
+                        if (f[11] > 1.0f && f[11] < 20000.0f)   // sane radius -> point/spot light_fs
                         {
-                            const float* V = f + 36;   // viewMatrix[36..51], col-major: cameraPos = -R^T*t
+                            const float* V = f + (isSpot ? 40 : 36);   // viewMatrix, col-major: cameraPos = -R^T*t
                             float bx = -(V[0]*V[12] + V[1]*V[13] + V[2]*V[14]);
                             float by = -(V[4]*V[12] + V[5]*V[13] + V[6]*V[14]);
                             float bz = -(V[8]*V[12] + V[9]*V[13] + V[10]*V[14]);

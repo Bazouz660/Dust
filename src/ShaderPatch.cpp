@@ -701,7 +701,7 @@ static std::string PatchDeferredShader(const std::string& src)
             "\t\t\t// The light's own fixture is excluded geometrically by the cube near plane\n"
             "\t\t\t// (kFaceNear=3u), NOT by nulling near casters here — that also erased valid\n"
             "\t\t\t// shadows that overlapped the fixture's direction. Bias handles residual acne.\n"
-            "\t\t\tfloat _bias = max(_surfZ * 0.03, 2.0);\n"
+            "\t\t\tfloat _bias = max(_surfZ * 0.03, 0.5);\n"
             "\t\t\tbool _shadowed = (_surfZ - _bias) > _casterZ;\n"
             // matched: light pos within 5 world units of a bound cube center.
             "\t\t\tbool _matched = (_bd < 100.0);\n"

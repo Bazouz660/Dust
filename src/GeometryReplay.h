@@ -40,10 +40,5 @@ namespace GeometryReplay
     // frame before the Replay() face loop — Replay() consults the cached decisions.
     void BeginFrame(ID3D11DeviceContext* ctx);
 
-    // Characters (skinned draws): enable/disable replaying them into the cube, and how many
-    // were replayed this frame (reset in BeginFrame). Used for the skin diagnostic + dump.
-    void SetSkinEnabled(bool on);
-    int  GetLastSkinReplayed();
-
     void Shutdown();
 }

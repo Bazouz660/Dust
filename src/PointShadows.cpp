@@ -135,7 +135,9 @@ void* GetDebugDepthSRV() { return sDebugSRV; }
 
 void Init()
 {
-    GeometryCapture::SetCaptureFlags(GeometryCapture::GetCaptureFlags() | 0x2u);
+    // 0x2 = geometry capture; 0x1 = DUST_CAPTURE_PS_RESOURCES (PS SRVs) — needed to bind the
+    // grass diffuse texture (t1) for the alpha-clip shadow PS so foliage casts leaf-shaped shadows.
+    GeometryCapture::SetCaptureFlags(GeometryCapture::GetCaptureFlags() | 0x2u | 0x1u);
     Log("PointShadows: geometry capture enabled (flags=0x%X)", GeometryCapture::GetCaptureFlags());
 }
 
@@ -247,51 +249,6 @@ static void PerspLH(float* m, float fovY, float aspect, float zn, float zf)
 static const float kFaceDir[6][3] = { {1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}, {0,0,1}, {0,0,-1} };
 static const float kFaceUp [6][3] = { {0,1,0}, {0,1,0}, {0,0,-1}, {0,0,1}, {0,1,0}, {0,1,0} };
 
-// [Diagnostic] dump one cube-array face (cube c, face f -> slice c*6+f) to a grayscale BMP
-// (depth normalized to min/max), so a replayed caster's silhouette can be inspected directly.
-static void DumpCubeFaceBMP(ID3D11DeviceContext* ctx, ID3D11Device* device, int c, int f, const char* path)
-{
-    if (!sCubeArrayTex) return;
-    D3D11_TEXTURE2D_DESC sd = {};
-    sd.Width = kSize; sd.Height = kSize; sd.MipLevels = 1; sd.ArraySize = 1;
-    sd.Format = DXGI_FORMAT_R32_FLOAT; sd.SampleDesc.Count = 1;
-    sd.Usage = D3D11_USAGE_STAGING; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-    ID3D11Texture2D* stg = nullptr;
-    if (FAILED(device->CreateTexture2D(&sd, nullptr, &stg)) || !stg) return;
-    UINT srcSub = D3D11CalcSubresource(0, (UINT)(c * 6 + f), 1);
-    ctx->CopySubresourceRegion(stg, 0, 0, 0, 0, sCubeArrayTex, srcSub, nullptr);
-    D3D11_MAPPED_SUBRESOURCE m;
-    if (SUCCEEDED(ctx->Map(stg, 0, D3D11_MAP_READ, 0, &m)))
-    {
-        const UINT W = kSize, H = kSize;
-        float mn = 1e30f, mx = -1e30f;
-        for (UINT y = 0; y < H; ++y) { const float* r = (const float*)((const char*)m.pData + y*m.RowPitch);
-            for (UINT x = 0; x < W; ++x) { float v = r[x]; if (v > 0.0f && v < 1.0f) { if (v<mn) mn=v; if (v>mx) mx=v; } } }
-        if (mx <= mn) mx = mn + 1e-6f;
-        const UINT rowBytes = W*3, imgSize = rowBytes*H, fileSize = 54 + imgSize;
-        unsigned char hdr[54] = {}; hdr[0]='B'; hdr[1]='M';
-        *(UINT*)&hdr[2]=fileSize; *(UINT*)&hdr[10]=54; *(UINT*)&hdr[14]=40;
-        *(int*)&hdr[18]=(int)W; *(int*)&hdr[22]=(int)H;
-        *(unsigned short*)&hdr[26]=1; *(unsigned short*)&hdr[28]=24; *(UINT*)&hdr[34]=imgSize;
-        std::ofstream fs(path, std::ios::binary);
-        if (fs)
-        {
-            fs.write((const char*)hdr, 54);
-            std::vector<unsigned char> row(rowBytes);
-            for (int y = (int)H-1; y >= 0; --y) {
-                const float* r = (const float*)((const char*)m.pData + y*m.RowPitch);
-                for (UINT x = 0; x < W; ++x) { float v = r[x];
-                    unsigned char g = (v > 0.0f && v < 1.0f) ? (unsigned char)(255.0f*(v-mn)/(mx-mn)) : 0;
-                    row[x*3]=g; row[x*3+1]=g; row[x*3+2]=g; }
-                fs.write((const char*)row.data(), rowBytes);
-            }
-            Log("PointShadows: dumped %s (min=%.5f max=%.5f)", path, mn, mx);
-        }
-        ctx->Unmap(stg, 0);
-    }
-    stg->Release();
-}
-
 void RenderFrame(ID3D11DeviceContext* ctx, ID3D11Device* device, const float* camPos3)
 {
     if (!ctx || !device || !camPos3) return;
@@ -397,25 +354,6 @@ void RenderFrame(ID3D11DeviceContext* ctx, ID3D11Device* device, const float* ca
         }
     }
     sStateBlock.Restore(ctx);
-
-    // [Skin diagnostic] dump cube 0's 6 faces ONCE, the first frame a character was actually
-    // replayed into it, so we can see whether skin lands coherently (frame bug) or smears
-    // radially (input bug). Reuses the depth-only cube content.
-    {
-        static bool sSkinDumped = false;
-        if (!sSkinDumped && GeometryReplay::GetLastSkinReplayed() > 0)
-        {
-            sSkinDumped = true;
-            for (int f = 0; f < 6; ++f)
-            {
-                char path[160];
-                snprintf(path, sizeof(path), "D:\\Github\\Dust-main\\dustpt_skin_face%d.bmp", f);
-                DumpCubeFaceBMP(ctx, device, 0, f, path);
-            }
-            Log("PointShadows: skin diagnostic — dumped cube0 6 faces (skinReplayed=%d)",
-                GeometryReplay::GetLastSkinReplayed());
-        }
-    }
 
     UpdateLightTableCB(ctx);
 
