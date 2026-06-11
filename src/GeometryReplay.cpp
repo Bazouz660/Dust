@@ -3,6 +3,7 @@
 #include "ShaderDatabase.h"
 #include "DustLog.h"
 #include "D3D11Hook.h"
+#include <tracy/Tracy.hpp>
 #include <cstring>
 #include <cmath>
 #include <d3dcompiler.h>
@@ -77,37 +78,124 @@ static bool Inverse4x4(float* out, const float* m)
 static bool  sCamVPValid = false;
 static float sCamVPInv[16];
 
-void BeginFrame(ID3D11DeviceContext* ctx)
+// ---- per-frame replay cache --------------------------------------------------------
+// One staging Map + one placement classification per captured draw per FRAME. The
+// point-shadow path calls Replay() once per cube face (lights x 6) — without this cache
+// every face re-Mapped every staging CB and re-classified every draw (~96x redundant).
+// Replay() only patches the 64-byte clip matrix from the cached bytes and draws.
+struct CachedEntry
 {
-    sCamVPValid = false;
-    float iv[16], pj[16];
-    if (!D3D11Hook::GetCameraMatrices(iv, pj)) return;
-    float anchor[16];
-    MatMul(anchor, iv, pj);
+    uint32_t           drawIndex;   // index into GeometryCapture::GetCaptures()
+    DustShaderCategory cat;
+    uint32_t           cbOffset;    // offset of this draw's CB bytes in sCbArena
+    uint32_t           cbSize;
+    int                place;       // 0 = PRE-TRANSFORMED, 1 = WORLD-PLACED
+    float              worldM[16];  // valid when place == 1
+};
+static std::vector<CachedEntry> sCache;
+static std::vector<uint8_t>     sCbArena;
+// Identity stamp of the captures the cache was built from. Replay() rebuilds lazily
+// on mismatch — covers the plugin path (HostReplayGeometry) that never calls
+// BeginFrame, and frame transitions (generation bumps every ResetFrame).
+static const void* sCacheData  = nullptr;
+static size_t      sCacheCount = 0;
+static uint32_t    sCacheGen   = 0;
+static bool        sCacheBuilt = false;
 
-    // Find the captured clip nearest the anchor and copy it out (the coherent same-frame
-    // cameraVP). Single pass: copy the running best into a local so no mapped pointer escapes.
+static int ClassifyPlacement(const float* clip, float worldOut[16]);
+
+static void BuildCache(ID3D11DeviceContext* ctx)
+{
+    ZoneScopedN("GeoReplay.BuildCache");
     const auto& captures = GeometryCapture::GetCaptures();
+    sCache.clear();
+    sCbArena.clear();
+    sCamVPValid = false;
+    sCacheData  = captures.data();
+    sCacheCount = captures.size();
+    sCacheGen   = GeometryCapture::GetGeneration();
+    sCacheBuilt = true;
+    if (captures.empty()) return;
+
+    float anchor[16];
+    bool haveAnchor = false;
+    {
+        float iv[16], pj[16];
+        if (D3D11Hook::GetCameraMatrices(iv, pj)) { MatMul(anchor, iv, pj); haveAnchor = true; }
+    }
+
+    // Single Map pass: snapshot each allowed draw's CB bytes into the arena, and track
+    // the captured clip nearest the anchor (the coherent same-frame cameraVP — see the
+    // COHERENCE comment above). The vote considers ALL classified draws, as before.
     float camVP[16];
     float bestDist = 1e30f;
-    for (const auto& d : captures)
+    for (uint32_t i = 0; i < (uint32_t)captures.size(); ++i)
     {
+        const auto& d = captures[i];
         if (!d.vsMetadata || d.vsMetadata->transformType == VSTransformType::UNKNOWN) continue;
         if (!d.cbStagingCopy || d.vsMetadata->clipMatrixOffset + 64 > d.cbStagingSize) continue;
+
+        DustShaderCategory cat = ShaderDatabase::GetVertexShaderCategory(d.vs);
+        // OBJECTS/DISTANT_TOWN/TRIPLANAR = static solid occluders. SKIN = characters,
+        // FOLIAGE = grass. TERRAIN excluded (vertex-texture fetch; open ground lacks occluders).
+        bool allow = cat == DUST_SHADER_OBJECTS || cat == DUST_SHADER_DISTANT_TOWN ||
+                     cat == DUST_SHADER_TRIPLANAR ||
+                     (cat == DUST_SHADER_SKIN && sSkinEnabled) ||
+                     (cat == DUST_SHADER_FOLIAGE && sFoliageEnabled);
+
         D3D11_MAPPED_SUBRESOURCE m;
         if (FAILED(ctx->Map(d.cbStagingCopy, 0, D3D11_MAP_READ, 0, &m))) continue;
         const float* clip = (const float*)((const char*)m.pData + d.vsMetadata->clipMatrixOffset);
-        float dist = 0.0f;
-        for (int k = 0; k < 16; ++k) { float a = clip[k]-anchor[k]; if (a<0) a=-a; if (a>dist) dist=a; }
-        if (dist < bestDist) { bestDist = dist; memcpy(camVP, clip, 64); }
+        if (haveAnchor)
+        {
+            float dist = 0.0f;
+            for (int k = 0; k < 16; ++k) { float a = clip[k]-anchor[k]; if (a<0) a=-a; if (a>dist) dist=a; }
+            if (dist < bestDist) { bestDist = dist; memcpy(camVP, clip, 64); }
+        }
+        if (allow)
+        {
+            CachedEntry e = {};
+            e.drawIndex = i;
+            e.cat      = cat;
+            e.cbSize   = d.cbStagingSize;
+            e.cbOffset = (uint32_t)sCbArena.size();
+            sCbArena.resize(sCbArena.size() + d.cbStagingSize);
+            memcpy(sCbArena.data() + e.cbOffset, m.pData, d.cbStagingSize);
+            sCache.push_back(e);
+        }
         ctx->Unmap(d.cbStagingCopy, 0);
     }
 
     // No captured clip near the anchor (pre-transformed batch not in view) -> use the raw
     // anchor; placement still correct, just with the minor 1-frame skew.
-    if (bestDist >= 100.0f) memcpy(camVP, anchor, 64);
+    if (haveAnchor)
+    {
+        if (bestDist >= 100.0f) memcpy(camVP, anchor, 64);
+        sCamVPValid = Inverse4x4(sCamVPInv, camVP);
+    }
 
-    sCamVPValid = Inverse4x4(sCamVPInv, camVP);
+    // Classify placement once per draw (was: once per draw per cube face). SKIN draws
+    // always take the transposed-VP path; "junk" classifications (2) fall back to PRE.
+    int nPre = 0, nWorld = 0;
+    for (auto& e : sCache)
+    {
+        if (e.cat == DUST_SHADER_SKIN) { e.place = 0; continue; }
+        const float* clip = (const float*)(sCbArena.data() + e.cbOffset +
+                                           captures[e.drawIndex].vsMetadata->clipMatrixOffset);
+        int place = ClassifyPlacement(clip, e.worldM);
+        e.place = (place == 1) ? 1 : 0;
+        if (e.place == 1) nWorld++; else nPre++;
+    }
+
+    static int dbg = 0;
+    if ((dbg++ % 120) == 0)
+        Log("GeoReplay cache: %d/%d draws (PRE=%d WORLD=%d) camVP=%d",
+            (int)sCache.size(), (int)captures.size(), nPre, nWorld, (int)sCamVPValid);
+}
+
+void BeginFrame(ID3D11DeviceContext* ctx)
+{
+    BuildCache(ctx);
 }
 
 // Classify M = clip x cameraVP^-1. Returns 0=PRE, 1=WORLD, 2=fallback-to-PRE.
@@ -194,10 +282,14 @@ static ID3D11Buffer* GetScratchCB(ID3D11Device* device, uint32_t requiredSize)
             return entry.buffer;
     }
 
+    // DYNAMIC + MAP_WRITE_DISCARD: the same-size scratch CB is rewritten for every
+    // replayed draw; DISCARD lets the driver rename the buffer instead of serializing
+    // each write against the previous draw's read (UpdateSubresource on DEFAULT did).
     D3D11_BUFFER_DESC desc = {};
     desc.ByteWidth      = requiredSize;
-    desc.Usage           = D3D11_USAGE_DEFAULT;
+    desc.Usage           = D3D11_USAGE_DYNAMIC;
     desc.BindFlags       = D3D11_BIND_CONSTANT_BUFFER;
+    desc.CPUAccessFlags  = D3D11_CPU_ACCESS_WRITE;
 
     ID3D11Buffer* buf = nullptr;
     HRESULT hr = device->CreateBuffer(&desc, nullptr, &buf);
@@ -271,6 +363,7 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
                 const float* replacementVPSkin,
                 const float* cullCenter, float cullRadius)
 {
+    ZoneScopedN("GeoReplay.Replay");
     const auto& captures = GeometryCapture::GetCaptures();
     if (captures.empty())
         return 0;
@@ -278,98 +371,59 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
 
     (void)cullCenter; (void)cullRadius;
 
+    // Cache stale (plugin path without BeginFrame, or captures changed) -> rebuild.
+    if (!sCacheBuilt || sCacheData != captures.data() || sCacheCount != captures.size() ||
+        sCacheGen != GeometryCapture::GetGeneration())
+        BuildCache(ctx);
+    if (sCache.empty())
+        return 0;
+
     ReplayStateBlock saved;
     saved.Capture(ctx);
     // The caller's rasterizer state (cull-back) — restore it for non-foliage draws and at the end.
     ID3D11RasterizerState* savedRS = nullptr;
     ctx->RSGetState(&savedRS);
 
+    // SKINNED: clip = viewProjectionMatrix (no world); the bone palette in the same CB
+    // transforms local verts -> world. The skin VS stores its VP TRANSPOSED vs the objects
+    // VS (measured: skinVP == cameraVP^T) — transpose once per face, not per draw.
+    float vpSkinT[16];
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            vpSkinT[r*4+c] = replacementVPSkin[c*4+r];
+
     uint32_t replayed = 0;
-    static std::vector<uint8_t> cbDataBuf;
 
-    // [Dust diag] per-category seen/drawn histogram, logged once per ~120 Replay calls.
-    static int dbgCall = 0;
-    bool dbgLog = ((dbgCall++ % 120) == 0);
-    int hSeen[8] = {0}, hDrawn[8] = {0}, culled = 0, instDrawn = 0;
-    int hPre = 0, hWorld = 0;
-
-    for (const auto& draw : captures)
+    for (const auto& e : sCache)
     {
-        if (!draw.vsMetadata || draw.vsMetadata->transformType == VSTransformType::UNKNOWN)
-            continue;
-
-        DustShaderCategory cat = ShaderDatabase::GetVertexShaderCategory(draw.vs);
-        int ci = ((int)cat >= 0 && (int)cat <= 7) ? (int)cat : 0;
-        if (dbgLog) hSeen[ci]++;
-        {
-            // OBJECTS/DISTANT_TOWN/TRIPLANAR = static solid occluders. SKIN = characters,
-            // FOLIAGE = grass. TERRAIN excluded (vertex-texture fetch; open ground lacks occluders).
-            bool allow = cat == DUST_SHADER_OBJECTS || cat == DUST_SHADER_DISTANT_TOWN ||
-                         cat == DUST_SHADER_TRIPLANAR ||
-                         (cat == DUST_SHADER_SKIN && sSkinEnabled) ||
-                         (cat == DUST_SHADER_FOLIAGE && sFoliageEnabled);
-            if (!allow) continue;
-        }
-
-        if (!draw.cbStagingCopy)
-            continue;
-
+        const CapturedDraw& draw = captures[e.drawIndex];
         const VSConstantBufferInfo& meta = *draw.vsMetadata;
+        DustShaderCategory cat = e.cat;
 
-        D3D11_MAPPED_SUBRESOURCE mapped;
-        HRESULT hr = ctx->Map(draw.cbStagingCopy, 0, D3D11_MAP_READ, 0, &mapped);
-        if (FAILED(hr))
-            continue;
-
-        if (cbDataBuf.size() < draw.cbStagingSize)
-            cbDataBuf.resize(draw.cbStagingSize);
-        memcpy(cbDataBuf.data(), mapped.pData, draw.cbStagingSize);
-        ctx->Unmap(draw.cbStagingCopy, 0);
-
-        if (meta.clipMatrixOffset + 64 > draw.cbStagingSize)
-            continue;
-
-        float* clipDst = reinterpret_cast<float*>(cbDataBuf.data() + meta.clipMatrixOffset);
-
-        if (cat == DUST_SHADER_SKIN)
-        {
-            // SKINNED: clip = viewProjectionMatrix (no world); the bone palette in this same CB
-            // transforms local verts -> world (same frame as static). The skin VS stores its VP
-            // TRANSPOSED vs the objects VS (measured: skinVP == cameraVP^T), so write the light
-            // VP's TRANSPOSE into the clip slot.
-            float vpT[16];
-            for (int r = 0; r < 4; ++r)
-                for (int c = 0; c < 4; ++c)
-                    vpT[r*4+c] = replacementVPSkin[c*4+r];
-            memcpy(clipDst, vpT, 64);
-        }
-        else
-        {
-            // Placement via the cameraVP oracle (BeginFrame). PRE-TRANSFORMED draws keep the bare
-            // light view-proj; WORLD-PLACED draws (else phantoms) compose their recovered world
-            // matrix with it so they replay at the right spot. Anything that doesn't classify as a
-            // clean rotation falls back to PRE (never a wild placement).
-            float worldM[16];
-            int place = ClassifyPlacement(clipDst, worldM);
-            if (place == 1)
-            {
-                float wvp[16];
-                MatMul(wvp, worldM, replacementVP);   // local -> world -> light clip
-                memcpy(clipDst, wvp, 64);
-                if (dbgLog) hWorld++;
-            }
-            else
-            {
-                memcpy(clipDst, replacementVP, 64);
-                if (dbgLog) hPre++;
-            }
-        }
-
-        ID3D11Buffer* scratchCB = GetScratchCB(device, draw.cbStagingSize);
+        ID3D11Buffer* scratchCB = GetScratchCB(device, e.cbSize);
         if (!scratchCB)
             continue;
 
-        ctx->UpdateSubresource(scratchCB, 0, nullptr, cbDataBuf.data(), 0, 0);
+        // Per-face clip matrix: PRE-TRANSFORMED draws take the bare light view-proj;
+        // WORLD-PLACED draws compose their cached recovered world matrix with it.
+        const float* patch;
+        float wvp[16];
+        if (cat == DUST_SHADER_SKIN)
+            patch = vpSkinT;
+        else if (e.place == 1)
+        {
+            MatMul(wvp, e.worldM, replacementVP);   // local -> world -> light clip
+            patch = wvp;
+        }
+        else
+            patch = replacementVP;
+
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        if (FAILED(ctx->Map(scratchCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+            continue;
+        memcpy(mapped.pData, sCbArena.data() + e.cbOffset, e.cbSize);
+        memcpy((char*)mapped.pData + meta.clipMatrixOffset, patch, 64);
+        ctx->Unmap(scratchCB, 0);
 
         // Set IA state (both VB slots — slot 1 has instance data for instanced draws)
         ctx->IASetInputLayout(draw.inputLayout);
@@ -437,7 +491,6 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
         }
 
         replayed++;
-        if (dbgLog) { hDrawn[ci]++; if (draw.instanceCount > 1) instDrawn++; }
     }
 
     // Reset the PS + the foliage diffuse SRV we bound (depth-only default), so the alpha PS and
@@ -450,13 +503,6 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
 
     saved.Restore(ctx);
 
-    if (dbgLog)
-        Log("GeoReplay seen[OBJ=%d SKIN=%d TERR=%d FOL=%d TRI=%d DT=%d UNK=%d] drawn[OBJ=%d SKIN=%d TRI=%d DT=%d] culled=%d caps=%d",
-            hSeen[1],hSeen[4],hSeen[2],hSeen[3],hSeen[5],hSeen[6],hSeen[0],
-            hDrawn[1],hDrawn[4],hDrawn[5],hDrawn[6], culled, (int)captures.size());
-    if (dbgLog) Log("GeoReplay instanced-drawn=%d  placement[PRE=%d WORLD=%d] camVP=%d",
-                    instDrawn, hPre, hWorld, (int)sCamVPValid);
-
     if (sReplaysIssued < 3 && replayed > 0)
     {
         Log("GeometryReplay: replayed %u / %u draws", replayed, (uint32_t)captures.size());
@@ -468,6 +514,9 @@ uint32_t Replay(ID3D11DeviceContext* ctx, ID3D11Device* device,
 
 void Shutdown()
 {
+    sCache.clear();
+    sCbArena.clear();
+    sCacheBuilt = false;
     for (auto& entry : sScratchCBs)
         if (entry.buffer) entry.buffer->Release();
     sScratchCBs.clear();

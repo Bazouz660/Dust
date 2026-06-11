@@ -8,6 +8,7 @@
 #include "TerrainTess.h"
 #include "D3D11StateBlock.h"
 
+#include <tracy/Tracy.hpp>
 #include <d3d11.h>
 #include <math.h>
 #include <vector>
@@ -49,10 +50,35 @@ static bool sFailed = false;
 static bool  sDebugViz    = false;   // 4-way tint (blue/green/yellow/red) for diagnosis; off = real shadows
 
 // Active light snapshot — filled by RenderFrame, consumed when building the CB.
+// Indexed by CUBE SLOT (not selection rank) so cube contents stay put across frames.
 static int   sActiveCount = 0;
 static float sActivePos[kNumLights][3] = {};
 static float sActiveRadius[kNumLights] = {};
 static void* sActiveLight[kNumLights] = {};   // Ogre::Light* handles for the selected lights
+
+// Persistent light->cube-slot assignment + budgeted refresh. Cube content is
+// camera-independent (depth from the light along render-world axes, translation-
+// invariant sampling), so a cube only needs re-rendering when its light moves or to
+// pick up moving casters (characters) — not 16 lights x 6 faces every frame.
+// Steady state: kMaxCubeRendersPerFrame cubes round-robin per frame (oldest first),
+// so every cube refreshes within kNumLights/kMaxCubeRendersPerFrame frames.
+// Slots are matched by ABSOLUTE render-world position (rebased + camera), which is
+// stable for static lamps. A floating-origin rebase breaks the match and re-renders
+// everything over a few frames — rare (region transitions), accepted.
+static const int   kMaxCubeRendersPerFrame = 4;
+static const float kSlotMatchEps = 2.0f;    // abs-pos distance: "same light as last frame"
+static const float kDirtyMoveEps = 0.10f;   // abs-pos delta that forces a re-render
+
+struct CubeSlot
+{
+    bool     valid = false;          // a selected light owns this slot this frame
+    bool     rendered = false;       // cube content matches this light (CB-matchable)
+    float    absPos[3] = {};         // light pos, render-world absolute (rebased + camPos)
+    float    renderedPos[3] = {};    // absPos at the last cube render
+    unsigned lastRenderFrame = 0;
+};
+static CubeSlot sSlots[kNumLights];
+static unsigned sFrameCounter = 0;
 
 // OGRE->shader-space translation (set per frame from D3D11Hook's ProbeLightCB).
 // Cube centers are mapped into shader space (center - R) so the in-shader match
@@ -115,18 +141,31 @@ void UpdateLightTableCB(ID3D11DeviceContext* ctx)
 {
     if (!ctx || !sPtCB) return;
     float cbData[4 * (kNumLights + 1)] = {};
+    int nMatchable = 0;
     for (int c = 0; c < kNumLights; ++c)
     {
-        if (c < sActiveCount)
+        // Only slots whose cube content matches their light are exposed; a freshly
+        // assigned slot awaiting its budgeted render gets a far sentinel so light_fs
+        // can't match a light against another light's stale cube.
+        if (sSlots[c].valid && sSlots[c].rendered)
         {
             cbData[c*4+0] = sActivePos[c][0] - (sLightSpaceRValid ? sLightSpaceR[0] : 0.0f);
             cbData[c*4+1] = sActivePos[c][1] - (sLightSpaceRValid ? sLightSpaceR[1] : 0.0f);
             cbData[c*4+2] = sActivePos[c][2] - (sLightSpaceRValid ? sLightSpaceR[2] : 0.0f);
             cbData[c*4+3] = sActiveRadius[c];
+            nMatchable++;
+        }
+        else
+        {
+            cbData[c*4+0] = cbData[c*4+1] = cbData[c*4+2] = 1.0e8f;
+            cbData[c*4+3] = 0.0f;
         }
     }
     float* meta = &cbData[4 * kNumLights];
-    meta[0] = kFaceNear; meta[1] = kFaceFar; meta[2] = (float)sActiveCount;
+    meta[0] = kFaceNear; meta[1] = kFaceFar;
+    // Slots are sparse — the shader scans all kNumLights entries (sentinels never
+    // win the nearest-match); z=0 short-circuits the whole block when nothing is up.
+    meta[2] = nMatchable > 0 ? (float)kNumLights : 0.0f;
     meta[3] = sDebugViz ? 1.0f : 0.0f;   // w: shader debug tint (green=lit/red=shadow)
     ctx->UpdateSubresource(sPtCB, 0, nullptr, cbData, 0, 0);
 }
@@ -251,8 +290,10 @@ static const float kFaceUp [6][3] = { {0,1,0}, {0,1,0}, {0,0,-1}, {0,0,1}, {0,1,
 
 void RenderFrame(ID3D11DeviceContext* ctx, ID3D11Device* device, const float* camPos3)
 {
+    ZoneScopedN("PointShadows.RenderFrame");
     if (!ctx || !device || !camPos3) return;
     if (!EnsureResources(device)) return;
+    sFrameCounter++;
 
     // No captures (GBuffer pass empty/not yet seen at this firing): keep last frame's
     // cubes and table. Proceeding would CLEAR every cube DSV with nothing to replay,
@@ -281,86 +322,159 @@ void RenderFrame(ID3D11DeviceContext* ctx, ID3D11Device* device, const float* ca
         cand.push_back({ dx*dx + dy*dy + dz*dz, i });
     }
     int sel = (int)cand.size(); if (sel > kNumLights) sel = kNumLights;
+    float selPos[kNumLights][3];   // rebased (light_fs frame) — the match centers
+    float selRadius[kNumLights];
     for (int a = 0; a < sel; ++a)
     {
         int m = a;
         for (int b = a+1; b < (int)cand.size(); ++b) if (cand[b].d < cand[m].d) m = b;
         Cand t = cand[a]; cand[a] = cand[m]; cand[m] = t;
-        sActivePos[a][0] = sDrawnLights[cand[a].i][0];
-        sActivePos[a][1] = sDrawnLights[cand[a].i][1];
-        sActivePos[a][2] = sDrawnLights[cand[a].i][2];
-        sActiveRadius[a] = sDrawnRadius[cand[a].i];
+        selPos[a][0] = sDrawnLights[cand[a].i][0];
+        selPos[a][1] = sDrawnLights[cand[a].i][1];
+        selPos[a][2] = sDrawnLights[cand[a].i][2];
+        selRadius[a] = sDrawnRadius[cand[a].i];
     }
-    sActiveCount = sel;
     if (sel <= 0) return;
+    sActiveCount = sel;
 
-    // sActivePos is ALREADY render-world -> the cube CENTER (match) stays render-world.
+    // selPos is ALREADY render-world -> the cube CENTER (match) stays render-world.
     sLightSpaceR[0] = sLightSpaceR[1] = sLightSpaceR[2] = 0.0f;
     sLightSpaceRValid = false;
 
     // FRAME MODEL (measured 2026-06-09, all from CB/vertex dumps):
     //   GBuffer:  depth = length(P_geo - cG)        cG = PS cameraPos uniform
     //   light_fs: worldPos = tL + R*(dir*dist)      tL = viewMatrix translation == (0,0,0)
-    // => light_fs is a camera-at-origin frame and the cube POV is lp = sActivePos + camera.
+    // => light_fs is a camera-at-origin frame and the cube POV is lp = selPos + camera.
     // The camera MUST come from the same pass that consumes the cubes (sDrawnCamPos, probed
     // from the light_fs CB). The GBuffer-pass camera reads one camera-delta behind while the
     // camera moves -> lagging shadows (user-visible); do not swap this source again.
     float worldOffset[3] = { sDrawnCamPos[0], sDrawnCamPos[1], sDrawnCamPos[2] };
 
-    // Render each light's 6 cube faces by replaying the captured GBuffer draws from the
-    // light's POV (GeometryReplay) with our depth-only output. CRITICAL: the GBuffer geometry
-    // is in RENDER-WORLD (worldViewProj uses worldMatrix=identity), so the replay light POV
-    // must also be render-world = sActivePos - R (== light_fs `position`, the match center).
-    // The old path used sActivePos (wrong frame) -> misplacement; this is the fix.
-    float proj[16];
-    PerspLH(proj, 1.5708f, 1.0f, kFaceNear, kFaceFar);   // 90 deg per face
-
-    // Compute per-draw placement decisions once for this frame's captures
-    // (majority cameraVP + PRE/COMPOSE/SKIP) — Replay() consults the cache per face.
-    GeometryReplay::BeginFrame(ctx);
-
-    sStateBlock.Capture(ctx);
-    ID3D11RenderTargetView* nullRTV[1] = { nullptr };
-    D3D11_VIEWPORT port = {}; port.Width = (float)kSize; port.Height = (float)kSize; port.MaxDepth = 1.0f;
-    ctx->RSSetViewports(1, &port);
-    ctx->RSSetState(sRasterState);
-    ctx->OMSetDepthStencilState(sDepthState, 0);
-    ctx->PSSetShader(nullptr, nullptr, 0);
-
-    uint32_t totalReplayed = 0;
-    for (int c = 0; c < sel; ++c)
+    // ---- persistent slot assignment (match by absolute render-world position) ----
+    bool claimed[kNumLights] = {};
+    int  slotOf[kNumLights];
+    for (int i = 0; i < sel; ++i) slotOf[i] = -1;
+    // Pass 1: re-claim the slot that already holds this light (its cube stays valid).
+    for (int i = 0; i < sel; ++i)
     {
-        // POV = light reprojected into the GBuffer geometry frame (see worldOffset above).
-        // The match center (UpdateLightTableCB) stays rebased (sActivePos).
-        float lp[3]     = { sActivePos[c][0]+worldOffset[0], sActivePos[c][1]+worldOffset[1], sActivePos[c][2]+worldOffset[2] };
-        // SKINNED frame test: the memory says skin shares the STATIC frame (bones = node-derived
-        // world, same as the GBuffer geometry). So test skin with the SAME POV as static (lp).
-        // If the character renders coherently -> static frame is right; if garbage -> input bug.
-        float lpSkin[3] = { lp[0], lp[1], lp[2] };
-        // Cull DISABLED: the captured world-matrix translation (world[12..14]) is ~0 for this
-        // camera-relative geometry (position is in the vertices), so a per-light origin cull
-        // wrongly drops nearly everything. Pass no cull center -> replay all occluders. A proper
-        // cull needs the real geometry position; revisit for perf (replays all geometry x lights).
-        for (int f = 0; f < 6; ++f)
+        float ax = selPos[i][0]+worldOffset[0], ay = selPos[i][1]+worldOffset[1], az = selPos[i][2]+worldOffset[2];
+        int best = -1; float bestD = kSlotMatchEps * kSlotMatchEps;
+        for (int s = 0; s < kNumLights; ++s)
         {
-            float target[3]  = { lp[0]+kFaceDir[f][0], lp[1]+kFaceDir[f][1], lp[2]+kFaceDir[f][2] };
-            float tgtSkin[3] = { lpSkin[0]+kFaceDir[f][0], lpSkin[1]+kFaceDir[f][1], lpSkin[2]+kFaceDir[f][2] };
-            float view[16], vp[16], viewSkin[16], vpSkin[16];
-            LookAtLH(view, lp, target, kFaceUp[f]);          Mul(vp, view, proj);
-            LookAtLH(viewSkin, lpSkin, tgtSkin, kFaceUp[f]); Mul(vpSkin, viewSkin, proj);
-            ctx->OMSetRenderTargets(1, nullRTV, sFaceDSV[c*6+f]);
-            ctx->ClearDepthStencilView(sFaceDSV[c*6+f], D3D11_CLEAR_DEPTH, 1.0f, 0);
-            totalReplayed += GeometryReplay::Replay(ctx, device, vp, vpSkin, nullptr, 0.0f);
+            if (!sSlots[s].valid || claimed[s]) continue;
+            float dx = ax-sSlots[s].absPos[0], dy = ay-sSlots[s].absPos[1], dz = az-sSlots[s].absPos[2];
+            float d = dx*dx + dy*dy + dz*dz;
+            if (d < bestD) { bestD = d; best = s; }
+        }
+        if (best >= 0)
+        {
+            claimed[best] = true; slotOf[i] = best;
+            sSlots[best].absPos[0] = ax; sSlots[best].absPos[1] = ay; sSlots[best].absPos[2] = az;
         }
     }
-    sStateBlock.Restore(ctx);
+    // Pass 2: new lights take free slots (prefer empty ones, else evict an unclaimed one).
+    for (int i = 0; i < sel; ++i)
+    {
+        if (slotOf[i] >= 0) continue;
+        int pick = -1;
+        for (int s = 0; s < kNumLights; ++s) if (!claimed[s] && !sSlots[s].valid) { pick = s; break; }
+        if (pick < 0)
+            for (int s = 0; s < kNumLights; ++s) if (!claimed[s]) { pick = s; break; }
+        if (pick < 0) break;   // can't happen: sel <= kNumLights
+        claimed[pick] = true; slotOf[i] = pick;
+        sSlots[pick].valid = true;
+        sSlots[pick].rendered = false;   // cube holds a previous light's depth -> sentinel until rendered
+        sSlots[pick].absPos[0] = selPos[i][0]+worldOffset[0];
+        sSlots[pick].absPos[1] = selPos[i][1]+worldOffset[1];
+        sSlots[pick].absPos[2] = selPos[i][2]+worldOffset[2];
+    }
+    // Slots whose light left the active set free up for future lights.
+    for (int s = 0; s < kNumLights; ++s)
+        if (!claimed[s]) { sSlots[s].valid = false; sSlots[s].rendered = false; }
+
+    // Per-slot CB data: this frame's rebased centers for the slot's light.
+    for (int i = 0; i < sel; ++i)
+    {
+        int s = slotOf[i];
+        if (s < 0) continue;
+        sActivePos[s][0] = selPos[i][0]; sActivePos[s][1] = selPos[i][1]; sActivePos[s][2] = selPos[i][2];
+        sActiveRadius[s] = selRadius[i];
+    }
+
+    // ---- budgeted refresh: pick up to kMaxCubeRendersPerFrame slots ----
+    // New/moved slots first (their cube content is wrong), then oldest-rendered
+    // (round-robin so moving characters keep updating in every cube).
+    int order[kNumLights]; int n = 0;
+    for (int s = 0; s < kNumLights; ++s) if (sSlots[s].valid) order[n++] = s;
+    auto needsRender = [](const CubeSlot& sl) -> bool {
+        if (!sl.rendered) return true;
+        float dx = sl.absPos[0]-sl.renderedPos[0], dy = sl.absPos[1]-sl.renderedPos[1], dz = sl.absPos[2]-sl.renderedPos[2];
+        return dx*dx + dy*dy + dz*dz > kDirtyMoveEps * kDirtyMoveEps;
+    };
+    for (int a = 1; a < n; ++a)   // insertion sort, n <= 16
+    {
+        int v = order[a]; int b = a - 1;
+        auto before = [&](int x, int y) {
+            bool nx = needsRender(sSlots[x]), ny = needsRender(sSlots[y]);
+            if (nx != ny) return nx;
+            return sSlots[x].lastRenderFrame < sSlots[y].lastRenderFrame;
+        };
+        while (b >= 0 && before(v, order[b])) { order[b+1] = order[b]; --b; }
+        order[b+1] = v;
+    }
+    int toRender = n < kMaxCubeRendersPerFrame ? n : kMaxCubeRendersPerFrame;
+
+    uint32_t totalReplayed = 0;
+    if (toRender > 0)
+    {
+        // Render the chosen lights' 6 cube faces by replaying the captured GBuffer draws
+        // from the light's POV (GeometryReplay) with our depth-only output. The GBuffer
+        // geometry is in RENDER-WORLD absolute, so the replay POV is the slot's absPos
+        // (= rebased + worldOffset). Cull stays disabled: the captured world-matrix
+        // translation is ~0 for this camera-relative geometry, so an origin cull would
+        // wrongly drop nearly everything.
+        float proj[16];
+        PerspLH(proj, 1.5708f, 1.0f, kFaceNear, kFaceFar);   // 90 deg per face
+
+        // One staging Map + placement classification per captured draw for the whole
+        // frame — Replay() consults the cache per face.
+        GeometryReplay::BeginFrame(ctx);
+
+        sStateBlock.Capture(ctx);
+        ID3D11RenderTargetView* nullRTV[1] = { nullptr };
+        D3D11_VIEWPORT port = {}; port.Width = (float)kSize; port.Height = (float)kSize; port.MaxDepth = 1.0f;
+        ctx->RSSetViewports(1, &port);
+        ctx->RSSetState(sRasterState);
+        ctx->OMSetDepthStencilState(sDepthState, 0);
+        ctx->PSSetShader(nullptr, nullptr, 0);
+
+        for (int k = 0; k < toRender; ++k)
+        {
+            int s = order[k];
+            const float* lp = sSlots[s].absPos;
+            for (int f = 0; f < 6; ++f)
+            {
+                float target[3] = { lp[0]+kFaceDir[f][0], lp[1]+kFaceDir[f][1], lp[2]+kFaceDir[f][2] };
+                float view[16], vp[16];
+                LookAtLH(view, lp, target, kFaceUp[f]);
+                Mul(vp, view, proj);
+                ctx->OMSetRenderTargets(1, nullRTV, sFaceDSV[s*6+f]);
+                ctx->ClearDepthStencilView(sFaceDSV[s*6+f], D3D11_CLEAR_DEPTH, 1.0f, 0);
+                totalReplayed += GeometryReplay::Replay(ctx, device, vp, vp, nullptr, 0.0f);
+            }
+            sSlots[s].rendered = true;
+            sSlots[s].renderedPos[0] = lp[0]; sSlots[s].renderedPos[1] = lp[1]; sSlots[s].renderedPos[2] = lp[2];
+            sSlots[s].lastRenderFrame = sFrameCounter;
+        }
+        sStateBlock.Restore(ctx);
+    }
 
     UpdateLightTableCB(ctx);
 
     static int frame = 0;
     if (((frame++) % 120) == 0)
-        Log("PointShadows: nLights=%d rebasedL0=(%.0f,%.0f,%.0f) worldOffset=(%.0f,%.0f,%.0f) replayed %u",
-            sActiveCount, sActivePos[0][0], sActivePos[0][1], sActivePos[0][2],
+        Log("PointShadows: nLights=%d cubesRendered=%d/%d worldOffset=(%.0f,%.0f,%.0f) replayed %u",
+            sActiveCount, toRender, n,
             worldOffset[0], worldOffset[1], worldOffset[2], totalReplayed);
 }
 
@@ -397,6 +511,7 @@ void Shutdown()
     if (sRasterState) { sRasterState->Release(); sRasterState = nullptr; }
     if (sPtSampler)   { sPtSampler->Release();   sPtSampler = nullptr; }
     if (sPtCB)        { sPtCB->Release();        sPtCB = nullptr; }
+    for (int s = 0; s < kNumLights; ++s) sSlots[s] = CubeSlot{};
     sReady = false;
 }
 

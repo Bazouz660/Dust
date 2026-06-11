@@ -121,6 +121,11 @@ namespace GeometryCapture
     const std::vector<CapturedDraw>& GetCaptures();
     uint32_t GetCaptureCount();
 
+    // Monotonic counter bumped every ResetFrame — lets consumers (GeometryReplay's
+    // per-frame cache) detect that the captures vector was repopulated even when its
+    // data pointer and size happen to match the previous frame's.
+    uint32_t GetGeneration();
+
     // Whether we're currently inside a detected GBuffer pass
     bool IsInGBufferPass();
 

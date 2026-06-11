@@ -1621,6 +1621,90 @@ static HRESULT STDMETHODCALLTYPE HookedCreateVertexShader(
     return hr;
 }
 
+// ==================== Deferred light-CB readback ====================
+// During the light-volume pass, ProbeLightCB queues a GPU copy of each qualifying
+// light_fs CB0 into a pooled staging buffer; FlushLightCBReadbacks maps them at the
+// NEXT frame's POST_LIGHTING, when the copies are long complete. The old code did
+// CreateBuffer + CopyResource + Map(READ) inline per light draw — a full CPU<->GPU
+// sync for EVERY light drawn, every frame. Data timing is unchanged: gDrawnLights
+// was already produced during frame N's light draws and consumed at frame N+1's
+// POST_LIGHTING (same double-buffer pattern as ExtractCameraData above).
+struct LightCBStaging { ID3D11Buffer* buf; UINT byteWidth; };
+static std::vector<LightCBStaging> gLightCBPool;
+static size_t gLightCBPoolUsed = 0;
+static std::vector<ID3D11Buffer*> gLightCBPending;   // queued this frame, mapped next
+
+static ID3D11Buffer* AcquireLightCBStaging(UINT byteWidth)
+{
+    for (size_t i = gLightCBPoolUsed; i < gLightCBPool.size(); ++i)
+    {
+        if (gLightCBPool[i].byteWidth == byteWidth)
+        {
+            if (i != gLightCBPoolUsed) std::swap(gLightCBPool[i], gLightCBPool[gLightCBPoolUsed]);
+            return gLightCBPool[gLightCBPoolUsed++].buf;
+        }
+    }
+    D3D11_BUFFER_DESC sd = {};
+    sd.ByteWidth      = byteWidth;
+    sd.Usage           = D3D11_USAGE_STAGING;
+    sd.CPUAccessFlags  = D3D11_CPU_ACCESS_READ;
+    ID3D11Buffer* buf = nullptr;
+    if (FAILED(gDevice->CreateBuffer(&sd, nullptr, &buf)) || !buf)
+        return nullptr;
+    gLightCBPool.push_back({ buf, byteWidth });
+    if (gLightCBPool.size() - 1 != gLightCBPoolUsed)
+        std::swap(gLightCBPool.back(), gLightCBPool[gLightCBPoolUsed]);
+    return gLightCBPool[gLightCBPoolUsed++].buf;
+}
+
+// Map last frame's queued copies and rebuild gDrawnLights/gRenderCamPos for
+// PointShadows. DO_NOT_WAIT: a copy still in flight (shouldn't happen a frame
+// later) is skipped rather than stalling the pipeline.
+static void FlushLightCBReadbacks(ID3D11DeviceContext* ctx)
+{
+    if (gLightCBPending.empty()) return;
+    gDrawnCount = 0;
+    for (ID3D11Buffer* buf : gLightCBPending)
+    {
+        D3D11_BUFFER_DESC bd; buf->GetDesc(&bd);
+        int nf = (int)(bd.ByteWidth / 4);
+        bool isSpot = (nf > 70);
+        D3D11_MAPPED_SUBRESOURCE mm;
+        if (FAILED(ctx->Map(buf, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mm)))
+            continue;
+        const float* f = (const float*)mm.pData;
+        if (f[11] > 1.0f && f[11] < 20000.0f)   // sane radius -> point/spot light_fs
+        {
+            const float* V = f + (isSpot ? 40 : 36);   // viewMatrix, col-major: cameraPos = -R^T*t
+            float bx = -(V[0]*V[12] + V[1]*V[13] + V[2]*V[14]);
+            float by = -(V[4]*V[12] + V[5]*V[13] + V[6]*V[14]);
+            float bz = -(V[8]*V[12] + V[9]*V[13] + V[10]*V[14]);
+            if (isfinite(bx) && isfinite(by) && isfinite(bz) && fabsf(bx) < 1e6f && fabsf(by) < 1e6f && fabsf(bz) < 1e6f)
+            {
+                gRenderCamPos[0]=bx; gRenderCamPos[1]=by; gRenderCamPos[2]=bz;
+                gRenderCamPosValid = true;
+                static int tlog = 0;
+                if ((tlog++ % 600) == 0) Log("RenderCamPos=(%.1f,%.1f,%.1f)", bx,by,bz);
+            }
+            // Collect this light's render-world position (position[12..14]) —
+            // the ground-truth cube light position. No R, no SceneAccess.
+            if (gDrawnCount < 256)
+            {
+                gDrawnLights[gDrawnCount][0] = f[12];
+                gDrawnLights[gDrawnCount][1] = f[13];
+                gDrawnLights[gDrawnCount][2] = f[14];
+                gDrawnRadius[gDrawnCount]    = f[11];   // falloff.w = light radius
+                gDrawnCount++;
+            }
+        }
+        ctx->Unmap(buf, 0);
+    }
+    if (gRenderCamPosValid)
+        PointShadows::SetRenderCamPos(gRenderCamPos, true);
+    gLightCBPending.clear();
+    gLightCBPoolUsed = 0;
+}
+
 static void STDMETHODCALLTYPE HookedDraw(
     ID3D11DeviceContext* pThis, UINT VertexCount, UINT StartVertexLocation)
 {
@@ -1774,6 +1858,11 @@ static void STDMETHODCALLTYPE HookedDraw(
         if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
             ExtractCameraData(pThis);
 
+        // Read back last frame's queued light-CB copies (complete by now -> no stall)
+        // and rebuild gDrawnLights/gRenderCamPos for the PointShadows block below.
+        if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
+            FlushLightCBReadbacks(pThis);
+
         // One-shot diagnostic dump of the captured scene light set.
         if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
             SceneAccess::DebugDumpOnce();
@@ -1882,21 +1971,21 @@ static void ProbeLightCB(ID3D11DeviceContext* ctx)
     static int reads = 0;        // CB reads sampled this frame
     static bool finalized = false;
 
-    // New frame: reset accumulation.
+    // New frame: reset accumulation. If the POST_LIGHTING flush didn't run last frame
+    // (injection missed / camera invalid), drain the queue here so it can't grow.
     if (gFrameIndex != lastFrame)
     {
         votes.clear();
         reads = 0;
-        gDrawnCount = 0;
         finalized = false;
         lastFrame = gFrameIndex;
+        FlushLightCBReadbacks(ctx);
     }
-    // NOTE: no early return here — we collect every drawn light's render-world position
-    // below (capped), accumulating across the frame's light draws.
+    // NOTE: no early return here — we queue every drawn light's CB (capped),
+    // accumulating across the frame's light draws.
 
-    // Extract the render-world camera position from the light_fs CB view matrix (offset 36).
-    // Two candidates (row- vs column-major); log both to confirm which == the capture's
-    // cameraPos (5.2,1803.8,-828.3), then we use it to reconcile OGRE <-> render-world.
+    // Queue this light draw's CB0 for next-frame readback (GPU-side copy only; the
+    // readback happens in FlushLightCBReadbacks at the next POST_LIGHTING).
     {
         ID3D11Buffer* cb = nullptr;
         ctx->PSGetConstantBuffers(0, 1, &cb);
@@ -1907,47 +1996,13 @@ static void ProbeLightCB(ID3D11DeviceContext* ctx)
             // POINT light_fs = 68 floats; SPOT light_fs = 72 (inserts direction[3]+spot[3] after
             // power, shifting viewMatrix 36->40). radius(falloff.w)@11 and position@12..14 are
             // BEFORE the insert, so they're unchanged for both.
-            if (nf >= 64 && nf <= 74 && gDrawnCount < 256)
+            if (nf >= 64 && nf <= 74 && gLightCBPending.size() < 256)
             {
-                bool isSpot = (nf > 70);
-                D3D11_BUFFER_DESC sd = bd; sd.Usage = D3D11_USAGE_STAGING;
-                sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.BindFlags = 0; sd.MiscFlags = 0;
-                ID3D11Buffer* stg = nullptr;
-                if (SUCCEEDED(gDevice->CreateBuffer(&sd, nullptr, &stg)) && stg)
+                ID3D11Buffer* stg = AcquireLightCBStaging(bd.ByteWidth);
+                if (stg)
                 {
                     ctx->CopyResource(stg, cb);
-                    D3D11_MAPPED_SUBRESOURCE mm;
-                    if (SUCCEEDED(ctx->Map(stg, 0, D3D11_MAP_READ, 0, &mm)))
-                    {
-                        const float* f = (const float*)mm.pData;
-                        if (f[11] > 1.0f && f[11] < 20000.0f)   // sane radius -> point/spot light_fs
-                        {
-                            const float* V = f + (isSpot ? 40 : 36);   // viewMatrix, col-major: cameraPos = -R^T*t
-                            float bx = -(V[0]*V[12] + V[1]*V[13] + V[2]*V[14]);
-                            float by = -(V[4]*V[12] + V[5]*V[13] + V[6]*V[14]);
-                            float bz = -(V[8]*V[12] + V[9]*V[13] + V[10]*V[14]);
-                            if (isfinite(bx) && isfinite(by) && isfinite(bz) && fabsf(bx) < 1e6f && fabsf(by) < 1e6f && fabsf(bz) < 1e6f)
-                            {
-                                gRenderCamPos[0]=bx; gRenderCamPos[1]=by; gRenderCamPos[2]=bz;
-                                gRenderCamPosValid = true;
-                                PointShadows::SetRenderCamPos(gRenderCamPos, true);
-                                static int tlog = 0;
-                                if ((tlog++ % 60) == 0) Log("RenderCamPos=(%.1f,%.1f,%.1f)", bx,by,bz);
-                            }
-                            // Collect this light's render-world position (position[12..14]) —
-                            // the ground-truth cube light position. No R, no SceneAccess.
-                            if (gDrawnCount < 256)
-                            {
-                                gDrawnLights[gDrawnCount][0] = f[12];
-                                gDrawnLights[gDrawnCount][1] = f[13];
-                                gDrawnLights[gDrawnCount][2] = f[14];
-                                gDrawnRadius[gDrawnCount]    = f[11];   // falloff.w = light radius
-                                gDrawnCount++;
-                            }
-                        }
-                        ctx->Unmap(stg, 0);
-                    }
-                    stg->Release();
+                    gLightCBPending.push_back(stg);
                 }
             }
             cb->Release();

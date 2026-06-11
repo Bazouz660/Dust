@@ -18,6 +18,7 @@ static UINT sExpectedHeight = 0;
 static ID3D11Device* sCachedDevice = nullptr;
 
 static uint32_t sFramesCaptured = 0;
+static uint32_t sGeneration     = 0;   // bumped every ResetFrame (see GetGeneration)
 
 // Staging buffer pool — each buffer has its own size (must match the CB it copies
 // from, since D3D11 CopyResource requires identical ByteWidth for buffers).
@@ -429,6 +430,7 @@ void ResetFrame()
 
     ReleaseCaptures();
     sInGBufferPass = false;
+    sGeneration++;
 }
 
 const std::vector<CapturedDraw>& GetCaptures()
@@ -439,6 +441,11 @@ const std::vector<CapturedDraw>& GetCaptures()
 uint32_t GetCaptureCount()
 {
     return (uint32_t)sCaptures.size();
+}
+
+uint32_t GetGeneration()
+{
+    return sGeneration;
 }
 
 bool IsInGBufferPass()
