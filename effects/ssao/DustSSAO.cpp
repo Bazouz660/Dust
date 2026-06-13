@@ -372,7 +372,7 @@ extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
 
     memset(desc, 0, sizeof(*desc));
     desc->apiVersion        = DUST_API_VERSION;
-    desc->name              = "SSAO";
+    desc->name              = "Ambient Occlusion";
     desc->injectionPoint    = DUST_INJECT_POST_LIGHTING;
     desc->Init              = SSAOInit;
     desc->Shutdown          = SSAOShutdown;

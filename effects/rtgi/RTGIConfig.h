@@ -17,6 +17,9 @@ struct RTGIConfig
     // Lighting
     float giIntensity   = 3.0f;    // final indirect light brightness (applied at composite)
     float aoIntensity   = 1.0f;    // ambient occlusion strength
+    float shadowContrast = 2.0f;   // power curve on the directional AO at composite —
+                                   // >1 deepens occluded contacts into Marty-style GI
+                                   // shadows while leaving open surfaces (ao=1) untouched
     float bounceIntensity = 0.3f;  // multi-bounce feedback (0 = single bounce only)
     float saturation    = 1.0f;    // color saturation of indirect light
 

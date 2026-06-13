@@ -37,6 +37,8 @@ struct CompositeCBData
     float giIntensity;
     float saturation;
     float giTexSize[2];
+    float shadowContrast;
+    float _pad[3];
 };
 
 // Track the last GI SRV for compositing
@@ -108,6 +110,7 @@ static void RTGIPostExecute(const DustFrameContext* ctx, const DustHostAPI* host
     ccb.saturation = gRTGIConfig.saturation;
     ccb.giTexSize[0] = (float)giW;
     ccb.giTexSize[1] = (float)giH;
+    ccb.shadowContrast = gRTGIConfig.shadowContrast;
     host->UpdateConstantBuffer(dc, gCompositeCB, &ccb, sizeof(ccb));
 
     ID3D11SamplerState* samplers[2] = { gLinearSampler, gPointSampler };
@@ -268,6 +271,7 @@ static DustSettingDesc gSettingsArray[] = {
     { "Enabled",            DUST_SETTING_BOOL,  &gRTGIConfig.enabled,         0.0f,   1.0f,  "Enabled",         nullptr, "Enable or disable ray-traced global illumination",                        DUST_PERF_HIGH   },
     { "GI Intensity",       DUST_SETTING_FLOAT, &gRTGIConfig.giIntensity,     0.0f,   5.0f,  "GIIntensity",     nullptr, "Brightness of indirect light bounces",                                    DUST_PERF_NONE   },
     { "AO Intensity",       DUST_SETTING_FLOAT, &gRTGIConfig.aoIntensity,     0.0f,   2.0f,  "AOIntensity",     nullptr, "Strength of ambient occlusion darkening",                                 DUST_PERF_NONE   },
+    { "Shadow Contrast",    DUST_SETTING_FLOAT, &gRTGIConfig.shadowContrast,  0.5f,   5.0f,  "ShadowContrast",  nullptr, "Contrast of the directional GI occlusion (Marty-style contact shadows). >1 deepens shadows in creases/under objects; 1.0 = plain linear AO.", DUST_PERF_NONE },
     { "Ray Length",         DUST_SETTING_FLOAT, &gRTGIConfig.rayLength,       0.05f,  1.0f,  "RayLength",       nullptr, "Maximum ray marching distance",                                           DUST_PERF_NONE   },
     { "Ray Steps",          DUST_SETTING_INT,   &gRTGIConfig.raySteps,        8.0f,   64.0f, "RaySteps",        nullptr, "Steps per ray (more = higher quality, higher cost)",                      DUST_PERF_HIGH   },
     { "Rays Per Pixel",     DUST_SETTING_INT,   &gRTGIConfig.raysPerPixel,    1.0f,   16.0f, "RaysPerPixel",    nullptr, "Number of rays cast per pixel (more = less noise, higher cost)",          DUST_PERF_HIGH   },
@@ -293,7 +297,7 @@ extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
 
     memset(desc, 0, sizeof(*desc));
     desc->apiVersion        = DUST_API_VERSION;
-    desc->name              = "RTGI";
+    desc->name              = "Global Illumination";
     desc->injectionPoint    = DUST_INJECT_POST_LIGHTING;
     desc->Init              = RTGIInit;
     desc->Shutdown          = RTGIShutdown;

@@ -345,7 +345,7 @@ extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
 
     memset(desc, 0, sizeof(*desc));
     desc->apiVersion          = DUST_API_VERSION;
-    desc->name                = "SMAA";
+    desc->name                = "Anti-Aliasing";
     desc->injectionPoint      = DUST_INJECT_POST_TONEMAP;
     desc->Init                = SMAAInit;
     desc->Shutdown            = SMAAShutdown;

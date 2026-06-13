@@ -549,6 +549,36 @@ static std::string PatchDeferredShader(const std::string& src)
     return result;
 }
 
+// [Dust][SkinSSS] Tag skin pixels in buf1.a (NORMALS.a, R8) so the screen-space
+// subsurface-scattering effect can gate on them. Tag = 17/255, placed in the
+// translucency sub-range [0,0.5) so it never collides with glowy-eye emissive
+// (>=0.5). Only character.hlsl is tagged (gated by skinToneMask, eyes preserved).
+// skin.hlsl is the CLOTHING/armor hardware-skinning shader (color1/color2 dye, no
+// skin tone), NOT skin — it is deliberately NOT tagged. Returns src unchanged if no hit.
+static std::string PatchSkinShader(const std::string& src)
+{
+    std::string result = src;
+
+    // --- character.hlsl: tag after the final glowy-eyes buf1.a write, skin-only.
+    // SINGLE-LINE anchor (no embedded newline, no trailing comment): OGRE reformats
+    // the shader source before D3DCompile, so the previous multi-line "...; // mul_sat"
+    // anchor never matched at runtime. Every working anchor in this file is one line.
+    const char* charAnchor = "buffer.buf1.a *= saturate(headMask.g * 255);";
+    size_t cpos = result.find(charAnchor);
+    if (cpos != std::string::npos)
+    {
+        std::string inject = std::string(charAnchor) +
+            "\n     // [Dust][SkinSSS] tag genuine skin (not eyes/clothing) for SSS.\n"
+            "     if (buffer.buf1.a < 0.5 && skinToneMask > 0.001) buffer.buf1.a = 17.0 / 255.0;";
+        result.replace(cpos, strlen(charAnchor), inject);
+        Log("ShaderPatch[SkinSSS]: tagged character.hlsl main_fs skin pixels");
+        return result;
+    }
+
+    Log("ShaderPatch[SkinSSS]: character.hlsl anchor not found, skipping");
+    return src;
+}
+
 // Patch vanilla objects.hlsl to fix foliage alpha threshold instability.
 // Replaces the hard binary clip with Bayer-dithered alpha testing and
 // stabilizes the threshold uniform against NaN / out-of-range values.
@@ -1200,6 +1230,50 @@ HRESULT WINAPI HookedD3DCompile(
                     Log("ShaderPatch: dumped patched source to %s", dumpPath.c_str());
                 }
                 // Fall through to compile original below
+            }
+        }
+    }
+
+    // [Dust][SkinSSS] Detect the character skin GBuffer-fill shader (character.hlsl,
+    // entry "main_fs") and tag genuine skin pixels into buf1.a. NOTE: skin.hlsl is
+    // the clothing/armor hardware-skinning shader (color1/color2 dye, no skin tone),
+    // NOT skin — it is deliberately NOT tagged. The skinToneMask+headMaskMap markers
+    // are absent from terrain/deferred main_fs so this never misfires on them.
+    if (pEntrypoint && pSrcData && SrcDataSize > 0 &&
+        strcmp(pEntrypoint, "main_fs") == 0)
+    {
+        std::string src((const char*)pSrcData, SrcDataSize);
+        bool isCharacter = src.find("skinToneMask") != std::string::npos &&
+                           src.find("headMaskMap")  != std::string::npos;
+        bool alreadyTagged = src.find("[Dust][SkinSSS]") != std::string::npos;
+
+        if (isCharacter && !alreadyTagged)
+        {
+            std::string patched = PatchSkinShader(src);
+            if (patched.size() != src.size())
+            {
+                Log("ShaderPatch: patched character.hlsl main_fs skin (%zu -> %zu bytes)",
+                    src.size(), patched.size());
+                HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
+                                          pDefines, pInclude, pEntrypoint, pTarget,
+                                          Flags1, Flags2, ppCode, ppErrorMsgs);
+                if (SUCCEEDED(hr))
+                {
+                    if (ppCode && *ppCode)
+                        SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
+                            pEntrypoint, pTarget, pSourceName,
+                            (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+                    return hr;
+                }
+                Log("ShaderPatch[SkinSSS]: patched skin shader failed to compile, falling back");
+                if (ppErrorMsgs && *ppErrorMsgs)
+                {
+                    Log("ShaderPatch[SkinSSS]: error: %s",
+                        (const char*)(*ppErrorMsgs)->GetBufferPointer());
+                    (*ppErrorMsgs)->Release();
+                    *ppErrorMsgs = nullptr;
+                }
+                // fall through to compile original
             }
         }
     }

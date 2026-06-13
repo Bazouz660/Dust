@@ -646,7 +646,7 @@ extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
 
     memset(desc, 0, sizeof(*desc));
     desc->apiVersion        = DUST_API_VERSION;
-    desc->name              = "LUT";
+    desc->name              = "Color Grading";
     desc->injectionPoint    = DUST_INJECT_POST_TONEMAP;
     desc->Init              = LUTInit;
     desc->Shutdown          = LUTShutdown;

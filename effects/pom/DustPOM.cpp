@@ -74,7 +74,7 @@ extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
     memset(desc, 0, sizeof(*desc));
 
     desc->apiVersion       = DUST_API_VERSION;
-    desc->name             = "POM";
+    desc->name             = "Parallax Occlusion Mapping";
     // Injection point is required by the framework but POM itself runs inside
     // the GBuffer pass via shader patching, not at any post-process slot. We
     // pick POST_GBUFFER as a no-op anchor; preExecute/postExecute are unused.

@@ -54,7 +54,8 @@ extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
     if (!desc) return -1;
     memset(desc, 0, sizeof(*desc));
     desc->apiVersion     = DUST_API_VERSION;
-    desc->name           = "SSAODebugOverlay";
+    desc->name           = "Ambient Occlusion Debug Overlay";
+    desc->configSection  = "SSAODebugOverlay";   // keep identity stable after the display-name rename
     // Note: PRE_PRESENT is defined in the enum but PipelineDetector never
     // classifies any draw to it — so plugins there are never dispatched.
     // POST_TONEMAP is the last actually-dispatched point; LDR target is final.
