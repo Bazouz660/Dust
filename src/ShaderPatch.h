@@ -23,4 +23,7 @@ namespace ShaderPatch
 
     const char* GetLastCompileError();
     void        ClearCompileError();
+
+    // True once the DustRT (t20/b9) injection landed in the deferred main_fs.
+    bool IsRtMainFsPatched();
 }

@@ -77,6 +77,7 @@ static bool Inverse4x4(float* out, const float* m)
 // pre-transformed batch isn't in view this frame).
 static bool  sCamVPValid = false;
 static float sCamVPInv[16];
+static float sCamVP[16];      // the chosen coherent camera VP (row-vector convention)
 
 // ---- per-frame replay cache --------------------------------------------------------
 // One staging Map + one placement classification per captured draw per FRAME. The
@@ -94,6 +95,8 @@ struct CachedEntry
 };
 static std::vector<CachedEntry> sCache;
 static std::vector<uint8_t>     sCbArena;
+// Public mirror of sCache for RtScene (drawIndex/category/placement/world).
+static std::vector<ReplayDrawInfo> sPublicCache;
 // Identity stamp of the captures the cache was built from. Replay() rebuilds lazily
 // on mismatch — covers the plugin path (HostReplayGeometry) that never calls
 // BeginFrame, and frame transitions (generation bumps every ResetFrame).
@@ -172,6 +175,8 @@ static void BuildCache(ID3D11DeviceContext* ctx)
     {
         if (bestDist >= 100.0f) memcpy(camVP, anchor, 64);
         sCamVPValid = Inverse4x4(sCamVPInv, camVP);
+        if (sCamVPValid)
+            memcpy(sCamVP, camVP, 64);
     }
 
     // Classify placement once per draw (was: once per draw per cube face). SKIN draws
@@ -187,6 +192,19 @@ static void BuildCache(ID3D11DeviceContext* ctx)
         if (e.place == 1) nWorld++; else nPre++;
     }
 
+    // public mirror for RtScene
+    sPublicCache.clear();
+    sPublicCache.reserve(sCache.size());
+    for (const auto& e : sCache)
+    {
+        ReplayDrawInfo info;
+        info.drawIndex = e.drawIndex;
+        info.category  = (int)e.cat;
+        info.placement = e.place;
+        memcpy(info.worldM, e.worldM, sizeof(info.worldM));
+        sPublicCache.push_back(info);
+    }
+
     static int dbg = 0;
     if ((dbg++ % 120) == 0)
         Log("GeoReplay cache: %d/%d draws (PRE=%d WORLD=%d) camVP=%d",
@@ -196,6 +214,50 @@ static void BuildCache(ID3D11DeviceContext* ctx)
 void BeginFrame(ID3D11DeviceContext* ctx)
 {
     BuildCache(ctx);
+}
+
+bool GetCameraVP(float out[16])
+{
+    if (!sCamVPValid || !out) return false;
+    memcpy(out, sCamVP, 64);
+    return true;
+}
+
+// Debug: copy up to maxMats raw clip matrices (+ placement flags) from the
+// current frame cache. Returns the number written. For the RT snapshot dump.
+uint32_t CopyDebugClips(float* outMats, int* outPlacement, uint32_t maxMats)
+{
+    uint32_t n = 0;
+    for (const auto& e : sCache)
+    {
+        if (n >= maxMats) break;
+        const auto& captures = GeometryCapture::GetCaptures();
+        if (e.drawIndex >= captures.size() || !captures[e.drawIndex].vsMetadata) continue;
+        const float* clip = (const float*)(sCbArena.data() + e.cbOffset +
+                                           captures[e.drawIndex].vsMetadata->clipMatrixOffset);
+        memcpy(outMats + n * 16, clip, 64);
+        outPlacement[n] = e.place;
+        n++;
+    }
+    return n;
+}
+
+bool GetFrameCache(ID3D11DeviceContext* ctx, const ReplayDrawInfo** outInfos,
+                   uint32_t* outCount)
+{
+    *outInfos = nullptr;
+    *outCount = 0;
+    const auto& captures = GeometryCapture::GetCaptures();
+    if (captures.empty())
+        return false;
+    // same staleness check as Replay() — rebuild covers callers that run before
+    // the point-shadow path (or frames where it didn't run at all)
+    if (!sCacheBuilt || sCacheData != captures.data() || sCacheCount != captures.size() ||
+        sCacheGen != GeometryCapture::GetGeneration())
+        BuildCache(ctx);
+    *outInfos = sPublicCache.data();
+    *outCount = (uint32_t)sPublicCache.size();
+    return *outCount > 0;
 }
 
 // Classify M = clip x cameraVP^-1. Returns 0=PRE, 1=WORLD, 2=fallback-to-PRE.

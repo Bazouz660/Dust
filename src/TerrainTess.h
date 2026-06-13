@@ -184,6 +184,11 @@ namespace TerrainTess
     // plugins can read it too.
     bool GetCameraPos(float outXYZ[3]);
 
+    // The terrain PS $Globals farClip uniform — the GBuffer depth
+    // normalization constant (depth01 = ray distance / farClip), captured in
+    // the same staging slice as cameraPos. False until terrain has drawn.
+    bool GetFarClip(float* out);
+
     // Called from PSSetShader / VSSetShader hooks. Maintains a cached
     // "is the currently-bound VS+PS a terrain pair" bool so the per-draw
     // check in TryDrawTessellated becomes a single load instead of two

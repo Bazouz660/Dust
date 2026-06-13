@@ -15,6 +15,12 @@ namespace PointShadows
     // Enable geometry capture so the replay has casters. Call once at startup.
     void Init();
 
+    // Master toggle (GUI). Disabled: cube rendering is skipped entirely and the
+    // light-table CB is zeroed so the light_fs patch short-circuits — lights
+    // render vanilla (unshadowed). Re-enabling resumes on the next frame.
+    void SetEnabled(bool enabled);
+    bool IsEnabled();
+
     // OGRE->shader-space translation R (3 floats) for matching cube centers to the
     // light_fs `position` uniform (rebased space). Call before RenderFrame each frame.
     void SetLightSpaceR(const float* r3, bool valid);

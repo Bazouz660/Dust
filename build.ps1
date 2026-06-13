@@ -90,6 +90,11 @@ if (Test-Path "$Root\mod\heightmaps") {
     Copy-Item "$Root\mod\heightmaps\*.bin" "$ModDir\heightmaps\" -Force -ErrorAction SilentlyContinue
 }
 
+# DustRT: DXR compute shaders (runtime-compiled by Dust.dll via DXC) + DXC toolchain
+New-Item -ItemType Directory -Force -Path "$ModDir\rt" | Out-Null
+Copy-Item "$Root\src\rt_shaders\*.hlsl","$Root\src\rt_shaders\*.hlsli" "$ModDir\rt\" -Force
+Copy-Item "$Root\external\dxc\x64\dxcompiler.dll","$Root\external\dxc\x64\dxil.dll" "$ModDir\" -Force
+
 foreach ($effect in $Effects) {
     $dll = Get-ChildItem "$Root\effects\$effect\build\Release\Dust*.dll" | Select-Object -First 1
     Copy-Item $dll.FullName "$ModDir\effects\"

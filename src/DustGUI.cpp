@@ -6,6 +6,7 @@
 #include "D3D11Hook.h"
 #include "GeometryCapture.h"
 #include "PointShadows.h"
+#include "RtSystem.h"
 #include "FrameProfiler.h"
 #include "ShaderMetadata.h"
 #include "Survey.h"
@@ -1864,6 +1865,82 @@ static void DrawPerformanceSection()
                      captureCount > 0 ? classified * 100.0f / captureCount : 0.0f);
         ImGui::Text("  Shaders:       %u tracked, %u classified",
                      ShaderMetadata::GetTrackedCount(), ShaderMetadata::GetClassifiedCount());
+    }
+
+    // Point-light shadow master toggle
+    {
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        ImGui::TextColored(DustHeadingColor(), "Point Light Shadows");
+        ImGui::Spacing();
+        bool plsEnabled = PointShadows::IsEnabled();
+        if (ImGui::Checkbox("Enable point light shadows", &plsEnabled))
+            PointShadows::SetEnabled(plsEnabled);
+    }
+
+    // DustRT — DXR path-traced lighting sidecar
+    {
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+        ImGui::TextColored(DustHeadingColor(), "Ray Tracing (DXR)");
+        ImGui::Spacing();
+
+        RtSystem::Settings& rt = RtSystem::GetSettings();
+        ImGui::Text("  Status: %s", RtSystem::StatusString());
+        ImGui::Checkbox("Enable DXR sidecar", &rt.enabled);
+        if (rt.enabled)
+        {
+            RtSystem::FrameStats fs = RtSystem::GetFrameStats();
+            ImGui::Text("  TLAS: %u instances, %u meshes (%u BLAS), %u pending",
+                        fs.instances, fs.meshes, fs.blasBuilt, fs.pendingPairs);
+            ImGui::Text("  Pools: %.1fM verts / %.1fM idx | skipped inst draws: %u | parse fails: %u",
+                        fs.poolVerts / 1.0e6, fs.poolIdx / 1.0e6, fs.skippedInstanced, fs.parseFailures);
+            const char* sunSrc[] = { "FALLBACK", "CSM", "scene light" };
+            ImGui::Text("  Traced this frame: %s | sun dir: %s | main_fs patch: %s",
+                        fs.traced ? "yes" : "no", sunSrc[fs.sunSource < 3 ? fs.sunSource : 0],
+                        fs.mainFsPatched ? "active" : "FALLBACK (additive)");
+
+            ImGui::Checkbox("Path-traced GI", &rt.gi);
+            ImGui::SameLine();
+            ImGui::Checkbox("RT sun shadows", &rt.sunShadows);
+            ImGui::SameLine();
+            ImGui::Checkbox("Flip sun dir", &rt.flipSunDir);
+
+            ImGui::SliderFloat("Ambient replace", &rt.ambientReplace, 0.0f, 1.0f);
+            ImGui::SliderFloat("Sun shadow strength", &rt.sunShadowStrength, 0.0f, 1.0f);
+            ImGui::SliderFloat("Vanilla shadow removal", &rt.vanillaShadowRemove, 0.0f, 1.0f);
+            if (rt.vanillaShadowRemove > 0.0f && ImGui::IsItemHovered())
+                ImGui::SetTooltip("1 = ray-traced shadows only.\nTerrain and characters are not in the TLAS yet —\ntheir sun shadows disappear at full removal.");
+            ImGui::SliderFloat("GI intensity", &rt.giIntensity, 0.0f, 4.0f);
+            ImGui::SliderInt("GI rays/pixel", &rt.giRaysPerPixel, 1, 4);
+            ImGui::SliderInt("GI bounces", &rt.giBounces, 1, 3);
+            ImGui::SliderInt("Shadow rays/pixel", &rt.shadowRaysPerPixel, 1, 8);
+            ImGui::SliderFloat("Sun radius (deg)", &rt.sunAngularRadiusDeg, 0.1f, 3.0f);
+            ImGui::SliderFloat("Sun intensity", &rt.sunIntensity, 0.0f, 10.0f);
+            ImGui::SliderFloat("Sky intensity", &rt.skyIntensity, 0.0f, 4.0f);
+            ImGui::SliderFloat("Bounce albedo", &rt.bounceAlbedo, 0.1f, 0.9f);
+            ImGui::SliderFloat("Temporal alpha", &rt.temporalAlpha, 0.02f, 1.0f);
+            ImGui::SliderInt("A-trous passes", &rt.atrousIterations, 1, 4);
+            ImGui::SliderFloat("Normal bias", &rt.normalBias, 0.005f, 0.5f);
+
+            const char* dbgModes[] = { "Off", "TLAS clay view", "Sun shadow mask", "GI radiance" };
+            ImGui::Combo("Debug view", &rt.debugMode, dbgModes, 4);
+            if (rt.debugMode == 1)
+            {
+                if (fs.tlasAlignPct >= 0.0f)
+                    ImGui::Text("  TLAS alignment: %.0f%% of GBuffer pixels match traced depth", fs.tlasAlignPct);
+                else
+                    ImGui::Text("  TLAS alignment: measuring...");
+            }
+
+            if (ImGui::Button("Flush captured geometry"))
+                RtSystem::RequestFlush();
+            ImGui::SameLine();
+            if (ImGui::Button("Dump RT snapshot"))
+                RtSystem::RequestDump();
+        }
     }
 
     // Custom point-light shadow depth preview (Stage 1 debug). The nearest

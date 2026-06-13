@@ -567,6 +567,11 @@ static uint32_t gFrameSkipDataFrame = 0xFFFFFFFFu;
 static float    gFrameCamX = 0, gFrameCamY = 0, gFrameCamZ = 0;
 static float    gFrameShiftX = 0, gFrameShiftY = 0, gFrameShiftZ = 0;
 static bool     gFrameHaveCam = false, gFrameHaveShift = false;
+// farClip uniform sits 4 bytes before cameraPos in the terrain PS $Globals
+// (offset 16 vs 20) — captured in the same staging slice for DustRT, which
+// needs the GBuffer depth normalization constant (depth01 = dist / farClip).
+static float    gFrameFarClip = 0.0f;
+static bool     gFrameHaveFar = false;
 constexpr int kCbStagingSlots = 2;
 static ID3D11Buffer* gCamStaging[kCbStagingSlots]   = {};
 static ID3D11Buffer* gShiftStaging[kCbStagingSlots] = {};
@@ -954,6 +959,13 @@ bool GetCameraPos(float outXYZ[3])
     outXYZ[0] = gLastCameraPos[0];
     outXYZ[1] = gLastCameraPos[1];
     outXYZ[2] = gLastCameraPos[2];
+    return true;
+}
+
+bool GetFarClip(float* out)
+{
+    if (!gFrameHaveFar || !out) return false;
+    *out = gFrameFarClip;
     return true;
 }
 
@@ -2375,11 +2387,13 @@ bool TryDrawTessellated(ID3D11DeviceContext* ctx,
                     const int writeSlot = gCbStagingWriteSlot;
                     const int readSlot  = 1 - writeSlot;
 
-                    // Copy current frame's slices into the write slot.
-                    if (psCb0 && gCamStaging[writeSlot])
+                    // Copy current frame's slices into the write slot. The
+                    // window starts 4 bytes early to include farClip (the
+                    // uniform directly precedes cameraPos in $Globals).
+                    if (psCb0 && gCamStaging[writeSlot] && gTerrainPsCameraPosOffset >= 4)
                     {
                         D3D11_BOX box = {};
-                        box.left   = (UINT)gTerrainPsCameraPosOffset;
+                        box.left   = (UINT)gTerrainPsCameraPosOffset - 4;
                         box.right  = (UINT)gTerrainPsCameraPosOffset + 12;
                         box.top    = 0; box.bottom = 1;
                         box.front  = 0; box.back   = 1;
@@ -2413,7 +2427,13 @@ bool TryDrawTessellated(ID3D11DeviceContext* ctx,
                                                D3D11_MAP_READ, 0, &mr)))
                         {
                             const float* p = reinterpret_cast<const float*>(mr.pData);
-                            gFrameCamX = p[0]; gFrameCamY = p[1]; gFrameCamZ = p[2];
+                            // slice layout: [0] = farClip, [1..3] = cameraPos
+                            if (p[0] > 1.0f && p[0] < 1.0e7f)
+                            {
+                                gFrameFarClip = p[0];
+                                gFrameHaveFar = true;
+                            }
+                            gFrameCamX = p[1]; gFrameCamY = p[2]; gFrameCamZ = p[3];
                             gFrameHaveCam = true;
                             ctx->Unmap(gCamStaging[readSlot], 0);
                         }

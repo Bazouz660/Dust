@@ -121,6 +121,9 @@
     <ClCompile Include="SceneAccess.cpp" />
     <ClCompile Include="PointShadows.cpp" />
     <ClCompile Include="PointShadowsOgre.cpp" />
+    <ClCompile Include="RtCore.cpp" />
+    <ClCompile Include="RtScene.cpp" />
+    <ClCompile Include="RtSystem.cpp" />
     <ClCompile Include="PssmDetour.cpp" />
     <ClCompile Include="imgui\imgui.cpp" />
     <ClCompile Include="imgui\imgui_draw.cpp" />
@@ -161,6 +164,10 @@
     <ClInclude Include="SceneAccess.h" />
     <ClInclude Include="PointShadows.h" />
     <ClInclude Include="PssmDetour.h" />
+    <ClInclude Include="RtCore.h" />
+    <ClInclude Include="RtScene.h" />
+    <ClInclude Include="RtSystem.h" />
+    <ClInclude Include="RtLog.h" />
     <ClInclude Include="imgui\imgui.h" />
     <ClInclude Include="imgui\backends\imgui_impl_win32.h" />
     <ClInclude Include="imgui\backends\imgui_impl_dx11.h" />

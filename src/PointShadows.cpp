@@ -137,6 +137,10 @@ void SetDrawnLights(const float (*positions)[3], const float* radii, int count, 
 // shader's rebased space, center = OGRE_center - R) then meta. Called from RenderFrame
 // (with last frame's R) and again mid-light-pass with the current frame's R so the
 // match has no 1-frame lag.
+static bool sEnabled = true;
+void SetEnabled(bool enabled) { sEnabled = enabled; }
+bool IsEnabled() { return sEnabled; }
+
 void UpdateLightTableCB(ID3D11DeviceContext* ctx)
 {
     if (!ctx || !sPtCB) return;
@@ -147,7 +151,8 @@ void UpdateLightTableCB(ID3D11DeviceContext* ctx)
         // Only slots whose cube content matches their light are exposed; a freshly
         // assigned slot awaiting its budgeted render gets a far sentinel so light_fs
         // can't match a light against another light's stale cube.
-        if (sSlots[c].valid && sSlots[c].rendered)
+        // Disabled: every slot becomes a sentinel -> meta z=0 -> shader short-circuits.
+        if (sEnabled && sSlots[c].valid && sSlots[c].rendered)
         {
             cbData[c*4+0] = sActivePos[c][0] - (sLightSpaceRValid ? sLightSpaceR[0] : 0.0f);
             cbData[c*4+1] = sActivePos[c][1] - (sLightSpaceRValid ? sLightSpaceR[1] : 0.0f);
@@ -293,6 +298,13 @@ void RenderFrame(ID3D11DeviceContext* ctx, ID3D11Device* device, const float* ca
     ZoneScopedN("PointShadows.RenderFrame");
     if (!ctx || !device || !camPos3) return;
     if (!EnsureResources(device)) return;
+    if (!sEnabled)
+    {
+        // skip all cube replay work; keep the (zeroed) table current so the
+        // light_fs patch sees no matchable lights
+        UpdateLightTableCB(ctx);
+        return;
+    }
     sFrameCounter++;
 
     // No captures (GBuffer pass empty/not yet seen at this firing): keep last frame's

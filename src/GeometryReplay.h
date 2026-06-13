@@ -40,5 +40,27 @@ namespace GeometryReplay
     // frame before the Replay() face loop — Replay() consults the cached decisions.
     void BeginFrame(ID3D11DeviceContext* ctx);
 
+    // Read-only view of this frame's placement cache (consumed by RtScene for
+    // TLAS instancing). Ensures the cache is fresh (rebuilds if stale), so it
+    // works whether or not the point-shadow path already ran this frame.
+    // Pointers are valid until the next BuildCache/ResetFrame.
+    struct ReplayDrawInfo
+    {
+        uint32_t drawIndex;    // index into GeometryCapture::GetCaptures()
+        int      category;     // DustShaderCategory
+        int      placement;    // 0 = PRE-TRANSFORMED (world identity), 1 = WORLD-PLACED
+        float    worldM[16];   // row-major row-vector world matrix (placement == 1)
+    };
+    bool GetFrameCache(ID3D11DeviceContext* ctx, const ReplayDrawInfo** outInfos,
+                       uint32_t* outCount);
+
+    // The coherent camera view-proj chosen by the placement cache (row-vector
+    // convention, same space as the captured GBuffer clip matrices). This is
+    // the authoritative matrix for reconstructing the VB-space camera.
+    bool GetCameraVP(float out[16]);
+
+    // Debug (RT snapshot): raw clip matrices + placement flags from the cache.
+    uint32_t CopyDebugClips(float* outMats, int* outPlacement, uint32_t maxMats);
+
     void Shutdown();
 }

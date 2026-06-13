@@ -18,6 +18,7 @@
 #include "ShaderDatabase.h"
 #include "GeometryCapture.h"
 #include "GeometryReplay.h"
+#include "RtSystem.h"
 #include "FrameProfiler.h"
 #include "POMState.h"
 #include "TerrainTess.h"
@@ -319,6 +320,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
         gEffectLoader.ShutdownAll();
         POMState::Shutdown();
         TerrainTess::Shutdown();
+        RtSystem::Shutdown();
         GeometryReplay::Shutdown();
         PointShadows::Shutdown();
         GeometryCapture::Shutdown();

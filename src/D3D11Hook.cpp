@@ -11,6 +11,8 @@
 #include "ShadowProbe.h"
 #include "SceneAccess.h"
 #include "PointShadows.h"
+#include "RtSystem.h"
+#include "RtScene.h"
 #include "PointShadowsOgre.h"
 #include "PssmDetour.h"
 #include "ShaderMetadata.h"
@@ -83,6 +85,7 @@ static const int VTIDX_SC1_Present1      = 22;
 // VTable indices — device (used by Install() for Detours hooks)
 static const int VTIDX_DEVICE_CreateBuffer          = 3;
 static const int VTIDX_DEVICE_CreateTexture2D       = 5;
+static const int VTIDX_DEVICE_CreateInputLayout     = 11;
 static const int VTIDX_DEVICE_CreateVertexShader    = 12;
 static const int VTIDX_DEVICE_CreatePixelShader     = 15;
 
@@ -1621,6 +1624,27 @@ static HRESULT STDMETHODCALLTYPE HookedCreateVertexShader(
     return hr;
 }
 
+typedef HRESULT(STDMETHODCALLTYPE* PFN_CreateInputLayout)(
+    ID3D11Device* pThis, const D3D11_INPUT_ELEMENT_DESC* pInputElementDescs, UINT NumElements,
+    const void* pShaderBytecodeWithInputSignature, SIZE_T BytecodeLength,
+    ID3D11InputLayout** ppInputLayout);
+
+static PFN_CreateInputLayout oCreateInputLayout = nullptr;
+
+// RtScene needs the POSITION element's offset/format per layout to parse
+// vertex buffers for BLAS builds — the layout desc only exists here.
+static HRESULT STDMETHODCALLTYPE HookedCreateInputLayout(
+    ID3D11Device* pThis, const D3D11_INPUT_ELEMENT_DESC* pInputElementDescs, UINT NumElements,
+    const void* pShaderBytecodeWithInputSignature, SIZE_T BytecodeLength,
+    ID3D11InputLayout** ppInputLayout)
+{
+    HRESULT hr = oCreateInputLayout(pThis, pInputElementDescs, NumElements,
+                                    pShaderBytecodeWithInputSignature, BytecodeLength, ppInputLayout);
+    if (SUCCEEDED(hr) && ppInputLayout && *ppInputLayout && !gShutdownSignaled)
+        RtScene::OnInputLayoutCreated(pInputElementDescs, NumElements, *ppInputLayout);
+    return hr;
+}
+
 // ==================== Deferred light-CB readback ====================
 // During the light-volume pass, ProbeLightCB queues a GPU copy of each qualifying
 // light_fs CB0 into a pooled staging buffer; FlushLightCBReadbacks maps them at the
@@ -1867,6 +1891,16 @@ static void STDMETHODCALLTYPE HookedDraw(
         if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
             SceneAccess::DebugDumpOnce();
 
+        // DustRT (DXR sidecar): the lighting-pass detection means the GBuffer is
+        // complete and its SRVs were just captured -> copy inputs and kick the
+        // D3D12 trace (sun shadows + path-traced GI) now, BEFORE the point-shadow
+        // cube replays, so the trace overlaps them and the lighting draw.
+        if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
+            RtSystem::OnLightingPre(pThis, gDevice,
+                gResourceRegistry.GetSRV(ResourceName::DEPTH_SRV),
+                gResourceRegistry.GetSRV(ResourceName::NORMALS_SRV),
+                gWidth, gHeight, gFrameIndex);
+
         // Stage 1: render the N nearest point lights' depth cubes from their POV.
         if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING) && gCameraData.valid)
         {
@@ -1888,12 +1922,26 @@ static void STDMETHODCALLTYPE HookedDraw(
         fctx.timing = DUST_TIMING_PRE;
         gEffectLoader.DispatchPre(dip, &fctx);
 
+        // DustRT: bind GI + sun visibility (t20/b9) for the patched main_fs and
+        // queue the GPU wait so the lighting draw consumes this frame's trace.
+        // After DispatchPre so no effect's save/restore clobbers the slots.
+        if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
+            RtSystem::BindForLightingDraw(pThis);
+
         // Execute the game's original draw call
         oDraw(pThis, VertexCount, StartVertexLocation);
 
         // POST: effects that operate after the draw
         fctx.timing = DUST_TIMING_POST;
         gEffectLoader.DispatchPost(dip, &fctx);
+
+        // DustRT: the lighting draw has run — GPU-wait on the trace, additively
+        // composite GI into the bound HDR target (before the light volumes add
+        // on top), then harvest this frame's captures for the next TLAS.
+        if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
+            RtSystem::OnLightingPost(pThis, gDevice,
+                gResourceRegistry.GetSRV(ResourceName::ALBEDO_SRV),
+                gWidth, gHeight);
 
         // Bind the point-light shadow cubes (rendered above by RenderFrame) for the
         // additive light-volume (light_fs) draws that follow this POST_LIGHTING
@@ -3105,6 +3153,7 @@ bool Install()
 
     void* addrCreateBuffer = devVtable[VTIDX_DEVICE_CreateBuffer];
     void* addrCreateTex2D  = devVtable[VTIDX_DEVICE_CreateTexture2D];
+    void* addrCreateIL     = devVtable[VTIDX_DEVICE_CreateInputLayout];
     void* addrCreateVS     = devVtable[VTIDX_DEVICE_CreateVertexShader];
     void* addrCreatePS     = devVtable[VTIDX_DEVICE_CreatePixelShader];
     void* addrPSSetShader  = ctxVtable[VTIDX_CTX_PSSetShader];
@@ -3208,6 +3257,10 @@ bool Install()
     if (KenshiLib::AddHook(addrCreateVS, (void*)HookedCreateVertexShader,
                            (void**)&oCreateVertexShader) != KenshiLib::SUCCESS)
     { Log("WARNING: Failed to hook CreateVertexShader (shader source tracking for VS disabled)"); }
+
+    if (KenshiLib::AddHook(addrCreateIL, (void*)HookedCreateInputLayout,
+                           (void**)&oCreateInputLayout) != KenshiLib::SUCCESS)
+    { Log("WARNING: Failed to hook CreateInputLayout (RT vertex parsing falls back to offset 0)"); }
 
     if (KenshiLib::AddHook(addrCreatePS, (void*)HookedCreatePixelShader,
                            (void**)&oCreatePixelShader) != KenshiLib::SUCCESS)

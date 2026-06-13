@@ -22,6 +22,12 @@ static char gCompileError[512] = {};
 const char* GetLastCompileError() { return gCompileError[0] ? gCompileError : nullptr; }
 void        ClearCompileError()   { gCompileError[0] = '\0'; }
 
+// Set when the DustRT injection (t20/b9 reads in main_fs) was applied to the
+// deferred shader — RtSystem switches from the additive composite fallback to
+// in-shader consumption when true.
+static bool gRtMainFsPatched = false;
+bool IsRtMainFsPatched() { return gRtMainFsPatched; }
+
 // Patch vanilla deferred.hlsl source to add AO support and improved shadow filtering.
 // Returns the modified source, or the original if patterns weren't found.
 static std::string PatchDeferredShader(const std::string& src)
@@ -64,7 +70,14 @@ static std::string PatchDeferredShader(const std::string& src)
             "};\n"
             "float DustSamplePtCube(int idx, float3 dir) {\n"
             "\treturn dustPtCubes.SampleLevel(dustPtSamp, float4(dir, (float)idx), 0);\n"
-            "}\n\n";
+            "}\n"
+            // [Dust] DustRT path-traced lighting (bound by RtSystem before the
+            // main_fs draw). rgb = albedo-demodulated GI irradiance, a = RT sun
+            // visibility. All-zeros (unbound) degrades to vanilla lighting.
+            "Texture2D<float4> dustRtLight : register(t20);\n"
+            "cbuffer DustRtParams : register(b9) {\n"
+            "\tfloat4 dustRtP;   // x = ambient replace, y = GI gain, z = sun shadow strength, w = vanilla shadow removal\n"
+            "};\n\n";
         result.insert(aoGlobalPos, aoGlobals);
     }
 
@@ -86,8 +99,36 @@ static std::string PatchDeferredShader(const std::string& src)
         "\tenvLight.specular *= ao;\n"
         "\tfloat directFade = lerp(1.0, ao, directAO);\n"
         "\tsunLight.diffuse *= directFade;\n"
-        "\tsunLight.specular *= directFade;\n\n\t";
+        "\tsunLight.specular *= directFade;\n\n"
+        // [Dust] DustRT: ray-traced sun visibility multiplies the sun term
+        // (combines with the game's RTWSM/CSM shadow — union of casters while
+        // terrain/characters aren't in the TLAS yet), and path-traced GI
+        // replaces a fraction of the flat IBL ambient. dustRt.rgb is
+        // albedo-demodulated irradiance — line "ld.diffuse * albedo" below
+        // applies the surface albedo, so units match envLight.diffuse exactly.
+        // Inserted AFTER the AO block so the replaced ambient keeps AO but the
+        // RT GI term (which carries its own traced occlusion) is not
+        // double-darkened by it.
+        "\tfloat4 dustRt = dustRtLight.Load(int3(pixel.xy, 0));\n"
+        "\tfloat dustRtSun = lerp(1.0, dustRt.a, dustRtP.z);\n"
+        "\tsunLight.diffuse *= dustRtSun;\n"
+        "\tsunLight.specular *= dustRtSun;\n"
+        "\tenvLight.diffuse = envLight.diffuse * (1.0 - dustRtP.x) + dustRt.rgb * dustRtP.y;\n\n\t";
     result.insert(pos2, inject2);
+
+    // [Dust] DustRT: optional vanilla sun-shadow removal — blend the RTW/CSM
+    // `shadow` factor back toward 1 BEFORE it is baked into the sun light, so
+    // dustRtP.w = 1 leaves the ray-traced visibility as the only sun shadow.
+    // Anchor is common to both shadow-mode variants; zeros-safe (w=0 = vanilla).
+    {
+        const char* shadowAnchor = "sunColour.rgb *= sunColour.w";
+        size_t sp = result.find(shadowAnchor);
+        if (sp != std::string::npos)
+            result.insert(sp, "shadow = lerp(shadow, 1.0f, dustRtP.w);\n\t");
+        else
+            Log("ShaderPatch: 'sunColour.rgb' anchor not found — vanilla shadow removal unavailable");
+    }
+    gRtMainFsPatched = true;
 
     // === Shadow Patches ===
     // Replace vanilla RTWShadow (3x3 PCF with 0.0001 texel size — essentially a single sample)
