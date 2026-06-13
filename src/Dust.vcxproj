@@ -96,6 +96,7 @@
   <ItemGroup>
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="D3D11Hook.cpp" />
+    <ClCompile Include="FrameProfiler.cpp" />
     <ClCompile Include="D3D11StateBlock.cpp" />
     <ClCompile Include="PipelineDetector.cpp" />
     <ClCompile Include="ResourceRegistry.cpp" />

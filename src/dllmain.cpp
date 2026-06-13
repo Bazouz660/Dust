@@ -16,6 +16,7 @@
 #include "ShaderDatabase.h"
 #include "GeometryCapture.h"
 #include "GeometryReplay.h"
+#include "FrameProfiler.h"
 #include "POMState.h"
 #include "TerrainTess.h"
 
@@ -310,6 +311,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
         TerrainTess::Shutdown();
         GeometryReplay::Shutdown();
         GeometryCapture::Shutdown();
+        FrameProfiler::Shutdown();
         ShaderDatabase::Shutdown();
         ShaderMetadata::Shutdown();
         break;

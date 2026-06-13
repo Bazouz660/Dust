@@ -13,6 +13,7 @@
 #include "ShaderMetadata.h"
 #include "ShaderDatabase.h"
 #include "GeometryCapture.h"
+#include "FrameProfiler.h"
 #include "POMState.h"
 #include "TerrainTess.h"
 #include "CSMCapture.h"
@@ -1162,6 +1163,7 @@ static bool AnyFeatureNeedsHooks()
     if (Survey::IsActive()) return true;
     if (GeometryCapture::detail::sCaptureFlags != 0) return true;
     if (ShadowCBRecon::IsArmed()) return true;
+    if (FrameProfiler::IsEnabled()) return true;  // pass-boundary marks live in the context hooks
     return false;
 }
 
@@ -1289,6 +1291,7 @@ static void TryCaptureDevice(ID3D11Device* device)
     gDevice = device;
     device->GetImmediateContext(&gContext);
     GeometryCapture::SetDevice(device);
+    FrameProfiler::Init(device);
     POMState::SetDevice(device);
     TerrainTess::Init(device);
 
@@ -1731,6 +1734,14 @@ static void STDMETHODCALLTYPE HookedDraw(
             }
         }
 
+        // [FrameProfiler] mark the lighting / fog / tonemap pass boundaries.
+        if (FrameProfiler::IsEnabled())
+        {
+            if (result.point == InjectionPoint::POST_LIGHTING)     FrameProfiler::MarkLighting(pThis);
+            else if (result.point == InjectionPoint::POST_FOG)     FrameProfiler::MarkFog(pThis);
+            else if (result.point == InjectionPoint::POST_TONEMAP) FrameProfiler::MarkTonemap(pThis);
+        }
+
         // Extract camera data at POST_LIGHTING (deferred CB is bound)
         if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
             ExtractCameraData(pThis);
@@ -2033,6 +2044,15 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
     {
         oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView);
     }
+    // [FrameProfiler] GPU timestamps at GBuffer / shadow-map pass boundaries
+    // (gInShadowPass still holds the previous state here).
+    if (FrameProfiler::IsEnabled())
+    {
+        if (!wasInGBuffer && isGBuffer)       FrameProfiler::MarkGBufferBegin(pThis);
+        else if (wasInGBuffer && !isGBuffer)  FrameProfiler::MarkGBufferEnd(pThis);
+        if (!gInShadowPass && nowInShadowPass)      FrameProfiler::MarkShadowBegin(pThis);
+        else if (gInShadowPass && !nowInShadowPass) FrameProfiler::MarkShadowEnd(pThis);
+    }
     gInShadowPass = nowInShadowPass;
     GeometryCapture::OnOMSetRenderTargetsWithResult(isGBuffer);
 
@@ -2254,6 +2274,10 @@ static void TickGuiOnPresent(IDXGISwapChain* swapChain, const char* via)
         }
         return;
     }
+
+    // [FrameProfiler] frame GPU boundary — once per canonical present. Closes
+    // the just-rendered frame's timestamps and opens the next.
+    if (gContext) FrameProfiler::OnPresent(gContext);
 
     // Survey: finalize frame at Present boundary
     if (Survey::IsActive())
