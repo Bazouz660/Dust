@@ -37,9 +37,8 @@ struct RTGIConfig
 
     // Camera (hidden)
     float tanHalfFov    = 0.5218f;
-
-    // Debug
-    int   debugView     = 0;       // 0=off, 1=GI, 2=AO, 3=combined, 4=world normals, 5=view normals, 6=depth
+    float farPlane      = 8000.0f; // depth->view-Z linear scale (matches SSAO); used by
+                                   // the temporal pass to scale the reprojection correctly
 };
 
 extern RTGIConfig gRTGIConfig;

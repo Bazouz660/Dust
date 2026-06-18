@@ -31,10 +31,28 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
     float vig = 1.0 - smoothstep(radius, radius + softness, dist);
 
-    if (debugView)
-        return float4(vig.xxx, 1.0);
-
     float3 color = sceneTex.SampleLevel(linearClamp, uv, 0).rgb;
     color *= lerp(1.0, vig, strength);
     return float4(color, 1.0);
+}
+
+// Standalone debug overlay: visualizes the vignette mask. Selected via the
+// host's centralized debug-view registry and drawn onto the final LDR target.
+float4 debug_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
+{
+    float2 d = (uv - 0.5) * 2.0;
+
+    float screenAspect = viewportSize.x * invViewportSize.y;
+    float2 adjusted = float2(d.x * screenAspect / aspectRatio, d.y * aspectRatio);
+
+    float dist;
+    if (shape == 1)
+        dist = max(abs(adjusted.x), abs(adjusted.y));
+    else if (shape == 2)
+        dist = abs(adjusted.x) + abs(adjusted.y);
+    else
+        dist = length(adjusted);
+
+    float vig = 1.0 - smoothstep(radius, radius + softness, dist);
+    return float4(vig.xxx, 1.0);
 }

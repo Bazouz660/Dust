@@ -146,12 +146,29 @@ static void RTGIPostExecute(const DustFrameContext* ctx, const DustHostAPI* host
     }
 
     host->RestoreState(dc);
+}
 
-    // Debug overlay (replaces scene if active)
-    if (gRTGIConfig.debugView != 0)
-    {
-        RTGIRenderer::RenderDebugOverlay(dc, hdrRTV, depthSRV, normalsSRV);
-    }
+// Handles for the centralized debug-view selector (API v11). RTGI exposes six
+// views; index i maps to shader debug mode i+1 (see rtgi_debug_ps.hlsl).
+static int gDebugViewHandles[6] = {};
+static const char* const kDebugViewLabels[6] = {
+    "RTGI: GI Color",
+    "RTGI: GI AO",
+    "RTGI: GI * AO",
+    "RTGI: World Normals",
+    "RTGI: View Normals",
+    "RTGI: Depth",
+};
+
+// Debug-view render callback. The host calls this for the active RTGI view,
+// handing the final LDR target and the registered mode via 'user'.
+static void RTGIDebugRender(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* targetRTV, void* user)
+{
+    if (!gRTGIConfig.enabled || !gHost)
+        return;
+    ID3D11ShaderResourceView* depthSRV   = gHost->GetSRV(DUST_RESOURCE_DEPTH);
+    ID3D11ShaderResourceView* normalsSRV = gHost->GetSRV(DUST_RESOURCE_NORMALS);
+    RTGIRenderer::RenderDebugOverlay(ctx, targetRTV, depthSRV, normalsSRV, (int)(INT_PTR)user);
 }
 
 static int RTGIInit(ID3D11Device* device, uint32_t width, uint32_t height, const DustHostAPI* host)
@@ -235,12 +252,19 @@ static int RTGIInit(ID3D11Device* device, uint32_t width, uint32_t height, const
     gCompositeCB = host->CreateConstantBuffer(device, sizeof(CompositeCBData));
     if (!gCompositeCB) return -9;
 
+    for (int i = 0; i < 6; i++)
+        gDebugViewHandles[i] = host->RegisterDebugView(kDebugViewLabels[i], RTGIDebugRender, (void*)(INT_PTR)(i + 1));
+
     Log("RTGI: Initialized (%ux%u)", width, height);
     return 0;
 }
 
 static void RTGIShutdown()
 {
+    if (gHost)
+        for (int i = 0; i < 6; i++)
+            if (gDebugViewHandles[i]) { gHost->UnregisterDebugView(gDebugViewHandles[i]); gDebugViewHandles[i] = 0; }
+
     RTGIRenderer::Shutdown();
 
 #define SR(p) if (p) { (p)->Release(); (p) = nullptr; }
@@ -286,9 +310,9 @@ static DustSettingDesc gSettingsArray[] = {
     { "Depth Sigma",        DUST_SETTING_FLOAT, &gRTGIConfig.depthSigma,      0.1f,   5.0f,  "DepthSigma",      nullptr, "Depth sensitivity of the denoiser",                                       DUST_PERF_NONE   },
     { "Color Phi",          DUST_SETTING_FLOAT, &gRTGIConfig.phiColor,        1.0f,   10.0f, "PhiColor",        nullptr, "Color sensitivity of the denoiser",                                       DUST_PERF_NONE   },
     { "Resolution %",       DUST_SETTING_INT,   &gRTGIConfig.resolutionScale, 25.0f,  100.0f, "ResolutionScale", nullptr, "Render resolution as percentage of native (lower = faster)",             DUST_PERF_HIGH   },
-    { "Debug View",         DUST_SETTING_INT,   &gRTGIConfig.debugView,       0.0f,   6.0f,  "DebugView",       nullptr, "Debug visualization mode (0 = off)",                                      DUST_PERF_NONE   },
     // Hidden
     { "Tan Half FOV",       DUST_SETTING_HIDDEN_FLOAT, &gRTGIConfig.tanHalfFov, 0.1f, 2.0f,  "TanHalfFov" },
+    { "Far Plane",          DUST_SETTING_HIDDEN_FLOAT, &gRTGIConfig.farPlane,   1.0f, 10000.0f, "FarPlane" },
 };
 
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)

@@ -40,9 +40,22 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     else
         noise = (hash13(seed) - 0.5).xxx;
 
-    if (debugView)
-        return float4(noise + 0.5, 1.0);
-
     color += noise * intensity;
     return float4(saturate(color), 1.0);
+}
+
+// Standalone debug overlay: visualizes the raw grain noise. Selected via the
+// host's centralized debug-view registry and drawn onto the final LDR target.
+float4 debug_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
+{
+    float2 grainCoord = floor(pos.xy / grainSize);
+    float3 seed = float3(grainCoord, (float)frameIndex);
+
+    float3 noise;
+    if (colored)
+        noise = hash33(seed) - 0.5;
+    else
+        noise = (hash13(seed) - 0.5).xxx;
+
+    return float4(noise + 0.5, 1.0);
 }

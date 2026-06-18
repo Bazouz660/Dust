@@ -27,6 +27,7 @@ static ID3D11VertexShader* gFullscreenVS = nullptr;
 static ID3D11PixelShader*  gBlurHPS = nullptr;
 static ID3D11PixelShader*  gBlurVPS = nullptr;
 static ID3D11PixelShader*  gCompositePS = nullptr;
+static ID3D11PixelShader*  gDebugPS = nullptr;
 
 // Pipeline state
 static ID3D11BlendState*        gNoBlend = nullptr;
@@ -111,6 +112,13 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
     cBlob->Release();
     if (FAILED(hr)) return false;
 
+    ID3DBlob* dBlob = host->CompileShaderFromFile((gShaderDir + "sss_composite_ps.hlsl").c_str(), "debug_main", "ps_5_0");
+    if (dBlob)
+    {
+        device->CreatePixelShader(dBlob->GetBufferPointer(), dBlob->GetBufferSize(), nullptr, &gDebugPS);
+        dBlob->Release();
+    }
+
     if (!CreateHDRTexture(device, width, height, &gTempTex, &gTempRTV, &gTempSRV)) return false;
     if (!CreateHDRTexture(device, width, height, &gBlurTex, &gBlurRTV, &gBlurSRV)) return false;
 
@@ -160,7 +168,7 @@ void Shutdown()
     SAFE_RELEASE(gTempTex); SAFE_RELEASE(gTempRTV); SAFE_RELEASE(gTempSRV);
     SAFE_RELEASE(gBlurTex); SAFE_RELEASE(gBlurRTV); SAFE_RELEASE(gBlurSRV);
     SAFE_RELEASE(gFullscreenVS);
-    SAFE_RELEASE(gBlurHPS); SAFE_RELEASE(gBlurVPS); SAFE_RELEASE(gCompositePS);
+    SAFE_RELEASE(gBlurHPS); SAFE_RELEASE(gBlurVPS); SAFE_RELEASE(gCompositePS); SAFE_RELEASE(gDebugPS);
     SAFE_RELEASE(gNoBlend); SAFE_RELEASE(gNoDepthDSS); SAFE_RELEASE(gNoCullRS);
     SAFE_RELEASE(gLinearClamp); SAFE_RELEASE(gPointClamp);
     SAFE_RELEASE(gCB);
@@ -214,7 +222,7 @@ void Render(ID3D11DeviceContext* ctx,
         cb.followSurface = gSSSConfig.followSurface;
         cb.maxRadiusPx = gSSSConfig.maxRadiusPx;
         cb.strength = gSSSConfig.strength;
-        cb.debugMode = gSSSConfig.debugView ? 1.0f : 0.0f;
+        cb.debugMode = 0.0f;   // unused — debug view is now a host-registered overlay
         gHost->UpdateConstantBuffer(ctx, gCB, &cb, sizeof(cb));
     }
 
@@ -273,6 +281,48 @@ void Render(ID3D11DeviceContext* ctx,
         ctx->Draw(3, 0);
         ctx->PSSetShaderResources(0, 3, nullSRV3);
     }
+
+    gHost->RestoreState(ctx);
+}
+
+// Debug-view overlay: tints skin-tagged pixels magenta onto the final LDR
+// target. The host calls this when this view is the active one (after
+// tonemapping). Binds the final LDR scene copy (t0) and the GBuffer normals
+// whose .a carries the skin tag (t2), then draws gDebugPS fullscreen.
+void DebugRender(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* targetRTV, void* /*user*/)
+{
+    if (!gInitialized || !gSSSConfig.enabled || !gHost || !gDebugPS)
+        return;
+
+    ID3D11ShaderResourceView* sceneCopy = gHost->GetSceneCopy(ctx, DUST_RESOURCE_LDR_RT);
+    if (!sceneCopy)
+        return;
+
+    ID3D11ShaderResourceView* normalsSRV = gHost->GetSRV(DUST_RESOURCE_NORMALS);
+    if (!normalsSRV)
+        return;
+
+    gHost->SaveState(ctx);
+
+    D3D11_VIEWPORT vp = {};
+    vp.Width = (float)gWidth;
+    vp.Height = (float)gHeight;
+    vp.MaxDepth = 1.0f;
+    ctx->RSSetViewports(1, &vp);
+    ctx->RSSetState(gNoCullRS);
+    ctx->OMSetRenderTargets(1, &targetRTV, nullptr);
+    ctx->OMSetBlendState(gNoBlend, nullptr, 0xFFFFFFFF);
+    ctx->OMSetDepthStencilState(gNoDepthDSS, 0);
+
+    ID3D11SamplerState* samplers[2] = { gLinearClamp, gPointClamp };
+    ID3D11ShaderResourceView* srvs[3] = { sceneCopy, nullptr, normalsSRV };
+    ctx->PSSetShaderResources(0, 3, srvs);
+    ctx->PSSetSamplers(0, 2, samplers);
+    ctx->PSSetConstantBuffers(0, 1, &gCB);
+    gHost->DrawFullscreenTriangle(ctx, gDebugPS);
+
+    ID3D11ShaderResourceView* nullSRV3[3] = { nullptr, nullptr, nullptr };
+    ctx->PSSetShaderResources(0, 3, nullSRV3);
 
     gHost->RestoreState(ctx);
 }

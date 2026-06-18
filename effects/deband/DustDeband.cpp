@@ -14,6 +14,8 @@ static const DustHostAPI* gHost = nullptr;
 static bool gInitialized = false;
 
 static ID3D11PixelShader* gPS = nullptr;
+static ID3D11PixelShader* gDebugPS = nullptr;
+static int gDebugViewHandle = 0;
 static ID3D11Buffer* gCB = nullptr;
 static ID3D11SamplerState* gSampler = nullptr;
 static ID3D11BlendState* gNoBlend = nullptr;
@@ -44,6 +46,45 @@ static std::string GetPluginDir()
     return (pos != std::string::npos) ? s.substr(0, pos) : s;
 }
 
+// Debug-view render callback. The host calls this when the Deband affected-
+// regions view is selected, drawing it onto the final LDR target. Reuses gCB,
+// which already holds this frame's params from DebandPostExecute. Samples the
+// scene color (t0) and depth (t1) to recompute the sky mask.
+static void DebandDebugRender(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* targetRTV, void* user)
+{
+    if (!gInitialized || !gDebandConfig.enabled || !gHost || !gDebugPS)
+        return;
+
+    ID3D11ShaderResourceView* sceneCopy = gHost->GetSceneCopy(ctx, DUST_RESOURCE_LDR_RT);
+    if (!sceneCopy) return;
+
+    ID3D11ShaderResourceView* depthSRV = gHost->GetSRV(DUST_RESOURCE_DEPTH);
+    if (!depthSRV) return;
+
+    gHost->SaveState(ctx);
+
+    D3D11_VIEWPORT vp = {};
+    vp.Width = (float)gWidth;
+    vp.Height = (float)gHeight;
+    vp.MaxDepth = 1.0f;
+    ctx->RSSetViewports(1, &vp);
+    ctx->RSSetState(gNoCull);
+    ctx->OMSetRenderTargets(1, &targetRTV, nullptr);
+    ctx->OMSetBlendState(gNoBlend, nullptr, 0xFFFFFFFF);
+    ctx->OMSetDepthStencilState(gNoDepth, 0);
+
+    ID3D11ShaderResourceView* srvs[2] = { sceneCopy, depthSRV };
+    ctx->PSSetShaderResources(0, 2, srvs);
+    ctx->PSSetSamplers(0, 1, &gSampler);
+    ctx->PSSetConstantBuffers(0, 1, &gCB);
+    gHost->DrawFullscreenTriangle(ctx, gDebugPS);
+
+    ID3D11ShaderResourceView* nullSRVs[2] = { nullptr, nullptr };
+    ctx->PSSetShaderResources(0, 2, nullSRVs);
+
+    gHost->RestoreState(ctx);
+}
+
 static int DebandInit(ID3D11Device* device, uint32_t width, uint32_t height, const DustHostAPI* host)
 {
 #undef Log
@@ -60,6 +101,13 @@ static int DebandInit(ID3D11Device* device, uint32_t width, uint32_t height, con
     HRESULT hr = device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &gPS);
     blob->Release();
     if (FAILED(hr)) return -1;
+
+    ID3DBlob* dblob = host->CompileShaderFromFile((shaderDir + "deband_ps.hlsl").c_str(), "debug_main", "ps_5_0");
+    if (dblob)
+    {
+        device->CreatePixelShader(dblob->GetBufferPointer(), dblob->GetBufferSize(), nullptr, &gDebugPS);
+        dblob->Release();
+    }
 
     gCB = host->CreateConstantBuffer(device, sizeof(DebandCBData));
     if (!gCB) return -1;
@@ -81,6 +129,8 @@ static int DebandInit(ID3D11Device* device, uint32_t width, uint32_t height, con
     rd.CullMode = D3D11_CULL_NONE;
     device->CreateRasterizerState(&rd, &gNoCull);
 
+    gDebugViewHandle = host->RegisterDebugView("Deband: Affected Regions", DebandDebugRender, (void*)(INT_PTR)1);
+
     gInitialized = true;
     Log("Deband: Initialized (%ux%u)", width, height);
     return 0;
@@ -88,7 +138,9 @@ static int DebandInit(ID3D11Device* device, uint32_t width, uint32_t height, con
 
 static void DebandShutdown()
 {
+    if (gHost && gDebugViewHandle) { gHost->UnregisterDebugView(gDebugViewHandle); gDebugViewHandle = 0; }
     if (gPS) { gPS->Release(); gPS = nullptr; }
+    if (gDebugPS) { gDebugPS->Release(); gDebugPS = nullptr; }
     if (gCB) { gCB->Release(); gCB = nullptr; }
     if (gSampler) { gSampler->Release(); gSampler = nullptr; }
     if (gNoBlend) { gNoBlend->Release(); gNoBlend = nullptr; }
@@ -131,7 +183,6 @@ static void DebandPostExecute(const DustFrameContext* ctx, const DustHostAPI* ho
     cb.intensity = gDebandConfig.intensity;
     cb.skyDepthThreshold = gDebandConfig.skyDepthThreshold;
     cb.frameIndex = (uint32_t)(ctx->frameIndex & 0xFFFFFFFF);
-    cb.debugView = gDebandConfig.debugView ? 1 : 0;
     cb.skyOnly = gDebandConfig.skyOnly ? 1 : 0;
     host->UpdateConstantBuffer(ctx->context, gCB, &cb, sizeof(cb));
 
@@ -169,7 +220,6 @@ static DustSettingDesc gSettingsArray[] = {
     { "Intensity",      DUST_SETTING_FLOAT, &gDebandConfig.intensity,        0.0f,  1.0f,  "Intensity",        nullptr, "Blend strength of the debanded result",             DUST_PERF_NONE },
     { "Sky Only",       DUST_SETTING_BOOL,  &gDebandConfig.skyOnly,          0.0f,  1.0f,  "SkyOnly",          nullptr, "Only apply debanding to sky pixels",                DUST_PERF_NONE },
     { "Sky Threshold",  DUST_SETTING_FLOAT, &gDebandConfig.skyDepthThreshold,0.9f,  1.0f,  "SkyDepthThreshold",nullptr, "Depth value above which pixels are treated as sky", DUST_PERF_NONE },
-    { "Debug View",     DUST_SETTING_BOOL,  &gDebandConfig.debugView,        0.0f,  1.0f,  "DebugView",        nullptr, "Highlight regions affected by debanding",           DUST_PERF_NONE },
 };
 
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)

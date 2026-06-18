@@ -29,7 +29,8 @@ static const float2 sectorDir[NUM_SECTORS] = {
     float2( 0.707, -0.707)
 };
 
-float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
+// Core filter: returns the lowest-variance sector mean for the given UV.
+float3 KuwaharaFilter(float2 uv)
 {
     float3 original = sceneTex.SampleLevel(pointClamp, uv, 0).rgb;
 
@@ -106,5 +107,20 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         }
     }
 
+    return filtered;
+}
+
+float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
+{
+    float3 original = sceneTex.SampleLevel(pointClamp, uv, 0).rgb;
+    float3 filtered = KuwaharaFilter(uv);
     return float4(lerp(original, filtered, strength), 1.0);
+}
+
+// Standalone debug overlay: the raw filtered result without blending back to
+// the original. Selected via the host's centralized debug-view registry and
+// drawn onto the final LDR target.
+float4 debug_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
+{
+    return float4(KuwaharaFilter(uv), 1.0);
 }

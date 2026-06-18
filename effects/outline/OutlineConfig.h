@@ -20,9 +20,6 @@ struct OutlineConfig
 
     // Limits
     float maxDepth          = 0.5f;     // Max depth to draw outlines (skip distant/sky)
-
-    // Debug
-    bool  debugView         = false;
 };
 
 extern OutlineConfig gOutlineConfig;

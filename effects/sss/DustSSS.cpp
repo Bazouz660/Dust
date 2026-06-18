@@ -32,7 +32,6 @@ DustLogFn gLogFn = nullptr;
 struct SSSConfig {
     bool  enabled        = true;
     bool  applyToSun     = false;   // multiply the sun term by the shadow (default OFF)
-    int   debugView      = 0;       // 0=Off, 1=Shadow, 2=WaveIndex, 3=EdgeMask
     float surfaceThickness = 0.005f;
     float bilinearThreshold = 0.02f;
     float shadowContrast = 4.0f;
@@ -50,6 +49,12 @@ static ID3D11Buffer*              gParamsCB = nullptr;
 static ID3D11SamplerState*        gBorderSampler = nullptr;  // point, clamp-to-border (= FarDepth)
 static ID3D11SamplerState*        gLinearClamp   = nullptr;  // for the deferred read + debug blit
 
+// States for the debug-view blit (the callback gets a fresh targetRTV and can't
+// rely on leftover framework state).
+static ID3D11BlendState*          gNoBlend  = nullptr;
+static ID3D11DepthStencilState*   gNoDepth  = nullptr;
+static ID3D11RasterizerState*     gNoCull   = nullptr;
+
 // Output shadow buffer (R8_UNORM), resized to match the depth SRV.
 static ID3D11Texture2D*           gOutTex   = nullptr;
 static ID3D11UnorderedAccessView* gOutUAV   = nullptr;
@@ -58,6 +63,30 @@ static uint32_t                   gOutW = 0, gOutH = 0;
 
 // Debug blit
 static ID3D11PixelShader*         gDebugPS  = nullptr;
+
+// Centralized debug-view handles (API v11). One per non-zero debug mode; index i
+// maps to the original gConfig.debugView enum value i+1 (1=Shadow, 2=Wave Index,
+// 3=Edge Mask). The host shows them in its single selector and calls SSSDebugRender
+// for whichever is active. The compute pass reads the active mode back via
+// gHost->GetActiveDebugView() so it can produce the matching visualization.
+static int gDebugViewHandles[3] = {};
+static const char* const kDebugViewLabels[3] = {
+    "Screen-Space Shadows: Shadow",
+    "Screen-Space Shadows: Wave Index",
+    "Screen-Space Shadows: Edge Mask",
+};
+
+// Return the original enum mode (1..3) of the active SSS debug view, or 0 if
+// none of ours is selected. Lets the compute pass set the right debug flags.
+static int ActiveDebugMode()
+{
+    if (!gHost || !gHost->GetActiveDebugView) return 0;
+    int active = gHost->GetActiveDebugView();
+    if (!active) return 0;
+    for (int i = 0; i < 3; i++)
+        if (gDebugViewHandles[i] == active) return i + 1;
+    return 0;
+}
 
 // Sun-apply gating cbuffer bound at PS slot b9. DustSSS owns this so we don't
 // have to touch the Shadows plugin's b7 buffer. The patched deferred main_fs
@@ -196,6 +225,38 @@ static const char* kDebugPS =
     "  return float4(s, s, s, 1);\n"
     "}\n";
 
+// Debug-view render callback (API v11). The host calls this for the active SSS
+// view after tonemapping, handing the final LDR target. We blit the raw R8
+// shadow buffer (gOutSRV) onto it as grayscale. The buffer's content already
+// reflects the active mode (Shadow / Wave Index / Edge Mask) because the compute
+// pass set the matching debug flags from gHost->GetActiveDebugView(); the blit
+// itself is mode-independent, so 'user' is only used to gate which view is live.
+static void SSSDebugRender(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* targetRTV, void* user)
+{
+    (void)user;
+    if (!gConfig.enabled || !gDebugPS || !gOutSRV || !gHost) return;
+
+    gHost->SaveState(ctx);
+
+    D3D11_VIEWPORT vp = {};
+    vp.Width = (float)gOutW;
+    vp.Height = (float)gOutH;
+    vp.MaxDepth = 1.0f;
+    ctx->RSSetViewports(1, &vp);
+    ctx->RSSetState(gNoCull);
+    ctx->OMSetRenderTargets(1, &targetRTV, nullptr);
+    ctx->OMSetBlendState(gNoBlend, nullptr, 0xFFFFFFFF);
+    ctx->OMSetDepthStencilState(gNoDepth, 0);
+    ctx->PSSetShaderResources(0, 1, &gOutSRV);
+    ctx->PSSetSamplers(0, 1, &gLinearClamp);
+    gHost->DrawFullscreenTriangle(ctx, gDebugPS);
+
+    ID3D11ShaderResourceView* nullSRV = nullptr;
+    ctx->PSSetShaderResources(0, 1, &nullSRV);
+
+    gHost->RestoreState(ctx);
+}
+
 // ==================== Init / Shutdown ====================
 
 static int SSSInit(ID3D11Device* device, uint32_t w, uint32_t h, const DustHostAPI* host)
@@ -256,6 +317,25 @@ static int SSSInit(ID3D11Device* device, uint32_t w, uint32_t h, const DustHostA
     if (FAILED(device->CreateSamplerState(&ld, &gLinearClamp)))
     { Log("SSS: linear sampler create failed"); return -1; }
 
+    // Opaque/no-depth/no-cull states for the debug-view blit callback.
+    {
+        D3D11_BLEND_DESC bd = {};
+        bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        device->CreateBlendState(&bd, &gNoBlend);
+        D3D11_DEPTH_STENCIL_DESC dsd = {};
+        device->CreateDepthStencilState(&dsd, &gNoDepth);
+        D3D11_RASTERIZER_DESC rd = {};
+        rd.FillMode = D3D11_FILL_SOLID;
+        rd.CullMode = D3D11_CULL_NONE;
+        device->CreateRasterizerState(&rd, &gNoCull);
+    }
+
+    // Register the debug views in the host's centralized selector (API v11).
+    // user = original enum mode (1..3); the compute pass reads the active mode
+    // back via gHost->GetActiveDebugView() to produce the matching output.
+    for (int i = 0; i < 3; i++)
+        gDebugViewHandles[i] = host->RegisterDebugView(kDebugViewLabels[i], SSSDebugRender, (void*)(INT_PTR)(i + 1));
+
     // GPU timestamp queries (non-fatal if unavailable).
     D3D11_QUERY_DESC qd = {};
     qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT; device->CreateQuery(&qd, &gTsDisjoint);
@@ -269,11 +349,18 @@ static int SSSInit(ID3D11Device* device, uint32_t w, uint32_t h, const DustHostA
 
 static void SSSShutdown()
 {
+    if (gHost)
+        for (int i = 0; i < 3; i++)
+            if (gDebugViewHandles[i]) { gHost->UnregisterDebugView(gDebugViewHandles[i]); gDebugViewHandles[i] = 0; }
+
     ReleaseOutput();
     if (gTsEnd)        { gTsEnd->Release();        gTsEnd = nullptr; }
     if (gTsBegin)      { gTsBegin->Release();      gTsBegin = nullptr; }
     if (gTsDisjoint)   { gTsDisjoint->Release();   gTsDisjoint = nullptr; }
     if (gDebugPS)      { gDebugPS->Release();      gDebugPS = nullptr; }
+    if (gNoCull)       { gNoCull->Release();       gNoCull = nullptr; }
+    if (gNoDepth)      { gNoDepth->Release();      gNoDepth = nullptr; }
+    if (gNoBlend)      { gNoBlend->Release();      gNoBlend = nullptr; }
     if (gLinearClamp)  { gLinearClamp->Release();  gLinearClamp = nullptr; }
     if (gBorderSampler){ gBorderSampler->Release(); gBorderSampler = nullptr; }
     if (gApplyCB)      { gApplyCB->Release();      gApplyCB = nullptr; }
@@ -381,9 +468,13 @@ static void SSSPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     cb.IgnoreEdgePixels = 0;
     cb.UsePrecisionOffset = 0;
     cb.BilinearSamplingOffsetMode = 0;
-    cb.DebugOutputEdgeMask    = (gConfig.debugView == 3) ? 1 : 0;
+    // The wave-index / edge-mask visualizations are produced by the compute pass
+    // writing those debug values into gOutSRV. Since the debug-view callback runs
+    // after this pass, learn the active mode from the host's registry selector.
+    int debugMode = ActiveDebugMode();
+    cb.DebugOutputEdgeMask    = (debugMode == 3) ? 1 : 0;
     cb.DebugOutputThreadIndex = 0;
-    cb.DebugOutputWaveIndex   = (gConfig.debugView == 2) ? 1 : 0;
+    cb.DebugOutputWaveIndex   = (debugMode == 2) ? 1 : 0;
 
     host->SaveState(dc);
     if (doTime) { dc->Begin(gTsDisjoint); dc->End(gTsBegin); }
@@ -437,38 +528,20 @@ static void SSSPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     if (gApplyCB)
     {
         SSSApplyCB acb = {};
-        acb.apply = (gConfig.applyToSun && gConfig.debugView == 0 && gOutSRV) ? 1.0f : 0.0f;
+        acb.apply = (gConfig.applyToSun && debugMode == 0 && gOutSRV) ? 1.0f : 0.0f;
         host->UpdateConstantBuffer(dc, gApplyCB, &acb, sizeof(acb));
         dc->PSSetConstantBuffers(9, 1, &gApplyCB);
     }
-}
-
-static void SSSPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
-{
-    // Debug view: blit the raw R8 shadow buffer over the current RT so it's
-    // visible. The shadow / wave-index / edge-mask content is selected via the
-    // compute-shader debug flags (debugView 1 = the plain shadow result).
-    if (!gConfig.enabled || gConfig.debugView == 0 || !gDebugPS || !gOutSRV) return;
-
-    host->SaveState(ctx->context);
-    ID3D11DeviceContext* dc = ctx->context;
-    dc->PSSetShaderResources(0, 1, &gOutSRV);
-    dc->PSSetSamplers(0, 1, &gLinearClamp);
-    host->DrawFullscreenTriangle(dc, gDebugPS);
-    host->RestoreState(ctx->context);
 }
 
 static int SSSIsEnabled() { return gConfig.enabled ? 1 : 0; }
 
 // ==================== GUI ====================
 
-static const char* const kDebugViewLabels[] = { "Off", "Shadow", "Wave Index", "Edge Mask", nullptr };
-
 static DustSettingDesc gSettings[] = {
     { "Screen Space Shadows", DUST_SETTING_SECTION, nullptr, 0.0f, 0.0f, nullptr, nullptr, nullptr, DUST_PERF_NONE },
     { "Enabled",        DUST_SETTING_BOOL,  &gConfig.enabled,    0.0f, 1.0f,  "Enabled",        nullptr, "Run the Bend screen-space sun-shadow compute pass each frame.", DUST_PERF_HIGH },
-    { "Apply To Sun",   DUST_SETTING_BOOL,  &gConfig.applyToSun, 0.0f, 1.0f,  "ApplyToSun",     nullptr, "Multiply the deferred sun light by the screen-space shadow. Off by default (validate with Debug View first).", DUST_PERF_NONE },
-    { "Debug View",     DUST_SETTING_ENUM,  &gConfig.debugView,  0.0f, 3.0f,  "DebugView",      kDebugViewLabels, "Blit the raw compute output to screen. Shadow = the shadow term; Wave Index / Edge Mask = Bend tuning visualizations.", DUST_PERF_NONE },
+    { "Apply To Sun",   DUST_SETTING_BOOL,  &gConfig.applyToSun, 0.0f, 1.0f,  "ApplyToSun",     nullptr, "Multiply the deferred sun light by the screen-space shadow. Off by default (validate with the debug views first).", DUST_PERF_NONE },
     { "Surface Thickness", DUST_SETTING_FLOAT, &gConfig.surfaceThickness, 0.0001f, 0.05f, "SurfaceThickness", nullptr, "Assumed pixel thickness for shadow casting, as a fraction of non-linear depth. Start 0.005; scale in multiples of 2.", DUST_PERF_NONE },
     { "Bilinear Threshold", DUST_SETTING_FLOAT, &gConfig.bilinearThreshold, 0.001f, 0.2f, "BilinearThreshold", nullptr, "Depth-difference threshold for edge detection. Use Debug View = Edge Mask to tune. Scale alongside Surface Thickness.", DUST_PERF_NONE },
     { "Shadow Contrast", DUST_SETTING_FLOAT, &gConfig.shadowContrast, 1.0f, 8.0f, "ShadowContrast", nullptr, "Contrast boost on the shadow transition. Values >= 1 valid; start 4.", DUST_PERF_NONE },
@@ -495,7 +568,6 @@ extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
     desc->Shutdown            = SSSShutdown;
     desc->OnResolutionChanged = SSSOnResolutionChanged;
     desc->preExecute          = SSSPreExecute;
-    desc->postExecute         = SSSPostExecute;
     desc->IsEnabled           = SSSIsEnabled;
     desc->settings            = gSettings;
     desc->settingCount        = sizeof(gSettings) / sizeof(gSettings[0]);

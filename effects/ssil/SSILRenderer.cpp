@@ -307,7 +307,7 @@ ID3D11ShaderResourceView* RenderIL(ID3D11DeviceContext* ctx,
         cb.minScreenRadius = gSSILConfig.minScreenRadius;
         cb.depthFadeStart = gSSILConfig.depthFadeStart;
         cb.colorBleeding = gSSILConfig.colorBleeding;
-        cb.debugMode = gSSILConfig.debugView ? 1.0f : 0.0f;
+        cb.debugMode = 0.0f;  // unused by shaders; debug view is host-driven now
         cb.blurSharpness = gSSILConfig.blurSharpness;
         int numDirs = gSSILConfig.sampleCount;
         if (numDirs < 2) numDirs = 2;
@@ -393,7 +393,7 @@ ID3D11ShaderResourceView* RenderIL(ID3D11DeviceContext* ctx,
 void RenderDebugOverlay(ID3D11DeviceContext* ctx,
                         ID3D11RenderTargetView* hdrRTV)
 {
-    if (!gInitialized || !ctx || !hdrRTV || !gSSILConfig.debugView || !gHost)
+    if (!gInitialized || !ctx || !hdrRTV || !gHost)
         return;
 
     gHost->SaveState(ctx);

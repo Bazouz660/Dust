@@ -270,12 +270,6 @@ jobs:
           /p:Configuration=Release
           /p:Platform=x64
 
-      - name: Build SSAO Debug plugin (DustSSAODebug.dll)
-        run: >
-          msbuild effects\ssaodebug\DustSSAODebug.vcxproj
-          /p:Configuration=Release
-          /p:Platform=x64
-
       - name: Package release
         if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/beta-')
         run: |
@@ -301,7 +295,6 @@ jobs:
           copy effects\vignette\build\Release\DustVignette.dll release\Dust\effects\
           copy effects\pom\build\Release\DustPOM.dll release\Dust\effects\
           copy effects\terraintess\build\Release\DustTerrainTess.dll release\Dust\effects\
-          copy effects\ssaodebug\build\Release\DustSSAODebug.dll release\Dust\effects\
           xcopy /Y effects\ssil\shaders\* release\Dust\effects\shaders\
           xcopy /Y effects\ssao\shaders\* release\Dust\effects\shaders\
           xcopy /Y effects\lut\shaders\* release\Dust\effects\shaders\

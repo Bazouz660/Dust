@@ -513,6 +513,21 @@ static void LUTPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     }
 }
 
+// Per-tonemapper brightness compensation (EV). Each operator maps middle-grey to
+// a different output level, so without this, switching off ACES reads darker/flatter.
+// Reference = ACES Narkowicz (0). Values estimated by matching middle-grey output at
+// the default exposure — fine-tune to taste. Order MUST match gTonemapperLabels.
+static const float gTonemapperExpComp[] = {
+    0.56f,   // 0 Linear (none)
+    1.36f,   // 1 Reinhard
+    1.27f,   // 2 Reinhard Extended
+    0.00f,   // 3 ACES (Narkowicz) — reference
+    0.00f,   // 4 ACES (Hill)
+    1.46f,   // 5 Uncharted 2 (Hable)
+   -1.16f,   // 6 AgX
+    0.69f,   // 7 Khronos PBR Neutral
+};
+
 // postExecute: fires AFTER the game's tonemap draw.
 // Overwrite the LDR target with our HDR -> tonemap -> LUT -> dither pipeline.
 static void LUTPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
@@ -535,6 +550,9 @@ static void LUTPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     host->SaveState(dc);
 
     float finalExposure = gConfig.autoExposure ? gAdaptedExposure : gConfig.exposure;
+    int tmIdx = gConfig.tonemapper;
+    if (tmIdx >= 0 && tmIdx < (int)(sizeof(gTonemapperExpComp) / sizeof(gTonemapperExpComp[0])))
+        finalExposure += gTonemapperExpComp[tmIdx];
     LUTParams params = { gConfig.intensity, (float)LUT_SIZE, finalExposure, gConfig.tonemapper,
                          gConfig.whitePoint, 0.0f, 0.0f, 0.0f };
     host->UpdateConstantBuffer(dc, gCB, &params, sizeof(params));
@@ -586,6 +604,11 @@ static const char* const gTonemapperLabels[] = {
     "Khronos PBR Neutral",
     nullptr
 };
+
+// One compensation entry per label (excluding the nullptr terminator).
+static_assert(sizeof(gTonemapperExpComp) / sizeof(gTonemapperExpComp[0])
+              == (sizeof(gTonemapperLabels) / sizeof(gTonemapperLabels[0])) - 1,
+              "gTonemapperExpComp must have one entry per tonemapper");
 
 // Tonemapper index for Reinhard Extended in gTonemapperLabels
 static const int TONEMAPPER_REINHARD_EXT = 2;

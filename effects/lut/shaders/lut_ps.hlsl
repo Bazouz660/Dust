@@ -96,9 +96,11 @@ float3 TM_AgX(float3 x) {
     v = clamp(log2(v), minEV, maxEV);
     v = (v - minEV) / (maxEV - minEV);
     v = TM_AgXContrastApprox(v);
-    // Inverse AgX matrix + 2.2 EOTF → sRGB linear (the 2D LUT then re-grades in that space)
-    v = mul(agxOut, v);
-    return pow(max(v, 0.0), 2.2);
+    // The AgX sigmoid output is already display-encoded (~gamma 2.2). Every other
+    // operator here emits display-referred values written straight to the UNORM
+    // target with no OETF, so do NOT linearize with a pow(2.2) EOTF — that's what
+    // left AgX crushed-dark and magenta. Just apply the outset matrix and clamp.
+    return max(mul(agxOut, v), 0.0);
 }
 
 // 7 — Khronos PBR Neutral (glTF standard, hue-preserving with highlight desat)

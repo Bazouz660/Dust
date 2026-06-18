@@ -45,7 +45,7 @@ cbuffer TemporalParams : register(b0)
     float    frameIndex;
     row_major float4x4 reprojMatrix; // currentInvView * prevView
     float    motionMagnitude;
-    float    _pad0;
+    float    farPlane;     // depth->view-Z scale (z = depth*farPlane + 1), matches SSAO
     float    _pad1;
     float    _pad2;
 };
@@ -78,7 +78,14 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     // Used ONLY to determine alpha, NOT to read history.
     float pixelMotion = 0.0;
 
-    float3 viewPos = ReconstructViewPos(uv, depth, tanHalfFov, aspectRatio);
+    // Linearize depth to world-unit view-space Z before reprojecting. The
+    // reprojection matrix's translation row is the camera's per-frame motion in
+    // WORLD units, so the reconstructed position must be in world units too
+    // (matches the SSAO pipeline's depth_to_z = depth*farPlane + 1). Feeding raw
+    // normalized depth here makes camera *translation* read as ~farPlane× too much
+    // motion, flushing history every frame → flicker while moving the camera.
+    float zLin = depth * farPlane + 1.0;
+    float3 viewPos = ReconstructViewPos(uv, zLin, tanHalfFov, aspectRatio);
     float3 prevViewPos = mul(float4(viewPos, 1.0), reprojMatrix).xyz;
 
     if (prevViewPos.z > 0.0001)

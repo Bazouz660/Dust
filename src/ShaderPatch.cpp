@@ -50,11 +50,22 @@ static std::string PatchDeferredShader(const std::string& src)
             "Texture2D<float> dustAoParams : register(t9);\n"
             "SamplerState     dustAoSamp   : register(s8);\n"
             // ==================================================================
-            // [Dust] Better-BRDF experimental helpers. All take their inputs as
-            // parameters (no cbuffer reads here), so they can live before the b7
-            // DustShadowParams cbuffer decl. Each is gated at the CALL SITE by
-            // dustBrdfEnabled + its own toggle.
+            // [Dust] Material / BRDF (experimental). Toggles come from a cbuffer
+            // bound by the Materials plugin at b10 (DustBrdfParams); the helpers
+            // below take their inputs as parameters (no cbuffer reads), so order
+            // relative to the cbuffer decl doesn't matter. Each term is gated at
+            // the CALL SITE by dustBrdfEnabled + its own toggle.
             // ==================================================================
+            // [Dust] Material / BRDF parameters (bound by Materials plugin at b10).
+            // Layout must match BrdfCBData in effects/materials/DustMaterials.cpp.
+            "cbuffer DustBrdfParams : register(b10) {\n"
+            "\tfloat dustBrdfEnabled;\n"
+            "\tfloat dustBrdfDisneyDiffuse;\n"
+            "\tfloat dustBrdfMultiscatter;\n"
+            "\tfloat dustBrdfSpecOcclusion;\n"
+            "\tfloat dustBrdfSpecAA;\n"
+            "\tfloat dustBrdfStrength;\n"
+            "};\n\n"
             // (2) Multiscatter GGX energy compensation.
             // Single-scatter GGX loses energy on rough/metallic surfaces. We add
             // back the energy lost to multiple bounces using the classic
@@ -94,6 +105,16 @@ static std::string PatchDeferredShader(const std::string& src)
             "\tfloat kernelRough2 = min(2.0 * variance, KAPPA);\n"
             "\tfloat r2 = saturate(rough * rough + kernelRough2);\n"
             "\treturn sqrt(r2);\n"
+            "}\n\n"
+            // Apply spec AA at the material level by widening GLOSS, so the vanilla
+            // GGX (sun + point/spot) and the env-IBL specular mip all inherit the
+            // AA'd roughness — not just the injected multiscatter/spec-occ terms.
+            // gloss<->roughness uses Kenshi's mapping (lightingFunctions.hlsl):
+            //   roughness = 1 - gloss*0.99  ->  gloss = (1 - roughness)/0.99
+            "float DustSpecAAGloss(float3 N, float gloss) {\n"
+            "\tfloat rough = 1.0 - gloss * 0.99;\n"
+            "\trough = DustSpecAARoughness(N, rough);\n"
+            "\treturn saturate((1.0 - rough) / 0.99);\n"
             "}\n\n";
         result.insert(aoGlobalPos, aoGlobals);
     }
@@ -171,14 +192,6 @@ static std::string PatchDeferredShader(const std::string& src)
             "\tfloat dustCsmBlendEnabled;\n"
             "\tfloat dustCsmBlendWidth;\n"
             "\tfloat dustRtwQuality;\n"
-            // [Dust] Material / BRDF (experimental) toggles — APPENDED at the end;
-            // order must match ShadowCBData tail in effects/shadows/DustShadows.cpp.
-            "\tfloat dustBrdfEnabled;\n"
-            "\tfloat dustBrdfDisneyDiffuse;\n"
-            "\tfloat dustBrdfMultiscatter;\n"
-            "\tfloat dustBrdfSpecOcclusion;\n"
-            "\tfloat dustBrdfSpecAA;\n"
-            "\tfloat dustBrdfStrength;\n"
             "};\n\n"
             // The warp map is 513x2 R32_FLOAT, sampled by vanilla GetOffsetLocationS
             // with tex2Dlod. The warp sampler is point-filtered, so adjacent screen
@@ -602,6 +615,39 @@ static std::string PatchDeferredShader(const std::string& src)
     }
 
     // ========================================================================
+    // [Dust] Geometric specular AA. Widen GLOSS after it is decoded from the
+    // GBuffer but BEFORE the vanilla specular is evaluated (CalcPunctualLight /
+    // CalcEnvironmentLight), so the sun GGX, point/spot GGX and env-IBL specular
+    // are all anti-aliased. Standalone: gated by dustBrdfSpecAA alone (the master
+    // dustBrdfEnabled is NOT required), so AA works without the experimental BRDF.
+    // ========================================================================
+    {
+        // main_fs: sun + ambient. gloss (gBuf0.a) and normal (gBuf1) are in scope.
+        const char* specAASunAnchor = "LightingData sunLight = CalcPunctualLight";
+        size_t specAASunPos = result.find(specAASunAnchor);
+        if (specAASunPos != std::string::npos)
+        {
+            std::string inj =
+                "[branch] if (dustBrdfSpecAA > 0.5)\n"
+                "\t\tgloss = DustSpecAAGloss(normal, gloss);\n\t";
+            result.insert(specAASunPos, inj);
+            Log("ShaderPatch: injected spec-AA gloss widen into main_fs");
+        }
+
+        // light_fs: point/spot. Same gloss/normal decode upstream.
+        const char* specAALightAnchor = "LightingData ld = CalcPunctualLight";
+        size_t specAALightPos = result.find(specAALightAnchor);
+        if (specAALightPos != std::string::npos)
+        {
+            std::string inj =
+                "[branch] if (dustBrdfSpecAA > 0.5)\n"
+                "\t\tgloss = DustSpecAAGloss(normal, gloss);\n\t";
+            result.insert(specAALightPos, inj);
+            Log("ShaderPatch: injected spec-AA gloss widen into light_fs");
+        }
+    }
+
+    // ========================================================================
     // [Dust] Better-BRDF per-term modifications. All gated by dustBrdfEnabled
     // plus each term's own toggle. main_fs has sunLight/envLight; light_fs has
     // only ld. Each block guards on whether its anchor exists, so this runs
@@ -620,11 +666,9 @@ static std::string PatchDeferredShader(const std::string& src)
                 "// [Dust] Better-BRDF (sun + ambient). All gated by dustBrdfEnabled.\n"
                 "\t[branch] if (dustBrdfEnabled > 0.5) {\n"
                 "\t\tfloat _brdfNoV   = saturate(dot(normal, viewDir));\n"
+                // gloss is already spec-AA-widened upstream (if dustBrdfSpecAA is on),
+                // so _brdfRough inherits the AA'd roughness for the terms below.
                 "\t\tfloat _brdfRough = GlossToRoughness(gloss);\n"
-                // (4) Spec AA: widen roughness from normal screen-space variance.
-                // Applied to the roughness fed to the multiscatter + spec-occ terms.
-                "\t\t[branch] if (dustBrdfSpecAA > 0.5)\n"
-                "\t\t\t_brdfRough = DustSpecAARoughness(normal, _brdfRough);\n"
                 // (1) Disney diffuse: swap the cheap constant FresnelDiffuse for the
                 // Burley angular response, preserving the existing N.L / translucency.
                 "\t\t[branch] if (dustBrdfDisneyDiffuse > 0.5) {\n"
@@ -658,8 +702,6 @@ static std::string PatchDeferredShader(const std::string& src)
                 "\t[branch] if (dustBrdfEnabled > 0.5) {\n"
                 "\t\tfloat _brdfNoV   = saturate(dot(normal, viewDir));\n"
                 "\t\tfloat _brdfRough = GlossToRoughness(gloss);\n"
-                "\t\t[branch] if (dustBrdfSpecAA > 0.5)\n"
-                "\t\t\t_brdfRough = DustSpecAARoughness(normal, _brdfRough);\n"
                 // (1) Disney diffuse.
                 "\t\t[branch] if (dustBrdfDisneyDiffuse > 0.5) {\n"
                 "\t\t\tfloat _dd = Fr_DisneyDiffuse(viewDir, lightDir, normal, _brdfRough);\n"

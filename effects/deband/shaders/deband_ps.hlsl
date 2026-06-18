@@ -32,14 +32,6 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         float depth = depthTex.SampleLevel(linearClamp, uv, 0).r;
         bool isSky = depth >= skyDepthThreshold || depth <= 0.0001;
 
-        if (debugView)
-        {
-            if (isSky)
-                return float4(0.0, 0.5, 1.0, 1.0);
-            else
-                return float4(color * 0.3, 1.0);
-        }
-
         if (!isSky)
             return float4(color, 1.0);
     }
@@ -60,4 +52,21 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     result.b = (diff.b < threshold) ? lerp(color.b, avg.b, intensity) : color.b;
 
     return float4(result, 1.0);
+}
+
+// Standalone debug overlay: highlights the regions affected by debanding.
+// Selected via the host's centralized debug-view registry and drawn onto the
+// final LDR target. Sky pixels (depth-based) are tinted blue; everything else
+// is dimmed scene color.
+float4 debug_main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
+{
+    float3 color = sceneTex.SampleLevel(linearClamp, uv, 0).rgb;
+
+    float depth = depthTex.SampleLevel(linearClamp, uv, 0).r;
+    bool isSky = depth >= skyDepthThreshold || depth <= 0.0001;
+
+    if (isSky)
+        return float4(0.0, 0.5, 1.0, 1.0);
+    else
+        return float4(color * 0.3, 1.0);
 }

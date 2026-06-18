@@ -23,6 +23,7 @@ DustLogFn gLogFn = nullptr;
 SSSConfig gSSSConfig;
 
 static HMODULE gPluginModule = nullptr;
+static int gDebugViewHandle = 0;
 
 static std::string GetPluginDir()
 {
@@ -71,12 +72,16 @@ static int SSSInit(ID3D11Device* device, uint32_t width, uint32_t height, const 
     if (!SSSRenderer::Init(device, width, height, host, pluginDir.c_str()))
         return -1;
 
+    gDebugViewHandle = host->RegisterDebugView("Subsurface: Skin Tag Coverage",
+                                               SSSRenderer::DebugRender, (void*)(INT_PTR)1);
+
     Log("SSS: Initialized (%ux%u)", width, height);
     return 0;
 }
 
 static void SSSShutdown()
 {
+    if (gHost && gDebugViewHandle) { gHost->UnregisterDebugView(gDebugViewHandle); gDebugViewHandle = 0; }
     SSSRenderer::Shutdown();
     Log("SSS: Shut down");
 }
@@ -101,7 +106,6 @@ static DustSettingDesc gSettingsArray[] = {
     { "Max Radius (px)", DUST_SETTING_FLOAT, &gSSSConfig.maxRadiusPx,    1.0f,  64.0f, "MaxRadiusPx",    nullptr, "Hard cap on per-tap pixel offset (stability for close-up faces)",  DUST_PERF_LOW    },
     { "Depth Threshold", DUST_SETTING_FLOAT, &gSSSConfig.depthThreshold, 0.001f,0.2f,  "DepthThreshold", nullptr, "Reject blur taps whose depth differs more than this fraction",     DUST_PERF_NONE   },
     { "Follow Surface",  DUST_SETTING_FLOAT, &gSSSConfig.followSurface,  0.0f,  1.0f,  "FollowSurface",  nullptr, "How strongly to restrict blur to skin-tagged taps (1 = strict)",   DUST_PERF_NONE   },
-    { "Debug View",      DUST_SETTING_BOOL,  &gSSSConfig.debugView,      0.0f,  1.0f,  "DebugView",      nullptr, "Tint skin-tagged pixels magenta to inspect tag coverage",          DUST_PERF_NONE   },
 };
 
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)

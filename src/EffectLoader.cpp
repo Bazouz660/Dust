@@ -1,5 +1,6 @@
 #include "EffectLoader.h"
 #include "ResourceRegistry.h"
+#include "DebugViewRegistry.h"
 #include "D3D11StateBlock.h"
 #include "D3D11Hook.h"
 #include "PssmDetour.h"
@@ -622,6 +623,21 @@ static int HostSetShadowRange(float farDistance)
     return PssmDetour::SetShadowFar(farDistance) ? 1 : 0;
 }
 
+// ==================== Host API wrappers (v11) ====================
+
+static int HostRegisterDebugView(const char* label, DustDebugViewRenderFn render, void* user)
+{
+    return gDebugViewRegistry.Register(label, render, user);
+}
+static void HostUnregisterDebugView(int handle)
+{
+    gDebugViewRegistry.Unregister(handle);
+}
+static int HostGetActiveDebugView(void)
+{
+    return gDebugViewRegistry.GetActiveHandle();
+}
+
 // ==================== EffectLoader ====================
 
 void EffectLoader::BuildHostAPI()
@@ -680,6 +696,11 @@ void EffectLoader::BuildHostAPI()
     // v9 additions
     hostAPI_.SetShadowRange             = HostSetShadowRange;
     hostAPI_.GetShadowBaseResolution    = D3D11Hook::GetShadowBaseResolution;
+
+    // v11 additions
+    hostAPI_.RegisterDebugView          = HostRegisterDebugView;
+    hostAPI_.UnregisterDebugView        = HostUnregisterDebugView;
+    hostAPI_.GetActiveDebugView         = HostGetActiveDebugView;
 }
 
 // ==================== v3: Config I/O ====================
@@ -1235,6 +1256,13 @@ void EffectLoader::DispatchPost(DustInjectionPoint point, const DustFrameContext
         if (frameworkTiming)
             EndTiming(le, ctx->context, 1);
     }
+
+    // After all POST_TONEMAP effects have run, draw the active debug view (if
+    // any) onto the final LDR target. POST_TONEMAP is the last dispatched point
+    // and the LDR target survives to present, so the overlay is the last thing
+    // written. Replaces the old DustSSAODebug companion plugin.
+    if (point == DUST_INJECT_POST_TONEMAP)
+        gDebugViewRegistry.RenderActive(ctx->context, gResourceRegistry.GetRTV(DUST_RESOURCE_LDR_RT));
 }
 
 // ==================== Lifecycle ====================
@@ -1285,6 +1313,10 @@ void EffectLoader::ShutdownAll()
             FreeLibrary(le.hModule);
     }
     effects_.clear();
+
+    // Drop any debug views whose owning plugin failed to unregister before its
+    // DLL was freed — their render pointers are now dangling.
+    gDebugViewRegistry.Clear();
 
     // Release cached resources
     ReleaseSceneCopies();

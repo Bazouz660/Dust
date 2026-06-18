@@ -2,7 +2,8 @@
 // pipeline component as ground truth so the user can identify which stage
 // is broken without interpretation.
 //
-// Mode table (kept in sync with SSAOConfig::debugViewMode):
+// Mode table (kept in sync with the debug-view registration order in
+// DustSSAO.cpp; the host passes the active mode via DebugView):
 //   0  Off (this shader does not run; gated CPU-side)
 //   1  Final R8 AO (whiteworld view)
 //   2  Raw scene depth, normalized to [0,1]

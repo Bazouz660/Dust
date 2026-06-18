@@ -2,6 +2,7 @@
 #include "DustGUI_DInputHook.h"
 #include "DustLog.h"
 #include "EffectLoader.h"
+#include "DebugViewRegistry.h"
 #include "FilePicker.h"
 #include "D3D11Hook.h"
 #include "GeometryCapture.h"
@@ -905,6 +906,47 @@ static void DrawFrameworkSection()
                 D3D11Hook::ShadowCBRecon::Arm(reconFrames);
         }
     }
+}
+
+// ==================== Drawing: Debug view selector ====================
+// Centralized picker for the debug-view overlays registered by plugins. Only
+// one can be active at a time; selecting one makes the host draw it over the
+// final image after tonemapping. The list is built dynamically from whatever
+// plugins are loaded, so it grows/shrinks as effects are added or removed.
+
+static void DrawDebugViewSection()
+{
+    const auto& views = gDebugViewRegistry.Views();
+
+    ImGui::TextColored(DustHeadingColor(), "Debug View");
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    if (views.empty())
+    {
+        ImGui::TextDisabled("No debug views available");
+        return;
+    }
+
+    int active = gDebugViewRegistry.GetActiveHandle();
+    const char* preview = "Off";
+    for (const auto& v : views)
+        if (v.handle == active) { preview = v.label.c_str(); break; }
+
+    ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+    if (ImGui::BeginCombo("##debugview", preview))
+    {
+        if (ImGui::Selectable("Off", active == 0))
+            gDebugViewRegistry.SetActiveHandle(0);
+        for (const auto& v : views)
+        {
+            if (ImGui::Selectable(v.label.c_str(), v.handle == active))
+                gDebugViewRegistry.SetActiveHandle(v.handle);
+        }
+        ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Overwrite the final image with a diagnostic view from any plugin.\nOnly one is shown at a time. Resets to Off on restart.");
 }
 
 // ==================== Drawing: Global preset selector ====================
@@ -2190,6 +2232,12 @@ void Render()
 
         // Framework settings
         DrawFrameworkSection();
+
+        ImGui::Spacing();
+        ImGui::Spacing();
+
+        // Centralized debug-view selector (registered by plugins)
+        DrawDebugViewSection();
 
         ImGui::Spacing();
         ImGui::Spacing();

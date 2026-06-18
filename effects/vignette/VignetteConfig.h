@@ -8,7 +8,6 @@ struct VignetteConfig
     float softness = 0.5f;
     int shape = 0;
     float aspectRatio = 1.0f;
-    bool debugView = false;
 };
 
 extern VignetteConfig gVignetteConfig;

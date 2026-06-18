@@ -14,6 +14,8 @@ static const DustHostAPI* gHost = nullptr;
 static bool gInitialized = false;
 
 static ID3D11PixelShader* gPS = nullptr;
+static ID3D11PixelShader* gDebugPS = nullptr;
+static int gDebugViewHandle = 0;
 static ID3D11Buffer* gCB = nullptr;
 static ID3D11SamplerState* gSampler = nullptr;
 static ID3D11BlendState* gNoBlend = nullptr;
@@ -43,6 +45,31 @@ static std::string GetPluginDir()
     return (pos != std::string::npos) ? s.substr(0, pos) : s;
 }
 
+// Debug-view render callback. The host calls this when the Vignette mask view
+// is selected, drawing it onto the final LDR target. Reuses gCB, which already
+// holds this frame's params from VignettePostExecute.
+static void VignetteDebugRender(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* targetRTV, void* user)
+{
+    if (!gInitialized || !gVignetteConfig.enabled || !gHost || !gDebugPS)
+        return;
+
+    gHost->SaveState(ctx);
+
+    D3D11_VIEWPORT vp = {};
+    vp.Width = (float)gWidth;
+    vp.Height = (float)gHeight;
+    vp.MaxDepth = 1.0f;
+    ctx->RSSetViewports(1, &vp);
+    ctx->RSSetState(gNoCull);
+    ctx->OMSetRenderTargets(1, &targetRTV, nullptr);
+    ctx->OMSetBlendState(gNoBlend, nullptr, 0xFFFFFFFF);
+    ctx->OMSetDepthStencilState(gNoDepth, 0);
+    ctx->PSSetConstantBuffers(0, 1, &gCB);
+    gHost->DrawFullscreenTriangle(ctx, gDebugPS);
+
+    gHost->RestoreState(ctx);
+}
+
 static int VignetteInit(ID3D11Device* device, uint32_t width, uint32_t height, const DustHostAPI* host)
 {
 #undef Log
@@ -59,6 +86,13 @@ static int VignetteInit(ID3D11Device* device, uint32_t width, uint32_t height, c
     HRESULT hr = device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &gPS);
     blob->Release();
     if (FAILED(hr)) return -1;
+
+    ID3DBlob* dblob = host->CompileShaderFromFile((shaderDir + "vignette_ps.hlsl").c_str(), "debug_main", "ps_5_0");
+    if (dblob)
+    {
+        device->CreatePixelShader(dblob->GetBufferPointer(), dblob->GetBufferSize(), nullptr, &gDebugPS);
+        dblob->Release();
+    }
 
     gCB = host->CreateConstantBuffer(device, sizeof(VignetteCBData));
     if (!gCB) return -1;
@@ -80,6 +114,8 @@ static int VignetteInit(ID3D11Device* device, uint32_t width, uint32_t height, c
     rd.CullMode = D3D11_CULL_NONE;
     device->CreateRasterizerState(&rd, &gNoCull);
 
+    gDebugViewHandle = host->RegisterDebugView("Vignette: Mask", VignetteDebugRender, (void*)(INT_PTR)1);
+
     gInitialized = true;
     Log("Vignette: Initialized (%ux%u)", width, height);
     return 0;
@@ -87,7 +123,9 @@ static int VignetteInit(ID3D11Device* device, uint32_t width, uint32_t height, c
 
 static void VignetteShutdown()
 {
+    if (gHost && gDebugViewHandle) { gHost->UnregisterDebugView(gDebugViewHandle); gDebugViewHandle = 0; }
     if (gPS) { gPS->Release(); gPS = nullptr; }
+    if (gDebugPS) { gDebugPS->Release(); gDebugPS = nullptr; }
     if (gCB) { gCB->Release(); gCB = nullptr; }
     if (gSampler) { gSampler->Release(); gSampler = nullptr; }
     if (gNoBlend) { gNoBlend->Release(); gNoBlend = nullptr; }
@@ -127,7 +165,6 @@ static void VignettePostExecute(const DustFrameContext* ctx, const DustHostAPI* 
     cb.softness = gVignetteConfig.softness;
     cb.shape = gVignetteConfig.shape;
     cb.aspectRatio = gVignetteConfig.aspectRatio;
-    cb.debugView = gVignetteConfig.debugView ? 1 : 0;
     host->UpdateConstantBuffer(ctx->context, gCB, &cb, sizeof(cb));
 
     D3D11_VIEWPORT vp = {};
@@ -164,7 +201,6 @@ static DustSettingDesc gSettingsArray[] = {
     { "Softness",  DUST_SETTING_FLOAT, &gVignetteConfig.softness,  0.01f,2.0f, "Softness",  nullptr,       "How gradual the transition from lit to dark",              DUST_PERF_NONE },
     { "Shape",        DUST_SETTING_ENUM,  &gVignetteConfig.shape,       0.0f, 2.0f, "Shape",       gShapeLabels,  "Vignette shape",                                       DUST_PERF_NONE },
     { "Aspect Ratio", DUST_SETTING_FLOAT, &gVignetteConfig.aspectRatio, 0.5f, 2.0f, "AspectRatio", nullptr,       "Stretch the vignette horizontally (>1) or vertically (<1)", DUST_PERF_NONE },
-    { "Debug View",   DUST_SETTING_BOOL,  &gVignetteConfig.debugView,   0.0f, 1.0f, "DebugView",   nullptr,       "Show the vignette mask",                                DUST_PERF_NONE },
 };
 
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)

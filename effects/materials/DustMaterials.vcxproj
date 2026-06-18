@@ -13,8 +13,8 @@
   <PropertyGroup Label="Globals">
     <VCProjectVersion>17.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>
-    <ProjectGuid>{A1B2C3D4-E5F6-7890-ABCD-EF0123456720}</ProjectGuid>
-    <RootNamespace>DustSSAODebug</RootNamespace>
+    <ProjectGuid>{A1B2C3D4-E5F6-7890-ABCD-MATERIAL0001}</ProjectGuid>
+    <RootNamespace>DustMaterials</RootNamespace>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -46,12 +46,12 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <OutDir>$(ProjectDir)build\Debug\</OutDir>
     <IntDir>$(ProjectDir)build\Debug\obj\</IntDir>
-    <TargetName>DustSSAODebug</TargetName>
+    <TargetName>DustMaterials</TargetName>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <OutDir>$(ProjectDir)build\Release\</OutDir>
     <IntDir>$(ProjectDir)build\Release\obj\</IntDir>
-    <TargetName>DustSSAODebug</TargetName>
+    <TargetName>DustMaterials</TargetName>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
@@ -84,10 +84,11 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="DustSSAODebug.cpp" />
+    <ClCompile Include="DustMaterials.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\src\DustAPI.h" />
+    <ClInclude Include="DustLog.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

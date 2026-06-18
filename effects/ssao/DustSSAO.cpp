@@ -34,6 +34,20 @@ static ID3D11ShaderResourceView* gWhiteAlbedoSRV = nullptr;
 static ID3D11Texture2D* gParamsTex = nullptr;
 static ID3D11ShaderResourceView* gParamsSRV = nullptr;
 
+// Debug-view overlay handles from host->RegisterDebugView (API v11). One per
+// diagnostic mode; the host shows them in its centralized selector and calls
+// SSAODebugRender for whichever is active. Index i maps to shader mode i+1.
+static int gDebugViewHandles[7] = {};
+static const char* const kDebugViewLabels[7] = {
+    "AO: Final AO",
+    "AO: Raw Depth",
+    "AO: Linearized Z",
+    "AO: View Pos.z",
+    "AO: Normals from Depth",
+    "AO: Jitter / Blue Noise",
+    "AO: Filtered AO",
+};
+
 static bool CreateAoSampler(ID3D11Device* device)
 {
     D3D11_SAMPLER_DESC sd = {};
@@ -231,17 +245,15 @@ static void SSAOPostExecute(const DustFrameContext* ctx, const DustHostAPI* host
 {
 }
 
-// Export consumed by the DustSSAODebug companion plugin at PRE_PRESENT.
-// Draws the diagnostic overlay onto whatever RTV the caller hands us — the
-// LDR target is the intended consumer since it survives until swap.
-extern "C" __declspec(dllexport) void Dust_RenderSSAODebugOverlay(
-    ID3D11DeviceContext* ctx,
-    ID3D11RenderTargetView* targetRTV,
-    ID3D11ShaderResourceView* depthSRV)
+// Debug-view render callback. The host invokes this for the active AO debug
+// view, handing the final LDR target and the registered mode (1..7 via 'user').
+// Draws the diagnostic overlay onto whatever RTV the host hands us.
+static void SSAODebugRender(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* targetRTV, void* user)
 {
-    if (!ctx || !targetRTV || !depthSRV) return;
-    if (gSSAOConfig.debugViewMode == 0 || !gSSAOConfig.enabled) return;
-    SSAORenderer::RenderDebugOverlay(ctx, targetRTV, depthSRV);
+    if (!ctx || !targetRTV || !gSSAOConfig.enabled || !gHost) return;
+    ID3D11ShaderResourceView* depthSRV = gHost->GetSRV(DUST_RESOURCE_DEPTH);
+    if (!depthSRV) return;
+    SSAORenderer::RenderDebugOverlay(ctx, targetRTV, depthSRV, (int)(INT_PTR)user);
 }
 
 static HMODULE gPluginModule = nullptr;
@@ -278,12 +290,21 @@ static int SSAOInit(ID3D11Device* device, uint32_t width, uint32_t height, const
     if (!SSAORenderer::Init(device, width, height, host, pluginDir.c_str()))
         return -3;
 
+    // Register the diagnostic views in the host's centralized debug-view
+    // selector. mode = i+1 matches ssao_debug_ps.hlsl's mode table.
+    for (int i = 0; i < 7; i++)
+        gDebugViewHandles[i] = host->RegisterDebugView(kDebugViewLabels[i], SSAODebugRender, (void*)(INT_PTR)(i + 1));
+
     Log("SSAO: Initialized (%ux%u)", width, height);
     return 0;
 }
 
 static void SSAOShutdown()
 {
+    if (gHost)
+        for (int i = 0; i < 7; i++)
+            if (gDebugViewHandles[i]) { gHost->UnregisterDebugView(gDebugViewHandles[i]); gDebugViewHandles[i] = 0; }
+
     SSAORenderer::Shutdown();
 
     if (gAoSampler)       { gAoSampler->Release();      gAoSampler = nullptr; }
@@ -322,18 +343,6 @@ static const char* const kShadingRateLabels[] = {
 static const char* const kAoTypeLabels[] = {
     "GTAO", "Solid Angle", "Visibility Bitmask", "Bitmask + Solid Angle", nullptr
 };
-static const char* const kDebugViewLabels[] = {
-    "Off",                  // 0
-    "Final AO",             // 1
-    "Raw Depth",            // 2
-    "Linearized Z",         // 3
-    "View Pos.z",           // 4
-    "Normals from Depth",   // 5
-    "Jitter / Blue Noise",  // 6
-    "Filtered AO",          // 7
-    nullptr
-};
-
 // Labels and grouping are display-only; the iniKey (6th field) is unchanged for
 // every setting so existing presets and saved configs keep loading.
 static DustSettingDesc gSettingsArray[] = {
@@ -355,8 +364,7 @@ static DustSettingDesc gSettingsArray[] = {
     { "Direct Light AO",  DUST_SETTING_FLOAT, &gSSAOConfig.directLightOcclusion, 0.0f, 1.0f, "DirectLightAO", nullptr,           "How much AO affects directly lit areas (0 = ambient only, 1 = full).", DUST_PERF_NONE },
 
     { "Advanced",         DUST_SETTING_SECTION, nullptr,                        0.0f, 0.0f,  nullptr,         nullptr,           nullptr,                                                                                DUST_PERF_NONE },
-    { "Far Plane",        DUST_SETTING_FLOAT, &gSSAOConfig.farPlane,            1.0f, 10000.0f, "FarPlane",    nullptr,           "Depth scale: z = depth * FarPlane + 1. High values cause halo artifacts at geometry/sky boundaries. Default 1000.", DUST_PERF_NONE },
-    { "Debug View",       DUST_SETTING_ENUM,  &gSSAOConfig.debugViewMode,       0.0f, 7.0f,  "DebugViewMode", kDebugViewLabels,  "Diagnostic visualizations for each pipeline stage.", DUST_PERF_NONE },
+    { "Far Plane",        DUST_SETTING_FLOAT, &gSSAOConfig.farPlane,            1.0f, 10000.0f, "FarPlane",    nullptr,           "Depth scale: z = depth * FarPlane + 1. High values cause halo artifacts at geometry/sky boundaries. Default 8000.", DUST_PERF_NONE },
 
     // FOV is hardcoded to 0.4142 (45° vertical), measured from Kenshi's projection
     // matrix. Persisted but hidden — not user-tunable.

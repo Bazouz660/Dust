@@ -32,12 +32,6 @@ struct SSAOConfig
     // Filter size: 0–2
     int filterSize = 1;
 
-    // Diagnostic visualization mode. 0 = off (no overlay).
-    // 1..10 select a specific pipeline component to render full-screen as
-    // ground truth so the user can identify which stage is broken.
-    // See ssao_debug_ps.hlsl for the mode table.
-    int debugViewMode = 0;
-
     // === Algorithm variant ===
 
     // AO type: 0=GTAO (high contrast), 1=Solid Angle (smooth, fastest),
@@ -54,8 +48,8 @@ struct SSAOConfig
     // Far plane reference. The depth_to_z formula is `d * FarPlane + 1`
     // and assumes d in [0,1] is linearized depth. Kenshi's depth from t0 is
     // linear view-Z in scene units; treating it as already-linearized [0,1]
-    // depth with FarPlane=1000 puts z in a comparable scale.
-    float farPlane = 1000.0f;
+    // depth with FarPlane=8000 puts z in a comparable scale.
+    float farPlane = 8000.0f;
 
     // How much AO affects directly lit areas (0 = ambient only, 1 = full).
     // Bound at slot 9 for the deferred shader to consume.

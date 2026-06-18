@@ -8,7 +8,6 @@ struct LetterboxConfig
     float colorG = 0.0f;
     float colorB = 0.0f;
     float opacity = 1.0f;
-    bool debugView = false;
 };
 
 extern LetterboxConfig gLetterboxConfig;

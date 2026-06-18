@@ -41,6 +41,18 @@ static void SSILPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     (void)ctx; (void)host;
 }
 
+// Handle for the centralized debug-view selector (API v11).
+static int gDebugViewHandle = 0;
+
+// Debug-view render callback. The host calls this when the SSIL debug view is
+// selected, handing the final LDR target to overwrite with the raw IL buffer.
+static void SSILDebugRender(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* targetRTV, void* user)
+{
+    if (!gSSILConfig.enabled || !SSILRenderer::IsInitialized())
+        return;
+    SSILRenderer::RenderDebugOverlay(ctx, targetRTV);
+}
+
 // Called AFTER the game's lighting draw — generate IL from the lit scene, then composite
 static void SSILPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
 {
@@ -88,12 +100,6 @@ static void SSILPostExecute(const DustFrameContext* ctx, const DustHostAPI* host
     dc->PSSetShaderResources(0, 1, &nullSRV);
 
     host->RestoreState(dc);
-
-    // Debug overlay
-    if (gSSILConfig.debugView)
-    {
-        SSILRenderer::RenderDebugOverlay(dc, hdrRTV);
-    }
 }
 
 static int SSILInit(ID3D11Device* device, uint32_t width, uint32_t height, const DustHostAPI* host)
@@ -143,12 +149,15 @@ static int SSILInit(ID3D11Device* device, uint32_t width, uint32_t height, const
         if (FAILED(hr)) return -5;
     }
 
+    gDebugViewHandle = host->RegisterDebugView("Indirect Light: Raw IL", SSILDebugRender, (void*)(INT_PTR)1);
+
     Log("SSIL: Initialized (%ux%u)", width, height);
     return 0;
 }
 
 static void SSILShutdown()
 {
+    if (gHost && gDebugViewHandle) { gHost->UnregisterDebugView(gDebugViewHandle); gDebugViewHandle = 0; }
     SSILRenderer::Shutdown();
 
     if (gCompositePS)   { gCompositePS->Release();   gCompositePS = nullptr; }
@@ -187,7 +196,6 @@ static DustSettingDesc gSettingsArray[] = {
     { "Directions",         DUST_SETTING_INT,   &gSSILConfig.sampleCount,      2.0f,    12.0f,  "Directions",     nullptr, "Number of sampling directions per pixel",                           DUST_PERF_HIGH },
     { "Steps",              DUST_SETTING_INT,   &gSSILConfig.stepCount,        1.0f,    6.0f,   "Steps",          nullptr, "Number of samples per direction",                                   DUST_PERF_HIGH },
     { "Blur Sharpness",     DUST_SETTING_FLOAT, &gSSILConfig.blurSharpness,    0.0f,    0.1f,   "BlurSharpness",  nullptr, "Edge-aware blur sharpness (higher = preserves more detail)",        DUST_PERF_NONE },
-    { "Debug View",         DUST_SETTING_BOOL,  &gSSILConfig.debugView,        0.0f,    1.0f,   "DebugView",      nullptr, "Show raw indirect lighting before compositing",                     DUST_PERF_NONE },
     // Hidden settings
     { "Depth Fade Start",   DUST_SETTING_HIDDEN_FLOAT, &gSSILConfig.depthFadeStart, 0.0f, 1.0f,   "DepthFadeStart" },
     { "Tan Half FOV",       DUST_SETTING_HIDDEN_FLOAT, &gSSILConfig.tanHalfFov,     0.1f, 2.0f,   "TanHalfFov" },

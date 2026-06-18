@@ -72,7 +72,7 @@
 extern "C" {
 #endif
 
-#define DUST_API_VERSION 10
+#define DUST_API_VERSION 11
 
 // Injection points in the rendering pipeline
 typedef enum DustInjectionPoint {
@@ -184,6 +184,15 @@ typedef struct DustGeometryDraw {
     uint32_t            clipMatrixOffset;   // byte offset of clip matrix in VS CB data
     uint32_t            worldMatrixOffset;  // byte offset of world matrix (0 if none)
 } DustGeometryDraw;
+
+// Debug-view overlay callback (API v11+). The host calls this for the single
+// active debug view after tonemapping, handing over the final LDR render
+// target. The plugin draws its diagnostic image onto targetRTV (own
+// SaveState/RestoreState). 'user' is the pointer passed to RegisterDebugView
+// (e.g. a sub-mode index cast to void*).
+typedef void (*DustDebugViewRenderFn)(ID3D11DeviceContext* ctx,
+                                      ID3D11RenderTargetView* targetRTV,
+                                      void* user);
 
 // Host API - function pointers provided by Dust to plugins
 typedef struct DustHostAPI {
@@ -355,6 +364,21 @@ typedef struct DustHostAPI {
     // Return the vanilla shadow atlas resolution (the size Kenshi created
     // before any Dust override). 0 if the atlas hasn't been created yet.
     uint32_t (*GetShadowBaseResolution)(void);
+
+    // === API v11 additions ===
+
+    // Centralized debug-view overlay. Any plugin can register one or more named
+    // views that overwrite the final image; the host lists them all in a single
+    // selector and renders only the active one (at most one visible at a time).
+    // Register in Init, unregister in Shutdown. Returns a non-zero handle, or 0
+    // on failure. 'user' is passed back to 'render' verbatim (e.g. a sub-mode).
+    int  (*RegisterDebugView)(const char* label, DustDebugViewRenderFn render, void* user);
+    void (*UnregisterDebugView)(int handle);
+
+    // Handle of the currently-selected debug view (0 = none). Lets a plugin
+    // detect that one of its views is active earlier in the frame than the
+    // render callback fires (e.g. to prepare data during an earlier pass).
+    int  (*GetActiveDebugView)(void);
 } DustHostAPI;
 
 // Performance impact hint for a single setting (API v3.2+).

@@ -22,4 +22,8 @@ namespace SSSRenderer
 
     void OnResolutionChanged(ID3D11Device* device, UINT newWidth, UINT newHeight);
     bool IsInitialized();
+
+    // Debug-view overlay callback (host's centralized debug-view registry, API
+    // v11+). Tints skin-tagged pixels magenta on the final LDR target.
+    void DebugRender(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* targetRTV, void* user);
 }

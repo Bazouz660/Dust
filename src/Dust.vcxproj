@@ -100,6 +100,7 @@
     <ClCompile Include="D3D11StateBlock.cpp" />
     <ClCompile Include="PipelineDetector.cpp" />
     <ClCompile Include="ResourceRegistry.cpp" />
+    <ClCompile Include="DebugViewRegistry.cpp" />
     <ClCompile Include="EffectLoader.cpp" />
     <ClCompile Include="EffectLoaderPresets.cpp" />
     <ClCompile Include="DustGUI.cpp" />
@@ -139,6 +140,7 @@
     <ClInclude Include="InjectionPoint.h" />
     <ClInclude Include="PipelineDetector.h" />
     <ClInclude Include="ResourceRegistry.h" />
+    <ClInclude Include="DebugViewRegistry.h" />
     <ClInclude Include="EffectLoader.h" />
     <ClInclude Include="FilePicker.h" />
     <ClInclude Include="D3D11Hook.h" />

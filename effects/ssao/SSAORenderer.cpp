@@ -108,6 +108,11 @@ struct AOPassCB
 };
 static ID3D11Buffer* gPassCB = nullptr;
 
+// Last AO pass cbuffer packed by RenderAO this frame. The debug overlay reuses
+// these values (FarPlane, FOV, etc.) and only overrides debugView per the
+// selected mode, so it doesn't have to re-derive the full AO state.
+static AOPassCB gLastCB = {};
+
 // ==================== Helpers ====================
 
 // Generate a 64x64 R8 blue noise tile via the void-and-cluster method
@@ -509,8 +514,9 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
         cb.deinterleaveTileCount = gDeinterleaveTileCount;
         cb.deinterleaveHigh    = gDeinterleaveHigh;
         cb.frameCount          = (uint32_t)gFrameIndex;
-        cb.debugView           = (float)gSSAOConfig.debugViewMode;
+        cb.debugView           = 0.0f;  // overridden per-mode by RenderDebugOverlay
         gHost->UpdateConstantBuffer(ctx, gPassCB, &cb, sizeof(cb));
+        gLastCB = cb;
     }
 
     // Common state
@@ -597,15 +603,20 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
 }
 
 void RenderDebugOverlay(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* hdrRTV,
-                        ID3D11ShaderResourceView* depthSRV)
+                        ID3D11ShaderResourceView* depthSRV, int mode)
 {
-    if (!gInitialized || !ctx || !hdrRTV || gSSAOConfig.debugViewMode == 0 || !gHost)
+    if (!gInitialized || !ctx || !hdrRTV || mode <= 0 || !gHost)
         return;
 
     // Use the same depthSRV that RenderAO used so debug views see identical
     // depth values even if the game modified the depth buffer between passes.
     if (gLastDepthSRV)
         depthSRV = gLastDepthSRV;
+
+    // Re-upload the AO cbuffer with the requested debug mode (RenderAO leaves
+    // debugView at 0 and a dynamic CB can't be partially updated).
+    gLastCB.debugView = (float)mode;
+    gHost->UpdateConstantBuffer(ctx, gPassCB, &gLastCB, sizeof(gLastCB));
 
     gHost->SaveState(ctx);
 

@@ -14,6 +14,8 @@ static const DustHostAPI* gHost = nullptr;
 static bool gInitialized = false;
 
 static ID3D11PixelShader* gPS = nullptr;
+static ID3D11PixelShader* gDebugPS = nullptr;
+static int gDebugViewHandle = 0;
 static ID3D11Buffer* gCB = nullptr;
 static ID3D11SamplerState* gSampler = nullptr;
 static ID3D11BlendState* gNoBlend = nullptr;
@@ -41,6 +43,31 @@ static std::string GetPluginDir()
     return (pos != std::string::npos) ? s.substr(0, pos) : s;
 }
 
+// Debug-view render callback. The host calls this when the Letterbox bar-region
+// view is selected, drawing it onto the final LDR target. Reuses gCB, which
+// already holds this frame's params from LetterboxPostExecute.
+static void LetterboxDebugRender(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* targetRTV, void* user)
+{
+    if (!gInitialized || !gLetterboxConfig.enabled || !gHost || !gDebugPS)
+        return;
+
+    gHost->SaveState(ctx);
+
+    D3D11_VIEWPORT vp = {};
+    vp.Width = (float)gWidth;
+    vp.Height = (float)gHeight;
+    vp.MaxDepth = 1.0f;
+    ctx->RSSetViewports(1, &vp);
+    ctx->RSSetState(gNoCull);
+    ctx->OMSetRenderTargets(1, &targetRTV, nullptr);
+    ctx->OMSetBlendState(gNoBlend, nullptr, 0xFFFFFFFF);
+    ctx->OMSetDepthStencilState(gNoDepth, 0);
+    ctx->PSSetConstantBuffers(0, 1, &gCB);
+    gHost->DrawFullscreenTriangle(ctx, gDebugPS);
+
+    gHost->RestoreState(ctx);
+}
+
 static int LetterboxInit(ID3D11Device* device, uint32_t width, uint32_t height, const DustHostAPI* host)
 {
 #undef Log
@@ -57,6 +84,13 @@ static int LetterboxInit(ID3D11Device* device, uint32_t width, uint32_t height, 
     HRESULT hr = device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &gPS);
     blob->Release();
     if (FAILED(hr)) return -1;
+
+    ID3DBlob* dblob = host->CompileShaderFromFile((shaderDir + "letterbox_ps.hlsl").c_str(), "debug_main", "ps_5_0");
+    if (dblob)
+    {
+        device->CreatePixelShader(dblob->GetBufferPointer(), dblob->GetBufferSize(), nullptr, &gDebugPS);
+        dblob->Release();
+    }
 
     gCB = host->CreateConstantBuffer(device, sizeof(LetterboxCBData));
     if (!gCB) return -1;
@@ -78,6 +112,8 @@ static int LetterboxInit(ID3D11Device* device, uint32_t width, uint32_t height, 
     rd.CullMode = D3D11_CULL_NONE;
     device->CreateRasterizerState(&rd, &gNoCull);
 
+    gDebugViewHandle = host->RegisterDebugView("Letterbox: Bar Regions", LetterboxDebugRender, (void*)(INT_PTR)1);
+
     gInitialized = true;
     Log("Letterbox: Initialized (%ux%u)", width, height);
     return 0;
@@ -85,7 +121,9 @@ static int LetterboxInit(ID3D11Device* device, uint32_t width, uint32_t height, 
 
 static void LetterboxShutdown()
 {
+    if (gHost && gDebugViewHandle) { gHost->UnregisterDebugView(gDebugViewHandle); gDebugViewHandle = 0; }
     if (gPS) { gPS->Release(); gPS = nullptr; }
+    if (gDebugPS) { gDebugPS->Release(); gDebugPS = nullptr; }
     if (gCB) { gCB->Release(); gCB = nullptr; }
     if (gSampler) { gSampler->Release(); gSampler = nullptr; }
     if (gNoBlend) { gNoBlend->Release(); gNoBlend = nullptr; }
@@ -129,7 +167,6 @@ static void LetterboxPostExecute(const DustFrameContext* ctx, const DustHostAPI*
     cb.barColor[0] = gLetterboxConfig.colorR;
     cb.barColor[1] = gLetterboxConfig.colorG;
     cb.barColor[2] = gLetterboxConfig.colorB;
-    cb.debugView = gLetterboxConfig.debugView ? 1 : 0;
     host->UpdateConstantBuffer(ctx->context, gCB, &cb, sizeof(cb));
 
     D3D11_VIEWPORT vp = {};
@@ -167,7 +204,6 @@ static DustSettingDesc gSettingsArray[] = {
     { "Bar Red",      DUST_SETTING_FLOAT, &gLetterboxConfig.colorR,     0.0f, 1.0f, "BarColorR",  nullptr, "Red component of the bar color",                                DUST_PERF_NONE },
     { "Bar Green",    DUST_SETTING_FLOAT, &gLetterboxConfig.colorG,     0.0f, 1.0f, "BarColorG",  nullptr, "Green component of the bar color",                              DUST_PERF_NONE },
     { "Bar Blue",     DUST_SETTING_FLOAT, &gLetterboxConfig.colorB,     0.0f, 1.0f, "BarColorB",  nullptr, "Blue component of the bar color",                               DUST_PERF_NONE },
-    { "Debug View",   DUST_SETTING_BOOL,  &gLetterboxConfig.debugView,  0.0f, 1.0f, "DebugView",  nullptr, "Highlight bar regions",                                         DUST_PERF_NONE },
 };
 
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)

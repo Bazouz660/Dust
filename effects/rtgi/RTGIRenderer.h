@@ -18,9 +18,11 @@ namespace RTGIRenderer
                                         ID3D11ShaderResourceView* sceneSRV,
                                         ID3D11ShaderResourceView* normalsSRV);
 
+    // 'mode' selects which view to draw (1..6, matching rtgi_debug_ps.hlsl).
     void RenderDebugOverlay(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* hdrRTV,
-                            ID3D11ShaderResourceView* depthSRV = nullptr,
-                            ID3D11ShaderResourceView* normalsSRV = nullptr);
+                            ID3D11ShaderResourceView* depthSRV,
+                            ID3D11ShaderResourceView* normalsSRV,
+                            int mode);
 
     void OnResolutionChanged(ID3D11Device* device, UINT newWidth, UINT newHeight);
     bool IsInitialized();

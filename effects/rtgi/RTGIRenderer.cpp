@@ -140,7 +140,8 @@ struct TemporalCBData
     float frameIndex;
     float reprojMatrix[16]; // currentInvView * prevView — direct view-to-prevView transform
     float motionMagnitude;  // length of translation in reprojection matrix (pixels approx)
-    float _pad0;
+    float farPlane;         // depth->view-Z scale (z = depth*farPlane + 1) so the reproj
+                            // matrix's world-unit translation matches the reconstructed pos
     float _pad1;
     float _pad2;
 };
@@ -742,6 +743,7 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
         cb.aspectRatio = aspect;
         cb.temporalBlend = gHasPrevFrame ? gRTGIConfig.temporalBlend : 0.0f;
         cb.frameIndex = (float)gFrameIndex;
+        cb.farPlane = gRTGIConfig.farPlane;
         if (gHasPrevFrame)
         {
             ComputeReprojectionMatrix(gInverseView, gPrevInverseView, cb.reprojMatrix);
@@ -902,9 +904,10 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
 
 void RenderDebugOverlay(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* hdrRTV,
                         ID3D11ShaderResourceView* depthSRV,
-                        ID3D11ShaderResourceView* normalsSRV)
+                        ID3D11ShaderResourceView* normalsSRV,
+                        int mode)
 {
-    if (!gInitialized || !ctx || !hdrRTV || gRTGIConfig.debugView == 0 || !gHost)
+    if (!gInitialized || !ctx || !hdrRTV || mode == 0 || !gHost)
         return;
 
     if (!gFinalGISRV) return;
@@ -936,7 +939,7 @@ void RenderDebugOverlay(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* hdrRTV
 
     float aspect = (float)gWidth / (float)gHeight;
     DebugCBData cb = {};
-    cb.debugMode = (float)gRTGIConfig.debugView;
+    cb.debugMode = (float)mode;
     cb.tanHalfFov = gRTGIConfig.tanHalfFov;
     cb.aspectRatio = aspect;
     cb.camRight[0]   = gInverseView[0]; cb.camRight[1]   = gInverseView[4]; cb.camRight[2]   = gInverseView[8];  cb.camRight[3]   = 0;

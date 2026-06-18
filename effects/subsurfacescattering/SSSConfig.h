@@ -16,9 +16,6 @@ struct SSSConfig
     // Bilateral / surface following
     float depthThreshold = 0.03f;  // reject taps whose depth differs > this fraction
     float followSurface  = 0.85f;  // 0 = ignore tag, 1 = only blur skin-tagged taps
-
-    // Debug
-    bool debugView = false;        // tint skin-tagged pixels magenta
 };
 
 extern SSSConfig gSSSConfig;

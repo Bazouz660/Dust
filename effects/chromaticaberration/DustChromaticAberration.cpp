@@ -14,6 +14,8 @@ static const DustHostAPI* gHost = nullptr;
 static bool gInitialized = false;
 
 static ID3D11PixelShader* gPS = nullptr;
+static ID3D11PixelShader* gDebugPS = nullptr;
+static int gDebugViewHandle = 0;
 static ID3D11Buffer* gCB = nullptr;
 static ID3D11SamplerState* gSampler = nullptr;
 static ID3D11BlendState* gNoBlend = nullptr;
@@ -39,6 +41,31 @@ static std::string GetPluginDir()
     return (pos != std::string::npos) ? s.substr(0, pos) : s;
 }
 
+// Debug-view render callback. The host calls this when the offset heatmap view
+// is selected, drawing it onto the final LDR target. Reuses gCB, which already
+// holds this frame's params from CAPostExecute.
+static void CADebugRender(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* targetRTV, void* user)
+{
+    if (!gInitialized || !gCAConfig.enabled || !gHost || !gDebugPS)
+        return;
+
+    gHost->SaveState(ctx);
+
+    D3D11_VIEWPORT vp = {};
+    vp.Width = (float)gWidth;
+    vp.Height = (float)gHeight;
+    vp.MaxDepth = 1.0f;
+    ctx->RSSetViewports(1, &vp);
+    ctx->RSSetState(gNoCull);
+    ctx->OMSetRenderTargets(1, &targetRTV, nullptr);
+    ctx->OMSetBlendState(gNoBlend, nullptr, 0xFFFFFFFF);
+    ctx->OMSetDepthStencilState(gNoDepth, 0);
+    ctx->PSSetConstantBuffers(0, 1, &gCB);
+    gHost->DrawFullscreenTriangle(ctx, gDebugPS);
+
+    gHost->RestoreState(ctx);
+}
+
 static int CAInit(ID3D11Device* device, uint32_t width, uint32_t height, const DustHostAPI* host)
 {
 #undef Log
@@ -55,6 +82,13 @@ static int CAInit(ID3D11Device* device, uint32_t width, uint32_t height, const D
     HRESULT hr = device->CreatePixelShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &gPS);
     blob->Release();
     if (FAILED(hr)) return -1;
+
+    ID3DBlob* dblob = host->CompileShaderFromFile((shaderDir + "ca_ps.hlsl").c_str(), "debug_main", "ps_5_0");
+    if (dblob)
+    {
+        device->CreatePixelShader(dblob->GetBufferPointer(), dblob->GetBufferSize(), nullptr, &gDebugPS);
+        dblob->Release();
+    }
 
     gCB = host->CreateConstantBuffer(device, sizeof(CACBData));
     if (!gCB) return -1;
@@ -76,6 +110,8 @@ static int CAInit(ID3D11Device* device, uint32_t width, uint32_t height, const D
     rd.CullMode = D3D11_CULL_NONE;
     device->CreateRasterizerState(&rd, &gNoCull);
 
+    gDebugViewHandle = host->RegisterDebugView("Chromatic Aberration: Offset Heatmap", CADebugRender, (void*)(INT_PTR)1);
+
     gInitialized = true;
     Log("ChromaticAberration: Initialized (%ux%u)", width, height);
     return 0;
@@ -83,7 +119,9 @@ static int CAInit(ID3D11Device* device, uint32_t width, uint32_t height, const D
 
 static void CAShutdown()
 {
+    if (gHost && gDebugViewHandle) { gHost->UnregisterDebugView(gDebugViewHandle); gDebugViewHandle = 0; }
     if (gPS) { gPS->Release(); gPS = nullptr; }
+    if (gDebugPS) { gDebugPS->Release(); gDebugPS = nullptr; }
     if (gCB) { gCB->Release(); gCB = nullptr; }
     if (gSampler) { gSampler->Release(); gSampler = nullptr; }
     if (gNoBlend) { gNoBlend->Release(); gNoBlend = nullptr; }
@@ -119,7 +157,6 @@ static void CAPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     cb.invViewportSize[0] = 1.0f / (float)gWidth;
     cb.invViewportSize[1] = 1.0f / (float)gHeight;
     cb.strength = gCAConfig.strength;
-    cb.debugView = gCAConfig.debugView ? 1 : 0;
     host->UpdateConstantBuffer(ctx->context, gCB, &cb, sizeof(cb));
 
     D3D11_VIEWPORT vp = {};
@@ -150,7 +187,6 @@ static int CAIsEnabled()
 static DustSettingDesc gSettingsArray[] = {
     { "Enabled",    DUST_SETTING_BOOL,  &gCAConfig.enabled,   0.0f,  1.0f,  "Enabled",   nullptr, "Enable or disable chromatic aberration",      DUST_PERF_NONE },
     { "Strength",   DUST_SETTING_FLOAT, &gCAConfig.strength,  0.0f,  0.02f, "Strength",  nullptr, "Intensity of the RGB fringe at screen edges", DUST_PERF_NONE },
-    { "Debug View", DUST_SETTING_BOOL,  &gCAConfig.debugView, 0.0f,  1.0f,  "DebugView", nullptr, "Visualize the offset magnitude as a heatmap", DUST_PERF_NONE },
 };
 
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)

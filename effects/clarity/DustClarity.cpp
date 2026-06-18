@@ -28,6 +28,21 @@ static std::string GetPluginDir()
     return (pos != std::string::npos) ? s.substr(0, pos) : s;
 }
 
+// Handle for the centralized debug-view selector (API v11).
+static int gDebugViewHandle = 0;
+
+// Debug-view render callback. The host calls this when the Clarity debug view
+// is selected, handing the final LDR target to overwrite.
+static void ClarityDebugRender(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* targetRTV, void* user)
+{
+    if (!ClarityRenderer::IsInitialized() || !gClarityConfig.enabled || !gHost)
+        return;
+    ID3D11ShaderResourceView* sceneCopy = gHost->GetSceneCopy(ctx, DUST_RESOURCE_LDR_RT);
+    if (!sceneCopy)
+        return;
+    ClarityRenderer::RenderDebugOverlay(ctx, sceneCopy, targetRTV);
+}
+
 // Called AFTER the game's tonemap draw
 static void ClarityPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
 {
@@ -43,12 +58,6 @@ static void ClarityPostExecute(const DustFrameContext* ctx, const DustHostAPI* h
     if (!ldrRTV)
         return;
 
-    if (gClarityConfig.debugView)
-    {
-        ClarityRenderer::RenderDebugOverlay(ctx->context, sceneCopy, ldrRTV);
-        return;
-    }
-
     ClarityRenderer::Render(ctx->context, sceneCopy, ldrRTV);
 }
 
@@ -63,12 +72,15 @@ static int ClarityInit(ID3D11Device* device, uint32_t width, uint32_t height, co
     if (!ClarityRenderer::Init(device, width, height, host, pluginDir.c_str()))
         return -1;
 
+    gDebugViewHandle = host->RegisterDebugView("Clarity: Detail Layer", ClarityDebugRender, (void*)(INT_PTR)1);
+
     Log("Clarity: Initialized (%ux%u)", width, height);
     return 0;
 }
 
 static void ClarityShutdown()
 {
+    if (gHost && gDebugViewHandle) { gHost->UnregisterDebugView(gDebugViewHandle); gDebugViewHandle = 0; }
     ClarityRenderer::Shutdown();
     Log("Clarity: Shut down");
 }
@@ -91,7 +103,6 @@ static DustSettingDesc gSettingsArray[] = {
     { "Strength",         DUST_SETTING_FLOAT, &gClarityConfig.strength,       0.0f, 2.0f,  "Strength",       nullptr, "Intensity of local contrast enhancement",                 DUST_PERF_NONE   },
     { "Midtone Protect",  DUST_SETTING_FLOAT, &gClarityConfig.midtoneProtect, 0.0f, 1.0f,  "MidtoneProtect", nullptr, "Protect midtones from over-sharpening (0 = no protection)", DUST_PERF_NONE },
     { "Blur Radius",      DUST_SETTING_FLOAT, &gClarityConfig.blurRadius,     1.0f, 32.0f, "BlurRadius",     nullptr, "Size of the detail extraction blur",                      DUST_PERF_HIGH   },
-    { "Debug View",       DUST_SETTING_BOOL,  &gClarityConfig.debugView,      0.0f, 1.0f,  "DebugView",      nullptr, "Show the extracted detail layer",                         DUST_PERF_NONE   },
 };
 
 // Plugin entry point

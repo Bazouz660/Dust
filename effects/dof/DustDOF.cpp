@@ -149,6 +149,21 @@ static void DOFPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     UpdateAutoFocus(ctx, host);
 }
 
+// Handle for the centralized debug-view selector (API v11).
+static int gDebugViewHandle = 0;
+
+// Debug-view render callback. The host calls this when the DOF debug view is
+// selected, handing the final LDR target to overwrite with the CoC overlay.
+static void DOFDebugRender(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* targetRTV, void* user)
+{
+    if (!DOFRenderer::IsInitialized() || !gDOFConfig.enabled || !gHost)
+        return;
+    ID3D11ShaderResourceView* depthSRV = gHost->GetSRV(DUST_RESOURCE_DEPTH);
+    if (!depthSRV)
+        return;
+    DOFRenderer::RenderDebugOverlay(ctx, depthSRV, targetRTV);
+}
+
 // Called AFTER the game's tonemap draw
 static void DOFPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
 {
@@ -162,12 +177,6 @@ static void DOFPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     ID3D11RenderTargetView* ldrRTV = host->GetRTV(DUST_RESOURCE_LDR_RT);
     if (!ldrRTV)
         return;
-
-    if (gDOFConfig.debugView)
-    {
-        DOFRenderer::RenderDebugOverlay(ctx->context, depthSRV, ldrRTV);
-        return;
-    }
 
     ID3D11ShaderResourceView* sceneCopy = host->GetSceneCopy(ctx->context, DUST_RESOURCE_LDR_RT);
     if (!sceneCopy)
@@ -194,12 +203,15 @@ static int DOFInit(ID3D11Device* device, uint32_t width, uint32_t height, const 
     QueryPerformanceCounter(&gLastFrameTime);
     gCurrentFocusDepth = gDOFConfig.focusDistance;
 
+    gDebugViewHandle = host->RegisterDebugView("DOF: Circle of Confusion", DOFDebugRender, (void*)(INT_PTR)1);
+
     Log("DOF: Initialized (%ux%u)", width, height);
     return 0;
 }
 
 static void DOFShutdown()
 {
+    if (gHost && gDebugViewHandle) { gHost->UnregisterDebugView(gDebugViewHandle); gDebugViewHandle = 0; }
     DOFRenderer::Shutdown();
     for (int i = 0; i < FOCUS_BUFFER_COUNT; i++)
     {
@@ -243,7 +255,6 @@ static DustSettingDesc gSettingsArray[] = {
     { "Aperture",            DUST_SETTING_FLOAT, &gDOFConfig.aperture,           0.001f,  0.1f,  "Aperture",           nullptr, "Lens aperture size for physical DoF (smaller = deeper focus)",  DUST_PERF_NONE   },
     { "Highlight Threshold", DUST_SETTING_FLOAT, &gDOFConfig.highlightThreshold, 0.0f,    1.0f,  "HighlightThreshold", nullptr, "Brightness above which highlights bleed through blur",          DUST_PERF_NONE   },
     { "Highlight Boost",     DUST_SETTING_FLOAT, &gDOFConfig.highlightBoost,     0.0f,    5.0f,  "HighlightBoost",     nullptr, "Strength of highlight bleed-through in blurred areas",          DUST_PERF_NONE   },
-    { "Debug View",          DUST_SETTING_BOOL,  &gDOFConfig.debugView,          0.0f,    1.0f,  "DebugView",          nullptr, "Visualize the circle of confusion as a color overlay",          DUST_PERF_NONE   },
 };
 
 // Plugin entry point

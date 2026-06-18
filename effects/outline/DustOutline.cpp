@@ -28,6 +28,22 @@ static std::string GetPluginDir()
     return (pos != std::string::npos) ? s.substr(0, pos) : s;
 }
 
+// Handle for the centralized debug-view selector (API v11).
+static int gDebugViewHandle = 0;
+
+// Debug-view render callback. The host calls this when the Outline debug view
+// is selected, handing the final LDR target to overwrite with raw edges.
+static void OutlineDebugRender(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* targetRTV, void* user)
+{
+    if (!OutlineRenderer::IsInitialized() || !gOutlineConfig.enabled || !gHost)
+        return;
+    ID3D11ShaderResourceView* depthSRV = gHost->GetSRV(DUST_RESOURCE_DEPTH);
+    if (!depthSRV)
+        return;
+    ID3D11ShaderResourceView* normalsSRV = gHost->GetSRV(DUST_RESOURCE_NORMALS);
+    OutlineRenderer::RenderDebugOverlay(ctx, depthSRV, normalsSRV, targetRTV);
+}
+
 // Called AFTER the game's lighting draw (before fog)
 static void OutlinePostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
 {
@@ -43,12 +59,6 @@ static void OutlinePostExecute(const DustFrameContext* ctx, const DustHostAPI* h
     ID3D11RenderTargetView* hdrRTV = host->GetRTV(DUST_RESOURCE_HDR_RT);
     if (!hdrRTV)
         return;
-
-    if (gOutlineConfig.debugView)
-    {
-        OutlineRenderer::RenderDebugOverlay(ctx->context, depthSRV, normalsSRV, hdrRTV);
-        return;
-    }
 
     ID3D11ShaderResourceView* sceneCopy = host->GetSceneCopy(ctx->context, DUST_RESOURCE_HDR_RT);
     if (!sceneCopy)
@@ -68,12 +78,15 @@ static int OutlineInit(ID3D11Device* device, uint32_t width, uint32_t height, co
     if (!OutlineRenderer::Init(device, width, height, host, pluginDir.c_str()))
         return -1;
 
+    gDebugViewHandle = host->RegisterDebugView("Outline: Edges", OutlineDebugRender, (void*)(INT_PTR)1);
+
     Log("Outline: Initialized (%ux%u)", width, height);
     return 0;
 }
 
 static void OutlineShutdown()
 {
+    if (gHost && gDebugViewHandle) { gHost->UnregisterDebugView(gDebugViewHandle); gDebugViewHandle = 0; }
     OutlineRenderer::Shutdown();
     Log("Outline: Shut down");
 }
@@ -101,7 +114,6 @@ static DustSettingDesc gSettingsArray[] = {
     { "Color G",           DUST_SETTING_FLOAT, &gOutlineConfig.colorG,           0.0f,    1.0f,  "ColorG",          nullptr, "Green component of the outline color",                  DUST_PERF_NONE },
     { "Color B",           DUST_SETTING_FLOAT, &gOutlineConfig.colorB,           0.0f,    1.0f,  "ColorB",          nullptr, "Blue component of the outline color",                   DUST_PERF_NONE },
     { "Max Depth",         DUST_SETTING_FLOAT, &gOutlineConfig.maxDepth,         0.01f,   1.0f,  "MaxDepth",        nullptr, "Maximum depth to draw outlines (skip distant objects)", DUST_PERF_NONE },
-    { "Debug View",        DUST_SETTING_BOOL,  &gOutlineConfig.debugView,        0.0f,    1.0f,  "DebugView",       nullptr, "Show raw edge detection result",                        DUST_PERF_NONE },
 };
 
 // Plugin entry point

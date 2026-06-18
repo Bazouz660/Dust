@@ -35,7 +35,6 @@ struct BloomConfig {
     float scatter    = 0.7f;
     float glowAmount = 0.0f;
     int   mipLevels  = 5;
-    bool  debugView  = false;
 };
 
 static BloomConfig gConfig;
@@ -53,6 +52,9 @@ static ID3D11BlendState*         gNoBlend        = nullptr;
 static ID3D11BlendState*         gAdditiveBlend  = nullptr;
 static ID3D11DepthStencilState*  gNoDepth        = nullptr;
 static ID3D11RasterizerState*    gRasterState    = nullptr;
+
+static int      gDebugViewHandle = 0;
+static uint32_t gWidth = 0, gHeight = 0;
 
 // CB layout (must match HLSL)
 struct BloomCB {
@@ -153,6 +155,40 @@ static ID3D11PixelShader* CompilePS(const char* filename, const char* name)
     return ps;
 }
 
+// Debug-view render callback. The host calls this when the raw-bloom view is
+// selected, drawing the bloom contribution (mip[0], scaled by intensity/curve)
+// onto the final LDR target with replace blending instead of compositing it.
+static void BloomDebugRender(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* targetRTV, void* user)
+{
+    if (!gDevice || !gConfig.enabled || !gHost || !gCompositePS)
+        return;
+
+    gHost->SaveState(ctx);
+
+    BloomCB cb = {};
+    cb.texelSizeX = 1.0f / (float)gMips[0].width;
+    cb.texelSizeY = 1.0f / (float)gMips[0].height;
+    cb.intensity  = gConfig.intensity;
+    cb.curve      = gConfig.curve;
+    gHost->UpdateConstantBuffer(ctx, gCB, &cb, sizeof(cb));
+
+    D3D11_VIEWPORT vp = { 0, 0, (float)gWidth, (float)gHeight, 0, 1 };
+    ctx->RSSetViewports(1, &vp);
+    ctx->RSSetState(gRasterState);
+    ctx->OMSetRenderTargets(1, &targetRTV, nullptr);
+    ctx->OMSetBlendState(gNoBlend, nullptr, 0xFFFFFFFF);
+    ctx->OMSetDepthStencilState(gNoDepth, 0);
+    ctx->PSSetShaderResources(0, 1, &gMips[0].srv);
+    ctx->PSSetSamplers(0, 1, &gLinearSampler);
+    ctx->PSSetConstantBuffers(0, 1, &gCB);
+    gHost->DrawFullscreenTriangle(ctx, gCompositePS);
+
+    ID3D11ShaderResourceView* nullSRV = nullptr;
+    ctx->PSSetShaderResources(0, 1, &nullSRV);
+
+    gHost->RestoreState(ctx);
+}
+
 static int BloomInit(ID3D11Device* device, uint32_t width, uint32_t height, const DustHostAPI* host)
 {
     gHost = host;
@@ -160,6 +196,8 @@ static int BloomInit(ID3D11Device* device, uint32_t width, uint32_t height, cons
     gLogFn = host->Log;
 #define Log DustLog
     gDevice = device;
+    gWidth = width;
+    gHeight = height;
     gShaderDir = GetPluginDir() + "\\shaders\\";
 
     // Compile shaders from .hlsl files
@@ -213,12 +251,15 @@ static int BloomInit(ID3D11Device* device, uint32_t width, uint32_t height, cons
     if (mipCount > BLOOM_MIP_MAX) mipCount = BLOOM_MIP_MAX;
     if (!CreateMips(device, width, height, mipCount)) return -8;
 
+    gDebugViewHandle = host->RegisterDebugView("Bloom: Raw Contribution", BloomDebugRender, (void*)(INT_PTR)1);
+
     Log("Bloom: Initialized (%ux%u, %d mip levels)", width, height, gActiveMipCount);
     return 0;
 }
 
 static void BloomShutdown()
 {
+    if (gHost && gDebugViewHandle) { gHost->UnregisterDebugView(gDebugViewHandle); gDebugViewHandle = 0; }
     ReleaseMips();
     if (gRasterState)   { gRasterState->Release();   gRasterState = nullptr; }
     if (gNoDepth)       { gNoDepth->Release();       gNoDepth = nullptr; }
@@ -236,6 +277,8 @@ static void BloomShutdown()
 
 static void BloomOnResolutionChanged(ID3D11Device* device, uint32_t w, uint32_t h)
 {
+    gWidth = w;
+    gHeight = h;
     CreateMips(device, w, h, gActiveMipCount);
     Log("Bloom: Resolution changed to %ux%u", w, h);
 }
@@ -362,13 +405,7 @@ static void BloomPostExecute(const DustFrameContext* ctx, const DustHostAPI* hos
         cb.curve      = gConfig.curve;
         host->UpdateConstantBuffer(dc, gCB, &cb, sizeof(cb));
 
-        if (gConfig.debugView)
-        {
-            // Debug: replace scene with bloom texture
-            dc->OMSetBlendState(gNoBlend, nullptr, 0xFFFFFFFF);
-        }
-        // else: still additive from upsample loop
-
+        // still additive from upsample loop
         dc->OMSetRenderTargets(1, &ldrRTV, nullptr);
 
         D3D11_VIEWPORT vp = { 0, 0, (float)ctx->width, (float)ctx->height, 0, 1 };
@@ -403,7 +440,6 @@ static DustSettingDesc gBloomSettingsArray[] = {
     { "Scatter",     DUST_SETTING_FLOAT, &gConfig.scatter,    0.1f, 1.0f, "Scatter",    nullptr, "How far bloom spreads across mip levels (higher = wider glow)",       DUST_PERF_NONE   },
     { "Glow Amount", DUST_SETTING_FLOAT, &gConfig.glowAmount, 0.0f, 1.0f, "GlowAmount", nullptr, "Extra scatter on deeper mips for visible halos around bright objects", DUST_PERF_NONE  },
     { "Mip Levels",  DUST_SETTING_INT,   &gConfig.mipLevels,  3.0f, 8.0f, "MipLevels",  nullptr, "Number of blur passes (more = wider bloom, higher cost)",             DUST_PERF_MEDIUM },
-    { "Debug View",  DUST_SETTING_BOOL,  &gConfig.debugView,  0.0f, 1.0f, "DebugView",  nullptr, "Show raw bloom contribution before compositing",                      DUST_PERF_NONE   },
 };
 
 // ==================== Plugin entry ====================

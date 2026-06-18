@@ -29,9 +29,6 @@ struct SSILConfig
 
     // Camera
     float tanHalfFov = 0.5218f;
-
-    // Debug
-    bool debugView = false;
 };
 
 extern SSILConfig gSSILConfig;

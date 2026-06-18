@@ -67,3 +67,20 @@ external/*
 # commit it here. These negations override both `*.lib` and `external/*` above.
 !external/prebuilt
 !external/prebuilt/OgreMain_x64.lib
+
+# Debug render dumps & profiling captures (rendering experiments, regenerable)
+/*.bmp
+/*.bmp.f32
+*.tracy
+/_dbg*.png
+/_kmenu.png
+/_kshot.png
+/_view_*.png
+/calib_pair*.png
+/replay_*.png
+/rt_selftest_*.png
+/gpu_zones*.csv
+/slow_scene*.csv
+
+# Local runtime config
+/settings.cfg
