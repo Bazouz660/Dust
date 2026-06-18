@@ -47,7 +47,7 @@ Build-Project (Join-Path $Root "boot\DustBoot.vcxproj")
 # Build host
 Build-Project (Join-Path $Root "src\Dust.vcxproj")
 
-$Effects = @("ssao", "ssaodebug", "lut", "bloom", "dof", "ssil", "clarity", "outline", "kuwahara", "rtgi", "shadows", "smaa", "chromaticaberration", "deband", "filmgrain", "letterbox", "vignette", "pom", "terraintess")
+$Effects = @("ssao", "ssaodebug", "lut", "bloom", "dof", "ssil", "clarity", "outline", "kuwahara", "rtgi", "shadows", "smaa", "chromaticaberration", "deband", "filmgrain", "letterbox", "vignette", "pom", "terraintess", "subsurfacescattering")
 foreach ($effect in $Effects) {
     $vcxproj = Get-ChildItem (Join-Path $Root "effects\$effect\*.vcxproj") | Select-Object -First 1
     Build-Project $vcxproj.FullName

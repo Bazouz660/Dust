@@ -9,6 +9,7 @@
 #include "ShaderPatch.h"
 #include "OgreSwapHook.h"
 #include "ShadowProbe.h"
+#include "SceneAccess.h"
 #include "PssmDetour.h"
 #include "ShaderMetadata.h"
 #include "ShaderDatabase.h"
@@ -53,6 +54,7 @@ static bool gDispatchedThisFrame = false;
 // (staging CBs are in gCameraStagingCB[2], declared near ExtractCameraData)
 static DustCameraData gCameraData = {};
 static bool gCameraDataExtracted = false; // per-frame flag
+
 static bool gCameraDataEverValid  = false; // sticky once first extraction succeeds
 
 // VTable indices — swap chain
@@ -206,6 +208,14 @@ bool GetCameraWorldPos(float outXYZ[3])
     outXYZ[0] = gCameraData.camPosition[0];
     outXYZ[1] = gCameraData.camPosition[1];
     outXYZ[2] = gCameraData.camPosition[2];
+    return true;
+}
+
+bool GetCameraMatrices(float outInverseView[16], float outProj[16])
+{
+    if (!gCameraDataEverValid || !outInverseView || !outProj) return false;
+    memcpy(outInverseView, gCameraData.inverseView, 64);
+    memcpy(outProj, gCameraData.projMatrix, 64);
     return true;
 }
 
@@ -1746,6 +1756,10 @@ static void STDMETHODCALLTYPE HookedDraw(
         if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
             ExtractCameraData(pThis);
 
+        // One-shot diagnostic dump of the captured scene light set.
+        if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
+            SceneAccess::DebugDumpOnce();
+
         DustFrameContext fctx = {};
         fctx.device = gDevice;
         fctx.context = pThis;
@@ -1813,6 +1827,7 @@ static void STDMETHODCALLTYPE HookedVSSetShader(
         TerrainTess::OnVsBound(pVertexShader);
 }
 
+
 static void STDMETHODCALLTYPE HookedDrawIndexed(
     ID3D11DeviceContext* pThis, UINT IndexCount, UINT StartIndexLocation,
     INT BaseVertexLocation)
@@ -1838,6 +1853,18 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
 
     if (Survey::IsActive())
         SurveyRecorder::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
+
+    // [Dust diag] Back-face capture investigation: of all DrawIndexed calls,
+    // how many land during the detected GBuffer pass and have capture active?
+    if (GeometryCapture::detail::sCaptureFlags != 0)
+    {
+        static uint64_t sTot = 0, sGB = 0, sCap = 0;
+        sTot++;
+        if (GeometryCapture::IsInGBufferPass()) sGB++;
+        if (GeometryCapture::HasActiveCapture()) sCap++;
+        if ((sTot % 20000) == 0)
+            Log("DrawIndexed diag: total=%llu inGBuffer=%llu activeCapture=%llu", sTot, sGB, sCap);
+    }
 
     // Inline early-out: skip the call entirely when no capture session is
     // active. Saves the function-call overhead on ~2000 draws/frame.

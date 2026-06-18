@@ -72,7 +72,7 @@
 extern "C" {
 #endif
 
-#define DUST_API_VERSION 9
+#define DUST_API_VERSION 10
 
 // Injection points in the rendering pipeline
 typedef enum DustInjectionPoint {

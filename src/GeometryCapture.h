@@ -21,8 +21,11 @@ struct CapturedDraw
     UINT instanceCount         = 1;
     UINT startInstanceLocation = 0;
 
-    // Input Assembler — slot 0 is geometry, slot 1 is instance data (if instanced)
-    static const UINT           MAX_VB_SLOTS  = 2;
+    // Input Assembler vertex-buffer slots. SKINNED meshes split their streams across 4 slots
+    // (RenderDoc-verified): 0=pos/normal, 1=uv/tangent/binormal, 2=BLENDINDICES/BLENDWEIGHT,
+    // 3=uv2. Capturing only 2 dropped the skinning streams -> garbage bones -> collapsed skin.
+    // Slot 1 doubles as instance data for instanced static draws.
+    static const UINT           MAX_VB_SLOTS  = 4;
     ID3D11Buffer*               vertexBuffers[MAX_VB_SLOTS] = {};
     UINT                        vbStrides[MAX_VB_SLOTS]     = {};
     UINT                        vbOffsets[MAX_VB_SLOTS]     = {};
@@ -36,6 +39,12 @@ struct CapturedDraw
     ID3D11VertexShader*         vs            = nullptr;
     static const UINT           MAX_VS_CBS    = 4;
     ID3D11Buffer*               vsCBs[MAX_VS_CBS] = {};
+    // VS-stage resources — needed to replay terrain/skin/foliage whose vertex
+    // shaders fetch from SRVs (heightmap, bone palette, vertex-fetch skinning).
+    static const UINT           MAX_VS_SRVS   = 8;
+    ID3D11ShaderResourceView*   vsSRVs[MAX_VS_SRVS] = {};
+    static const UINT           MAX_VS_SAMPLERS = 4;
+    ID3D11SamplerState*         vsSamplers[MAX_VS_SAMPLERS] = {};
 
     // Pixel Shader
     ID3D11PixelShader*          ps            = nullptr;
@@ -55,6 +64,17 @@ struct CapturedDraw
     // Null for unclassified draws (UNKNOWN transform type).
     ID3D11Buffer* cbStagingCopy = nullptr;
     uint32_t      cbStagingSize = 0;
+
+    // Bindable per-slot snapshots of the OTHER VS CBs, populated only for SKINNED draws.
+    // The bone-palette CB is Map_WRITE_DISCARDed by OGRE every skinned draw, so its live
+    // pointer holds the LAST draw's pose by replay time; the replay rebinds these copies.
+    ID3D11Buffer* cbCopies[MAX_VS_CBS] = {};
+
+    // Bindable snapshot of the per-instance transform vertex buffer (slot 1), populated only
+    // for instanced draws. OGRE recycles the HW-instance buffer per batch, so the live pointer
+    // holds the LAST batch's transforms by replay time -> instanced geometry collapses. The
+    // replay rebinds this copy at slot 1.
+    ID3D11Buffer* instVBCopy = nullptr;
 };
 
 namespace GeometryCapture
@@ -100,6 +120,11 @@ namespace GeometryCapture
     // Access captured draws (valid from end of GBuffer pass until ResetFrame)
     const std::vector<CapturedDraw>& GetCaptures();
     uint32_t GetCaptureCount();
+
+    // Monotonic counter bumped every ResetFrame — lets consumers (GeometryReplay's
+    // per-frame cache) detect that the captures vector was repopulated even when its
+    // data pointer and size happen to match the previous frame's.
+    uint32_t GetGeneration();
 
     // Whether we're currently inside a detected GBuffer pass
     bool IsInGBufferPass();

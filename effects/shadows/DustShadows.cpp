@@ -49,6 +49,16 @@ struct ShadowConfig {
     float cascade1Filter    = 1.0f;   // (relative to Kenshi's vanilla per-
     float cascade2Filter    = 1.0f;   // cascade taper; default 1.0 = vanilla)
     float cascade3Filter    = 1.0f;
+
+    // === Material / BRDF (experimental) ===
+    // Injected BRDF improvements in deferred.hlsl main_fs + light_fs. All default
+    // OFF for in-game A/B; each runs only when brdfEnabled (master) is also on.
+    bool  brdfEnabled        = false; // master gate for all four BRDF improvements
+    bool  brdfDisneyDiffuse  = false; // swap cheap FresnelDiffuse for Burley/Disney diffuse
+    bool  brdfMultiscatter   = false; // multiscatter GGX energy compensation on specular
+    bool  brdfSpecOcclusion  = false; // Lagarde specular occlusion from AO on env specular
+    bool  brdfSpecAA         = false; // geometric specular AA (roughness from normal variance)
+    float brdfStrength       = 1.0f;  // A/B exaggeration multiplier (1=physical, higher=visible)
 };
 
 static ShadowConfig gConfig;
@@ -288,6 +298,14 @@ struct alignas(16) ShadowCBData {
     float csmBlendWidth;
     // Quality
     float rtwQuality;
+    // Material / BRDF (experimental) — APPENDED; order must match the HLSL
+    // DustShadowParams cbuffer tail in ShaderPatch.cpp.
+    float brdfEnabled;
+    float brdfDisneyDiffuse;
+    float brdfMultiscatter;
+    float brdfSpecOcclusion;
+    float brdfSpecAA;
+    float brdfStrength;
 };
 
 static int ShadowInit(ID3D11Device* device, uint32_t w, uint32_t h, const DustHostAPI* host)
@@ -325,6 +343,7 @@ static int ShadowInit(ID3D11Device* device, uint32_t w, uint32_t h, const DustHo
     // which runs early enough to beat Kenshi's startup read. A write here
     // would land too late and could clobber the early write with a stale
     // per-effect INI value (the framework's INI load runs after our seed).
+
     Log("Shadows: Initialized (atlas resolution = %u, shadow range = %d)",
         GetSelectedShadowResolution(), gConfig.shadowRange);
     return 0;
@@ -370,6 +389,14 @@ static void ShadowPreExecute(const DustFrameContext* ctx, const DustHostAPI* hos
     if      (atlasRes >= 12288.0f) data.rtwQuality = 4.0f;
     else if (atlasRes >=  8192.0f) data.rtwQuality = 8.0f;
     else                           data.rtwQuality = 12.0f;
+
+    // Material / BRDF (experimental) toggles.
+    data.brdfEnabled       = gConfig.brdfEnabled ? 1.0f : 0.0f;
+    data.brdfDisneyDiffuse = gConfig.brdfDisneyDiffuse ? 1.0f : 0.0f;
+    data.brdfMultiscatter  = gConfig.brdfMultiscatter ? 1.0f : 0.0f;
+    data.brdfSpecOcclusion = gConfig.brdfSpecOcclusion ? 1.0f : 0.0f;
+    data.brdfSpecAA        = gConfig.brdfSpecAA ? 1.0f : 0.0f;
+    data.brdfStrength      = gConfig.brdfStrength;
 
     host->UpdateConstantBuffer(ctx->context, gCB, &data, sizeof(data));
     // Bind to b7: b2 collides with CSM's auto-allocated $Globals cbuffer
@@ -465,6 +492,17 @@ static DustSettingDesc gSettings[] = {
     { "Cascade 1 Filter",    DUST_SETTING_FLOAT, &gConfig.cascade1Filter,   0.0f, 5.0f,  "Cascade1Filter",   nullptr, "Filter-radius multiplier for CSM cascade 1 (mid-range shadows).",                                                                                                                            DUST_PERF_NONE },
     { "Cascade 2 Filter",    DUST_SETTING_FLOAT, &gConfig.cascade2Filter,   0.0f, 5.0f,  "Cascade2Filter",   nullptr, "Filter-radius multiplier for CSM cascade 2 (far-mid shadows).",                                                                                                                              DUST_PERF_NONE },
     { "Cascade 3 Filter",    DUST_SETTING_FLOAT, &gConfig.cascade3Filter,   0.0f, 5.0f,  "Cascade3Filter",   nullptr, "Filter-radius multiplier for the farthest CSM cascade (where blockiness shows most). >1.0 softens the far-cascade artifacts.",                                                            DUST_PERF_NONE },
+
+    // === Material / BRDF (experimental) ===
+    // Injected into the deferred lighting shader (main_fs + light_fs). All default
+    // OFF; the master "BRDF Improvements" toggle gates the other four for A/B testing.
+    { "Material / BRDF (experimental)", DUST_SETTING_SECTION, nullptr,      0.0f, 0.0f,  nullptr,            nullptr, nullptr, DUST_PERF_NONE },
+    { "BRDF Improvements",   DUST_SETTING_BOOL,  &gConfig.brdfEnabled,      0.0f, 1.0f,  "BrdfEnabled",      nullptr, "Master switch for the experimental physically-based lighting improvements below. When off, the vanilla Kenshi BRDF is used. Each sub-option also has its own toggle.", DUST_PERF_LOW },
+    { "Disney Diffuse",      DUST_SETTING_BOOL,  &gConfig.brdfDisneyDiffuse, 0.0f, 1.0f, "BrdfDisneyDiffuse", nullptr, "Replace the cheap constant diffuse Fresnel with the Burley/Disney diffuse term (view/light-angle-dependent retroreflection and edge darkening). Affects sun and point/spot diffuse.", DUST_PERF_LOW },
+    { "Multiscatter Specular", DUST_SETTING_BOOL, &gConfig.brdfMultiscatter, 0.0f, 1.0f, "BrdfMultiscatter", nullptr, "Energy-compensate single-scatter GGX so rough metals don't lose energy (they appear too dark in vanilla). Boosts specular based on the single-scatter directional albedo.", DUST_PERF_LOW },
+    { "Specular Occlusion",  DUST_SETTING_BOOL,  &gConfig.brdfSpecOcclusion, 0.0f, 1.0f, "BrdfSpecOcclusion", nullptr, "Apply Lagarde's specular occlusion so ambient specular is dimmed in crevices (vanilla AO only dims diffuse, so specular leaks into cavities).", DUST_PERF_LOW },
+    { "Specular Anti-Aliasing", DUST_SETTING_BOOL, &gConfig.brdfSpecAA,     0.0f, 1.0f,  "BrdfSpecAA",       nullptr, "Geometric specular AA: widen roughness from the screen-space variance of the GBuffer normal to reduce specular shimmer/sparkle on high-frequency surfaces. Affects the injected specular terms only.", DUST_PERF_LOW },
+    { "BRDF Strength",       DUST_SETTING_FLOAT, &gConfig.brdfStrength,     0.0f, 10.0f, "BrdfStrength",     nullptr, "Exaggeration multiplier for the BRDF terms above. 1.0 = physically correct (subtle on most Kenshi materials). Crank to 5-8 to clearly SEE the effect for A/B, then dial back toward 1-2 for a natural look.", DUST_PERF_NONE },
 };
 
 // Runs in EffectLoader::LoadAll right after our INI is loaded, BEFORE Init.

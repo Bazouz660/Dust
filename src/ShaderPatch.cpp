@@ -48,7 +48,53 @@ static std::string PatchDeferredShader(const std::string& src)
             "// [Dust] AO textures — explicit t-register to prevent compiler remapping\n"
             "Texture2D<float> dustAoTex    : register(t8);\n"
             "Texture2D<float> dustAoParams : register(t9);\n"
-            "SamplerState     dustAoSamp   : register(s8);\n\n";
+            "SamplerState     dustAoSamp   : register(s8);\n"
+            // ==================================================================
+            // [Dust] Better-BRDF experimental helpers. All take their inputs as
+            // parameters (no cbuffer reads here), so they can live before the b7
+            // DustShadowParams cbuffer decl. Each is gated at the CALL SITE by
+            // dustBrdfEnabled + its own toggle.
+            // ==================================================================
+            // (2) Multiscatter GGX energy compensation.
+            // Single-scatter GGX loses energy on rough/metallic surfaces. We add
+            // back the energy lost to multiple bounces using the classic
+            // Fdez-Aguera / Kulla-Conty form:
+            //     spec *= 1 + F0 * (1/Ess - 1)
+            // where Ess is the single-scatter directional albedo for white F0.
+            // Ess is estimated with Karis' analytic env-BRDF approximation
+            // (UE4 'EnvBRDFApprox'): Ess = scale + bias for F0 = 1.
+            // rough = GlossToRoughness(gloss); NoV = saturate(dot(normal,viewDir)).
+            "float3 DustEnergyComp(float3 specColor, float rough, float NoV) {\n"
+            "\tconst float4 c0 = float4(-1.0, -0.0275, -0.572,  0.022);\n"
+            "\tconst float4 c1 = float4( 1.0,  0.0425,  1.04,  -0.04);\n"
+            "\tfloat4 r = rough * c0 + c1;\n"
+            "\tfloat a004 = min(r.x * r.x, exp2(-9.28 * NoV)) * r.x + r.y;\n"
+            "\tfloat2 ab = float2(-1.04, 1.04) * a004 + r.zw;\n"
+            "\tfloat Ess = ab.x + ab.y;\n"          // single-scatter directional albedo (white F0)
+            "\tEss = clamp(Ess, 1e-3, 1.0);\n"
+            "\treturn 1.0 + specColor * (1.0 / Ess - 1.0);\n"
+            "}\n\n"
+            // (3) Lagarde specular occlusion. AO normally dims only diffuse; this
+            // lets ambient specular be occluded in crevices too. Frostbite form.
+            "float DustSpecOcc(float NoV, float ao, float rough) {\n"
+            // NoV and ao are both saturated upstream, so the base is in [0,2];
+            // max(.,0) just silences fxc's generic pow(neg) warning.
+            "\treturn saturate(pow(max(NoV + ao, 0.0), exp2(-16.0 * rough - 1.0)) - 1.0 + ao);\n"
+            "}\n\n"
+            // (4) Geometric specular anti-aliasing (Tokuyoshi/Kaplanyan normal
+            // filtering). Widen roughness using the screen-space variance of the
+            // GBuffer normal (ddx/ddy of the world normal). Reduces specular
+            // shimmer on high-frequency surfaces. Returns a NEW roughness.
+            "float DustSpecAARoughness(float3 N, float rough) {\n"
+            "\tconst float SIGMA2 = 0.25;\n"     // screen-space variance scale
+            "\tconst float KAPPA  = 0.18;\n"     // clamp on added roughness
+            "\tfloat3 dndu = ddx(N);\n"
+            "\tfloat3 dndv = ddy(N);\n"
+            "\tfloat variance = SIGMA2 * (dot(dndu, dndu) + dot(dndv, dndv));\n"
+            "\tfloat kernelRough2 = min(2.0 * variance, KAPPA);\n"
+            "\tfloat r2 = saturate(rough * rough + kernelRough2);\n"
+            "\treturn sqrt(r2);\n"
+            "}\n\n";
         result.insert(aoGlobalPos, aoGlobals);
     }
 
@@ -125,6 +171,14 @@ static std::string PatchDeferredShader(const std::string& src)
             "\tfloat dustCsmBlendEnabled;\n"
             "\tfloat dustCsmBlendWidth;\n"
             "\tfloat dustRtwQuality;\n"
+            // [Dust] Material / BRDF (experimental) toggles — APPENDED at the end;
+            // order must match ShadowCBData tail in effects/shadows/DustShadows.cpp.
+            "\tfloat dustBrdfEnabled;\n"
+            "\tfloat dustBrdfDisneyDiffuse;\n"
+            "\tfloat dustBrdfMultiscatter;\n"
+            "\tfloat dustBrdfSpecOcclusion;\n"
+            "\tfloat dustBrdfSpecAA;\n"
+            "\tfloat dustBrdfStrength;\n"
             "};\n\n"
             // The warp map is 513x2 R32_FLOAT, sampled by vanilla GetOffsetLocationS
             // with tex2Dlod. The warp sampler is point-filtered, so adjacent screen
@@ -539,11 +593,86 @@ static std::string PatchDeferredShader(const std::string& src)
             "\t\tcolor *= lerp(1.0, _ao, _dAO);\n"
             "\t}\n";
         result.insert(insertPos, lightAO);
+
         Log("ShaderPatch: injected AO into light_fs");
     }
     else
     {
         Log("ShaderPatch: 'color = color * attenuation * power;' not found, light_fs AO skipped");
+    }
+
+    // ========================================================================
+    // [Dust] Better-BRDF per-term modifications. All gated by dustBrdfEnabled
+    // plus each term's own toggle. main_fs has sunLight/envLight; light_fs has
+    // only ld. Each block guards on whether its anchor exists, so this runs
+    // safely for both entry points (PatchDeferredShader is called for each).
+    // ========================================================================
+
+    // --- main_fs: sun + ambient. Anchor on the ld.diffuse accumulate line.
+    // In scope here: normal, viewDir, lightDir, gloss, specColor, sunLight,
+    // envLight, and the injected ao (from AO injection 2 above).
+    {
+        const char* brdfMainAnchor = "ld.diffuse = sunLight.diffuse + envLight.diffuse;";
+        size_t brdfMainPos = result.find(brdfMainAnchor);
+        if (brdfMainPos != std::string::npos)
+        {
+            std::string brdfMain =
+                "// [Dust] Better-BRDF (sun + ambient). All gated by dustBrdfEnabled.\n"
+                "\t[branch] if (dustBrdfEnabled > 0.5) {\n"
+                "\t\tfloat _brdfNoV   = saturate(dot(normal, viewDir));\n"
+                "\t\tfloat _brdfRough = GlossToRoughness(gloss);\n"
+                // (4) Spec AA: widen roughness from normal screen-space variance.
+                // Applied to the roughness fed to the multiscatter + spec-occ terms.
+                "\t\t[branch] if (dustBrdfSpecAA > 0.5)\n"
+                "\t\t\t_brdfRough = DustSpecAARoughness(normal, _brdfRough);\n"
+                // (1) Disney diffuse: swap the cheap constant FresnelDiffuse for the
+                // Burley angular response, preserving the existing N.L / translucency.
+                "\t\t[branch] if (dustBrdfDisneyDiffuse > 0.5) {\n"
+                "\t\t\tfloat _dd = Fr_DisneyDiffuse(viewDir, lightDir, normal, _brdfRough);\n"
+                "\t\t\tsunLight.diffuse *= lerp(1.0, _dd / max(FresnelDiffuse(specColor).x, 1e-3), dustBrdfStrength);\n"
+                "\t\t}\n"
+                // (2) Multiscatter energy compensation on specular (sun + ambient).
+                "\t\t[branch] if (dustBrdfMultiscatter > 0.5) {\n"
+                "\t\t\tfloat3 _ec = lerp(float3(1.0,1.0,1.0), DustEnergyComp(specColor, _brdfRough, _brdfNoV), dustBrdfStrength);\n"
+                "\t\t\tsunLight.specular *= _ec;\n"
+                "\t\t\tenvLight.specular *= _ec;\n"
+                "\t\t}\n"
+                // (3) Specular occlusion on ambient specular (uses injected ao).
+                "\t\t[branch] if (dustBrdfSpecOcclusion > 0.5) {\n"
+                "\t\t\tenvLight.specular *= lerp(1.0, DustSpecOcc(_brdfNoV, ao, _brdfRough), dustBrdfStrength);\n"
+                "\t\t}\n"
+                "\t}\n\t";
+            result.insert(brdfMainPos, brdfMain);
+            Log("ShaderPatch: injected Better-BRDF terms into main_fs");
+        }
+
+        // --- light_fs: point/spot. Anchor on the color accumulate line. In scope:
+        // normal, viewDir, lightDir, gloss, specColor, ld, texCoord. No ambient
+        // specular term here, so spec-occlusion (an ambient-only term) is N/A.
+        const char* brdfLightAnchor = "float3 color = ld.specular + ld.diffuse * albedo;";
+        size_t brdfLightPos = result.find(brdfLightAnchor);
+        if (brdfLightPos != std::string::npos)
+        {
+            std::string brdfLight =
+                "// [Dust] Better-BRDF (point/spot). Gated by dustBrdfEnabled.\n"
+                "\t[branch] if (dustBrdfEnabled > 0.5) {\n"
+                "\t\tfloat _brdfNoV   = saturate(dot(normal, viewDir));\n"
+                "\t\tfloat _brdfRough = GlossToRoughness(gloss);\n"
+                "\t\t[branch] if (dustBrdfSpecAA > 0.5)\n"
+                "\t\t\t_brdfRough = DustSpecAARoughness(normal, _brdfRough);\n"
+                // (1) Disney diffuse.
+                "\t\t[branch] if (dustBrdfDisneyDiffuse > 0.5) {\n"
+                "\t\t\tfloat _dd = Fr_DisneyDiffuse(viewDir, lightDir, normal, _brdfRough);\n"
+                "\t\t\tld.diffuse *= lerp(1.0, _dd / max(FresnelDiffuse(specColor).x, 1e-3), dustBrdfStrength);\n"
+                "\t\t}\n"
+                // (2) Multiscatter energy compensation on direct specular.
+                "\t\t[branch] if (dustBrdfMultiscatter > 0.5) {\n"
+                "\t\t\tld.specular *= lerp(float3(1.0,1.0,1.0), DustEnergyComp(specColor, _brdfRough, _brdfNoV), dustBrdfStrength);\n"
+                "\t\t}\n"
+                "\t}\n\t";
+            result.insert(brdfLightPos, brdfLight);
+            Log("ShaderPatch: injected Better-BRDF terms into light_fs");
+        }
     }
 
     return result;
@@ -1182,6 +1311,12 @@ HRESULT WINAPI HookedD3DCompile(
         }
     }
 
+    // [Dust] Kenshi compiles the deferred main_fs/light_fs as ps_4_0, which predates
+    // TextureCubeArray (needed by the point-light shadow injection). Bump 4_0 -> 4_1
+    // (FL11 hardware, backward-compatible) so the cube-array sample compiles. Used for
+    // both deferred compile calls below.
+    const char* defTarget = (pTarget && strncmp(pTarget, "ps_4_0", 6) == 0) ? "ps_4_1" : pTarget;
+
     // Detect the deferred lighting pixel shader: entry point is "main_fs"
     // and source contains deferred-specific identifiers.
     if (pEntrypoint && pSrcData && SrcDataSize > 0 &&
@@ -1197,7 +1332,7 @@ HRESULT WINAPI HookedD3DCompile(
                 Log("ShaderPatch: patched deferred main_fs (%zu -> %zu bytes)",
                     src.size(), patched.size());
                 HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
-                                          pDefines, pInclude, pEntrypoint, pTarget,
+                                          pDefines, pInclude, pEntrypoint, defTarget,
                                           Flags1, Flags2, ppCode, ppErrorMsgs);
                 if (SUCCEEDED(hr))
                 {
@@ -1294,7 +1429,7 @@ HRESULT WINAPI HookedD3DCompile(
                 Log("ShaderPatch: patched deferred light_fs (%zu -> %zu bytes)",
                     src.size(), patched.size());
                 HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
-                                          pDefines, pInclude, pEntrypoint, pTarget,
+                                          pDefines, pInclude, pEntrypoint, defTarget,
                                           Flags1, Flags2, ppCode, ppErrorMsgs);
                 if (SUCCEEDED(hr))
                 {

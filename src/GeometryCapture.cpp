@@ -18,6 +18,7 @@ static UINT sExpectedHeight = 0;
 static ID3D11Device* sCachedDevice = nullptr;
 
 static uint32_t sFramesCaptured = 0;
+static uint32_t sGeneration     = 0;   // bumped every ResetFrame (see GetGeneration)
 
 // Staging buffer pool — each buffer has its own size (must match the CB it copies
 // from, since D3D11 CopyResource requires identical ByteWidth for buffers).
@@ -63,6 +64,62 @@ static ID3D11Buffer* AcquireStagingBuffer(ID3D11Device* device, uint32_t require
     return sStagingPool[sStagingPoolUsed++].buffer;
 }
 
+// Bindable (DEFAULT + CONSTANT_BUFFER) snapshot pool — for CBs that must be RE-BOUND at replay
+// (the skinned bone palette). Unlike the staging pool above, these can be set on the VS stage.
+static std::vector<StagingEntry> sCBCopyPool;
+static uint32_t sCBCopyPoolUsed = 0;
+
+static ID3D11Buffer* AcquireCBCopy(ID3D11Device* device, uint32_t requiredSize)
+{
+    for (uint32_t i = sCBCopyPoolUsed; i < (uint32_t)sCBCopyPool.size(); i++)
+    {
+        if (sCBCopyPool[i].size == requiredSize)
+        {
+            if (i != sCBCopyPoolUsed) std::swap(sCBCopyPool[i], sCBCopyPool[sCBCopyPoolUsed]);
+            return sCBCopyPool[sCBCopyPoolUsed++].buffer;
+        }
+    }
+    D3D11_BUFFER_DESC desc = {};
+    desc.ByteWidth = requiredSize;
+    desc.Usage     = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    ID3D11Buffer* buf = nullptr;
+    if (FAILED(device->CreateBuffer(&desc, nullptr, &buf)) || !buf)
+        return nullptr;
+    sCBCopyPool.push_back({ buf, requiredSize });
+    if (sCBCopyPool.size() - 1 != sCBCopyPoolUsed)
+        std::swap(sCBCopyPool.back(), sCBCopyPool[sCBCopyPoolUsed]);
+    return sCBCopyPool[sCBCopyPoolUsed++].buffer;
+}
+
+// Bindable (DEFAULT + VERTEX_BUFFER) snapshot pool — for the per-instance transform VB, which
+// OGRE recycles per HW-instance batch so the live pointer is stale by replay time.
+static std::vector<StagingEntry> sVBCopyPool;
+static uint32_t sVBCopyPoolUsed = 0;
+
+static ID3D11Buffer* AcquireVBCopy(ID3D11Device* device, uint32_t requiredSize)
+{
+    for (uint32_t i = sVBCopyPoolUsed; i < (uint32_t)sVBCopyPool.size(); i++)
+    {
+        if (sVBCopyPool[i].size == requiredSize)
+        {
+            if (i != sVBCopyPoolUsed) std::swap(sVBCopyPool[i], sVBCopyPool[sVBCopyPoolUsed]);
+            return sVBCopyPool[sVBCopyPoolUsed++].buffer;
+        }
+    }
+    D3D11_BUFFER_DESC desc = {};
+    desc.ByteWidth = requiredSize;
+    desc.Usage     = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    ID3D11Buffer* buf = nullptr;
+    if (FAILED(device->CreateBuffer(&desc, nullptr, &buf)) || !buf)
+        return nullptr;
+    sVBCopyPool.push_back({ buf, requiredSize });
+    if (sVBCopyPool.size() - 1 != sVBCopyPoolUsed)
+        std::swap(sVBCopyPool.back(), sVBCopyPool[sVBCopyPoolUsed]);
+    return sVBCopyPool[sVBCopyPoolUsed++].buffer;
+}
+
 static void ReleaseCaptures()
 {
     for (auto& draw : sCaptures)
@@ -78,6 +135,14 @@ static void ReleaseCaptures()
         {
             if (draw.vsCBs[i]) { draw.vsCBs[i]->Release(); draw.vsCBs[i] = nullptr; }
         }
+        for (UINT i = 0; i < CapturedDraw::MAX_VS_SRVS; i++)
+        {
+            if (draw.vsSRVs[i]) { draw.vsSRVs[i]->Release(); draw.vsSRVs[i] = nullptr; }
+        }
+        for (UINT i = 0; i < CapturedDraw::MAX_VS_SAMPLERS; i++)
+        {
+            if (draw.vsSamplers[i]) { draw.vsSamplers[i]->Release(); draw.vsSamplers[i] = nullptr; }
+        }
         if (draw.ps) { draw.ps->Release(); draw.ps = nullptr; }
         for (UINT i = 0; i < CapturedDraw::MAX_PS_CBS; i++)
         {
@@ -92,9 +157,13 @@ static void ReleaseCaptures()
             if (draw.psSamplers[i]) { draw.psSamplers[i]->Release(); draw.psSamplers[i] = nullptr; }
         }
         draw.cbStagingCopy = nullptr;
+        for (UINT i = 0; i < CapturedDraw::MAX_VS_CBS; i++) draw.cbCopies[i] = nullptr; // pool-owned
+        draw.instVBCopy = nullptr; // pool-owned
     }
     sCaptures.clear();
     sStagingPoolUsed = 0;
+    sCBCopyPoolUsed  = 0;
+    sVBCopyPoolUsed  = 0;
 }
 
 // Multi-entry classification cache. Caching ONLY the GBuffer config (one
@@ -224,6 +293,10 @@ static void CaptureDrawState(ID3D11DeviceContext* ctx, CapturedDraw& draw)
     // VS
     ctx->VSGetShader(&draw.vs, nullptr, nullptr);
     ctx->VSGetConstantBuffers(0, CapturedDraw::MAX_VS_CBS, draw.vsCBs);
+    // VS-stage resources (bone palette / heightmap / vertex-fetch) so terrain
+    // and skinned casters can be replayed without GPU-faulting on unbound SRVs.
+    ctx->VSGetShaderResources(0, CapturedDraw::MAX_VS_SRVS, draw.vsSRVs);
+    ctx->VSGetSamplers(0, CapturedDraw::MAX_VS_SAMPLERS, draw.vsSamplers);
 
     // PS pointer (always — cheap, enables shader identification)
     ctx->PSGetShader(&draw.ps, nullptr, nullptr);
@@ -256,6 +329,45 @@ static void CaptureDrawState(ID3D11DeviceContext* ctx, CapturedDraw& draw)
                 draw.cbStagingSize = cbSize;
             }
         }
+
+        // SKINNED draws: snapshot the OTHER bound VS CBs (the bone palette) to bindable copies,
+        // because OGRE Map_WRITE_DISCARDs the palette every skinned draw -> the live pointer is
+        // stale (last draw's pose) by replay time. The replay rebinds these per-draw copies.
+        if (draw.vsMetadata->transformType == VSTransformType::SKINNED)
+        {
+            static int sklog = 0;
+            if (sklog < 3)
+            {
+                sklog++;
+                D3D11_BUFFER_DESC bd[4] = {};
+                for (int s = 0; s < 4; s++) if (draw.vsCBs[s]) draw.vsCBs[s]->GetDesc(&bd[s]);
+                Log("SKIN draw: cbSlot=%u clipOff=%u cbTotal=%u instCount=%u | cbSizes[%u,%u,%u,%u]",
+                    draw.vsMetadata->cbSlot, draw.vsMetadata->clipMatrixOffset, draw.vsMetadata->cbTotalSize,
+                    draw.instanceCount, bd[0].ByteWidth, bd[1].ByteWidth, bd[2].ByteWidth, bd[3].ByteWidth);
+            }
+            uint32_t clipSlot = draw.vsMetadata->cbSlot;
+            for (uint32_t i = 0; i < CapturedDraw::MAX_VS_CBS; i++)
+            {
+                if (i == clipSlot || !draw.vsCBs[i]) continue;
+                D3D11_BUFFER_DESC bd; draw.vsCBs[i]->GetDesc(&bd);
+                ID3D11Buffer* copy = AcquireCBCopy(sCachedDevice, bd.ByteWidth);
+                if (copy)
+                {
+                    ctx->CopyResource(copy, draw.vsCBs[i]);
+                    draw.cbCopies[i] = copy;
+                }
+            }
+        }
+    }
+
+    // Instanced draws: snapshot the per-instance transform VB (slot 1) to a bindable copy,
+    // because OGRE recycles the HW-instance buffer per batch -> the live pointer holds the last
+    // batch's transforms by replay time. The replay rebinds this copy at slot 1.
+    if (draw.instanceCount > 1 && draw.vertexBuffers[1] && sCachedDevice)
+    {
+        D3D11_BUFFER_DESC bd; draw.vertexBuffers[1]->GetDesc(&bd);
+        ID3D11Buffer* copy = AcquireVBCopy(sCachedDevice, bd.ByteWidth);
+        if (copy) { ctx->CopyResource(copy, draw.vertexBuffers[1]); draw.instVBCopy = copy; }
     }
 }
 
@@ -318,6 +430,7 @@ void ResetFrame()
 
     ReleaseCaptures();
     sInGBufferPass = false;
+    sGeneration++;
 }
 
 const std::vector<CapturedDraw>& GetCaptures()
@@ -328,6 +441,11 @@ const std::vector<CapturedDraw>& GetCaptures()
 uint32_t GetCaptureCount()
 {
     return (uint32_t)sCaptures.size();
+}
+
+uint32_t GetGeneration()
+{
+    return sGeneration;
 }
 
 bool IsInGBufferPass()
@@ -376,6 +494,14 @@ void Shutdown()
         if (entry.buffer) entry.buffer->Release();
     sStagingPool.clear();
     sStagingPoolUsed = 0;
+    for (auto& entry : sCBCopyPool)
+        if (entry.buffer) entry.buffer->Release();
+    sCBCopyPool.clear();
+    sCBCopyPoolUsed = 0;
+    for (auto& entry : sVBCopyPool)
+        if (entry.buffer) entry.buffer->Release();
+    sVBCopyPool.clear();
+    sVBCopyPoolUsed = 0;
 }
 
 } // namespace GeometryCapture

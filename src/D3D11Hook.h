@@ -53,6 +53,11 @@ namespace D3D11Hook
     // avoid per-draw constant-buffer shadowing for the chunk-skip metric.
     bool GetCameraWorldPos(float outXYZ[3]);
 
+    // Raw deferred-camera matrices from the GBuffer/deferred CB (inverseView @c8,
+    // projMatrix @c34), as stored in memory. Returns false until first extraction.
+    // Used by the point-shadow cameraVP oracle (cameraVP = inverse(inverseView) x proj).
+    bool GetCameraMatrices(float outInverseView[16], float outProj[16]);
+
     namespace ShadowCBRecon
     {
         void Arm(int numFrames);

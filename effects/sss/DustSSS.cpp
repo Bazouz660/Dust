@@ -424,8 +424,11 @@ static void SSSPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     // patched deferred main_fs sun pass (and the debug blit) can read it.
     if (gOutSRV)
     {
-        dc->PSSetShaderResources(11, 1, &gOutSRV);
-        dc->PSSetSamplers(11, 1, &gLinearClamp);
+        // Bind at t15/s15, NOT t11/s11: the point-light cube shadows own t11/s11,
+        // and this SSS buffer isn't read by any patched shader on main yet — sharing
+        // t11 silently clobbered the point-cube SRV (no point shadows). Move off it.
+        dc->PSSetShaderResources(15, 1, &gOutSRV);
+        dc->PSSetSamplers(15, 1, &gLinearClamp);
     }
 
     // Now the shadow buffer is valid for this frame: enable the sun multiply if
