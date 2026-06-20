@@ -27,6 +27,17 @@ struct SMAAConfig {
     int   edgeMode          = 0;
     float lumaThreshold     = 0.1f;
     float depthThreshold    = 0.01f;
+
+    // Temporal stabilization (opt-in). Reprojects the previous resolved frame
+    // and blends it in to suppress edge crawl / aliasing flicker under camera
+    // motion. Kept sharp via Catmull-Rom history + neighborhood clipping.
+    bool  temporalEnabled   = false;
+    float temporalStrength  = 0.85f;
+    float tanHalfFov        = 0.4142f;   // Kenshi: projMatrix[1][1]=2.414 → 1/2.414
+    // True view far clip. Kenshi stores depth as linear viewZ/farClip, so the
+    // reprojection world-unit scale is depth*farPlane. Measured ~50000 from the
+    // deferred far frustum corner; tunable if a different view distance is used.
+    float farPlane          = 50000.0f;
 };
 
 static SMAAConfig gConfig;
@@ -34,6 +45,7 @@ static SMAAConfig gConfig;
 static ID3D11PixelShader* gEdgeDetectPS   = nullptr;
 static ID3D11PixelShader* gBlendWeightPS  = nullptr;
 static ID3D11PixelShader* gResolvePS      = nullptr;
+static ID3D11PixelShader* gTemporalPS     = nullptr;
 
 static ID3D11Buffer*             gCB            = nullptr;
 static ID3D11SamplerState*       gPointSampler  = nullptr;
@@ -52,17 +64,40 @@ static SMAATexture gEdgeTex;
 static SMAATexture gBlendTex;
 static uint32_t gWidth = 0, gHeight = 0;
 
+// Temporal resources: current SMAA-1x output + ping-pong history.
+static SMAATexture gCurrentTex;
+static SMAATexture gHistoryTex[2];
+static int         gHistoryIdx = 0;
+static bool        gHasHistory = false;
+static bool        gPrevTemporalEnabled = false;
+static float       gInverseView[16] = {};
+static float       gPrevInverseView[16] = {};
+
 static ID3D11Texture2D*          gAreaTexture  = nullptr;
 static ID3D11ShaderResourceView* gAreaSRV      = nullptr;
 static ID3D11Texture2D*          gSearchTexture = nullptr;
 static ID3D11ShaderResourceView* gSearchSRV    = nullptr;
 
 struct SMAACB {
+    // First 32 bytes are byte-identical to the rtMetrics layout the edge /
+    // blend-weight / resolve shaders expect — do not reorder.
     float invWidth, invHeight, width, height;
     float lumaThreshold;
     float depthThreshold;
     int   edgeMode;
-    int   pad;
+    int   temporalEnabled;       // was 'pad'; ignored by the non-temporal passes
+
+    // Temporal-only fields (read by smaa_temporal_ps.hlsl).
+    float tanHalfFov;
+    float aspectRatio;
+    float temporalStrength;
+    float farPlane;
+
+    float reproj[16];            // row-major, currentInvView * prevView
+
+    float frameIndex;
+    float hasHistory;
+    float pad0, pad1;
 };
 
 static void ReleaseTexture(SMAATexture& t)
@@ -105,7 +140,38 @@ static bool CreateTextures(ID3D11Device* dev, uint32_t w, uint32_t h)
         return false;
     if (!CreateTexture(dev, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, gBlendTex, "blend"))
         return false;
+    if (!CreateTexture(dev, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, gCurrentTex, "current"))
+        return false;
+    if (!CreateTexture(dev, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, gHistoryTex[0], "history0"))
+        return false;
+    if (!CreateTexture(dev, w, h, DXGI_FORMAT_R8G8B8A8_UNORM, gHistoryTex[1], "history1"))
+        return false;
+    gHasHistory = false;   // history is stale after a (re)allocation
     return true;
+}
+
+// Compute reproj = currentInvView * prevView (row-major), used in the temporal
+// shader as mul(float4(viewPos,1), reproj). Ported verbatim from the proven
+// RTGI pipeline — keeps the convention identical so reprojection stays exact.
+static void ComputeReprojectionMatrix(const float* curInv, const float* prevInv, float* out)
+{
+    // prevView = inverse(prevInvView): transpose the 3x3 rotation, derive translation.
+    float pv[16];
+    pv[0]  = prevInv[0]; pv[1]  = prevInv[4]; pv[2]  = prevInv[8];  pv[3]  = 0;
+    pv[4]  = prevInv[1]; pv[5]  = prevInv[5]; pv[6]  = prevInv[9];  pv[7]  = 0;
+    pv[8]  = prevInv[2]; pv[9]  = prevInv[6]; pv[10] = prevInv[10]; pv[11] = 0;
+    float px = prevInv[12], py = prevInv[13], pz = prevInv[14];
+    pv[12] = -(px * pv[0] + py * pv[4] + pz * pv[8]);
+    pv[13] = -(px * pv[1] + py * pv[5] + pz * pv[9]);
+    pv[14] = -(px * pv[2] + py * pv[6] + pz * pv[10]);
+    pv[15] = 1;
+
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+            out[i * 4 + j] = curInv[i * 4 + 0] * pv[0 * 4 + j]
+                           + curInv[i * 4 + 1] * pv[1 * 4 + j]
+                           + curInv[i * 4 + 2] * pv[2 * 4 + j]
+                           + curInv[i * 4 + 3] * pv[3 * 4 + j];
 }
 
 static std::string gShaderDir;
@@ -136,7 +202,8 @@ static int SMAAInit(ID3D11Device* device, uint32_t width, uint32_t height, const
     gEdgeDetectPS  = CompilePS("smaa_edge_detect_ps.hlsl",   "edge detect");
     gBlendWeightPS = CompilePS("smaa_blend_weight_ps.hlsl",  "blend weight");
     gResolvePS     = CompilePS("smaa_resolve_ps.hlsl",       "resolve");
-    if (!gEdgeDetectPS || !gBlendWeightPS || !gResolvePS) return -1;
+    gTemporalPS    = CompilePS("smaa_temporal_ps.hlsl",      "temporal");
+    if (!gEdgeDetectPS || !gBlendWeightPS || !gResolvePS || !gTemporalPS) return -1;
 
     gCB = host->CreateConstantBuffer(device, sizeof(SMAACB));
     if (!gCB) return -2;
@@ -214,6 +281,10 @@ static void SMAAShutdown()
 {
     ReleaseTexture(gEdgeTex);
     ReleaseTexture(gBlendTex);
+    ReleaseTexture(gCurrentTex);
+    ReleaseTexture(gHistoryTex[0]);
+    ReleaseTexture(gHistoryTex[1]);
+    if (gTemporalPS)    { gTemporalPS->Release();      gTemporalPS = nullptr; }
     if (gSearchSRV)     { gSearchSRV->Release();      gSearchSRV = nullptr; }
     if (gSearchTexture) { gSearchTexture->Release();   gSearchTexture = nullptr; }
     if (gAreaSRV)       { gAreaSRV->Release();         gAreaSRV = nullptr; }
@@ -255,6 +326,22 @@ static void SMAAPostExecute(const DustFrameContext* ctx, const DustHostAPI* host
     dc->OMSetBlendState(gNoBlend, nullptr, 0xFFFFFFFF);
     dc->PSSetConstantBuffers(0, 1, &gCB);
 
+    // Temporal needs camera data; fall back to plain SMAA 1x if it's missing.
+    bool temporal = gConfig.temporalEnabled && ctx->camera.valid;
+
+    // Toggling temporal invalidates the accumulated history.
+    if (gConfig.temporalEnabled != gPrevTemporalEnabled) {
+        gHasHistory = false;
+        gPrevTemporalEnabled = gConfig.temporalEnabled;
+    }
+
+    // Shift the camera matrices every frame so prev/cur stay adjacent even
+    // across frames where temporal was disabled.
+    if (ctx->camera.valid) {
+        memcpy(gPrevInverseView, gInverseView, sizeof(gInverseView));
+        memcpy(gInverseView, ctx->camera.inverseView, sizeof(gInverseView));
+    }
+
     SMAACB cb = {};
     cb.invWidth       = 1.0f / (float)ctx->width;
     cb.invHeight      = 1.0f / (float)ctx->height;
@@ -263,6 +350,17 @@ static void SMAAPostExecute(const DustFrameContext* ctx, const DustHostAPI* host
     cb.lumaThreshold  = gConfig.lumaThreshold;
     cb.depthThreshold = gConfig.depthThreshold;
     cb.edgeMode       = gConfig.edgeMode;
+
+    cb.temporalEnabled  = temporal ? 1 : 0;
+    cb.tanHalfFov       = gConfig.tanHalfFov;
+    cb.aspectRatio      = (float)ctx->width / (float)ctx->height;
+    cb.temporalStrength = gConfig.temporalStrength;
+    cb.farPlane         = gConfig.farPlane;
+    cb.frameIndex       = (float)ctx->frameIndex;
+    cb.hasHistory       = (temporal && gHasHistory) ? 1.0f : 0.0f;
+    cb.reproj[0] = cb.reproj[5] = cb.reproj[10] = cb.reproj[15] = 1.0f; // identity
+    if (temporal && gHasHistory)
+        ComputeReprojectionMatrix(gInverseView, gPrevInverseView, cb.reproj);
 
     host->UpdateConstantBuffer(dc, gCB, &cb, sizeof(cb));
 
@@ -308,8 +406,11 @@ static void SMAAPostExecute(const DustFrameContext* ctx, const DustHostAPI* host
     }
 
     // --- Pass 3: Neighborhood blending ---
+    // Writes the final image to ldr_rt for plain SMAA, or to the "current"
+    // buffer when the temporal pass will consume it next.
     {
-        dc->OMSetRenderTargets(1, &ldrRTV, nullptr);
+        ID3D11RenderTargetView* resolveRTV = temporal ? gCurrentTex.rtv : ldrRTV;
+        dc->OMSetRenderTargets(1, &resolveRTV, nullptr);
 
         dc->PSSetShaderResources(0, 1, &sceneCopy);
         dc->PSSetShaderResources(1, 1, &gBlendTex.srv);
@@ -320,6 +421,37 @@ static void SMAAPostExecute(const DustFrameContext* ctx, const DustHostAPI* host
 
         dc->PSSetShaderResources(0, 1, &nullSRV);
         dc->PSSetShaderResources(1, 1, &nullSRV);
+    }
+
+    // --- Pass 4: Temporal resolve (optional) ---
+    // Blends the reprojected, neighborhood-clipped history into the current
+    // SMAA output. Writes the display image to ldr_rt and the new history
+    // (ping-pong) in a single MRT draw.
+    if (temporal)
+    {
+        int prevIdx = gHistoryIdx;
+        int currIdx = gHistoryIdx ^ 1;
+
+        ID3D11RenderTargetView* rtvs[2] = { ldrRTV, gHistoryTex[currIdx].rtv };
+        dc->OMSetRenderTargets(2, rtvs, nullptr);
+
+        dc->PSSetShaderResources(0, 1, &gCurrentTex.srv);
+        dc->PSSetShaderResources(1, 1, &gHistoryTex[prevIdx].srv);
+        ID3D11ShaderResourceView* depthSRV = host->GetSRV(DUST_RESOURCE_DEPTH);
+        dc->PSSetShaderResources(2, 1, &depthSRV);
+        ID3D11SamplerState* samplers[2] = { gPointSampler, gLinearSampler };
+        dc->PSSetSamplers(0, 2, samplers);
+
+        host->DrawFullscreenTriangle(dc, gTemporalPS);
+
+        dc->PSSetShaderResources(0, 1, &nullSRV);
+        dc->PSSetShaderResources(1, 1, &nullSRV);
+        dc->PSSetShaderResources(2, 1, &nullSRV);
+        ID3D11RenderTargetView* nullRTVs[2] = { nullptr, nullptr };
+        dc->OMSetRenderTargets(2, nullRTVs, nullptr);
+
+        gHistoryIdx = currIdx;
+        gHasHistory = true;
     }
 
     host->RestoreState(dc);
@@ -337,6 +469,14 @@ static DustSettingDesc gSettings[] = {
     { "Mode",               DUST_SETTING_ENUM,    &gConfig.edgeMode,         0.0f,  2.0f, "EdgeMode",          gEdgeModeLabels,  "Edge detection method: Luma, Depth, or both",                     DUST_PERF_LOW    },
     { "Luma Threshold",     DUST_SETTING_FLOAT,   &gConfig.lumaThreshold,    0.05f, 0.5f, "LumaThreshold",     nullptr,          "Sensitivity for luma-based edge detection (lower = more edges)",  DUST_PERF_NONE   },
     { "Depth Threshold",    DUST_SETTING_FLOAT,   &gConfig.depthThreshold,   0.001f,0.1f, "DepthThreshold",    nullptr,          "Sensitivity for depth-based edge detection (lower = more edges)", DUST_PERF_NONE   },
+
+    { "Temporal",           DUST_SETTING_SECTION, nullptr,                   0.0f,  0.0f, nullptr,             nullptr,          nullptr,                                                           DUST_PERF_NONE   },
+    { "Temporal Stabilize", DUST_SETTING_BOOL,    &gConfig.temporalEnabled,  0.0f,  1.0f, "Temporal",          nullptr,          "Reproject and blend the previous frame to suppress edge crawl / aliasing flicker while the camera moves. Stays sharp via Catmull-Rom history and neighborhood clipping.", DUST_PERF_MEDIUM },
+    { "Temporal Strength",  DUST_SETTING_FLOAT,   &gConfig.temporalStrength, 0.0f,  0.95f,"TemporalStrength",  nullptr,          "Max history blend weight. Higher = steadier but softer; lower = sharper but more flicker. 0.85 is a good balance.", DUST_PERF_NONE },
+
+    // Reprojection tuning — hidden, but persisted so it can be adjusted in the INI.
+    { "Tan Half FOV",       DUST_SETTING_HIDDEN_FLOAT, &gConfig.tanHalfFov,  0.1f,  2.0f,     "TanHalfFov" },
+    { "Far Plane",          DUST_SETTING_HIDDEN_FLOAT, &gConfig.farPlane,    1000.0f, 100000.0f, "ReprojFarClip" },
 };
 
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)

@@ -71,6 +71,7 @@ struct FrameworkConfig {
     int toggleKey = VK_F11;        // virtual key code for overlay toggle
     int toggleEffectsKey = 0;      // 0 = unbound; else VK code that flips all effects on/off
     std::string theme = "kenshi";  // GUI theme: "kenshi" or "dark"
+    int uiScalePercent = 0;        // overlay scale; 0 = Auto (follow OS/monitor DPI)
 
     // True when LastPreset key was absent from Dust.ini at load time, false
     // when present (even with empty value — that means user picked Custom).
@@ -106,6 +107,8 @@ bool gInitialized = false;
 bool gOverlayVisible = false;
 static volatile bool gResizeInProgress = false;
 static HWND gHWnd = nullptr;
+static float gOsDpiScale = 1.0f;   // window's OS/monitor DPI scale, captured at init
+static bool gFontRebuildPending = false;  // rebuild atlas at top of next Render (scale changed)
 static WNDPROC oWndProc = nullptr;
 static ID3D11Device* gDevice = nullptr;
 static ID3D11DeviceContext* gContext = nullptr;
@@ -535,11 +538,57 @@ static bool CreateBackBufferRTV(IDXGISwapChain* swapChain)
 
 // ==================== Theme ====================
 
+// Effective UI scale factor. uiScalePercent == 0 means "Auto" — follow the
+// OS/monitor DPI scale captured at init. Clamped to a sane range.
+static float ResolveUiScale()
+{
+    float s = (gFwConfig.uiScalePercent <= 0)
+                  ? gOsDpiScale
+                  : gFwConfig.uiScalePercent / 100.0f;
+    if (s < 0.5f) s = 0.5f;
+    if (s > 3.0f) s = 3.0f;
+    return s;
+}
+
+// (Re)build the font atlas at the current UI scale. Loads Segoe UI from the
+// Windows fonts directory so text stays crisp at any scale (rasterized at the
+// target pixel size rather than bilinearly stretched); falls back to ImGui's
+// built-in font if it can't be loaded. Must NOT run mid-frame — the atlas is
+// locked between NewFrame and Render, so runtime scale changes go through
+// gFontRebuildPending, which Render() drains before the frame starts.
+static void RebuildFontAtlas()
+{
+    ImGuiIO& io = ImGui::GetIO();
+    io.FontGlobalScale = 1.0f;   // atlas is pre-scaled; don't stretch on top
+    const float px = 16.0f * ResolveUiScale();   // 16 = logical base size
+
+    io.Fonts->Clear();
+
+    char fontPath[MAX_PATH] = {};
+    UINT n = GetWindowsDirectoryA(fontPath, MAX_PATH);
+    bool loaded = false;
+    if (n > 0 && n + 19 < MAX_PATH)
+    {
+        strcat_s(fontPath, sizeof(fontPath), "\\Fonts\\segoeui.ttf");
+        if (GetFileAttributesA(fontPath) != INVALID_FILE_ATTRIBUTES)
+            loaded = (io.Fonts->AddFontFromFileTTF(fontPath, px) != nullptr);
+    }
+    if (!loaded)
+    {
+        ImFontConfig cfg;
+        cfg.SizePixels = 13.0f * ResolveUiScale();
+        io.Fonts->AddFontDefault(&cfg);
+        Log("GUI: Segoe UI unavailable, using built-in font");
+    }
+    io.Fonts->Build();
+}
+
 // Two themes: "kenshi" (warm parchment / dusty amber, matches the game) and
 // "dark" (ImGui default). Applied at init and live-previewed on combo change.
 static void ApplyDustTheme(const std::string& name)
 {
     ImGuiStyle& style = ImGui::GetStyle();
+    style = ImGuiStyle();   // pristine base so the UI-scale below never compounds
     ImVec4* c = style.Colors;
 
     if (name == "dark")
@@ -605,6 +654,12 @@ static void ApplyDustTheme(const std::string& name)
     style.Alpha         = 0.95f;
     style.WindowPadding = ImVec2(10, 10);
     style.ItemSpacing   = ImVec2(8, 5);
+
+    // Apply UI scale last so it multiplies the final base sizes. ScaleAllSizes
+    // grows padding/spacing/borders; the font is rasterized at the scaled pixel
+    // size separately (RebuildFontAtlas), so no FontGlobalScale stretch here.
+    // Resets cleanly each call because the style was rebuilt from scratch above.
+    style.ScaleAllSizes(ResolveUiScale());
 }
 
 // Semantic accent colors, theme-aware.
@@ -653,6 +708,11 @@ static void LoadFrameworkConfig()
     gFwConfig.theme = themeBuf;
     if (gFwConfig.theme != "kenshi" && gFwConfig.theme != "dark")
         gFwConfig.theme = "kenshi";
+
+    gFwConfig.uiScalePercent = GetPrivateProfileIntA("Dust", "UiScalePercent", 0, gDustIniPath.c_str());
+    if (gFwConfig.uiScalePercent != 0 &&
+        (gFwConfig.uiScalePercent < 50 || gFwConfig.uiScalePercent > 300))
+        gFwConfig.uiScalePercent = 0;
 
     // Distinguishing "key missing" (first launch) from "key empty" (Custom)
     // requires a sentinel — GetPrivateProfileStringA's default-string return
@@ -707,6 +767,8 @@ static void SaveFrameworkConfig()
     snprintf(keyBuf, sizeof(keyBuf), "%d", gFwConfig.toggleEffectsKey);
     WritePrivateProfileStringA("Dust", "ToggleEffectsKey", keyBuf, gDustIniPath.c_str());
     WritePrivateProfileStringA("Dust", "Theme", gFwConfig.theme.c_str(), gDustIniPath.c_str());
+    snprintf(keyBuf, sizeof(keyBuf), "%d", gFwConfig.uiScalePercent);
+    WritePrivateProfileStringA("Dust", "UiScalePercent", keyBuf, gDustIniPath.c_str());
     WritePrivateProfileStringA("Dust", "LastPreset", gFwConfig.lastPreset.c_str(), gDustIniPath.c_str());
     WritePrivateProfileStringA("Dust", "LastPresetSource", gFwConfig.lastPresetSource.c_str(), gDustIniPath.c_str());
     WritePrivateProfileStringA("Dust", "LastPresetLabel", gFwConfig.lastPresetLabel.c_str(), gDustIniPath.c_str());
@@ -722,6 +784,7 @@ static void ResetFrameworkConfig()
     gFwConfig = gFwDiskConfig;
     DustLogEnabled() = gFwConfig.logging;
     ApplyDustTheme(gFwConfig.theme);
+    gFontRebuildPending = true;  // restored uiScalePercent may differ
 }
 
 static bool IsFrameworkDirty()
@@ -734,7 +797,8 @@ static bool IsFrameworkDirty()
            gFwConfig.lastPresetLabel != gFwDiskConfig.lastPresetLabel ||
            gFwConfig.toggleKey != gFwDiskConfig.toggleKey ||
            gFwConfig.toggleEffectsKey != gFwDiskConfig.toggleEffectsKey ||
-           gFwConfig.theme != gFwDiskConfig.theme;
+           gFwConfig.theme != gFwDiskConfig.theme ||
+           gFwConfig.uiScalePercent != gFwDiskConfig.uiScalePercent;
 }
 
 // ==================== Drawing: Framework pane ====================
@@ -810,6 +874,25 @@ static void DrawFrameworkSection()
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("UI theme. Kenshi: desaturated grey-tan palette matching the game. Dark: ImGui default.");
+    }
+
+    ImGui::Spacing();
+
+    {
+        // 0 == "Auto" (follow Windows display scaling); the rest are fixed percentages.
+        static const int   scalePcts[]   = { 0, 100, 125, 150, 175, 200 };
+        static const char* scaleLabels[] = { "Auto (Windows)", "100%", "125%", "150%", "175%", "200%" };
+        int scaleIdx = 0;
+        for (int i = 0; i < IM_ARRAYSIZE(scalePcts); ++i)
+            if (scalePcts[i] == gFwConfig.uiScalePercent) { scaleIdx = i; break; }
+        if (ImGui::Combo("UI Scale", &scaleIdx, scaleLabels, IM_ARRAYSIZE(scaleLabels)))
+        {
+            gFwConfig.uiScalePercent = scalePcts[scaleIdx];
+            ApplyDustTheme(gFwConfig.theme);  // re-applies colors + scaled style sizes
+            gFontRebuildPending = true;       // rebuild font atlas at the new scale
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Scale the Dust overlay. Auto matches your Windows display scaling (%.0f%%).", gOsDpiScale * 100.0f);
     }
 
     ImGui::Spacing();
@@ -2026,6 +2109,9 @@ bool Init(IDXGISwapChain* swapChain, ID3D11Device* device, ID3D11DeviceContext* 
     if (!gHWnd) { Log("GUI: No HWND"); return false; }
     if (!IsWindow(gHWnd)) { Log("GUI: hwnd %p is not a valid window", gHWnd); return false; }
 
+    gOsDpiScale = ImGui_ImplWin32_GetDpiScaleForHwnd(gHWnd);
+    Log("GUI: OS DPI scale = %.2f", gOsDpiScale);
+
     if (!CreateBackBufferRTV(swapChain))
     { Log("GUI: Failed to create back buffer RTV"); return false; }
     Log("GUI: back buffer RTV ok");
@@ -2065,6 +2151,7 @@ bool Init(IDXGISwapChain* swapChain, ID3D11Device* device, ID3D11DeviceContext* 
 
     LoadFrameworkConfig();
     ApplyDustTheme(gFwConfig.theme);
+    RebuildFontAtlas();  // build TTF atlas at the configured scale (texture made on first NewFrame)
 
     gInitialized = true;
     Log("GUI: Initialized (%s to toggle)", VKKeyName(gFwConfig.toggleKey));
@@ -2199,6 +2286,16 @@ void Render()
     // Skip rendering if device has been removed (alt-tab, resolution change, etc.)
     HRESULT removeReason = gDevice->GetDeviceRemovedReason();
     if (removeReason != S_OK) return;
+
+    // Font atlas can only change between frames. A UI-scale change sets the flag;
+    // rebuild here and drop the stale GPU font texture so the DX11 backend
+    // recreates it from the new atlas during this NewFrame.
+    if (gFontRebuildPending)
+    {
+        gFontRebuildPending = false;
+        RebuildFontAtlas();
+        ImGui_ImplDX11_InvalidateDeviceObjects();
+    }
 
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
