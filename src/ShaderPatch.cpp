@@ -720,36 +720,6 @@ static std::string PatchDeferredShader(const std::string& src)
     return result;
 }
 
-// [Dust][SkinSSS] Tag skin pixels in buf1.a (NORMALS.a, R8) so the screen-space
-// subsurface-scattering effect can gate on them. Tag = 17/255, placed in the
-// translucency sub-range [0,0.5) so it never collides with glowy-eye emissive
-// (>=0.5). Only character.hlsl is tagged (gated by skinToneMask, eyes preserved).
-// skin.hlsl is the CLOTHING/armor hardware-skinning shader (color1/color2 dye, no
-// skin tone), NOT skin — it is deliberately NOT tagged. Returns src unchanged if no hit.
-static std::string PatchSkinShader(const std::string& src)
-{
-    std::string result = src;
-
-    // --- character.hlsl: tag after the final glowy-eyes buf1.a write, skin-only.
-    // SINGLE-LINE anchor (no embedded newline, no trailing comment): OGRE reformats
-    // the shader source before D3DCompile, so the previous multi-line "...; // mul_sat"
-    // anchor never matched at runtime. Every working anchor in this file is one line.
-    const char* charAnchor = "buffer.buf1.a *= saturate(headMask.g * 255);";
-    size_t cpos = result.find(charAnchor);
-    if (cpos != std::string::npos)
-    {
-        std::string inject = std::string(charAnchor) +
-            "\n     // [Dust][SkinSSS] tag genuine skin (not eyes/clothing) for SSS.\n"
-            "     if (buffer.buf1.a < 0.5 && skinToneMask > 0.001) buffer.buf1.a = 17.0 / 255.0;";
-        result.replace(cpos, strlen(charAnchor), inject);
-        Log("ShaderPatch[SkinSSS]: tagged character.hlsl main_fs skin pixels");
-        return result;
-    }
-
-    Log("ShaderPatch[SkinSSS]: character.hlsl anchor not found, skipping");
-    return src;
-}
-
 // Patch vanilla objects.hlsl to fix foliage alpha threshold instability.
 // Replaces the hard binary clip with Bayer-dithered alpha testing and
 // stabilizes the threshold uniform against NaN / out-of-range values.
@@ -1005,12 +975,14 @@ static std::string PatchTerrainShaderForHeightDebug(const std::string& src)
 
     std::string inject1 =
         "// [Dust] Terrain debug overlay driven by gDebugViewMode (TessControl b1).\n"
-        "// Layout MUST match TerrainTess::Controls (15 plugin floats + 1 pad + 3 float4 masks).\n"
+        "// Layout MUST match TerrainTess::Controls exactly (24 floats + 3 float4 masks).\n"
         "cbuffer TessControl : register(b1) {\n"
         "\tfloat gMaxFactor; float gFactFadeStart; float gFactFadeEnd; float gAmplitude;\n"
         "\tfloat gAmpFadeStart; float gAmpFadeEnd; float gAmpFadeEnabled; float gDebugViewMode;\n"
         "\tfloat gDisplacementBias; float gFactorSnapStep; float gDispDirWorldUp; float gWireframeMode;\n"
-        "\tfloat gSharpMip; float gScale; float gHfWeight; float _gPad0;\n"
+        "\tfloat gSharpMip; float gScale; float gHfWeight; float gSpikeCap;\n"
+        "\tfloat gSmoothHi; float gSmoothHiMid; float gSmoothMid; float gSmoothLo;\n"
+        "\tfloat gFarHi; float gFarMid; float gSkipDistance; float _gPad1;\n"
         "\tfloat4 gBlend1Mask; float4 gBlend2Mask; float4 gBlend3Mask;\n"
         "};\n"
         "float DustLum(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }\n\n"
@@ -1052,21 +1024,24 @@ static std::string PatchTerrainShaderForHeightDebug(const std::string& src)
     }
     std::string replacement =
         "if (gDebugViewMode > 2.5) {\n"
-        "\t\t// Mode 3: chunk-distance heatmap. Shows the CPU-side skip\n"
-        "\t\t// classification visually. dist = distance from camera to\n"
-        "\t\t// this vertex (same coord system the CPU-skip uses).\n"
-        "\t\t// Green (close) → yellow (mid) → red (at/past tess radius).\n"
+        "\t\t// Mode 3: radius rings. Draws a color-coded contour ring on the\n"
+        "\t\t// terrain at each tess distance threshold (camera-relative, the\n"
+        "\t\t// same metric the fades + CPU-skip use), over dimmed terrain so\n"
+        "\t\t// each radius is visible where it lands in the world.\n"
         "\t\tfloat dustDist = length(worldPos - cameraPos);\n"
-        "\t\tfloat dustRadius = max(gFactFadeEnd, 1.0);\n"
-        "\t\tfloat dustT = saturate(dustDist / dustRadius);\n"
-        "\t\tfloat3 dustColor;\n"
-        "\t\tif (dustT < 0.5) {\n"
-        "\t\t\tfloat k = dustT * 2.0;\n"
-        "\t\t\tdustColor = float3(k, 1.0, 0.0);\n"
-        "\t\t} else {\n"
-        "\t\t\tfloat k = (dustT - 0.5) * 2.0;\n"
-        "\t\t\tdustColor = float3(1.0, 1.0 - k, 0.0);\n"
-        "\t\t}\n"
+        "\t\tfloat dustL = DustLum(biome.albedo.rgb);\n"
+        "\t\tfloat3 dustColor = float3(dustL, dustL, dustL) * 0.25;\n"
+        "\t\t// Ring half-width grows with distance so far rings stay visible\n"
+        "\t\t// (a fixed world width goes sub-pixel thin at range).\n"
+        "\t\tfloat dustRingW = max(40.0, dustDist * 0.01);\n"
+        "\t\t// Nearer-listed rings win on overlap (e.g. coincident fade starts).\n"
+        "\t\tif (gSkipDistance > 1.0 && abs(dustDist - gSkipDistance) < dustRingW) dustColor = float3(1.0, 1.0, 1.0);\n"
+        "\t\tif (abs(dustDist - gFarMid)        < dustRingW) dustColor = float3(1.0, 0.5, 0.0);\n"
+        "\t\tif (abs(dustDist - gFarHi)         < dustRingW) dustColor = float3(1.0, 1.0, 0.0);\n"
+        "\t\tif (abs(dustDist - gFactFadeEnd)   < dustRingW) dustColor = float3(1.0, 0.0, 1.0);\n"
+        "\t\tif (abs(dustDist - gAmpFadeEnd)    < dustRingW) dustColor = float3(1.0, 0.0, 0.0);\n"
+        "\t\tif (abs(dustDist - gAmpFadeStart)  < dustRingW) dustColor = float3(0.0, 1.0, 1.0);\n"
+        "\t\tif (abs(dustDist - gFactFadeStart) < dustRingW) dustColor = float3(0.0, 1.0, 0.0);\n"
         "\t\tbiome.albedo.rgb = dustColor;\n"
         "\t} else if (gDebugViewMode > 1.5) {\n"
         "\t\t// Mode 2: diff overlay. Computes the same BLEND0+1+2+3 replica\n"
@@ -1407,50 +1382,6 @@ HRESULT WINAPI HookedD3DCompile(
                     Log("ShaderPatch: dumped patched source to %s", dumpPath.c_str());
                 }
                 // Fall through to compile original below
-            }
-        }
-    }
-
-    // [Dust][SkinSSS] Detect the character skin GBuffer-fill shader (character.hlsl,
-    // entry "main_fs") and tag genuine skin pixels into buf1.a. NOTE: skin.hlsl is
-    // the clothing/armor hardware-skinning shader (color1/color2 dye, no skin tone),
-    // NOT skin — it is deliberately NOT tagged. The skinToneMask+headMaskMap markers
-    // are absent from terrain/deferred main_fs so this never misfires on them.
-    if (pEntrypoint && pSrcData && SrcDataSize > 0 &&
-        strcmp(pEntrypoint, "main_fs") == 0)
-    {
-        std::string src((const char*)pSrcData, SrcDataSize);
-        bool isCharacter = src.find("skinToneMask") != std::string::npos &&
-                           src.find("headMaskMap")  != std::string::npos;
-        bool alreadyTagged = src.find("[Dust][SkinSSS]") != std::string::npos;
-
-        if (isCharacter && !alreadyTagged)
-        {
-            std::string patched = PatchSkinShader(src);
-            if (patched.size() != src.size())
-            {
-                Log("ShaderPatch: patched character.hlsl main_fs skin (%zu -> %zu bytes)",
-                    src.size(), patched.size());
-                HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
-                                          pDefines, pInclude, pEntrypoint, pTarget,
-                                          Flags1, Flags2, ppCode, ppErrorMsgs);
-                if (SUCCEEDED(hr))
-                {
-                    if (ppCode && *ppCode)
-                        SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
-                            pEntrypoint, pTarget, pSourceName,
-                            (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
-                    return hr;
-                }
-                Log("ShaderPatch[SkinSSS]: patched skin shader failed to compile, falling back");
-                if (ppErrorMsgs && *ppErrorMsgs)
-                {
-                    Log("ShaderPatch[SkinSSS]: error: %s",
-                        (const char*)(*ppErrorMsgs)->GetBufferPointer());
-                    (*ppErrorMsgs)->Release();
-                    *ppErrorMsgs = nullptr;
-                }
-                // fall through to compile original
             }
         }
     }

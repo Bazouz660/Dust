@@ -21,16 +21,19 @@ struct TerrainTessConfig
     int   maxFactor        = 16;
     int   factorSnapStep   = 6;
 
-    // Tessellation radius in world units (Kenshi unit ~cm; 30000 ≈ 300m).
-    // Single user-facing knob that drives every distance threshold:
-    //   - factor fade band:  radius * 0.3  -> radius
-    //   - amp fade band:     radius * 0.3  -> radius
-    //   - DS HF tap cutoff:  radius * 0.15 (far-hi)
-    //   - DS mid tap cutoff: radius * 0.5  (far-mid)
-    //   - CPU per-chunk skip past:  radius * 1.05
-    // PushRuntime() derives all of these and ships them to the host. The
-    // user only ever touches Tess Radius.
-    float tessRadius       = 30000.0f;
+    // Tessellation distance thresholds in world units (Kenshi unit ~cm;
+    // 30000 ≈ 300m), all camera-relative. Formerly derived from a single
+    // tessRadius knob via fixed ratios; now each is exposed directly so the
+    // factor-fade band, amp-fade band, DS LOD cutoffs, and CPU per-chunk
+    // skip can be tuned independently. Defaults reproduce the old radius=30000
+    // behavior. See "Debug: View Mode" 3 (radius rings) to see these in-world.
+    float factFadeStart    = 900.0f;    // mesh density full <here, tapers to 1 by factFadeEnd
+    float factFadeEnd      = 3000.0f;
+    float ampFadeStart     = 900.0f;    // displacement full <here, tapers to 0 by ampFadeEnd
+    float ampFadeEnd       = 3000.0f;
+    float farHi            = 450.0f;    // DS drops HF detail bands past here
+    float farMid           = 1500.0f;   // DS drops MF detail band past here
+    float skipDistance     = 3000.0f;   // CPU bypasses HS/DS entirely past here (0 = never)
 
     // Displacement (bandpass + soft saturation). Kept as user-tunable
     // because they're quality knobs, not distance knobs.
@@ -65,30 +68,20 @@ static float sGpuTimeMs = 0.0f;
 // memcpy's these directly into the start of Controls (1 pad float and 3
 // mask float4s follow, keeping the layout 16-byte aligned).
 //
-// Distance fields (factFadeStart, ampFadeStart, farHi, farMid, skipDistance)
-// are derived from a single user-facing `tessRadius` here — never exposed
-// directly in the GUI. The ratios pick a sensible band where chunks fade
-// to factor=1 by the radius and CPU-side skip kicks in just past it.
+// Distance fields are now exposed directly in the GUI (one slider each)
+// rather than derived from a single tessRadius knob — the old ratio coupling
+// made them hard to reason about. They map 1:1 onto the host Controls layout.
 static void PushRuntime()
 {
     if (!gHost || !gHost->SetTerrainTessControls) return;
 
-    const float r = gConfig.tessRadius;
-    const float factFadeStart = r * 0.3f;
-    const float factFadeEnd   = r;
-    const float ampFadeStart  = r * 0.3f;
-    const float ampFadeEnd    = r;
-    const float farHi         = r * 0.15f;
-    const float farMid        = r * 0.5f;
-    const float skipDistance  = r * 1.05f;
-
     float buf[23] = {};
     buf[0]  = (float)gConfig.maxFactor;
-    buf[1]  = factFadeStart;
-    buf[2]  = factFadeEnd;
+    buf[1]  = gConfig.factFadeStart;
+    buf[2]  = gConfig.factFadeEnd;
     buf[3]  = gConfig.amplitude;
-    buf[4]  = ampFadeStart;
-    buf[5]  = ampFadeEnd;
+    buf[4]  = gConfig.ampFadeStart;
+    buf[5]  = gConfig.ampFadeEnd;
     buf[6]  = gConfig.ampFadeEnabled ? 1.0f : 0.0f;
     buf[7]  = (float)gConfig.debugViewMode;
     buf[8]  = gConfig.displacementBias;
@@ -103,9 +96,9 @@ static void PushRuntime()
     buf[17] = gConfig.smoothHiMid;
     buf[18] = gConfig.smoothMid;
     buf[19] = gConfig.smoothLo;
-    buf[20] = farHi;
-    buf[21] = farMid;
-    buf[22] = skipDistance;
+    buf[20] = gConfig.farHi;
+    buf[21] = gConfig.farMid;
+    buf[22] = gConfig.skipDistance;
     gHost->SetTerrainTessControls(buf);
 }
 
@@ -151,8 +144,20 @@ static DustSettingDesc gSettings[] = {
     { "Enabled",           DUST_SETTING_BOOL,  &gConfig.enabled,         0.0f,  1.0f,  "Enabled",         nullptr, "Master enable. When off, terrain renders flat with no HS/DS routing.", DUST_PERF_HIGH },
 
     // Tessellation
-    { "Tess Radius",       DUST_SETTING_FLOAT, &gConfig.tessRadius,      0.0f, 200000.0f, "TessRadius",  nullptr, "World-space radius (camera-relative, in Kenshi units ~cm) of the tessellated zone. Past this, terrain is rendered without tessellation entirely. Drives all distance thresholds — factor fade, amp fade, DS LOD cutoffs, and CPU per-chunk skip — via fixed ratios. Lower = bigger fps win, smaller visible-displacement zone. HIGH perf impact.", DUST_PERF_HIGH },
     { "Max Factor",        DUST_SETTING_INT,   &gConfig.maxFactor,       1.0f,  64.0f, "MaxFactor",       nullptr, "Maximum tess subdivision factor at near range. Higher = denser mesh, more displacement detail.", DUST_PERF_HIGH },
+
+    // Tessellation distance thresholds (camera-relative, Kenshi units ~cm).
+    // Each was formerly derived from one Tess Radius knob via fixed ratios;
+    // now tunable independently. Use Debug View Mode 3 (radius rings) to see
+    // exactly where each lands on the terrain.
+    { "Factor Fade Start", DUST_SETTING_FLOAT, &gConfig.factFadeStart,   0.0f, 3000.0f, "FactFadeStart", nullptr, "Distance where mesh density starts tapering. Closer than this, tess factor is full (Max Factor). RING: green.", DUST_PERF_HIGH },
+    { "Factor Fade End",   DUST_SETTING_FLOAT, &gConfig.factFadeEnd,     0.0f, 3000.0f, "FactFadeEnd",   nullptr, "Distance where mesh density reaches factor 1 (no subdivision). Past this the mesh is undisplaced unless still inside the amp fade. RING: magenta.", DUST_PERF_HIGH },
+    { "Amp Fade Start",    DUST_SETTING_FLOAT, &gConfig.ampFadeStart,    0.0f, 3000.0f, "AmpFadeStart",  nullptr, "Distance where displacement amplitude starts tapering. Closer than this, displacement is full (Amplitude). Requires Amp Fade Enabled. RING: cyan.", DUST_PERF_NONE },
+    { "Amp Fade End",      DUST_SETTING_FLOAT, &gConfig.ampFadeEnd,      0.0f, 3000.0f, "AmpFadeEnd",    nullptr, "Distance where displacement amplitude reaches 0. Past this, vertices are flat. The DS early-outs here, saving texture samples. RING: red.", DUST_PERF_HIGH },
+    { "Far Hi (HF cutoff)",DUST_SETTING_FLOAT, &gConfig.farHi,           0.0f, 3000.0f, "FarHi",         nullptr, "Past this distance the DS drops the two high-frequency detail bands (finest rocks) — they aren't visible at range anyway. Lower = fewer texture samples far out = faster. RING: yellow.", DUST_PERF_HIGH },
+    { "Far Mid (MF cutoff)",DUST_SETTING_FLOAT,&gConfig.farMid,          0.0f, 3000.0f, "FarMid",        nullptr, "Past this distance the DS additionally drops the mid-frequency band, leaving only the low-frequency dune surface. Lower = faster. Should be >= Far Hi. RING: orange.", DUST_PERF_HIGH },
+    { "Skip Distance",     DUST_SETTING_FLOAT, &gConfig.skipDistance,    0.0f, 3000.0f, "SkipDistance",  nullptr, "Past this distance the CPU bypasses the HS/DS pipeline entirely (chunk renders flat via the original draw) — recovers fixed tess-pipeline overhead per distant chunk. 0 = never skip. RING: white.", DUST_PERF_HIGH },
+
     { "Factor Snap Step",  DUST_SETTING_INT,   &gConfig.factorSnapStep,  1.0f,  16.0f, "FactorSnapStep",  nullptr, "Quantize tess factor to multiples of this for stable LOD. Bigger = more stable, coarser steps.", DUST_PERF_NONE },
 
     // Displacement (bandpass + soft saturation)
@@ -170,7 +175,7 @@ static DustSettingDesc gSettings[] = {
     { "Amp Fade Enabled",  DUST_SETTING_BOOL,  &gConfig.ampFadeEnabled,  0.0f,  1.0f,  "AmpFadeEnabled",  nullptr, "Fade displacement amplitude with distance. Disabling makes displacement uniform across the tess radius (the fade band still affects factor but amp stays full).", DUST_PERF_NONE },
 
     // Debug
-    { "Debug: View Mode",  DUST_SETTING_INT,   &gConfig.debugViewMode,   0.0f,  3.0f,  "DebugViewMode",  nullptr, "0=off, 1=PS visible luminance (grayscale), 2=DS-replica diff overlay, 3=chunk-distance heatmap (green=close/kept by CPU-skip, red=far/would-be-skipped — mode 3 disables actual skipping so every chunk shows its color).", DUST_PERF_NONE },
+    { "Debug: View Mode",  DUST_SETTING_INT,   &gConfig.debugViewMode,   0.0f,  3.0f,  "DebugViewMode",  nullptr, "0=off, 1=PS visible luminance (grayscale), 2=DS-replica diff overlay, 3=radius rings: color-coded contour rings on the terrain at each distance threshold over dimmed terrain. Legend: green=Factor Fade Start, magenta=Factor Fade End, cyan=Amp Fade Start, red=Amp Fade End, yellow=Far Hi, orange=Far Mid, white=Skip Distance.", DUST_PERF_NONE },
     { "Debug: Wireframe",  DUST_SETTING_INT,   &gConfig.wireframe,       0.0f,  4.0f,  "Wireframe",      nullptr, "0=off, 1=tess wireframe, 2=vanilla mesh wireframe (no tess), 3=strip→list IB conversion + TRIANGLELIST + no tess (isolates IB conversion), 4=DIAG: force-skip tess on every terrain draw (no HS/DS — for perf bisection).", DUST_PERF_NONE },
 };
 
