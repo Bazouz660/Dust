@@ -563,6 +563,13 @@ void EffectLoader::EffectConfigWriteDefaults(LoadedEffect& le)
 
 void EffectLoader::EffectConfigCheckHotReload(LoadedEffect& le)
 {
+    // Stat the INI at most every 500 ms — this runs per effect per frame,
+    // and per-frame disk polling is pure overhead for a file humans edit.
+    ULONGLONG now = GetTickCount64();
+    if (now < le.configNextPollTick)
+        return;
+    le.configNextPollTick = now + 500;
+
     WIN32_FILE_ATTRIBUTE_DATA fad;
     if (!GetFileAttributesExA(le.configPath.c_str(), GetFileExInfoStandard, &fad))
         return;

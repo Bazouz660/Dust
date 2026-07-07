@@ -12,15 +12,14 @@ cbuffer ClarityParams : register(b0)
     float  midtoneProtect;
     float  blurRadius;
     float  _pad;
+    // Normalized gaussian weights for |offset| = index, precomputed on the
+    // CPU (sigma = radius / 3). Saves up to 65 exp() per pixel per pass.
+    float4 blurWeights[33];
 };
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 {
-    float sigma = max(blurRadius / 3.0, 0.5);
-    float invSigma2 = -0.5 / (sigma * sigma);
-
     float3 total = float3(0, 0, 0);
-    float totalWeight = 0.0;
 
     int iRadius = (int)ceil(blurRadius);
     iRadius = min(iRadius, 32);
@@ -28,12 +27,10 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     [loop]
     for (int i = -iRadius; i <= iRadius; i++)
     {
-        float w = exp(float(i * i) * invSigma2);
+        float w = blurWeights[abs(i)].x;
         float2 sampleUV = uv + float2(0.0, float(i) * invViewportSize.y);
         total += sceneTex.SampleLevel(linearClamp, sampleUV, 0).rgb * w;
-        totalWeight += w;
     }
 
-    float3 result = total / totalWeight;
-    return float4(result, 1.0);
+    return float4(total, 1.0);
 }

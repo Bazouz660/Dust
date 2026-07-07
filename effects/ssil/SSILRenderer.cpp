@@ -255,7 +255,10 @@ ID3D11ShaderResourceView* RenderIL(ID3D11DeviceContext* ctx,
     if (!gInitialized || !ctx || !depthSRV || !albedoSRV || !gHost)
         return nullptr;
 
-    // Detect resolution from depth texture
+    // Detect resolution from depth texture (throttled backstop — the host
+    // drives OnResolutionChanged; this only catches drift, same as SSAO/RTGI)
+    static uint32_t sResProbeCounter = 0;
+    if ((sResProbeCounter++ % 300) == 0)
     {
         ID3D11Resource* res = nullptr;
         depthSRV->GetResource(&res);
@@ -343,9 +346,8 @@ ID3D11ShaderResourceView* RenderIL(ID3D11DeviceContext* ctx,
     ID3D11ShaderResourceView* nullSRVs[3] = { nullptr, nullptr, nullptr };
 
     // Pass 1: Generate raw indirect light
+    // (no clear needed — the fullscreen pass writes every pixel)
     {
-        float clearColor[4] = { 0, 0, 0, 1 };
-        ctx->ClearRenderTargetView(gILRTV, clearColor);
         ctx->OMSetRenderTargets(1, &gILRTV, nullptr);
         ctx->OMSetBlendState(gNoBlend, blendFactor, 0xFFFFFFFF);
         ctx->PSSetShader(gSSILGenPS, nullptr, 0);

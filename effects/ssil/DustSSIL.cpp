@@ -47,6 +47,12 @@ static void SSILPostExecute(const DustFrameContext* ctx, const DustHostAPI* host
     if (!gSSILConfig.enabled || !SSILRenderer::IsInitialized())
         return;
 
+    // colorBleeding 0 => the gen shader multiplies the final IL by it, so the
+    // whole chain (scene copy + gen + 2 blurs + additive composite) adds exact
+    // zero — skip it all (debug view still needs the chain)
+    if (gSSILConfig.colorBleeding <= 0.0f && !gSSILConfig.debugView)
+        return;
+
     ID3D11ShaderResourceView* depthSRV = host->GetSRV(DUST_RESOURCE_DEPTH);
     if (!depthSRV)
         return;

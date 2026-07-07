@@ -155,6 +155,12 @@ static void DOFPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     if (!DOFRenderer::IsInitialized() || !gDOFConfig.enabled)
         return;
 
+    // Both strengths zero => CoC is 0 everywhere in both focus modes and the
+    // composite reduces to the sharp scene — skip all 5 passes and the scene
+    // copy. Debug view still renders its overlay below.
+    if (gDOFConfig.nearStrength <= 0.0f && gDOFConfig.farStrength <= 0.0f && !gDOFConfig.debugView)
+        return;
+
     ID3D11ShaderResourceView* depthSRV = host->GetSRV(DUST_RESOURCE_DEPTH);
     if (!depthSRV)
         return;

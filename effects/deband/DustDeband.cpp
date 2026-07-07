@@ -110,6 +110,11 @@ static void DebandPostExecute(const DustFrameContext* ctx, const DustHostAPI* ho
     if (!gInitialized || !gDebandConfig.enabled)
         return;
 
+    // intensity 0 => `lerp(color, avg, 0)` leaves every pixel unchanged —
+    // skip the scene copy and the pass (debug view still needs them)
+    if (gDebandConfig.intensity <= 0.0f && !gDebandConfig.debugView)
+        return;
+
     ID3D11ShaderResourceView* sceneCopy = host->GetSceneCopy(ctx->context, DUST_RESOURCE_LDR_RT);
     if (!sceneCopy) return;
 

@@ -66,6 +66,13 @@ static void RTGIPostExecute(const DustFrameContext* ctx, const DustHostAPI* host
     if (!gRTGIConfig.enabled || !RTGIRenderer::IsInitialized())
         return;
 
+    // Both composite passes are gated on their intensity being > 0, so with
+    // both at zero the whole trace/temporal/denoise chain would run for
+    // nothing — skip it (same resume semantics as toggling Enabled).
+    if (gRTGIConfig.giIntensity <= 0.0f && gRTGIConfig.aoIntensity <= 0.0f
+        && gRTGIConfig.debugView == 0)
+        return;
+
     ID3D11ShaderResourceView* depthSRV = host->GetSRV(DUST_RESOURCE_DEPTH);
     if (!depthSRV)
         return;
@@ -259,7 +266,7 @@ static void RTGIOnResolutionChanged(ID3D11Device* device, uint32_t w, uint32_t h
 
 static int RTGIIsEnabled()
 {
-    return 1; // Always dispatch so we can extract camera data in preExecute
+    return gRTGIConfig.enabled ? 1 : 0;
 }
 
 // ==================== Settings ====================

@@ -30,9 +30,8 @@ static UINT gRenderWidth = 0;
 static UINT gRenderHeight = 0;
 static int gLastResScale = 50; // Track resolution scale (25-100%) for runtime texture recreation
 
-// Raw ray trace output (RGBA16F) — UAV for compute shader write
+// Raw ray trace output (RGBA16F) — UAV for compute shader write, no RTV needed
 static ID3D11Texture2D*           gRawTex = nullptr;
-static ID3D11RenderTargetView*    gRawRTV = nullptr;
 static ID3D11ShaderResourceView*  gRawSRV = nullptr;
 static ID3D11UnorderedAccessView* gRawUAV = nullptr;
 
@@ -47,23 +46,17 @@ static ID3D11ShaderResourceView* gAccumSRVB = nullptr;
 
 static int gAccumWriteIndex = 0; // 0 = write to A (read B as history), 1 = write to B (read A)
 
-// Moments ping-pong for SVGF (RGBA16F: R=m1, G=m2, B=historyLength, A=variance)
+// Luminance std-dev from the variance pass (R16F — atrous reads only .r)
 static ID3D11Texture2D*          gMomentsTexA = nullptr;
 static ID3D11RenderTargetView*   gMomentsRTVA = nullptr;
 static ID3D11ShaderResourceView* gMomentsSRVA = nullptr;
 
-static ID3D11Texture2D*          gMomentsTexB = nullptr;
-static ID3D11RenderTargetView*   gMomentsRTVB = nullptr;
-static ID3D11ShaderResourceView* gMomentsSRVB = nullptr;
-
-// Denoise ping-pong (RGBA16F) — UAV for compute-shader atrous
+// Denoise ping-pong (RGBA16F) — UAV for compute-shader atrous, no RTV needed
 static ID3D11Texture2D*           gDenoiseTexA = nullptr;
-static ID3D11RenderTargetView*    gDenoiseRTVA = nullptr;
 static ID3D11ShaderResourceView*  gDenoiseSRVA = nullptr;
 static ID3D11UnorderedAccessView* gDenoiseUAVA = nullptr;
 
 static ID3D11Texture2D*           gDenoiseTexB = nullptr;
-static ID3D11RenderTargetView*    gDenoiseRTVB = nullptr;
 static ID3D11ShaderResourceView*  gDenoiseSRVB = nullptr;
 static ID3D11UnorderedAccessView* gDenoiseUAVB = nullptr;
 
@@ -238,36 +231,43 @@ static void ComputeReprojectionMatrix(const float* curInv, const float* prevInv,
         }
 }
 
-static bool CreateRGBA16FTexture(ID3D11Device* device, UINT width, UINT height,
-                                  ID3D11Texture2D** outTex,
-                                  ID3D11RenderTargetView** outRTV,
-                                  ID3D11ShaderResourceView** outSRV,
-                                  ID3D11UnorderedAccessView** outUAV = nullptr)
+// outRTV == nullptr means the texture is UAV/SRV-only: the RENDER_TARGET bind
+// flag is omitted so the driver doesn't have to allow for RTV usage.
+static bool CreateGITexture(ID3D11Device* device, UINT width, UINT height,
+                            ID3D11Texture2D** outTex,
+                            ID3D11RenderTargetView** outRTV,
+                            ID3D11ShaderResourceView** outSRV,
+                            ID3D11UnorderedAccessView** outUAV = nullptr,
+                            DXGI_FORMAT format = DXGI_FORMAT_R16G16B16A16_FLOAT)
 {
     D3D11_TEXTURE2D_DESC desc = {};
     desc.Width = width;
     desc.Height = height;
     desc.MipLevels = 1;
     desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    desc.Format = format;
     desc.SampleDesc.Count = 1;
     desc.Usage = D3D11_USAGE_DEFAULT;
-    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    if (outRTV) desc.BindFlags |= D3D11_BIND_RENDER_TARGET;
     if (outUAV) desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
 
     HRESULT hr = device->CreateTexture2D(&desc, nullptr, outTex);
-    if (FAILED(hr)) { Log("RTGI: Failed to create RGBA16F texture (%ux%u): 0x%08X", width, height, hr); return false; }
+    if (FAILED(hr)) { Log("RTGI: Failed to create GI texture (%ux%u, fmt %d): 0x%08X", width, height, (int)format, hr); return false; }
 
-    hr = device->CreateRenderTargetView(*outTex, nullptr, outRTV);
-    if (FAILED(hr)) { Log("RTGI: Failed to create RGBA16F RTV: 0x%08X", hr); return false; }
+    if (outRTV)
+    {
+        hr = device->CreateRenderTargetView(*outTex, nullptr, outRTV);
+        if (FAILED(hr)) { Log("RTGI: Failed to create GI RTV: 0x%08X", hr); return false; }
+    }
 
     hr = device->CreateShaderResourceView(*outTex, nullptr, outSRV);
-    if (FAILED(hr)) { Log("RTGI: Failed to create RGBA16F SRV: 0x%08X", hr); return false; }
+    if (FAILED(hr)) { Log("RTGI: Failed to create GI SRV: 0x%08X", hr); return false; }
 
     if (outUAV)
     {
         hr = device->CreateUnorderedAccessView(*outTex, nullptr, outUAV);
-        if (FAILED(hr)) { Log("RTGI: Failed to create RGBA16F UAV: 0x%08X", hr); return false; }
+        if (FAILED(hr)) { Log("RTGI: Failed to create GI UAV: 0x%08X", hr); return false; }
     }
 
     return true;
@@ -304,13 +304,12 @@ static bool CreateR32FTexture(ID3D11Device* device, UINT width, UINT height,
 
 static void ReleaseTextures()
 {
-    SAFE_RELEASE(gRawTex);     SAFE_RELEASE(gRawRTV);     SAFE_RELEASE(gRawSRV);     SAFE_RELEASE(gRawUAV);
+    SAFE_RELEASE(gRawTex);     SAFE_RELEASE(gRawSRV);     SAFE_RELEASE(gRawUAV);
     SAFE_RELEASE(gAccumTexA);  SAFE_RELEASE(gAccumRTVA);  SAFE_RELEASE(gAccumSRVA);
     SAFE_RELEASE(gAccumTexB);  SAFE_RELEASE(gAccumRTVB);  SAFE_RELEASE(gAccumSRVB);
     SAFE_RELEASE(gMomentsTexA);SAFE_RELEASE(gMomentsRTVA);SAFE_RELEASE(gMomentsSRVA);
-    SAFE_RELEASE(gMomentsTexB);SAFE_RELEASE(gMomentsRTVB);SAFE_RELEASE(gMomentsSRVB);
-    SAFE_RELEASE(gDenoiseTexA);SAFE_RELEASE(gDenoiseRTVA);SAFE_RELEASE(gDenoiseSRVA);SAFE_RELEASE(gDenoiseUAVA);
-    SAFE_RELEASE(gDenoiseTexB);SAFE_RELEASE(gDenoiseRTVB);SAFE_RELEASE(gDenoiseSRVB);SAFE_RELEASE(gDenoiseUAVB);
+    SAFE_RELEASE(gDenoiseTexA);SAFE_RELEASE(gDenoiseSRVA);SAFE_RELEASE(gDenoiseUAVA);
+    SAFE_RELEASE(gDenoiseTexB);SAFE_RELEASE(gDenoiseSRVB);SAFE_RELEASE(gDenoiseUAVB);
     SAFE_RELEASE(gPrevDepthTex);SAFE_RELEASE(gPrevDepthSRV);
 }
 
@@ -326,13 +325,14 @@ static bool CreateTextures(ID3D11Device* device, UINT width, UINT height)
     gRenderWidth = rw;
     gRenderHeight = rh;
 
-    if (!CreateRGBA16FTexture(device, rw, rh, &gRawTex, &gRawRTV, &gRawSRV, &gRawUAV)) return false;
-    if (!CreateRGBA16FTexture(device, rw, rh, &gAccumTexA, &gAccumRTVA, &gAccumSRVA)) return false;
-    if (!CreateRGBA16FTexture(device, rw, rh, &gAccumTexB, &gAccumRTVB, &gAccumSRVB)) return false;
-    if (!CreateRGBA16FTexture(device, rw, rh, &gMomentsTexA, &gMomentsRTVA, &gMomentsSRVA)) return false;
-    if (!CreateRGBA16FTexture(device, rw, rh, &gMomentsTexB, &gMomentsRTVB, &gMomentsSRVB)) return false;
-    if (!CreateRGBA16FTexture(device, rw, rh, &gDenoiseTexA, &gDenoiseRTVA, &gDenoiseSRVA, &gDenoiseUAVA)) return false;
-    if (!CreateRGBA16FTexture(device, rw, rh, &gDenoiseTexB, &gDenoiseRTVB, &gDenoiseSRVB, &gDenoiseUAVB)) return false;
+    if (!CreateGITexture(device, rw, rh, &gRawTex, nullptr, &gRawSRV, &gRawUAV)) return false;
+    if (!CreateGITexture(device, rw, rh, &gAccumTexA, &gAccumRTVA, &gAccumSRVA)) return false;
+    if (!CreateGITexture(device, rw, rh, &gAccumTexB, &gAccumRTVB, &gAccumSRVB)) return false;
+    // Variance/atrous only ever touch .r — R16F keeps the exact same half
+    // precision as the old RGBA16F R channel at 1/4 the bandwidth
+    if (!CreateGITexture(device, rw, rh, &gMomentsTexA, &gMomentsRTVA, &gMomentsSRVA, nullptr, DXGI_FORMAT_R16_FLOAT)) return false;
+    if (!CreateGITexture(device, rw, rh, &gDenoiseTexA, nullptr, &gDenoiseSRVA, &gDenoiseUAVA)) return false;
+    if (!CreateGITexture(device, rw, rh, &gDenoiseTexB, nullptr, &gDenoiseSRVB, &gDenoiseUAVB)) return false;
     // Previous frame depth — full res, CopyResource target + SRV for temporal pass
     {
         D3D11_TEXTURE2D_DESC desc = {};
@@ -772,9 +772,16 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
     // The accumulation result to denoise
     ID3D11ShaderResourceView* accumResultSRV = (gAccumWriteIndex == 0) ? gAccumSRVA : gAccumSRVB;
 
+    // Denoise iteration count — needed now to decide whether variance runs at all
+    int numDenoiseSteps = gRTGIConfig.denoiseSteps;
+    if (numDenoiseSteps < 0) numDenoiseSteps = 0;
+    if (numDenoiseSteps > 5) numDenoiseSteps = 5;
+
     // ---- Pass 2b: Variance estimate (3x3 luminance stddev) ----
     // Computed once from the temporal output; atrous reads this value across
-    // all denoise iterations instead of recomputing it 4 times.
+    // all denoise iterations instead of recomputing it 4 times. The atrous
+    // pass is its only consumer, so skip it entirely when denoise is off.
+    if (numDenoiseSteps > 0)
     {
         ctx->OMSetRenderTargets(1, &gMomentsRTVA, nullptr);
         ctx->OMSetBlendState(gNoBlend, blendFactor, 0xFFFFFFFF);
@@ -802,10 +809,6 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
     // trims ~6 redundant D3D11 calls per iteration.
     ID3D11ShaderResourceView* denoiseInputSRV = accumResultSRV;
     ID3D11ShaderResourceView* denoiseOutputSRV = accumResultSRV; // fallback if 0 iterations
-
-    int numDenoiseSteps = gRTGIConfig.denoiseSteps;
-    if (numDenoiseSteps < 0) numDenoiseSteps = 0;
-    if (numDenoiseSteps > 5) numDenoiseSteps = 5;
 
     if (numDenoiseSteps > 0)
     {

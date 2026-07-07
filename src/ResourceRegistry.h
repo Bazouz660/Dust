@@ -2,8 +2,6 @@
 
 #include "InjectionPoint.h"
 #include <d3d11.h>
-#include <unordered_map>
-#include <string>
 
 namespace ResourceName
 {
@@ -28,8 +26,14 @@ public:
     void PopulateFrameContext(FrameContext& ctx) const;
 
 private:
-    std::unordered_map<std::string, ID3D11ShaderResourceView*> srvs_;
-    std::unordered_map<std::string, ID3D11RenderTargetView*>   rtvs_;
+    // The resource names form a small closed set — fixed slots instead of
+    // string-keyed maps keep the per-frame ResetFrame and the per-effect
+    // lookups (dozens per frame) allocation- and hash-free.
+    enum SlotId { SLOT_DEPTH, SLOT_NORMALS, SLOT_ALBEDO, SLOT_HDR, SLOT_LDR, SLOT_COUNT, SLOT_INVALID = SLOT_COUNT };
+    static int SlotForName(const char* name);
+
+    ID3D11ShaderResourceView* srvs_[SLOT_COUNT] = {};
+    ID3D11RenderTargetView*   rtvs_[SLOT_COUNT] = {};
 };
 
 extern ResourceRegistry gResourceRegistry;

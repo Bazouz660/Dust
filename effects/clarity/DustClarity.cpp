@@ -34,6 +34,11 @@ static void ClarityPostExecute(const DustFrameContext* ctx, const DustHostAPI* h
     if (!ClarityRenderer::IsInitialized() || !gClarityConfig.enabled)
         return;
 
+    // strength 0 => composite is `original + detail*0` — identical output,
+    // so skip the scene copy and all 3 passes (debug view still needs them)
+    if (gClarityConfig.strength <= 0.0f && !gClarityConfig.debugView)
+        return;
+
     // Get a copy of the current LDR scene (after LUT has run)
     ID3D11ShaderResourceView* sceneCopy = host->GetSceneCopy(ctx->context, DUST_RESOURCE_LDR_RT);
     if (!sceneCopy)

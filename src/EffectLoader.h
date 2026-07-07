@@ -25,6 +25,7 @@ struct LoadedEffect {
     std::string     effectDir;      // directory containing the DLL
     std::string     configPath;     // full path to .ini
     FILETIME        configMtime;    // for hot-reload
+    ULONGLONG       configNextPollTick = 0; // GetTickCount64 deadline for next mtime poll
 };
 
 // Global preset system — each preset is a folder with per-effect INI files

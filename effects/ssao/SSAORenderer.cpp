@@ -24,23 +24,11 @@ static ID3D11Texture2D*          gAoBlurTex = nullptr;
 static ID3D11RenderTargetView*   gAoBlurRTV = nullptr;
 static ID3D11ShaderResourceView* gAoBlurSRV = nullptr;
 
-// Half-res AO textures (used when halfResolution is enabled)
-static UINT gHalfWidth = 0;
-static UINT gHalfHeight = 0;
-static ID3D11Texture2D*          gAoHalfTex = nullptr;
-static ID3D11RenderTargetView*   gAoHalfRTV = nullptr;
-static ID3D11ShaderResourceView* gAoHalfSRV = nullptr;
-
-static ID3D11Texture2D*          gAoHalfBlurTex = nullptr;
-static ID3D11RenderTargetView*   gAoHalfBlurRTV = nullptr;
-static ID3D11ShaderResourceView* gAoHalfBlurSRV = nullptr;
-
 // Shaders
 static ID3D11VertexShader* gFullscreenVS = nullptr;
 static ID3D11PixelShader*  gSSAOGenPS = nullptr;
 static ID3D11PixelShader*  gSSAOBlurHPS = nullptr;
 static ID3D11PixelShader*  gSSAOBlurVPS = nullptr;
-static ID3D11PixelShader*  gSSAOUpsamplePS = nullptr;
 static ID3D11PixelShader*  gSSAODebugPS = nullptr;
 
 // Pipeline states
@@ -48,7 +36,6 @@ static ID3D11BlendState*        gNoBlend = nullptr;
 static ID3D11DepthStencilState* gNoDepthDSS = nullptr;
 static ID3D11RasterizerState*   gNoCullRS = nullptr;
 static ID3D11SamplerState*      gPointClampSampler = nullptr;
-static ID3D11SamplerState*      gLinearClampSampler = nullptr;
 
 // Blue noise texture for AO sample jitter
 static ID3D11Texture2D*          gBlueNoiseTex = nullptr;
@@ -139,11 +126,8 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
     ID3DBlob* blurVBlob = host->CompileShaderFromFile((gShaderDir + "ssao_blur_v_ps.hlsl").c_str(), "main", "ps_5_0");
     if (!blurVBlob) { vsBlob->Release(); genBlob->Release(); blurHBlob->Release(); return false; }
 
-    ID3DBlob* upsampleBlob = host->CompileShaderFromFile((gShaderDir + "ssao_upsample_ps.hlsl").c_str(), "main", "ps_5_0");
-    if (!upsampleBlob) { vsBlob->Release(); genBlob->Release(); blurHBlob->Release(); blurVBlob->Release(); return false; }
-
     ID3DBlob* debugBlob = host->CompileShaderFromFile((gShaderDir + "ssao_debug_ps.hlsl").c_str(), "main", "ps_5_0");
-    if (!debugBlob) { vsBlob->Release(); genBlob->Release(); blurHBlob->Release(); blurVBlob->Release(); upsampleBlob->Release(); return false; }
+    if (!debugBlob) { vsBlob->Release(); genBlob->Release(); blurHBlob->Release(); blurVBlob->Release(); return false; }
 
     HRESULT hr;
 
@@ -163,10 +147,6 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
     blurVBlob->Release();
     if (FAILED(hr)) { Log("Failed to create blur V PS: 0x%08X", hr); return false; }
 
-    hr = device->CreatePixelShader(upsampleBlob->GetBufferPointer(), upsampleBlob->GetBufferSize(), nullptr, &gSSAOUpsamplePS);
-    upsampleBlob->Release();
-    if (FAILED(hr)) { Log("Failed to create upsample PS: 0x%08X", hr); return false; }
-
     hr = device->CreatePixelShader(debugBlob->GetBufferPointer(), debugBlob->GetBufferSize(), nullptr, &gSSAODebugPS);
     debugBlob->Release();
     if (FAILED(hr)) { Log("Failed to create debug PS: 0x%08X", hr); return false; }
@@ -175,14 +155,6 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
     if (!CreateR8Texture(device, width, height, &gAoTex, &gAoRTV, &gAoSRV))
         return false;
     if (!CreateR8Texture(device, width, height, &gAoBlurTex, &gAoBlurRTV, &gAoBlurSRV))
-        return false;
-
-    // Half-res textures (for optional half-res mode)
-    gHalfWidth = (width + 1) / 2;
-    gHalfHeight = (height + 1) / 2;
-    if (!CreateR8Texture(device, gHalfWidth, gHalfHeight, &gAoHalfTex, &gAoHalfRTV, &gAoHalfSRV))
-        return false;
-    if (!CreateR8Texture(device, gHalfWidth, gHalfHeight, &gAoHalfBlurTex, &gAoHalfBlurRTV, &gAoHalfBlurSRV))
         return false;
 
     // No blend
@@ -221,17 +193,6 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
         desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
         desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
         hr = device->CreateSamplerState(&desc, &gPointClampSampler);
-        if (FAILED(hr)) return false;
-    }
-
-    // Linear-clamp sampler (for half-res upsample)
-    {
-        D3D11_SAMPLER_DESC desc = {};
-        desc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-        desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
-        desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
-        desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-        hr = device->CreateSamplerState(&desc, &gLinearClampSampler);
         if (FAILED(hr)) return false;
     }
 
@@ -295,14 +256,12 @@ void Shutdown()
 #define SAFE_RELEASE(p) if (p) { (p)->Release(); (p) = nullptr; }
     SAFE_RELEASE(gAoTex);         SAFE_RELEASE(gAoRTV);         SAFE_RELEASE(gAoSRV);
     SAFE_RELEASE(gAoBlurTex);     SAFE_RELEASE(gAoBlurRTV);     SAFE_RELEASE(gAoBlurSRV);
-    SAFE_RELEASE(gAoHalfTex);     SAFE_RELEASE(gAoHalfRTV);     SAFE_RELEASE(gAoHalfSRV);
-    SAFE_RELEASE(gAoHalfBlurTex); SAFE_RELEASE(gAoHalfBlurRTV); SAFE_RELEASE(gAoHalfBlurSRV);
     SAFE_RELEASE(gFullscreenVS);
     SAFE_RELEASE(gSSAOGenPS);  SAFE_RELEASE(gSSAOBlurHPS);
-    SAFE_RELEASE(gSSAOBlurVPS); SAFE_RELEASE(gSSAOUpsamplePS); SAFE_RELEASE(gSSAODebugPS);
+    SAFE_RELEASE(gSSAOBlurVPS); SAFE_RELEASE(gSSAODebugPS);
     SAFE_RELEASE(gNoBlend);
     SAFE_RELEASE(gNoDepthDSS);   SAFE_RELEASE(gNoCullRS);
-    SAFE_RELEASE(gPointClampSampler); SAFE_RELEASE(gLinearClampSampler); SAFE_RELEASE(gSSAOCB);
+    SAFE_RELEASE(gPointClampSampler); SAFE_RELEASE(gSSAOCB);
     SAFE_RELEASE(gBlueNoiseTex); SAFE_RELEASE(gBlueNoiseSRV); SAFE_RELEASE(gPointWrapSampler);
 #undef SAFE_RELEASE
     gInitialized = false;
@@ -321,18 +280,12 @@ void OnResolutionChanged(ID3D11Device* device, UINT newWidth, UINT newHeight)
 #define SAFE_RELEASE(p) if (p) { (p)->Release(); (p) = nullptr; }
     SAFE_RELEASE(gAoTex);         SAFE_RELEASE(gAoRTV);         SAFE_RELEASE(gAoSRV);
     SAFE_RELEASE(gAoBlurTex);     SAFE_RELEASE(gAoBlurRTV);     SAFE_RELEASE(gAoBlurSRV);
-    SAFE_RELEASE(gAoHalfTex);     SAFE_RELEASE(gAoHalfRTV);     SAFE_RELEASE(gAoHalfSRV);
-    SAFE_RELEASE(gAoHalfBlurTex); SAFE_RELEASE(gAoHalfBlurRTV); SAFE_RELEASE(gAoHalfBlurSRV);
 #undef SAFE_RELEASE
 
     gWidth = newWidth;
     gHeight = newHeight;
-    gHalfWidth = (newWidth + 1) / 2;
-    gHalfHeight = (newHeight + 1) / 2;
     if (!CreateR8Texture(device, newWidth, newHeight, &gAoTex, &gAoRTV, &gAoSRV)
-        || !CreateR8Texture(device, newWidth, newHeight, &gAoBlurTex, &gAoBlurRTV, &gAoBlurSRV)
-        || !CreateR8Texture(device, gHalfWidth, gHalfHeight, &gAoHalfTex, &gAoHalfRTV, &gAoHalfSRV)
-        || !CreateR8Texture(device, gHalfWidth, gHalfHeight, &gAoHalfBlurTex, &gAoHalfBlurRTV, &gAoHalfBlurSRV))
+        || !CreateR8Texture(device, newWidth, newHeight, &gAoBlurTex, &gAoBlurRTV, &gAoBlurSRV))
     {
         Log("WARNING: Failed to recreate AO textures after resolution change");
         gInitialized = false;

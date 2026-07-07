@@ -248,6 +248,11 @@ static void BloomPreExecute(const DustFrameContext* ctx, const DustHostAPI* host
     if (!gConfig.enabled)
         return;
 
+    // Zero intensity contributes nothing (composite writes bloom * 0) — skip the
+    // whole chain including this scene copy. Debug view still needs the chain.
+    if (gConfig.intensity <= 0.0f && !gConfig.debugView)
+        return;
+
     gHdrCopySRV = host->GetSceneCopy(ctx->context, DUST_RESOURCE_HDR_RT);
 }
 
@@ -388,7 +393,7 @@ static void BloomPostExecute(const DustFrameContext* ctx, const DustHostAPI* hos
 
 static int BloomIsEnabled()
 {
-    return 1;
+    return gConfig.enabled ? 1 : 0;
 }
 
 // ==================== GUI Settings ====================

@@ -105,6 +105,11 @@ static void CAPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     if (!gInitialized || !gCAConfig.enabled)
         return;
 
+    // strength 0 => zero offset, all three channels sample the same UV —
+    // identical output, skip copy + pass (debug view still needs the pass)
+    if (gCAConfig.strength <= 0.0f && !gCAConfig.debugView)
+        return;
+
     ID3D11ShaderResourceView* sceneCopy = host->GetSceneCopy(ctx->context, DUST_RESOURCE_LDR_RT);
     if (!sceneCopy) return;
 

@@ -109,6 +109,11 @@ static void VignettePostExecute(const DustFrameContext* ctx, const DustHostAPI* 
     if (!gInitialized || !gVignetteConfig.enabled)
         return;
 
+    // strength 0 => `color * lerp(1, vig, 0)` is a no-op — skip copy + pass
+    // (debug view still needs the pass to show the mask)
+    if (gVignetteConfig.strength <= 0.0f && !gVignetteConfig.debugView)
+        return;
+
     ID3D11ShaderResourceView* sceneCopy = host->GetSceneCopy(ctx->context, DUST_RESOURCE_LDR_RT);
     if (!sceneCopy) return;
 

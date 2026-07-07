@@ -1,33 +1,49 @@
 #include "ResourceRegistry.h"
+#include <cstring>
 
 ResourceRegistry gResourceRegistry;
 
+int ResourceRegistry::SlotForName(const char* name)
+{
+    if (!name) return SLOT_INVALID;
+    if (strcmp(name, ResourceName::DEPTH_SRV) == 0)   return SLOT_DEPTH;
+    if (strcmp(name, ResourceName::NORMALS_SRV) == 0) return SLOT_NORMALS;
+    if (strcmp(name, ResourceName::ALBEDO_SRV) == 0)  return SLOT_ALBEDO;
+    if (strcmp(name, ResourceName::HDR_RTV) == 0)     return SLOT_HDR;
+    if (strcmp(name, ResourceName::LDR_RTV) == 0)     return SLOT_LDR;
+    return SLOT_INVALID;
+}
+
 void ResourceRegistry::SetSRV(const char* name, ID3D11ShaderResourceView* srv)
 {
-    srvs_[name] = srv;
+    int slot = SlotForName(name);
+    if (slot != SLOT_INVALID)
+        srvs_[slot] = srv;
 }
 
 ID3D11ShaderResourceView* ResourceRegistry::GetSRV(const char* name) const
 {
-    auto it = srvs_.find(name);
-    return (it != srvs_.end()) ? it->second : nullptr;
+    int slot = SlotForName(name);
+    return (slot != SLOT_INVALID) ? srvs_[slot] : nullptr;
 }
 
 void ResourceRegistry::SetRTV(const char* name, ID3D11RenderTargetView* rtv)
 {
-    rtvs_[name] = rtv;
+    int slot = SlotForName(name);
+    if (slot != SLOT_INVALID)
+        rtvs_[slot] = rtv;
 }
 
 ID3D11RenderTargetView* ResourceRegistry::GetRTV(const char* name) const
 {
-    auto it = rtvs_.find(name);
-    return (it != rtvs_.end()) ? it->second : nullptr;
+    int slot = SlotForName(name);
+    return (slot != SLOT_INVALID) ? rtvs_[slot] : nullptr;
 }
 
 void ResourceRegistry::ResetFrame()
 {
-    srvs_.clear();
-    rtvs_.clear();
+    memset(srvs_, 0, sizeof(srvs_));
+    memset(rtvs_, 0, sizeof(rtvs_));
 }
 
 void ResourceRegistry::PopulateFrameContext(FrameContext& ctx) const

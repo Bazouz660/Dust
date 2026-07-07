@@ -1846,6 +1846,20 @@ void Render()
         }
     }
 
+    // Nothing to draw => skip the whole ImGui frame: NewFrame/Render pair,
+    // Win32 cursor/focus polling, the backbuffer RTV bind and the per-present
+    // GetDeviceRemovedReason all cost real time every frame for an empty UI.
+    // A ~6s grace window after the overlay closes lets ImGui's lazy .ini
+    // autosave (5s timer inside NewFrame) flush the final window layout.
+    {
+        static ULONGLONG sLastVisibleTick = 0;
+        ULONGLONG now = GetTickCount64();
+        if (gOverlayVisible || (gToastActive && gToastTimer > 0.0f))
+            sLastVisibleTick = now;
+        else if (sLastVisibleTick == 0 || now - sLastVisibleTick > 6000)
+            return;
+    }
+
     // Skip rendering if device has been removed (alt-tab, resolution change, etc.)
     HRESULT removeReason = gDevice->GetDeviceRemovedReason();
     if (removeReason != S_OK) return;

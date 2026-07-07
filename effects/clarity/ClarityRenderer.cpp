@@ -44,6 +44,10 @@ struct ClarityCBData
     float midtoneProtect;
     float blurRadius;
     float _pad;
+    // Normalized gaussian weights for |offset| = index (float4-aligned to
+    // match the HLSL cbuffer array layout; only .x of each entry is used).
+    // Precomputed here so the blur shaders don't evaluate exp() per tap.
+    float blurWeights[33][4];
 };
 static ID3D11Buffer* gClarityCB = nullptr;
 
@@ -245,6 +249,30 @@ void Render(ID3D11DeviceContext* ctx,
         cb.strength = gClarityConfig.strength;
         cb.midtoneProtect = gClarityConfig.midtoneProtect;
         cb.blurRadius = gClarityConfig.blurRadius;
+
+        // Gaussian weights (sigma = radius / 3, 99.7% of energy within radius),
+        // pre-normalized so the shaders skip both exp() and the weight sum
+        {
+            float sigma = gClarityConfig.blurRadius / 3.0f;
+            if (sigma < 0.5f) sigma = 0.5f;
+            float invSigma2 = -0.5f / (sigma * sigma);
+
+            int iRadius = (int)ceilf(gClarityConfig.blurRadius);
+            if (iRadius > 32) iRadius = 32;
+            if (iRadius < 0)  iRadius = 0;
+
+            float totalWeight = 0.0f;
+            for (int i = 0; i <= iRadius; i++)
+            {
+                float w = expf((float)(i * i) * invSigma2);
+                cb.blurWeights[i][0] = w;
+                totalWeight += (i == 0) ? w : 2.0f * w; // each |i|>0 tap fires twice
+            }
+            float invTotal = 1.0f / totalWeight;
+            for (int i = 0; i <= iRadius; i++)
+                cb.blurWeights[i][0] *= invTotal;
+        }
+
         gHost->UpdateConstantBuffer(ctx, gClarityCB, &cb, sizeof(cb));
     }
 

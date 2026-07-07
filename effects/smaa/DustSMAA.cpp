@@ -353,7 +353,7 @@ static void SMAAPostExecute(const DustFrameContext* ctx, const DustHostAPI* host
 
 static int SMAAIsEnabled()
 {
-    return 1;
+    return gConfig.enabled ? 1 : 0;
 }
 
 static const char* const gEdgeModeLabels[] = { "Luma", "Depth", "Luma + Depth", nullptr };

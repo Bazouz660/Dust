@@ -30,6 +30,11 @@ static void KuwaharaPostExecute(const DustFrameContext* ctx, const DustHostAPI* 
     if (!KuwaharaRenderer::IsInitialized() || !gKuwaharaConfig.enabled)
         return;
 
+    // strength 0 => output is `lerp(original, filtered, 0)` — identical,
+    // skip the scene copy and the (expensive) filter pass entirely
+    if (gKuwaharaConfig.strength <= 0.0f)
+        return;
+
     ID3D11RenderTargetView* hdrRTV = host->GetRTV(DUST_RESOURCE_HDR_RT);
     if (!hdrRTV)
         return;

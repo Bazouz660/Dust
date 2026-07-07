@@ -34,6 +34,11 @@ static void OutlinePostExecute(const DustFrameContext* ctx, const DustHostAPI* h
     if (!OutlineRenderer::IsInitialized() || !gOutlineConfig.enabled)
         return;
 
+    // strength 0 => `lerp(scene, color, edge*0)` — identical output, skip
+    // the HDR scene copy and the pass (debug view still needs them)
+    if (gOutlineConfig.strength <= 0.0f && !gOutlineConfig.debugView)
+        return;
+
     ID3D11ShaderResourceView* depthSRV = host->GetSRV(DUST_RESOURCE_DEPTH);
     if (!depthSRV)
         return;

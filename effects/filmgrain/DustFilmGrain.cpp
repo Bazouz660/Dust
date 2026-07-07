@@ -108,6 +108,11 @@ static void FilmGrainPostExecute(const DustFrameContext* ctx, const DustHostAPI*
     if (!gInitialized || !gFilmGrainConfig.enabled)
         return;
 
+    // intensity 0 => `color + noise*0` — identical output, skip copy + pass
+    // (debug view still needs the pass to show the raw noise)
+    if (gFilmGrainConfig.intensity <= 0.0f && !gFilmGrainConfig.debugView)
+        return;
+
     ID3D11ShaderResourceView* sceneCopy = host->GetSceneCopy(ctx->context, DUST_RESOURCE_LDR_RT);
     if (!sceneCopy) return;
 
