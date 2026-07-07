@@ -1,5 +1,6 @@
 #include "RTGIRenderer.h"
 #include "RTGIConfig.h"
+#include "rtgi_bluenoise.h"
 #include "DustLog.h"
 #include <cstring>
 #include <cmath>
@@ -63,6 +64,13 @@ static ID3D11UnorderedAccessView* gDenoiseUAVB = nullptr;
 // Previous frame depth — populated at end of each frame via CopyResource
 static ID3D11Texture2D*          gPrevDepthTex = nullptr;
 static ID3D11ShaderResourceView* gPrevDepthSRV = nullptr;
+
+// Tiling blue-noise (R8G8, 128x128, embedded) — R dithers slice rotation,
+// G dithers sample distances. Static spatial noise: unstructured, all energy
+// at high frequencies, so the a-trous filter removes it without temporal
+// accumulation. Resolution-independent, lives for the renderer's lifetime.
+static ID3D11Texture2D*          gBlueNoiseTex = nullptr;
+static ID3D11ShaderResourceView* gBlueNoiseSRV = nullptr;
 
 // Tracks the last final (denoised) GI output for debug overlay
 static ID3D11ShaderResourceView* gFinalGISRV = nullptr;
@@ -180,23 +188,6 @@ struct DebugCBData
 
 
 // ==================== Helpers ====================
-
-// Radical-inverse Halton sequence — quasi-random low-discrepancy sampler.
-// With b=2 and b=3 on orthogonal axes, gives an evenly-distributed 2D jitter
-// grid that doesn't clump. Cycling a 16-sample window is enough to cover the
-// 4×4 full-res footprint of a quarter-res pixel.
-static float Halton(uint32_t i, uint32_t b)
-{
-    float f = 1.0f;
-    float r = 0.0f;
-    while (i > 0)
-    {
-        f /= (float)b;
-        r += f * (float)(i % b);
-        i /= b;
-    }
-    return r;
-}
 
 // Compute reprojection matrix: currentInvView * prevView
 // Transforms current view-space positions directly to previous view-space,
@@ -430,6 +421,28 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
     if (!CreateTextures(device, width, height))
         return false;
 
+    // Blue-noise texture (immutable, embedded data)
+    {
+        D3D11_TEXTURE2D_DESC desc = {};
+        desc.Width = kBlueNoiseSize;
+        desc.Height = kBlueNoiseSize;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_R8G8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_IMMUTABLE;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        D3D11_SUBRESOURCE_DATA init = {};
+        init.pSysMem = kBlueNoiseRG;
+        init.SysMemPitch = kBlueNoiseSize * 2;
+
+        hr = device->CreateTexture2D(&desc, &init, &gBlueNoiseTex);
+        if (FAILED(hr)) { Log("RTGI: Failed to create blue-noise texture: 0x%08X", hr); return false; }
+        hr = device->CreateShaderResourceView(gBlueNoiseTex, nullptr, &gBlueNoiseSRV);
+        if (FAILED(hr)) { Log("RTGI: Failed to create blue-noise SRV: 0x%08X", hr); return false; }
+    }
+
     // Pipeline states
     {
         D3D11_BLEND_DESC desc = {};
@@ -516,6 +529,7 @@ void Shutdown()
 {
     ReleaseTextures();
 
+    SAFE_RELEASE(gBlueNoiseTex);  SAFE_RELEASE(gBlueNoiseSRV);
     SAFE_RELEASE(gFullscreenVS);
     SAFE_RELEASE(gRayTraceCS);    SAFE_RELEASE(gTemporalPS);
     SAFE_RELEASE(gVariancePS);    SAFE_RELEASE(gAtrousCS);
@@ -668,9 +682,9 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
 
         ID3D11ShaderResourceView* prevGISRV = (gAccumWriteIndex == 0) ? gAccumSRVB : gAccumSRVA;
 
-        // t0=depth, t1=scene, t2=prevGI, t3=normals
-        ID3D11ShaderResourceView* srvs[4] = { depthSRV, sceneSRV, prevGISRV, normalsSRV };
-        ctx->CSSetShaderResources(0, 4, srvs);
+        // t0=depth, t1=scene, t2=prevGI, t3=normals, t4=blue noise
+        ID3D11ShaderResourceView* srvs[5] = { depthSRV, sceneSRV, prevGISRV, normalsSRV, gBlueNoiseSRV };
+        ctx->CSSetShaderResources(0, 5, srvs);
         ID3D11SamplerState* samplers[2] = { gPointClampSampler, gLinearClampSampler };
         ctx->CSSetSamplers(0, 2, samplers);
 
@@ -691,13 +705,8 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
         cb.raysPerPixel = (float)gRTGIConfig.raysPerPixel;
         cb.thicknessCurve = gRTGIConfig.thicknessCurve;
         cb.normalDetail = gRTGIConfig.normalDetail;
-        // Sub-pixel jitter: Halton(2,3) indexed by a 16-frame cycle. Skip i=0
-        // (which Halton returns as (0,0)) so every frame contributes a unique offset.
-        {
-            uint32_t jIdx = (uint32_t)(gFrameIndex & 15u) + 1u;
-            cb.sampleJitter[0] = Halton(jIdx, 2) - 0.5f;
-            cb.sampleJitter[1] = Halton(jIdx, 3) - 0.5f;
-        }
+        // sampleJitter stays zero: the bitmask trace uses static spatial noise
+        // so the raw GI is deterministic per camera pose (no shimmer).
         // Extract COLUMNS of inverseView (= rows of view matrix = camera axes in world space)
         cb.camRight[0]   = gInverseView[0]; cb.camRight[1]   = gInverseView[4]; cb.camRight[2]   = gInverseView[8];  cb.camRight[3]   = 0;
         cb.camUp[0]      = gInverseView[1]; cb.camUp[1]      = gInverseView[5]; cb.camUp[2]      = gInverseView[9];  cb.camUp[3]      = 0;
@@ -712,8 +721,8 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
         // Unbind CS resources
         ID3D11UnorderedAccessView* nullUAV = nullptr;
         ctx->CSSetUnorderedAccessViews(0, 1, &nullUAV, &initialCount);
-        ID3D11ShaderResourceView* nullSRVs[4] = {};
-        ctx->CSSetShaderResources(0, 4, nullSRVs);
+        ID3D11ShaderResourceView* nullSRVs[5] = {};
+        ctx->CSSetShaderResources(0, 5, nullSRVs);
     }
 
     // ---- Pass 2: Temporal Accumulation (single RT: color+AO) ----

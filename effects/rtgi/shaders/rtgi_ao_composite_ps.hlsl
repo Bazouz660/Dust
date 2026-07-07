@@ -16,6 +16,7 @@ cbuffer CompositeParams : register(b0)
     float  giIntensity;
     float  saturation;
     float2 giTexSize;
+    float  shadowContrast;
 };
 
 float4 BilateralUpsample(float2 uv, float refDepth, float3 refNormal)
@@ -89,6 +90,8 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         gi = giTex.SampleLevel(linearClamp, uv, 0);
     }
 
-    float ao = gi.a;
+    // Power curve = directional GI shadows: open surfaces (ao=1) stay lit,
+    // occluded creases/contacts deepen with the contrast.
+    float ao = pow(saturate(gi.a), shadowContrast);
     return float4(ao, ao, ao, 1.0);
 }

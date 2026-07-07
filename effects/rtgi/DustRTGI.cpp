@@ -1,7 +1,9 @@
-// DustRTGI.cpp - Screen-Space Ray-Traced Global Illumination effect plugin for Dust (API v3)
-// Traces rays through the depth buffer, samples lit scene radiance at hit points for
-// indirect bounce lighting, and derives ambient occlusion from ray miss/hit ratio.
-// Uses temporal accumulation and a-trous wavelet denoising for stable output.
+// DustRTGI.cpp - Screen-Space Global Illumination effect plugin for Dust (API v3)
+// Visibility-bitmask horizon GI (Therrien 2023): sweeps depth-buffer slices per
+// pixel, tracking occluded hemisphere sectors in a 32-bit mask — directional
+// occlusion plus bounce light gathered only from newly-closed sectors.
+// Static spatial noise + a-trous wavelet denoising; temporal accumulation is
+// residual smoothing only, not required for convergence.
 
 #include "../../src/DustAPI.h"
 #include "DustLog.h"
@@ -37,6 +39,8 @@ struct CompositeCBData
     float giIntensity;
     float saturation;
     float giTexSize[2];
+    float shadowContrast;
+    float _pad[3];
 };
 
 // Track the last GI SRV for compositing
@@ -115,6 +119,7 @@ static void RTGIPostExecute(const DustFrameContext* ctx, const DustHostAPI* host
     ccb.saturation = gRTGIConfig.saturation;
     ccb.giTexSize[0] = (float)giW;
     ccb.giTexSize[1] = (float)giH;
+    ccb.shadowContrast = gRTGIConfig.shadowContrast;
     host->UpdateConstantBuffer(dc, gCompositeCB, &ccb, sizeof(ccb));
 
     ID3D11SamplerState* samplers[2] = { gLinearSampler, gPointSampler };
@@ -275,16 +280,17 @@ static DustSettingDesc gSettingsArray[] = {
     { "Enabled",            DUST_SETTING_BOOL,  &gRTGIConfig.enabled,         0.0f,   1.0f,  "Enabled",         nullptr, "Enable or disable ray-traced global illumination",                        DUST_PERF_HIGH   },
     { "GI Intensity",       DUST_SETTING_FLOAT, &gRTGIConfig.giIntensity,     0.0f,   5.0f,  "GIIntensity",     nullptr, "Brightness of indirect light bounces",                                    DUST_PERF_NONE   },
     { "AO Intensity",       DUST_SETTING_FLOAT, &gRTGIConfig.aoIntensity,     0.0f,   2.0f,  "AOIntensity",     nullptr, "Strength of ambient occlusion darkening",                                 DUST_PERF_NONE   },
-    { "Ray Length",         DUST_SETTING_FLOAT, &gRTGIConfig.rayLength,       0.05f,  1.0f,  "RayLength",       nullptr, "Maximum ray marching distance",                                           DUST_PERF_NONE   },
-    { "Ray Steps",          DUST_SETTING_INT,   &gRTGIConfig.raySteps,        8.0f,   64.0f, "RaySteps",        nullptr, "Steps per ray (more = higher quality, higher cost)",                      DUST_PERF_HIGH   },
-    { "Rays Per Pixel",     DUST_SETTING_INT,   &gRTGIConfig.raysPerPixel,    1.0f,   16.0f, "RaysPerPixel",    nullptr, "Number of rays cast per pixel (more = less noise, higher cost)",          DUST_PERF_HIGH   },
-    { "Thickness",          DUST_SETTING_FLOAT, &gRTGIConfig.thickness,       0.005f, 0.5f,  "Thickness",       nullptr, "Assumed surface thickness for hit detection",                             DUST_PERF_NONE   },
+    { "Shadow Contrast",    DUST_SETTING_FLOAT, &gRTGIConfig.shadowContrast,  0.5f,   5.0f,  "ShadowContrast",  nullptr, "Contrast of the directional GI occlusion. >1 deepens shadows in creases/under objects; 1.0 = plain linear AO.", DUST_PERF_NONE },
+    { "Ray Length",         DUST_SETTING_FLOAT, &gRTGIConfig.rayLength,       0.05f,  1.0f,  "RayLength",       nullptr, "GI gather radius (screen-space horizon march distance)",                  DUST_PERF_NONE   },
+    { "Steps Per Slice",    DUST_SETTING_INT,   &gRTGIConfig.raySteps,        8.0f,   64.0f, "RaySteps",        nullptr, "Depth samples per horizon slice (more = higher quality, higher cost)",    DUST_PERF_HIGH   },
+    { "Slices",             DUST_SETTING_INT,   &gRTGIConfig.raysPerPixel,    2.0f,   16.0f, "RaysPerPixel",    nullptr, "Horizon slice directions per pixel (more = less noise, higher cost)",     DUST_PERF_HIGH   },
+    { "Thickness",          DUST_SETTING_FLOAT, &gRTGIConfig.thickness,       0.005f, 0.5f,  "Thickness",       nullptr, "Assumed occluder thickness behind visible surfaces",                      DUST_PERF_NONE   },
     { "Thickness Curve",    DUST_SETTING_FLOAT, &gRTGIConfig.thicknessCurve,  0.3f,   1.5f,  "ThicknessCurve",  nullptr, "How thickness scales with distance",                                      DUST_PERF_NONE   },
     { "Fade Distance",      DUST_SETTING_FLOAT, &gRTGIConfig.fadeDistance,     0.01f,  1.0f,  "FadeDistance",    nullptr, "Distance at which the effect fades out",                                 DUST_PERF_NONE   },
     { "Normal Detail",      DUST_SETTING_FLOAT, &gRTGIConfig.normalDetail,    0.0f,   1.0f,  "NormalDetail",    nullptr, "Normal map influence (0 = smooth geometry, 1 = full detail)",             DUST_PERF_NONE   },
     { "Bounce Intensity",   DUST_SETTING_FLOAT, &gRTGIConfig.bounceIntensity, 0.0f,   2.0f,  "BounceIntensity", nullptr, "Strength of secondary light bounces",                                     DUST_PERF_NONE   },
     { "Saturation",         DUST_SETTING_FLOAT, &gRTGIConfig.saturation,      0.0f,   2.0f,  "Saturation",      nullptr, "Color saturation of indirect light",                                      DUST_PERF_NONE   },
-    { "Temporal Blend",     DUST_SETTING_FLOAT, &gRTGIConfig.temporalBlend,   0.5f,   0.99f, "TemporalBlend",   nullptr, "Frame blending for noise reduction (higher = smoother but more ghosting)", DUST_PERF_NONE  },
+    { "Temporal Blend",     DUST_SETTING_FLOAT, &gRTGIConfig.temporalBlend,   0.5f,   0.99f, "TemporalBlend",   nullptr, "Residual frame smoothing (quality does not depend on it; higher = smoother but more ghosting)", DUST_PERF_NONE  },
     { "Denoise Steps",      DUST_SETTING_INT,   &gRTGIConfig.denoiseSteps,    0.0f,   5.0f,  "DenoiseSteps",    nullptr, "Number of spatial denoising passes",                                      DUST_PERF_MEDIUM },
     { "Depth Sigma",        DUST_SETTING_FLOAT, &gRTGIConfig.depthSigma,      0.1f,   5.0f,  "DepthSigma",      nullptr, "Depth sensitivity of the denoiser",                                       DUST_PERF_NONE   },
     { "Color Phi",          DUST_SETTING_FLOAT, &gRTGIConfig.phiColor,        1.0f,   10.0f, "PhiColor",        nullptr, "Color sensitivity of the denoiser",                                       DUST_PERF_NONE   },
