@@ -6,6 +6,7 @@
 #include "DustLog.h"
 #include <d3dcompiler.h>
 #include <vector>
+#include <unordered_map>
 #include <cstring>
 #include <string>
 #include <windows.h>
@@ -31,9 +32,13 @@ static ID3D11Texture2D*          sVelStaging = nullptr;   // CPU readback for st
 
 static ID3D11VertexShader*   sVelVS = nullptr;
 static ID3D11PixelShader*    sVelPS = nullptr;
-static ID3D11VertexShader*   sFsVS  = nullptr;
+static ID3D11VertexShader*   sVelSkinVS = nullptr;   // A.3b skinned velocity VS
 static ID3D11PixelShader*    sFsPS  = nullptr;
+static ID3D11VertexShader*   sFsVS  = nullptr;
 static ID3D11Buffer*         sVelCB = nullptr;
+static ID3D11Buffer*         sCurBoneCB = nullptr;    // 80 float3x4 bone palette (this frame)
+static ID3D11Buffer*         sPrevBoneCB = nullptr;   // matched previous-frame bone palette
+static ID3D11Buffer*         sVpCB = nullptr;         // { curVP, prevVP } for skinned
 static ID3D11DepthStencilState* sDepthState = nullptr;
 static ID3D11RasterizerState*   sRaster = nullptr;
 static ID3D11BlendState*        sBlend = nullptr;
@@ -49,6 +54,49 @@ VOut main(float3 iPos : POSITION) {
     VOut o;
     o.cur  = mul(curWVP, float4(iPos, 1.0));
     o.prev = mul(reproj, o.cur);      // analytic reprojection to previous frame's clip space
+    o.pos  = o.cur;
+    return o;
+})";
+
+// Skinned velocity VS (A.3b): skin the vertex with CURRENT bones (this frame's pose+camera)
+// and PREVIOUS bones (last frame's matched pose+camera) to get true per-object motion.
+// Bones are worldMatrix3x4Array at CB offset 0 in every skinned shader; VP passed separately.
+static const char* kVelSkinVS = R"(
+// Mirrors the game's skin.hlsl main_vs EXACTLY (the only skinned deferred shader):
+//   #define WEIGHTS 3, #define BONES 60; blendPos = sum_{i<3} mul(bone[idx[i]],pos).xyz*wgt[i];
+//   oPosition = mul(viewProjectionMatrix, float4(blendPos,1)).
+// skin.hlsl is compiled ROW-major (proof: its float3x4 bones are 48 B/bone -> boneCnt*48 lands
+// exactly on clipOff; a column-major float3x4 would be 64 B). So EVERY matrix in this shader's
+// CB is row-major: bones AND viewProjectionMatrix. Declare both row_major or D3DCompile's
+// column-major default reads them transposed (48B bone stride -> garbage skinning; transposed
+// VP -> negative/near-zero w -> radial spike blowup). NOTE the static pass reads objects.hlsl's
+// worldViewProj COLUMN-major because that's a *separate* compilation (column-major) — the pack
+// convention is per-shader, not engine-wide, so static != skinned here.
+// CRITICAL: loop i<3 not i<4 — the vertex BLENDWEIGHT/BLENDINDICES stream is 3-component, so a
+// 4th read auto-fills w=1.0 (weight) / w=1 (index) => a full bogus bone added to every vertex.
+cbuffer CurBones  : register(b0) { row_major float3x4 curBones[80]; };
+cbuffer PrevBones : register(b1) { row_major float3x4 prevBones[80]; };
+cbuffer VelVP     : register(b2) { row_major float4x4 curVP; row_major float4x4 prevVP; };
+struct VOut { float4 pos:SV_Position; float4 cur:TEXCOORD0; float4 prev:TEXCOORD1; };
+// Declare the FULL game main_vs input signature (POSITION, TEXCOORD0, NORMAL, TANGENT0,
+// BINORMAL0, BLENDINDICES, BLENDWEIGHT) even though we only use position+blend. The captured
+// input layout was built against this full signature; pairing it with a REDUCED signature
+// misaligns the IA fetch for trailing (blend) elements even when POSITION reads fine.
+VOut main(float4 iPos : POSITION, float2 iTex : TEXCOORD0, float3 iNrm : NORMAL,
+          float4 iTan : TANGENT0, float3 iBin : BINORMAL0,
+          uint4 bidx : BLENDINDICES, float4 bwgt : BLENDWEIGHT) {
+    VOut o;
+    // blendPos accumulates float4(worldPos,1)*weight so blendPos.w = sum(weights); feed that .w
+    // (NOT a forced 1.0) into mul(VP,blendPos), exactly like the game — verts whose weights don't
+    // sum to 1 project correctly only with the carried .w.
+    float4 cwv = float4(0,0,0,0), pwv = float4(0,0,0,0);
+    [unroll] for (int i = 0; i < 3; i++) {
+        uint bi = (uint)bidx[i]; bi = (bi < 60u) ? bi : 0u;
+        cwv += float4(mul(curBones[bi],  iPos).xyz, 1.0) * bwgt[i];
+        pwv += float4(mul(prevBones[bi], iPos).xyz, 1.0) * bwgt[i];
+    }
+    o.cur  = mul(curVP,  cwv);
+    o.prev = mul(prevVP, pwv);
     o.pos  = o.cur;
     return o;
 })";
@@ -141,6 +189,7 @@ static bool EnsureResources()
 
     if (!sVelVS && !CompileVS(kVelVS, &sVelVS)) return false;
     if (!sVelPS && !CompilePS(kVelPS, &sVelPS)) return false;
+    if (!sVelSkinVS && !CompileVS(kVelSkinVS, &sVelSkinVS)) return false;
     if (!sFsVS  && !CompileVS(kFsVS,  &sFsVS))  return false;
     if (!sFsPS  && !CompilePS(kFsPS,  &sFsPS))  return false;
 
@@ -150,6 +199,21 @@ static bool EnsureResources()
         bd.ByteWidth = sizeof(VelCB); bd.Usage = D3D11_USAGE_DYNAMIC;
         bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         sDevice->CreateBuffer(&bd, nullptr, &sVelCB);
+    }
+    if (!sCurBoneCB)   // 80 float3x4 = 3840 bytes; holds any skinned palette
+    {
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = 80 * 48; bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        sDevice->CreateBuffer(&bd, nullptr, &sCurBoneCB);
+        sDevice->CreateBuffer(&bd, nullptr, &sPrevBoneCB);
+    }
+    if (!sVpCB)
+    {
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = 128; bd.Usage = D3D11_USAGE_DYNAMIC;   // curVP + prevVP
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        sDevice->CreateBuffer(&bd, nullptr, &sVpCB);
     }
     if (!sDepthState)
     {
@@ -408,6 +472,46 @@ void RenderVelocity(ID3D11DeviceContext* ctx)
         ogreVsGeom = FrobDiff2(curVP, geomVP) / mag;
     }
 
+    // --- A.3b: gather skinned draws with bone palette + skinnedVP, matched to the previous frame
+    //     by MESH IDENTITY (ib+idxCount+baseVtx) + nearest ROOT bone, NOT draw order (the game
+    //     reorders/culls skinned draws as the camera moves -> order-matching pairs the wrong
+    //     character -> huge bogus MV -> flashing). A gate rejects no-confident-prev -> skip. ---
+    struct SkinRec { std::vector<uint8_t> bones; float vp[16];
+                     ID3D11Buffer* ib; uint32_t idxCount; INT baseVtx; float root[3]; };
+    static std::unordered_map<ID3D11VertexShader*, std::vector<SkinRec>> sPrevSkin;
+    std::unordered_map<ID3D11VertexShader*, std::vector<SkinRec>> curSkin;
+    struct SkinItem { const CapturedDraw* d; ID3D11VertexShader* vs; uint32_t classIdx; };
+    std::vector<SkinItem> skinItems;
+    uint32_t skinTotal = 0, skinMatched = 0;
+
+    for (const auto& d : caps)
+    {
+        if (!d.vsMetadata || d.vsMetadata->transformType != VSTransformType::SKINNED) continue;
+        if (!d.cbStagingCopy || !d.indexBuffer || !d.inputLayout) continue;
+        uint32_t clipOff  = d.vsMetadata->clipMatrixOffset;
+        uint32_t boneOff  = d.vsMetadata->boneArrayOffset;
+        uint32_t boneCnt  = d.vsMetadata->boneCount;
+        if (clipOff + 64 > d.cbStagingSize) continue;
+        if (boneCnt == 0 || boneCnt > 80) continue;                 // need reflected bones; cap to CB
+        uint32_t bonesLen = boneCnt * 48;
+        if (boneOff + bonesLen > d.cbStagingSize) continue;
+
+        D3D11_MAPPED_SUBRESOURCE ms;
+        if (FAILED(ctx->Map(d.cbStagingCopy, 0, D3D11_MAP_READ, 0, &ms))) continue;
+        SkinRec rec;
+        rec.bones.assign((const uint8_t*)ms.pData + boneOff, (const uint8_t*)ms.pData + boneOff + bonesLen);
+        memcpy(rec.vp, (const uint8_t*)ms.pData + clipOff, 64);       // skinned viewProjectionMatrix
+        const float* bf = (const float*)rec.bones.data();            // bone0 row-major float3x4
+        rec.root[0] = bf[3]; rec.root[1] = bf[7]; rec.root[2] = bf[11];   // bone0 translation (rebased world)
+        rec.ib = d.indexBuffer; rec.idxCount = d.indexCount; rec.baseVtx = d.baseVertexLocation;
+        ctx->Unmap(d.cbStagingCopy, 0);
+
+        uint32_t idx = (uint32_t)curSkin[d.vs].size();
+        curSkin[d.vs].push_back(std::move(rec));
+        skinItems.push_back({ &d, d.vs, idx });
+        skinTotal++;
+    }
+
     // reproj = prevVP * inv(curVP), used RAW (no clamp/reuse) so we can see the truth.
     static Mat4 sPrevVP; static bool sHaveVP = false;
     static float sLastReproj[16]; static bool sHaveLast = false;
@@ -462,6 +566,61 @@ void RenderVelocity(ID3D11DeviceContext* ctx)
         drawn++;
     }
 
+    // Skinned velocity (A.3b): render each matched character with cur + prev bone pose. Same
+    // OM/depth/raster/viewport/PS as the static pass; just swap the VS + its bone/VP CBs.
+    ctx->VSSetShader(sVelSkinVS, nullptr, 0);
+    uint32_t skinDrawn = 0;
+    // Per-prev-vector "already claimed" flags so matching is one-to-one.
+    std::unordered_map<ID3D11VertexShader*, std::vector<char>> prevUsed;
+    const float kMatchGate2 = 25.0f * 25.0f;   // rebased world units^2; rejects wrong-char / origin-resnap
+    for (const auto& si : skinItems)
+    {
+        auto pit = sPrevSkin.find(si.vs);
+        if (pit == sPrevSkin.end()) continue;
+        const SkinRec& cur = curSkin[si.vs][si.classIdx];
+        auto& prevVec = pit->second;
+        auto& usedVec = prevUsed[si.vs];
+        if (usedVec.size() != prevVec.size()) usedVec.assign(prevVec.size(), 0);
+
+        // Match to the same-mesh previous draw whose root bone is nearest (characters barely move
+        // between frames). Gate rejects "no real prev" -> skip -> no wrong MV (reactive later).
+        int best = -1; float bestD = 1e30f;
+        for (size_t j = 0; j < prevVec.size(); j++)
+        {
+            const SkinRec& pr = prevVec[j];
+            if (usedVec[j] || pr.ib != cur.ib || pr.idxCount != cur.idxCount || pr.baseVtx != cur.baseVtx) continue;
+            float dx = cur.root[0]-pr.root[0], dy = cur.root[1]-pr.root[1], dz = cur.root[2]-pr.root[2];
+            float dd = dx*dx + dy*dy + dz*dz;
+            if (dd < bestD) { bestD = dd; best = (int)j; }
+        }
+        if (best < 0 || bestD > kMatchGate2) continue;   // no confident prev -> skip this character
+        usedVec[best] = 1; skinMatched++;
+        const SkinRec& prev = prevVec[best];
+        const CapturedDraw& d = *si.d;
+
+        D3D11_MAPPED_SUBRESOURCE ms;
+        // Zero the full 80-slot CB before uploading the (<=60) real bones, so an out-of-range
+        // blend index reads mul(0,pos)=0 (benign) instead of stale garbage from a prior draw.
+        if (SUCCEEDED(ctx->Map(sCurBoneCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms)))
+        { memset(ms.pData, 0, 80 * 48); memcpy(ms.pData, cur.bones.data(), cur.bones.size()); ctx->Unmap(sCurBoneCB, 0); }
+        if (SUCCEEDED(ctx->Map(sPrevBoneCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms)))
+        { memset(ms.pData, 0, 80 * 48); memcpy(ms.pData, prev.bones.data(), prev.bones.size()); ctx->Unmap(sPrevBoneCB, 0); }
+        if (SUCCEEDED(ctx->Map(sVpCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms)))
+        { memcpy(ms.pData, cur.vp, 64); memcpy((uint8_t*)ms.pData + 64, prev.vp, 64); ctx->Unmap(sVpCB, 0); }
+        ID3D11Buffer* cbs[3] = { sCurBoneCB, sPrevBoneCB, sVpCB };
+        ctx->VSSetConstantBuffers(0, 3, cbs);
+
+        ctx->IASetInputLayout(d.inputLayout);
+        ctx->IASetPrimitiveTopology(d.topology);
+        ctx->IASetVertexBuffers(0, CapturedDraw::MAX_VB_SLOTS,
+            (ID3D11Buffer* const*)d.vertexBuffers, d.vbStrides, d.vbOffsets);
+        ctx->IASetIndexBuffer(d.indexBuffer, d.indexFormat, d.ibOffset);
+        ctx->DrawIndexed(d.indexCount, d.startIndexLocation, d.baseVertexLocation);
+        skinDrawn++;
+    }
+    if ((sFrame % 60) == 0)
+        Log("MV[A.3b]: skinned=%u matched=%u drawn=%u", skinTotal, skinMatched, skinDrawn);
+
     if ((sFrame % 300) == 0)   // heavy full-RT readback: rare, so its stall isn't a periodic hitch
         LogStats(ctx, drawn);
 
@@ -471,6 +630,7 @@ void RenderVelocity(ID3D11DeviceContext* ctx)
     for (int i = 0; i < 4; i++) if (savedVB[i]) savedVB[i]->Release();
     if (savedIB) savedIB->Release();
 
+    sPrevSkin = std::move(curSkin);   // this frame's poses become next frame's "previous"
     sFrame++;
 }
 
@@ -499,9 +659,13 @@ void Shutdown()
     ReleaseTargets();
     if (sVelVS) { sVelVS->Release(); sVelVS = nullptr; }
     if (sVelPS) { sVelPS->Release(); sVelPS = nullptr; }
+    if (sVelSkinVS) { sVelSkinVS->Release(); sVelSkinVS = nullptr; }
     if (sFsVS)  { sFsVS->Release();  sFsVS = nullptr; }
     if (sFsPS)  { sFsPS->Release();  sFsPS = nullptr; }
     if (sVelCB) { sVelCB->Release(); sVelCB = nullptr; }
+    if (sCurBoneCB)  { sCurBoneCB->Release();  sCurBoneCB = nullptr; }
+    if (sPrevBoneCB) { sPrevBoneCB->Release(); sPrevBoneCB = nullptr; }
+    if (sVpCB)  { sVpCB->Release();  sVpCB = nullptr; }
     if (sDepthState) { sDepthState->Release(); sDepthState = nullptr; }
     if (sRaster) { sRaster->Release(); sRaster = nullptr; }
     if (sBlend) { sBlend->Release(); sBlend = nullptr; }

@@ -2,6 +2,8 @@
 
 #include <d3d11.h>
 #include <cstdint>
+#include <vector>
+#include <string>
 
 // How the VS transforms vertices to clip space.
 // Determined by which matrix parameter the shader declares.
@@ -26,6 +28,11 @@ struct VSConstantBufferInfo
     uint32_t worldMatrixOffset = 0;
     uint32_t worldMatrixSize   = 0;
 
+    // SKINNED: byte offset + count of worldMatrix3x4Array (bone palette, 48 bytes/bone).
+    // The offset varies per shader (some declare uniforms before it), so it must be reflected.
+    uint32_t boneArrayOffset = 0;
+    uint32_t boneCount       = 0;
+
     // Total size of the constant buffer containing the matrices.
     uint32_t cbTotalSize = 0;
 
@@ -33,8 +40,28 @@ struct VSConstantBufferInfo
     uint32_t cbSlot = 0;
 };
 
+// One element of a vertex declaration, captured from CreateInputLayout (deep copy: the
+// D3D11_INPUT_ELEMENT_DESC.SemanticName pointer is caller-owned and dangles after the call).
+struct InputElement
+{
+    std::string                semantic;
+    uint32_t                   semanticIndex;
+    DXGI_FORMAT                format;
+    uint32_t                   inputSlot;
+    uint32_t                   alignedByteOffset;
+    D3D11_INPUT_CLASSIFICATION slotClass;
+    uint32_t                   instanceStepRate;
+};
+
 namespace ShaderMetadata
 {
+    // Record the real vertex declaration for a created input layout (ground-truth slot/
+    // offset/format per semantic — the only place OGRE's mesh vertex format is visible).
+    void OnInputLayoutCreated(ID3D11InputLayout* layout,
+                              const D3D11_INPUT_ELEMENT_DESC* descs, UINT count);
+    // Look up the elements for a layout. Returns nullptr if never seen.
+    const std::vector<InputElement>* GetInputLayoutElements(ID3D11InputLayout* layout);
+
     // Called from HookedCreateVertexShader after the VS is created.
     // Runs D3DReflect on the bytecode to extract the constant buffer layout.
     // Safe to call for any VS — non-GBuffer shaders are stored as UNKNOWN.

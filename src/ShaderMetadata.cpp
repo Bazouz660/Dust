@@ -9,6 +9,34 @@ namespace ShaderMetadata
 {
 
 static std::unordered_map<ID3D11VertexShader*, VSConstantBufferInfo> sVSMap;
+static std::unordered_map<ID3D11InputLayout*, std::vector<InputElement>> sLayoutMap;
+
+void OnInputLayoutCreated(ID3D11InputLayout* layout,
+                          const D3D11_INPUT_ELEMENT_DESC* descs, UINT count)
+{
+    if (!layout || !descs || count == 0) return;
+    std::vector<InputElement> elems;
+    elems.reserve(count);
+    for (UINT i = 0; i < count; i++)
+    {
+        InputElement e;
+        e.semantic          = descs[i].SemanticName ? descs[i].SemanticName : "";
+        e.semanticIndex     = descs[i].SemanticIndex;
+        e.format            = descs[i].Format;
+        e.inputSlot         = descs[i].InputSlot;
+        e.alignedByteOffset = descs[i].AlignedByteOffset;
+        e.slotClass         = descs[i].InputSlotClass;
+        e.instanceStepRate  = descs[i].InstanceDataStepRate;
+        elems.push_back(std::move(e));
+    }
+    sLayoutMap[layout] = std::move(elems);
+}
+
+const std::vector<InputElement>* GetInputLayoutElements(ID3D11InputLayout* layout)
+{
+    auto it = sLayoutMap.find(layout);
+    return (it != sLayoutMap.end()) ? &it->second : nullptr;
+}
 
 // Clip-space transform matrix names, verified from every Kenshi GBuffer VS source:
 //   objects.hlsl    -> worldViewProjMatrix   (param_named_auto worldviewproj_matrix)
@@ -120,6 +148,14 @@ void OnVertexShaderCreated(const void* bytecode, SIZE_T bytecodeSize,
             {
                 info.worldMatrixOffset = varDesc.StartOffset;
                 info.worldMatrixSize   = varDesc.Size;
+            }
+
+            // Skinned bone palette (worldMatrix3x4Array[BONES]) — offset varies per shader
+            // (some declare uniforms before it), so the MV pass must read it from here, not 0.
+            if (strcmp(varDesc.Name, "worldMatrix3x4Array") == 0)
+            {
+                info.boneArrayOffset = varDesc.StartOffset;
+                info.boneCount       = varDesc.Size / 48;   // each float3x4 bone = 48 bytes (row-major)
             }
         }
     }

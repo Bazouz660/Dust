@@ -1296,6 +1296,27 @@ static HRESULT STDMETHODCALLTYPE HookedCreatePixelShader(
     return hr;
 }
 
+// ==================== CreateInputLayout hook (records vertex declarations) ====================
+
+typedef HRESULT(STDMETHODCALLTYPE* PFN_CreateInputLayout)(
+    ID3D11Device* pThis, const D3D11_INPUT_ELEMENT_DESC* pInputElementDescs, UINT NumElements,
+    const void* pShaderBytecodeWithInputSignature, SIZE_T BytecodeLength,
+    ID3D11InputLayout** ppInputLayout);
+
+static PFN_CreateInputLayout oCreateInputLayout = nullptr;
+
+static HRESULT STDMETHODCALLTYPE HookedCreateInputLayout(
+    ID3D11Device* pThis, const D3D11_INPUT_ELEMENT_DESC* pInputElementDescs, UINT NumElements,
+    const void* pShaderBytecodeWithInputSignature, SIZE_T BytecodeLength,
+    ID3D11InputLayout** ppInputLayout)
+{
+    HRESULT hr = oCreateInputLayout(pThis, pInputElementDescs, NumElements,
+                                    pShaderBytecodeWithInputSignature, BytecodeLength, ppInputLayout);
+    if (!gShutdownSignaled && SUCCEEDED(hr) && ppInputLayout && *ppInputLayout)
+        ShaderMetadata::OnInputLayoutCreated(*ppInputLayout, pInputElementDescs, NumElements);
+    return hr;
+}
+
 // ==================== CreateVertexShader hook (for shader source tracking) ====================
 
 typedef HRESULT(STDMETHODCALLTYPE* PFN_CreateVertexShader)(
@@ -1984,6 +2005,7 @@ static HRESULT STDMETHODCALLTYPE HookedResizeBuffers(
 // ==================== Install ====================
 
 static const int VTIDX_DEVICE_CreateTexture2D       = 5;
+static const int VTIDX_DEVICE_CreateInputLayout     = 11;
 static const int VTIDX_DEVICE_CreateVertexShader    = 12;
 static const int VTIDX_DEVICE_CreatePixelShader     = 15;
 static const int VTIDX_CTX_PSSetShaderResources     = 8;
@@ -2041,6 +2063,7 @@ bool Install()
     void** scVtable  = *reinterpret_cast<void***>(tmpSwapChain);
 
     void* addrCreateTex2D  = devVtable[VTIDX_DEVICE_CreateTexture2D];
+    void* addrCreateInpLay = devVtable[VTIDX_DEVICE_CreateInputLayout];
     void* addrCreateVS     = devVtable[VTIDX_DEVICE_CreateVertexShader];
     void* addrCreatePS     = devVtable[VTIDX_DEVICE_CreatePixelShader];
     void* addrDraw         = ctxVtable[VTIDX_CTX_Draw];
@@ -2130,6 +2153,10 @@ bool Install()
     if (KenshiLib::AddHook(addrCreateTex2D, (void*)HookedCreateTexture2D,
                            (void**)&oCreateTexture2D) != KenshiLib::SUCCESS)
     { Log("ERROR: Failed to hook CreateTexture2D"); ok = false; }
+
+    if (KenshiLib::AddHook(addrCreateInpLay, (void*)HookedCreateInputLayout,
+                           (void**)&oCreateInputLayout) != KenshiLib::SUCCESS)
+    { Log("WARNING: Failed to hook CreateInputLayout (vertex-declaration RE disabled)"); }
 
     if (KenshiLib::AddHook(addrCreateVS, (void*)HookedCreateVertexShader,
                            (void**)&oCreateVertexShader) != KenshiLib::SUCCESS)
