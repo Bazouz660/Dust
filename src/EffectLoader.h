@@ -61,6 +61,10 @@ public:
     void DispatchPre(DustInjectionPoint point, const DustFrameContext* ctx);
     void DispatchPost(DustInjectionPoint point, const DustFrameContext* ctx);
 
+    // Dispatch the v5 postLightVolumes callback (point-agnostic). Fired once per
+    // frame by the hook after the point/spot light volumes, before fog/tonemap.
+    void DispatchPostLightVolumes(const DustFrameContext* ctx);
+
     void CapturePreFogHDR(ID3D11DeviceContext* ctx);
     void OnResolutionChanged(ID3D11Device* device, uint32_t w, uint32_t h);
     void ShutdownAll();

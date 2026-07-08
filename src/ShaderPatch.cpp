@@ -596,6 +596,63 @@ static std::string PatchObjectsShader(const std::string& src)
     return result;
 }
 
+// Patch the point/spot light-volume pixel shader (light_fs in deferred.hlsl) to apply
+// the same direct-light AO term the sun pass uses. Without this, SSAO's "Direct Light AO"
+// only darkens the sun; point and spot lights (rendered as additive forward light volumes
+// through light_fs, a separate compile) stay fully lit regardless of the setting.
+// The AO map is fed to s8/s9 per-draw by the host's light-volume path (see D3D11Hook.cpp),
+// which recognizes this shader via the bytecode registered in HookedD3DCompile below.
+// Returns the modified source, or the original if anchors weren't found.
+static std::string PatchLightVolumeShader(const std::string& src)
+{
+    std::string result = src;
+
+    // Injection 1: declare the AO texture/sampler as globals with EXPLICIT texture
+    // registers t8/t9. This is load-bearing: light_fs only uses t0-t2, so a combined
+    // "sampler aoMap : register(s8)" binds the SAMPLER to s8 but lets the compiler
+    // auto-assign the TEXTURE to t3 — while the host binds the AO SRV to t8. light_fs
+    // would then read whatever the engine left at t3 (a tiled texture => screen-space
+    // rectangles). Separate Texture2D : register(t8) pins the texture to t8 to match the
+    // host bind (D3D11Hook.cpp LightVolumeAoScope). Verified with fxc.
+    // Anchor: "float4 light_fs(" — the function definition (unique in deferred.hlsl).
+    const char* anchorDecl = "float4 light_fs(";
+    size_t posDecl = result.find(anchorDecl);
+    if (posDecl == std::string::npos)
+    {
+        Log("ShaderPatch: light_fs anchor 'float4 light_fs(' not found, skipping");
+        return src;
+    }
+    result.insert(posDecl,
+        "// [Dust] Direct-light AO (host binds per light-volume draw): SSAO map at t8/t9,\n"
+        "// RTGI AO at t10 (white when RTGI is off). Explicit registers are REQUIRED here\n"
+        "// (light_fs only uses t0-t2, so the compiler would otherwise pack these low).\n"
+        "Texture2D    dustLvAoTex       : register(t8);\n"
+        "Texture2D    dustLvAoParamsTex : register(t9);\n"
+        "Texture2D    dustLvRtgiAoTex   : register(t10);\n"
+        "SamplerState dustLvAoSamp      : register(s8);\n\n");
+
+    // Injection 2: fade the light's contribution by the direct-light AO amount.
+    // Anchor: "color = color * attenuation * power;" — unique to light_fs. texCoord is
+    // already in scope (computed from VPOS at the top of light_fs). Same directFade
+    // formula as the sun pass: lerp(1, ao, directAO).
+    const char* anchorApply = "color = color * attenuation * power;";
+    size_t posApply = result.find(anchorApply);
+    if (posApply == std::string::npos)
+    {
+        Log("ShaderPatch: light_fs anchor 'attenuation * power' not found, skipping");
+        return src;
+    }
+    posApply += strlen(anchorApply);
+    result.insert(posApply,
+        "\n\t// [Dust] Direct-light AO for point/spot lights\n"
+        "\tfloat aoLV = dustLvAoTex.Sample(dustLvAoSamp, texCoord).r;\n"
+        "\tfloat directAOLV = dustLvAoParamsTex.Sample(dustLvAoSamp, texCoord).r;\n"
+        "\tcolor *= lerp(1.0, aoLV, directAOLV);\n"
+        "\tcolor *= dustLvRtgiAoTex.Sample(dustLvAoSamp, texCoord).r;  // RTGI AO (white when off)");
+
+    return result;
+}
+
 HRESULT WINAPI HookedD3DCompile(
     LPCVOID pSrcData, SIZE_T SrcDataSize, LPCSTR pSourceName,
     const D3D_SHADER_MACRO* pDefines, ID3DInclude* pInclude,
@@ -636,6 +693,50 @@ HRESULT WINAPI HookedD3DCompile(
                 }
 
                 Log("ShaderPatch: patched shader failed to compile, falling back to original");
+                if (ppErrorMsgs && *ppErrorMsgs)
+                {
+                    Log("ShaderPatch: error: %s", (const char*)(*ppErrorMsgs)->GetBufferPointer());
+                    (*ppErrorMsgs)->Release();
+                    *ppErrorMsgs = nullptr;
+                }
+                // Fall through to compile original below
+            }
+        }
+    }
+
+    // Detect the point/spot light-volume pixel shader: entry point "light_fs".
+    // Apply direct-light AO so SSAO darkens local lights too, matching the sun pass.
+    if (pEntrypoint && pSrcData && SrcDataSize > 0 &&
+        strcmp(pEntrypoint, "light_fs") == 0)
+    {
+        std::string src((const char*)pSrcData, SrcDataSize);
+        if (src.find("attenuation * power") != std::string::npos &&
+            src.find("aoMap") == std::string::npos)  // not already patched
+        {
+            std::string patched = PatchLightVolumeShader(src);
+            if (patched.size() != src.size())
+            {
+                Log("ShaderPatch: patched deferred light_fs (%zu -> %zu bytes)",
+                    src.size(), patched.size());
+                HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
+                                          pDefines, pInclude, pEntrypoint, pTarget,
+                                          Flags1, Flags2, ppCode, ppErrorMsgs);
+                if (SUCCEEDED(hr))
+                {
+                    if (ppCode && *ppCode)
+                    {
+                        // Register the compiled blob so the host recognizes the resulting
+                        // pixel shader at CreatePixelShader time and feeds it AO at s8/s9.
+                        D3D11Hook::NoteLightVolumeShaderBytecode(
+                            (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+                        SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
+                            pEntrypoint, pTarget, pSourceName,
+                            (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+                    }
+                    return hr;
+                }
+
+                Log("ShaderPatch: patched light_fs failed to compile, falling back to original");
                 if (ppErrorMsgs && *ppErrorMsgs)
                 {
                     Log("ShaderPatch: error: %s", (const char*)(*ppErrorMsgs)->GetBufferPointer());

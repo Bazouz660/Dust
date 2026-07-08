@@ -412,6 +412,9 @@ void EffectLoader::BuildHostAPI()
     hostAPI_.GetShadowBaseResolution  = D3D11Hook::GetShadowBaseResolution;
     hostAPI_.SetCascadeLambda         = PssmDetour::SetLambda;
     hostAPI_.SetShadowRange           = HostSetShadowRange;
+
+    // v6 additions
+    hostAPI_.SetLightVolumeAoTexture  = D3D11Hook::SetLightVolumeAoTexture;
 }
 
 // ==================== v3: Config I/O ====================
@@ -963,6 +966,21 @@ void EffectLoader::DispatchPost(DustInjectionPoint point, const DustFrameContext
 
         if (frameworkTiming)
             EndTiming(le, ctx->context, 1);
+    }
+}
+
+void EffectLoader::DispatchPostLightVolumes(const DustFrameContext* ctx)
+{
+    for (auto& le : effects_)
+    {
+        // Gate on apiVersion >= 5: a plugin built against an older header has no
+        // postLightVolumes field, so reading it would be undefined.
+        if (!le.initialized || le.desc.apiVersion < 5 || !le.desc.postLightVolumes)
+            continue;
+        if (le.desc.IsEnabled && !le.desc.IsEnabled())
+            continue;
+
+        le.desc.postLightVolumes(ctx, &hostAPI_);
     }
 }
 

@@ -17,6 +17,8 @@
 #include <cstring>
 #include <vector>
 #include <atomic>
+#include <unordered_set>
+#include <mutex>
 
 namespace D3D11Hook
 {
@@ -31,6 +33,11 @@ static UINT gWidth = 0;
 static UINT gHeight = 0;
 static uint64_t gFrameIndex = 0;
 static bool gDispatchedThisFrame = false;
+static bool gPostLightVolumesFired = false;  // v5 postLightVolumes: once per frame
+
+// Light-volume direct AO (defined below, near the CreatePixelShader hook).
+static void ReleaseLightVolumeAO();
+void SetLightVolumeAoTexture(ID3D11ShaderResourceView* srv);
 
 // Camera extraction from the game's deferred lighting CB
 // (staging CBs are in gCameraStagingCBs[], declared near ExtractCameraData)
@@ -359,7 +366,10 @@ void ResetFrameState()
     ClearShadowReplacements();
     gPipelineDetector.ResetFrame();
     gResourceRegistry.ResetFrame();
+    ReleaseLightVolumeAO();
+    SetLightVolumeAoTexture(nullptr);   // clear RTGI's per-light AO; it republishes each frame
     gDispatchedThisFrame = false;
+    gPostLightVolumesFired = false;
     gCameraDataExtracted = false;
     gDeviceRemovedThisFrame = false;
     gFrameIndex++;
@@ -925,6 +935,237 @@ static HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
     return hr;
 }
 
+// ==================== Light-volume direct AO ====================
+// Point/spot lights render as additive forward light volumes (light_fs) AFTER the
+// fullscreen sun pass (main_fs). SSAO's direct-light AO term is injected into light_fs
+// by ShaderPatch, but light_fs samples the AO map at s8/s9 — slots the engine reuses
+// between the sun pass and the light volumes. So we can't just leave the sun pass's AO
+// binding in place (that painted garbage over the light volumes). Instead we:
+//   1. identify the patched light_fs pixel shader(s) by bytecode hash at creation time,
+//   2. snapshot the AO/params SRVs the SSAO plugin binds for the sun pass (guaranteed
+//      valid at POST_LIGHTING), and
+//   3. re-bind them at s8/s9 for exactly the light-volume draws, restoring the engine's
+//      previous binding immediately after — so no state leaks into any other pass.
+// If ShaderPatch never patches light_fs (e.g. anchors missing), gLightVolumePS stays
+// empty and the whole path is a no-op.
+
+static const uint32_t AO_SLOT        = 8;   // register(s8) in deferred.hlsl (aoMap)
+static const uint32_t AO_PARAMS_SLOT = 9;   // register(s9) (aoParams)
+static const uint32_t RTGI_AO_SLOT   = 10;  // register(t10) — RTGI's per-light AO
+
+static std::mutex gLightVolumeMutex;
+static std::unordered_set<uint64_t> gLightVolumeBytecodeHashes;  // patched light_fs blobs
+static std::unordered_set<ID3D11PixelShader*> gLightVolumePS;    // created light_fs shaders
+
+// Snapshot of the AO bindings captured at POST_LIGHTING, re-applied per light-volume draw.
+static ID3D11ShaderResourceView* gLvAoSRV[2]     = { nullptr, nullptr };
+static ID3D11SamplerState*       gLvAoSampler[2] = { nullptr, nullptr };
+static bool                      gLvAoReady      = false;
+
+// RTGI publishes its per-light AO texture here each frame (via the SetLightVolumeAoTexture
+// host API); light_fs multiplies by it at t10. Null when RTGI isn't applying AO → the
+// scope binds a 1x1 white fallback so the multiply is a no-op (never leave t10 unbound —
+// an unbound SRV reads 0 and would black out the lights).
+static ID3D11ShaderResourceView* gRtgiLvAoSRV = nullptr;   // borrowed ref, refreshed per frame
+static ID3D11ShaderResourceView* gLvWhiteSRV  = nullptr;   // host-owned 1x1 R8 white
+
+static ID3D11ShaderResourceView* GetLvWhiteSRV()
+{
+    if (gLvWhiteSRV || !gDevice) return gLvWhiteSRV;
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = 1; td.Height = 1; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8_UNORM; td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_IMMUTABLE; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    uint8_t val = 255;
+    D3D11_SUBRESOURCE_DATA sd = {}; sd.pSysMem = &val; sd.SysMemPitch = 1;
+    ID3D11Texture2D* tex = nullptr;
+    if (SUCCEEDED(gDevice->CreateTexture2D(&td, &sd, &tex)) && tex)
+    {
+        gDevice->CreateShaderResourceView(tex, nullptr, &gLvWhiteSRV);
+        tex->Release();
+    }
+    return gLvWhiteSRV;
+}
+
+// Called by RTGI (via host API) each frame it produces a light-volume AO texture.
+// nullptr clears it (→ white fallback). Borrowed ref: AddRef for the frame, released on
+// the next call or at frame reset.
+void SetLightVolumeAoTexture(ID3D11ShaderResourceView* srv)
+{
+    if (srv == gRtgiLvAoSRV) return;
+    if (gRtgiLvAoSRV) gRtgiLvAoSRV->Release();
+    gRtgiLvAoSRV = srv;
+    if (gRtgiLvAoSRV) gRtgiLvAoSRV->AddRef();
+}
+
+static uint64_t Fnv1a64(const void* data, size_t len)
+{
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < len; ++i) { h ^= p[i]; h *= 1099511628211ULL; }
+    return h;
+}
+
+// Called by ShaderPatch after it successfully compiles a PATCHED light_fs blob.
+void NoteLightVolumeShaderBytecode(const void* bytecode, size_t len)
+{
+    if (!bytecode || !len) return;
+    uint64_t h = Fnv1a64(bytecode, len);
+    std::lock_guard<std::mutex> lock(gLightVolumeMutex);
+    gLightVolumeBytecodeHashes.insert(h);
+}
+
+static void ReleaseLightVolumeAO()
+{
+    for (int i = 0; i < 2; ++i)
+    {
+        if (gLvAoSRV[i])     { gLvAoSRV[i]->Release();     gLvAoSRV[i] = nullptr; }
+        if (gLvAoSampler[i]) { gLvAoSampler[i]->Release(); gLvAoSampler[i] = nullptr; }
+    }
+    gLvAoReady = false;
+}
+
+// Mirror of EffectLoader's ResolveSlot: the deferred shaders remap sampler registers by
+// shadow variant, so the AO the SSAO plugin bound at baseSlot 8/9 (via host->BindSRV) may
+// physically live at 8/9 (shadow mode) or 6/7 (no-shadow mode). We must snapshot from the
+// same physical slot it was bound to, else we'd capture an engine texture.
+static UINT ResolveAoSlot(ID3D11DeviceContext* ctx, uint32_t baseSlot)
+{
+    if (baseSlot <= 5) return baseSlot;
+    ID3D11ShaderResourceView* srv6 = nullptr;
+    ctx->PSGetShaderResources(6, 1, &srv6);
+    if (srv6) { srv6->Release(); return baseSlot; }   // shadow mode: as declared
+    return baseSlot - 2;                              // no-shadow mode: shifted down
+}
+
+// Snapshot whatever the SSAO plugin bound (logically) at s8/s9 for the sun pass. Called
+// right after DispatchPre at POST_LIGHTING, while those slots still hold the AO map+params.
+static void CaptureLightVolumeAO(ID3D11DeviceContext* ctx)
+{
+    {
+        std::lock_guard<std::mutex> lock(gLightVolumeMutex);
+        if (gLightVolumePS.empty()) return;   // nothing patched → nothing to feed
+    }
+    ReleaseLightVolumeAO();  // drop last frame's snapshot
+
+    UINT aoSlot     = ResolveAoSlot(ctx, AO_SLOT);
+    UINT paramsSlot = ResolveAoSlot(ctx, AO_PARAMS_SLOT);
+    ctx->PSGetShaderResources(aoSlot,     1, &gLvAoSRV[0]);       // AddRefs
+    ctx->PSGetShaderResources(paramsSlot, 1, &gLvAoSRV[1]);
+    ctx->PSGetSamplers(aoSlot,     1, &gLvAoSampler[0]);
+    ctx->PSGetSamplers(paramsSlot, 1, &gLvAoSampler[1]);
+    gLvAoReady = (gLvAoSRV[0] != nullptr);                        // AO map present
+
+    static bool sLogged = false;
+    if (!sLogged && gLvAoReady)
+    {
+        // Log the AO texture's dimensions so a bad capture (e.g. a 4096² shadow atlas)
+        // is obvious in the log rather than only on screen.
+        UINT w = 0, h = 0; DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+        ID3D11Resource* res = nullptr;
+        gLvAoSRV[0]->GetResource(&res);
+        if (res)
+        {
+            ID3D11Texture2D* tex = nullptr;
+            if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex)) && tex)
+            {
+                D3D11_TEXTURE2D_DESC d; tex->GetDesc(&d);
+                w = d.Width; h = d.Height; fmt = d.Format;
+                tex->Release();
+            }
+            res->Release();
+        }
+        Log("LightVolumeAO: captured AO snapshot from slots %u/%u (ao=%p %ux%u fmt=%u), %zu light_fs shader(s)",
+            aoSlot, paramsSlot, gLvAoSRV[0], w, h, (unsigned)fmt, gLightVolumePS.size());
+        sLogged = true;
+    }
+}
+
+// True if this draw is a point/spot light volume (patched light_fs bound).
+static bool IsLightVolumeDraw(ID3D11DeviceContext* ctx)
+{
+    ID3D11PixelShader* ps = nullptr;
+    ctx->PSGetShader(&ps, nullptr, nullptr);  // AddRefs
+    if (!ps) return false;
+
+    bool match;
+    {
+        std::lock_guard<std::mutex> lock(gLightVolumeMutex);
+        match = gLightVolumePS.count(ps) != 0;
+    }
+    ps->Release();
+    return match;
+}
+
+// Scoped swap of s8/s9 to the AO snapshot for a light-volume draw. Both DrawIndexed and
+// DrawIndexedInstanced route through this so the fix holds whichever call the engine uses.
+struct LightVolumeAoScope
+{
+    ID3D11DeviceContext* ctx = nullptr;
+    ID3D11ShaderResourceView* savedSRV[3] = { nullptr, nullptr, nullptr };  // t8,t9,t10
+    ID3D11SamplerState*       savedSmp[2] = { nullptr, nullptr };            // s8,s9
+    bool active = false;
+
+    // isLightVolume is precomputed by the caller (which also needs it for the
+    // postLightVolumes fire decision) to avoid a second PSGetShader per draw.
+    LightVolumeAoScope(ID3D11DeviceContext* c, bool isLightVolume)
+    {
+        if (!isLightVolume) return;
+        ctx = c;
+        // Save t8/t9/t10 + s8/s9, then bind the SSAO snapshot (t8/t9) and RTGI AO (t10,
+        // white fallback when RTGI isn't publishing) so light_fs multiplies by both.
+        ctx->PSGetShaderResources(AO_SLOT, 3, savedSRV);   // AddRefs engine's binding
+        ctx->PSGetSamplers(AO_SLOT, 2, savedSmp);
+        ID3D11ShaderResourceView* rtgi = gRtgiLvAoSRV ? gRtgiLvAoSRV : GetLvWhiteSRV();
+        ID3D11ShaderResourceView* bind3[3] = { gLvAoSRV[0], gLvAoSRV[1], rtgi };
+        ctx->PSSetShaderResources(AO_SLOT, 3, bind3);
+        ctx->PSSetSamplers(AO_SLOT, 2, gLvAoSampler);
+        active = true;
+
+        static bool sLogged = false;
+        if (!sLogged) { Log("LightVolumeAO: applying AO to light-volume draws"); sLogged = true; }
+    }
+
+    ~LightVolumeAoScope()
+    {
+        if (!active) return;
+        ctx->PSSetShaderResources(AO_SLOT, 3, savedSRV);   // restore engine's binding
+        ctx->PSSetSamplers(AO_SLOT, 2, savedSmp);
+        for (int i = 0; i < 3; ++i) if (savedSRV[i]) savedSRV[i]->Release();
+        for (int i = 0; i < 2; ++i) if (savedSmp[i]) savedSmp[i]->Release();
+    }
+};
+
+// Fire the v5 postLightVolumes callbacks once per frame (builds a frame context from the
+// captured globals). Fired at POST_FOG/POST_TONEMAP — after the point/spot light volumes.
+static void FirePostLightVolumes(ID3D11DeviceContext* ctx, const char* where)
+{
+    gPostLightVolumesFired = true;
+
+    DustFrameContext fctx = {};
+    fctx.device = gDevice;
+    fctx.context = ctx;
+    fctx.point = static_cast<DustInjectionPoint>(InjectionPoint::POST_FOG);
+    fctx.timing = DUST_TIMING_PRE;
+    fctx.width = gWidth;
+    fctx.height = gHeight;
+    fctx.frameIndex = gFrameIndex;
+    fctx.camera = gCameraData;
+    gEffectLoader.DispatchPostLightVolumes(&fctx);
+
+    // Log the first occurrence of each distinct fire path (string literals have stable
+    // addresses). "pre-transparent" = fired after light volumes, before water (good);
+    // "fog/tonemap fallback" = no light volume this frame, so it fired at POST_FOG,
+    // which is after water — surfaces the no-local-light water edge case.
+    static const char* sLoggedA = nullptr;
+    static const char* sLoggedB = nullptr;
+    if (where != sLoggedA && where != sLoggedB)
+    {
+        Log("PostLightVolumes: dispatched (%s)", where);
+        if (!sLoggedA) sLoggedA = where; else sLoggedB = where;
+    }
+}
+
 static HRESULT STDMETHODCALLTYPE HookedCreatePixelShader(
     ID3D11Device* pThis, const void* pShaderBytecode, SIZE_T BytecodeLength,
     ID3D11ClassLinkage* pClassLinkage, ID3D11PixelShader** ppPixelShader)
@@ -940,7 +1181,18 @@ static HRESULT STDMETHODCALLTYPE HookedCreatePixelShader(
     HRESULT hr = oCreatePixelShader(pThis, pShaderBytecode, BytecodeLength,
                                      pClassLinkage, ppPixelShader);
     if (SUCCEEDED(hr) && ppPixelShader && *ppPixelShader)
+    {
         SurveyRecorder::OnPixelShaderCreated(pShaderBytecode, BytecodeLength, *ppPixelShader);
+
+        // Record this shader if it's a patched light_fs (matches a hash ShaderPatch noted).
+        if (pShaderBytecode && BytecodeLength)
+        {
+            uint64_t h = Fnv1a64(pShaderBytecode, BytecodeLength);
+            std::lock_guard<std::mutex> lock(gLightVolumeMutex);
+            if (gLightVolumeBytecodeHashes.count(h))
+                gLightVolumePS.insert(*ppPixelShader);
+        }
+    }
     return hr;
 }
 
@@ -1114,9 +1366,28 @@ static void STDMETHODCALLTYPE HookedDraw(
         fctx.frameIndex = gFrameIndex;
         fctx.camera = gCameraData;
 
+        // v5 postLightVolumes: fire at the first pass after the point/spot light volumes
+        // (fog, or tonemap if no fog this frame), so effects can composite over the fully
+        // lit scene incl. local lights.
+        if (!gPostLightVolumesFired &&
+            (result.point == InjectionPoint::POST_FOG ||
+             result.point == InjectionPoint::POST_TONEMAP))
+        {
+            FirePostLightVolumes(pThis, "post-fog");
+        }
+
         // PRE: effects bind resources before the game's draw
         fctx.timing = DUST_TIMING_PRE;
         gEffectLoader.DispatchPre(dip, &fctx);
+
+        // At POST_LIGHTING the SSAO plugin has just bound the AO map + params at s8/s9
+        // for the sun pass; snapshot them so the point/spot light volumes (which draw
+        // after this, through the patched light_fs) can sample the same AO. By POST_FOG
+        // all light volumes are done, so stop feeding them.
+        if (result.point == InjectionPoint::POST_LIGHTING)
+            CaptureLightVolumeAO(pThis);
+        else if (result.point == InjectionPoint::POST_FOG)
+            gLvAoReady = false;
 
         // Execute the game's original draw call
         oDraw(pThis, VertexCount, StartVertexLocation);
@@ -1140,6 +1411,11 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     if (Survey::IsActive())
         SurveyRecorder::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 
+    // Direct-light AO for point/spot lights: for a light_fs draw, swap the AO snapshot
+    // into s8/s9 for the draw and restore afterward (scope dtor). gLvAoReady gates the
+    // PSGetShader check to the POST_LIGHTING→POST_FOG window.
+    bool isLV = gLvAoReady && IsLightVolumeDraw(pThis);
+    LightVolumeAoScope lvAo(pThis, isLV);
     oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 }
 
@@ -1154,6 +1430,9 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
                                                 StartIndexLocation, BaseVertexLocation,
                                                 StartInstanceLocation);
 
+    // Direct-light AO for point/spot lights (instanced light-volume path — see HookedDrawIndexed).
+    bool isLV = gLvAoReady && IsLightVolumeDraw(pThis);
+    LightVolumeAoScope lvAo(pThis, isLV);
     oDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
                           StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
 }

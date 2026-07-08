@@ -46,6 +46,35 @@ struct CompositeCBData
 // Track the last GI SRV for compositing
 static ID3D11ShaderResourceView* gLastGISRV = nullptr;
 
+// Standalone full-res AO texture handed to the framework so it can multiply RTGI's AO
+// into each point/spot light-volume draw (light_fs). This lets local lights get AO
+// without a fullscreen multiply that would also darken water/transparents.
+static ID3D11Texture2D*          gRtgiAoTex = nullptr;
+static ID3D11RenderTargetView*   gRtgiAoRTV = nullptr;
+static ID3D11ShaderResourceView* gRtgiAoSRV = nullptr;
+
+static void ReleaseRtgiAoTex()
+{
+    if (gRtgiAoSRV) { gRtgiAoSRV->Release(); gRtgiAoSRV = nullptr; }
+    if (gRtgiAoRTV) { gRtgiAoRTV->Release(); gRtgiAoRTV = nullptr; }
+    if (gRtgiAoTex) { gRtgiAoTex->Release(); gRtgiAoTex = nullptr; }
+}
+
+static bool CreateRtgiAoTex(ID3D11Device* device, uint32_t w, uint32_t h)
+{
+    ReleaseRtgiAoTex();
+    if (!device || w == 0 || h == 0) return false;
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8_UNORM; td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(device->CreateTexture2D(&td, nullptr, &gRtgiAoTex)))       { ReleaseRtgiAoTex(); return false; }
+    if (FAILED(device->CreateRenderTargetView(gRtgiAoTex, nullptr, &gRtgiAoRTV)))   { ReleaseRtgiAoTex(); return false; }
+    if (FAILED(device->CreateShaderResourceView(gRtgiAoTex, nullptr, &gRtgiAoSRV))) { ReleaseRtgiAoTex(); return false; }
+    return true;
+}
+
 static std::string GetPluginDir()
 {
     char path[MAX_PATH] = {};
@@ -139,17 +168,32 @@ static void RTGIPostExecute(const DustFrameContext* ctx, const DustHostAPI* host
         dc->PSSetShaderResources(0, 3, nullSRVs);
     }
 
-    // Step 2: Apply AO (multiply blend)
+    // Step 2: Apply AO to the opaque scene (multiply blend). Runs here at POST_LIGHTING,
+    // BEFORE water/transparents, so those are never darkened.
     if (gRTGIConfig.aoIntensity > 0.0f)
     {
-        dc->OMSetRenderTargets(1, &hdrRTV, nullptr);
-        float bf[4] = { 0, 0, 0, 0 };
-        dc->OMSetBlendState(gMultiplyBlend, bf, 0xFFFFFFFF);
         ID3D11ShaderResourceView* srvs[3] = { giSRV, depthSRV, normalsSRV };
         dc->PSSetShaderResources(0, 3, srvs);
         dc->PSSetSamplers(0, 2, samplers);
         dc->PSSetConstantBuffers(0, 1, &gCompositeCB);
+
+        float bf[4] = { 0, 0, 0, 0 };
+        dc->OMSetRenderTargets(1, &hdrRTV, nullptr);
+        dc->OMSetBlendState(gMultiplyBlend, bf, 0xFFFFFFFF);
         host->DrawFullscreenTriangle(dc, gAOCompositePS);
+
+        // Step 3: render the same AO factor to a standalone texture and hand it to the
+        // framework, which multiplies it into each point/spot light-volume draw (light_fs).
+        // That gives local lights the same AO — without a fullscreen pass over water.
+        // (Reuses the SRVs/CB/samplers bound above; DrawFullscreenTriangle leaves them.)
+        if (gRtgiAoRTV && host->SetLightVolumeAoTexture)
+        {
+            dc->OMSetRenderTargets(1, &gRtgiAoRTV, nullptr);
+            dc->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);   // opaque write
+            host->DrawFullscreenTriangle(dc, gAOCompositePS);
+            host->SetLightVolumeAoTexture(gRtgiAoSRV);
+        }
+
         ID3D11ShaderResourceView* nullSRVs[3] = {};
         dc->PSSetShaderResources(0, 3, nullSRVs);
     }
@@ -244,6 +288,11 @@ static int RTGIInit(ID3D11Device* device, uint32_t width, uint32_t height, const
     gCompositeCB = host->CreateConstantBuffer(device, sizeof(CompositeCBData));
     if (!gCompositeCB) return -9;
 
+    // Full-res AO texture published to the framework for per-light AO (light_fs).
+    // Non-fatal if it fails — RTGI still applies opaque AO; local lights just don't get it.
+    if (!CreateRtgiAoTex(device, width, height))
+        Log("RTGI: WARNING: failed to create light-volume AO texture");
+
     Log("RTGI: Initialized (%ux%u)", width, height);
     return 0;
 }
@@ -251,6 +300,7 @@ static int RTGIInit(ID3D11Device* device, uint32_t width, uint32_t height, const
 static void RTGIShutdown()
 {
     RTGIRenderer::Shutdown();
+    ReleaseRtgiAoTex();
 
 #define SR(p) if (p) { (p)->Release(); (p) = nullptr; }
     SR(gCompositePS); SR(gAOCompositePS);
@@ -266,6 +316,7 @@ static void RTGIShutdown()
 static void RTGIOnResolutionChanged(ID3D11Device* device, uint32_t w, uint32_t h)
 {
     RTGIRenderer::OnResolutionChanged(device, w, h);
+    CreateRtgiAoTex(device, w, h);
     Log("RTGI: Resolution changed to %ux%u", w, h);
 }
 

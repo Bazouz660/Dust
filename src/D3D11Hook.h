@@ -35,4 +35,13 @@ namespace D3D11Hook
     UINT GetShadowAtlasResolution();
     // Vanilla atlas size the game requested (0 until the atlas exists).
     UINT GetShadowBaseResolution();
+
+    // Direct-light AO for point/spot lights. ShaderPatch calls this after it compiles a
+    // patched light_fs blob, so the CreatePixelShader hook can recognize the resulting
+    // pixel shader and feed it the SSAO map at s8/s9 during its (light-volume) draws.
+    void NoteLightVolumeShaderBytecode(const void* bytecode, size_t len);
+
+    // RTGI publishes its per-light AO texture here each frame (via the SetLightVolumeAoTexture
+    // host API). Bound at t10 for light_fs; null → white fallback (no-op). Cleared per frame.
+    void SetLightVolumeAoTexture(ID3D11ShaderResourceView* srv);
 }

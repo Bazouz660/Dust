@@ -72,7 +72,7 @@
 extern "C" {
 #endif
 
-#define DUST_API_VERSION 4
+#define DUST_API_VERSION 6
 
 // Injection points in the rendering pipeline
 typedef enum DustInjectionPoint {
@@ -202,6 +202,17 @@ typedef struct DustHostAPI {
     // only; persisting across restarts is the plugin's job (settings.cfg
     // "Shadow Range").
     int (*SetShadowRange)(float farDistance);
+
+    // === API v6 additions ===
+
+    // Publish a per-pixel AO texture (screen-res, .r = occlusion in [0,1]) that the
+    // framework multiplies into each point/spot light-volume draw (light_fs), so an AO
+    // effect can darken local lights without a fullscreen pass that would also hit water.
+    // Call once per frame while active (e.g. at POST_LIGHTING); the framework holds a ref
+    // for the frame and clears it at frame start. Pass NULL to stop. The texture must
+    // already have the effect's strength/curve baked in — it is sampled and multiplied
+    // as-is. Requires apiVersion >= 6.
+    void (*SetLightVolumeAoTexture)(ID3D11ShaderResourceView* ao);
 } DustHostAPI;
 
 // Performance impact hint for a single setting (API v3.2+).
@@ -296,6 +307,17 @@ typedef struct DustEffectDesc {
     // atlas resolution override (Kenshi builds its atlas between LoadAll
     // and InitAll). NULL if unused.
     void (*OnEarlyConfigApply)(const DustHostAPI* host);
+
+    // === API v5 additions ===
+    // Called once per frame AFTER the point/spot light volumes are drawn but
+    // BEFORE fog/tonemap, regardless of this effect's injectionPoint. Lets an
+    // effect composite over the fully-lit scene (all lights accumulated) — e.g.
+    // an AO multiply that must also darken local lights, which the normal
+    // POST_LIGHTING callbacks run too early to catch. Fires at the first of
+    // POST_FOG / POST_TONEMAP each frame, so it still runs on frames with no
+    // fog pass. The frame context's point reflects that trigger pass. NULL if
+    // unused. Requires apiVersion >= 5.
+    DustEffectCallback postLightVolumes;
 } DustEffectDesc;
 
 // Every effect DLL must export this function.
