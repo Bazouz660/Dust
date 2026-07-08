@@ -1211,13 +1211,36 @@ static HRESULT STDMETHODCALLTYPE HookedCreatePixelShader(
     {
         SurveyRecorder::OnPixelShaderCreated(pShaderBytecode, BytecodeLength, *ppPixelShader);
 
-        // Record this shader if it's a patched light_fs (matches a hash ShaderPatch noted).
+        // Record this shader if it's a patched light_fs. This MUST be reliable: the patched
+        // light_fs multiplies each light by t8/t9/t10, so a shader we fail to recognize
+        // never gets those slots bound → it reads 0 → the light casts no light.
         if (pShaderBytecode && BytecodeLength)
         {
+            // Primary: exact hash of the D3DCompile output (ShaderPatch noted it).
             uint64_t h = Fnv1a64(pShaderBytecode, BytecodeLength);
-            std::lock_guard<std::mutex> lock(gLightVolumeMutex);
-            if (gLightVolumeBytecodeHashes.count(h))
+            bool isLightFs;
+            {
+                std::lock_guard<std::mutex> lock(gLightVolumeMutex);
+                isLightFs = gLightVolumeBytecodeHashes.count(h) != 0;
+            }
+            // Robust fallback: scan for the unique resource name our patch injects. It lives
+            // in the DXBC reflection (RDEF) chunk, which the engine can't strip (it binds
+            // params by name) — so this survives even when the bytecode bytes differ from
+            // D3DCompile's output (blob re-sign/strip by driver/d3dcompiler) and break the hash.
+            if (!isLightFs)
+            {
+                const char* p = (const char*)pShaderBytecode;
+                static const char kMark[] = "dustLvRtgiAoTex";
+                const size_t mlen = sizeof(kMark) - 1;
+                if (BytecodeLength >= mlen)
+                    for (size_t i = 0, n = BytecodeLength - mlen; i <= n; ++i)
+                        if (memcmp(p + i, kMark, mlen) == 0) { isLightFs = true; break; }
+            }
+            if (isLightFs)
+            {
+                std::lock_guard<std::mutex> lock(gLightVolumeMutex);
                 gLightVolumePS.insert(*ppPixelShader);
+            }
         }
     }
     return hr;
