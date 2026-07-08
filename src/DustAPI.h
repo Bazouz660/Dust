@@ -72,7 +72,7 @@
 extern "C" {
 #endif
 
-#define DUST_API_VERSION 6
+#define DUST_API_VERSION 7
 
 // Injection points in the rendering pipeline
 typedef enum DustInjectionPoint {
@@ -213,6 +213,16 @@ typedef struct DustHostAPI {
     // already have the effect's strength/curve baked in — it is sampled and multiplied
     // as-is. Requires apiVersion >= 6.
     void (*SetLightVolumeAoTexture)(ID3D11ShaderResourceView* ao);
+
+    // === API v7 additions ===
+
+    // Publish SSAO's AO map + params textures for the point/spot light-volume draws
+    // (light_fs multiplies by lerp(1, ao.r, params.r)). This is a robust alternative to
+    // the framework snapshotting them off the deferred sampler slots — some shadow/effect
+    // configs leave those slots empty at snapshot time, which drops AO on local lights.
+    // Call once per frame while SSAO is active (pass its white fallback + params when
+    // disabled). NULL clears. Takes precedence over the snapshot. Requires apiVersion >= 7.
+    void (*SetLightVolumeSsaoAo)(ID3D11ShaderResourceView* ao, ID3D11ShaderResourceView* params);
 } DustHostAPI;
 
 // Performance impact hint for a single setting (API v3.2+).

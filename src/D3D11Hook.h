@@ -44,4 +44,8 @@ namespace D3D11Hook
     // RTGI publishes its per-light AO texture here each frame (via the SetLightVolumeAoTexture
     // host API). Bound at t10 for light_fs; null → white fallback (no-op). Cleared per frame.
     void SetLightVolumeAoTexture(ID3D11ShaderResourceView* srv);
+
+    // SSAO publishes its AO map + params here each frame (via SetLightVolumeSsaoAo). Bound at
+    // t8/t9 for light_fs, preferred over the deferred-slot snapshot. Cleared per frame.
+    void SetLightVolumeSsaoAo(ID3D11ShaderResourceView* ao, ID3D11ShaderResourceView* params);
 }

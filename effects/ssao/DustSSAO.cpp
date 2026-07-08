@@ -129,6 +129,15 @@ static void UpdateParamsTexture(ID3D11DeviceContext* ctx)
 static const uint32_t AO_REGISTER = 8;
 static const uint32_t AO_PARAMS_REGISTER = 9;
 
+// Publish SSAO's AO map (+ params) directly to the framework for the point/spot light
+// volumes (v7). More robust than the framework snapshotting the deferred sampler slots,
+// which some shadow/effect configs leave empty at snapshot time.
+static void PublishLightVolumeAo(const DustHostAPI* host, ID3D11ShaderResourceView* ao)
+{
+    if (host->apiVersion >= 7 && host->SetLightVolumeSsaoAo)
+        host->SetLightVolumeSsaoAo(ao, gParamsSRV);
+}
+
 // Called BEFORE the game's lighting draw
 static void SSAOPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
 {
@@ -154,6 +163,7 @@ static void SSAOPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
         if (!sWarnedNoInit) { Log("[SSAO] WARNING: Renderer not initialized, binding white fallback"); sWarnedNoInit = true; }
         host->BindSRV(ctx->context, AO_REGISTER, gWhiteSRV, gAoSampler);
         host->BindSRV(ctx->context, AO_PARAMS_REGISTER, gParamsSRV, gAoSampler);
+        PublishLightVolumeAo(host, gWhiteSRV);
         return;
     }
 
@@ -165,6 +175,7 @@ static void SSAOPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     {
         // Bind white (no occlusion) so deferred.hlsl still reads a valid texture
         host->BindSRV(ctx->context, AO_REGISTER, gWhiteSRV, gAoSampler);
+        PublishLightVolumeAo(host, gWhiteSRV);
         return;
     }
 
@@ -179,6 +190,8 @@ static void SSAOPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
 
     // Bind AO for deferred.hlsl to sample
     host->BindSRV(ctx->context, AO_REGISTER, aoSRV, gAoSampler);
+    // Also publish it directly for the point/spot light volumes (robust; see host).
+    PublishLightVolumeAo(host, aoSRV);
 }
 
 // Called AFTER the game's lighting draw

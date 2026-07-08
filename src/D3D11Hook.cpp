@@ -38,6 +38,7 @@ static bool gPostLightVolumesFired = false;  // v5 postLightVolumes: once per fr
 // Light-volume direct AO (defined below, near the CreatePixelShader hook).
 static void ReleaseLightVolumeAO();
 void SetLightVolumeAoTexture(ID3D11ShaderResourceView* srv);
+void SetLightVolumeSsaoAo(ID3D11ShaderResourceView* ao, ID3D11ShaderResourceView* params);
 
 // Camera extraction from the game's deferred lighting CB
 // (staging CBs are in gCameraStagingCBs[], declared near ExtractCameraData)
@@ -367,7 +368,8 @@ void ResetFrameState()
     gPipelineDetector.ResetFrame();
     gResourceRegistry.ResetFrame();
     ReleaseLightVolumeAO();
-    SetLightVolumeAoTexture(nullptr);   // clear RTGI's per-light AO; it republishes each frame
+    SetLightVolumeAoTexture(nullptr);        // clear RTGI's per-light AO; republished each frame
+    SetLightVolumeSsaoAo(nullptr, nullptr);  // clear SSAO's per-light AO; republished each frame
     gDispatchedThisFrame = false;
     gPostLightVolumesFired = false;
     gCameraDataExtracted = false;
@@ -970,6 +972,12 @@ static ID3D11ShaderResourceView* gRtgiLvAoSRV = nullptr;   // borrowed ref, refr
 static ID3D11ShaderResourceView* gLvWhiteSRV  = nullptr;   // host-owned 1x1 R8 white
 static ID3D11SamplerState*       gLvDefaultSampler = nullptr;  // fallback when SSAO didn't bind
 
+// SSAO publishes its AO map + params here each frame (v7 SetLightVolumeSsaoAo). These take
+// precedence over the deferred-slot snapshot (gLvAoSRV) at t8/t9 — the snapshot comes back
+// empty on some configs, dropping AO on local lights. Borrowed refs, cleared per frame.
+static ID3D11ShaderResourceView* gSsaoLvAoSRV     = nullptr;
+static ID3D11ShaderResourceView* gSsaoLvParamsSRV = nullptr;
+
 static ID3D11ShaderResourceView* GetLvWhiteSRV()
 {
     if (gLvWhiteSRV || !gDevice) return gLvWhiteSRV;
@@ -1007,6 +1015,26 @@ void SetLightVolumeAoTexture(ID3D11ShaderResourceView* srv)
     if (gRtgiLvAoSRV) gRtgiLvAoSRV->Release();
     gRtgiLvAoSRV = srv;
     if (gRtgiLvAoSRV) gRtgiLvAoSRV->AddRef();
+}
+
+// Called by SSAO (via host API) each frame to publish its AO map + params for light volumes.
+void SetLightVolumeSsaoAo(ID3D11ShaderResourceView* ao, ID3D11ShaderResourceView* params)
+{
+    if (ao != gSsaoLvAoSRV)
+    {
+        if (gSsaoLvAoSRV) gSsaoLvAoSRV->Release();
+        gSsaoLvAoSRV = ao;
+        if (gSsaoLvAoSRV) gSsaoLvAoSRV->AddRef();
+    }
+    if (params != gSsaoLvParamsSRV)
+    {
+        if (gSsaoLvParamsSRV) gSsaoLvParamsSRV->Release();
+        gSsaoLvParamsSRV = params;
+        if (gSsaoLvParamsSRV) gSsaoLvParamsSRV->AddRef();
+    }
+
+    static bool sLogged = false;
+    if (!sLogged && ao) { Log("LightVolumeAO: SSAO published its AO for light volumes (t8/t9)"); sLogged = true; }
 }
 
 static uint64_t Fnv1a64(const void* data, size_t len)
@@ -1135,10 +1163,12 @@ struct LightVolumeAoScope
         ctx->PSGetShaderResources(AO_SLOT, 3, savedSRV);   // AddRefs engine's binding
         ctx->PSGetSamplers(AO_SLOT, 2, savedSmp);
         ID3D11ShaderResourceView* white = GetLvWhiteSRV();
+        // t8/t9: prefer SSAO's directly-published textures (robust), then the deferred-slot
+        // snapshot, then white. t10: RTGI's published texture, else white.
         ID3D11ShaderResourceView* bind3[3] = {
-            gLvAoSRV[0]   ? gLvAoSRV[0]   : white,
-            gLvAoSRV[1]   ? gLvAoSRV[1]   : white,
-            gRtgiLvAoSRV  ? gRtgiLvAoSRV  : white,
+            gSsaoLvAoSRV     ? gSsaoLvAoSRV     : (gLvAoSRV[0] ? gLvAoSRV[0] : white),
+            gSsaoLvParamsSRV ? gSsaoLvParamsSRV : (gLvAoSRV[1] ? gLvAoSRV[1] : white),
+            gRtgiLvAoSRV     ? gRtgiLvAoSRV     : white,
         };
         ID3D11SamplerState* def = GetLvDefaultSampler();
         ID3D11SamplerState* smp2[2] = {

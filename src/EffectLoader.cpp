@@ -415,6 +415,9 @@ void EffectLoader::BuildHostAPI()
 
     // v6 additions
     hostAPI_.SetLightVolumeAoTexture  = D3D11Hook::SetLightVolumeAoTexture;
+
+    // v7 additions
+    hostAPI_.SetLightVolumeSsaoAo     = D3D11Hook::SetLightVolumeSsaoAo;
 }
 
 // ==================== v3: Config I/O ====================
