@@ -306,7 +306,9 @@ static std::string PatchDeferredShader(const std::string& src)
             "\t\t\tfloat avgDelta = blockerDeltaSum / blockerCnt;\n"
             "\t\t\tfloat receiver = max(shadowUv.z, 0.001);\n"
             "\t\t\tfloat pen = (avgDelta / (receiver - avgDelta)) * (dustCsmLightSize * baseRadius);\n"
-            "\t\t\tradius = clamp(pen, baseRadius * 0.5, baseRadius * 4.0);\n"
+            // Cap penumbra growth at 2x. The old 4x let the far cascades'
+            // large depth deltas blow the estimate up into a smeary mess.
+            "\t\t\tradius = clamp(pen, baseRadius * 0.5, baseRadius * 2.0);\n"
             "\t\t}\n"
             "\t}\n"
             "\n"
@@ -349,7 +351,9 @@ static std::string PatchDeferredShader(const std::string& src)
             "\t\t\tfloat avgDelta = blockerDeltaSum / blockerCnt;\n"
             "\t\t\tfloat receiver = max(shadowUv.z, 0.001);\n"
             "\t\t\tfloat pen = (avgDelta / (receiver - avgDelta)) * (dustCsmLightSize * baseRadius);\n"
-            "\t\t\tradius = clamp(pen, baseRadius * 0.5, baseRadius * 4.0);\n"
+            // This is the FAR cascade (4-tap). Its huge texels already look
+            // soft, so keep the penumbra tight (1.5x) to avoid over-blur.
+            "\t\t\tradius = clamp(pen, baseRadius * 0.5, baseRadius * 1.5);\n"
             "\t\t}\n"
             "\t}\n"
             "\n"
@@ -415,7 +419,12 @@ static std::string PatchDeferredShader(const std::string& src)
             // Sample primary cascade. Far cascade uses the cheaper 4-tap
             // path: huge texels mean extra samples mostly blur noise.
             "\tfloat3 shadowUv0 = csmTrans[idx].xyz + csmScale[idx].xyz * posLs;\n"
-            "\tfloat baseRadius0 = csmParams[idx][1] * dustCsmFilterRadius;\n"
+            // 0.75 matches vanilla's effective footprint: vanilla scales its
+            // hex offsets (avg magnitude ~2.07) by csmParams[i][1]*0.3; our
+            // Poisson offsets (avg ~0.82) need ~0.75 to land at the same
+            // average filter width. dustCsmFilterRadius (default 1.0) is the
+            // user multiplier on top.
+            "\tfloat baseRadius0 = csmParams[idx][1] * dustCsmFilterRadius * 0.75;\n"
             "\tfloat s0 = (idx >= SHADOW_MAP_COUNT - 1)\n"
             "\t\t? DustSampleCascade4(shadowDepthMap, shadowJitterMap, shadowUv0, sampleProj, baseRadius0)\n"
             "\t\t: DustSampleCascade8(shadowDepthMap, shadowJitterMap, shadowUv0, sampleProj, baseRadius0);\n"
@@ -434,7 +443,7 @@ static std::string PatchDeferredShader(const std::string& src)
             "\t\tfloat blendT    = saturate((posSs.z - (splitFar - band)) / band);\n"
             "\t\tif (blendT > 0.0) {\n"
             "\t\t\tfloat3 shadowUv1 = csmTrans[idx + 1].xyz + csmScale[idx + 1].xyz * posLs;\n"
-            "\t\t\tfloat baseRadius1 = csmParams[idx + 1][1] * dustCsmFilterRadius;\n"
+            "\t\t\tfloat baseRadius1 = csmParams[idx + 1][1] * dustCsmFilterRadius * 0.75;\n"
             "\t\t\tfloat s1 = (idx + 1 >= SHADOW_MAP_COUNT - 1)\n"
             "\t\t\t\t? DustSampleCascade4(shadowDepthMap, shadowJitterMap, shadowUv1, sampleProj, baseRadius1)\n"
             "\t\t\t\t: DustSampleCascade8(shadowDepthMap, shadowJitterMap, shadowUv1, sampleProj, baseRadius1);\n"
