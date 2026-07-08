@@ -968,6 +968,7 @@ static bool                      gLvAoReady      = false;
 // an unbound SRV reads 0 and would black out the lights).
 static ID3D11ShaderResourceView* gRtgiLvAoSRV = nullptr;   // borrowed ref, refreshed per frame
 static ID3D11ShaderResourceView* gLvWhiteSRV  = nullptr;   // host-owned 1x1 R8 white
+static ID3D11SamplerState*       gLvDefaultSampler = nullptr;  // fallback when SSAO didn't bind
 
 static ID3D11ShaderResourceView* GetLvWhiteSRV()
 {
@@ -985,6 +986,16 @@ static ID3D11ShaderResourceView* GetLvWhiteSRV()
         tex->Release();
     }
     return gLvWhiteSRV;
+}
+
+static ID3D11SamplerState* GetLvDefaultSampler()
+{
+    if (gLvDefaultSampler || !gDevice) return gLvDefaultSampler;
+    D3D11_SAMPLER_DESC sd = {};
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    gDevice->CreateSamplerState(&sd, &gLvDefaultSampler);
+    return gLvDefaultSampler;
 }
 
 // Called by RTGI (via host API) each frame it produces a light-volume AO texture.
@@ -1054,10 +1065,15 @@ static void CaptureLightVolumeAO(ID3D11DeviceContext* ctx)
     ctx->PSGetShaderResources(paramsSlot, 1, &gLvAoSRV[1]);
     ctx->PSGetSamplers(aoSlot,     1, &gLvAoSampler[0]);
     ctx->PSGetSamplers(paramsSlot, 1, &gLvAoSampler[1]);
-    gLvAoReady = (gLvAoSRV[0] != nullptr);                        // AO map present
+
+    // Ready = "light_fs is patched and we're in its draw window" — NOT "SSAO bound valid
+    // AO". The patched light_fs ALWAYS samples t8/t9/t10, so the scope must run for every
+    // light-volume draw and white-fill any missing slot; otherwise unbound slots read 0 and
+    // the light multiplies to black. (SSAO removed / not yet bound must not kill lights.)
+    gLvAoReady = true;
 
     static bool sLogged = false;
-    if (!sLogged && gLvAoReady)
+    if (!sLogged && gLvAoSRV[0])
     {
         // Log the AO texture's dimensions so a bad capture (e.g. a 4096² shadow atlas)
         // is obvious in the log rather than only on screen.
@@ -1112,14 +1128,25 @@ struct LightVolumeAoScope
     {
         if (!isLightVolume) return;
         ctx = c;
-        // Save t8/t9/t10 + s8/s9, then bind the SSAO snapshot (t8/t9) and RTGI AO (t10,
-        // white fallback when RTGI isn't publishing) so light_fs multiplies by both.
+        // Save t8/t9/t10 + s8/s9, then bind SSAO's AO (t8/t9) and RTGI's AO (t10). Any slot
+        // without a real texture gets a 1x1 white fallback (= 1.0, a no-op multiply) — the
+        // patched light_fs samples all three unconditionally, so an unbound slot would read
+        // 0 and turn the light black. This keeps lights lit even if SSAO/RTGI aren't active.
         ctx->PSGetShaderResources(AO_SLOT, 3, savedSRV);   // AddRefs engine's binding
         ctx->PSGetSamplers(AO_SLOT, 2, savedSmp);
-        ID3D11ShaderResourceView* rtgi = gRtgiLvAoSRV ? gRtgiLvAoSRV : GetLvWhiteSRV();
-        ID3D11ShaderResourceView* bind3[3] = { gLvAoSRV[0], gLvAoSRV[1], rtgi };
+        ID3D11ShaderResourceView* white = GetLvWhiteSRV();
+        ID3D11ShaderResourceView* bind3[3] = {
+            gLvAoSRV[0]   ? gLvAoSRV[0]   : white,
+            gLvAoSRV[1]   ? gLvAoSRV[1]   : white,
+            gRtgiLvAoSRV  ? gRtgiLvAoSRV  : white,
+        };
+        ID3D11SamplerState* def = GetLvDefaultSampler();
+        ID3D11SamplerState* smp2[2] = {
+            gLvAoSampler[0] ? gLvAoSampler[0] : def,
+            gLvAoSampler[1] ? gLvAoSampler[1] : def,
+        };
         ctx->PSSetShaderResources(AO_SLOT, 3, bind3);
-        ctx->PSSetSamplers(AO_SLOT, 2, gLvAoSampler);
+        ctx->PSSetSamplers(AO_SLOT, 2, smp2);
         active = true;
 
         static bool sLogged = false;
