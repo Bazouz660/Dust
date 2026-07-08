@@ -2,7 +2,6 @@
 #include "GeometryCapture.h"
 #include "ShaderMetadata.h"
 #include "D3D11StateBlock.h"
-#include "D3D11Hook.h"
 #include "CameraAccess.h"
 #include "DustLog.h"
 #include <d3dcompiler.h>

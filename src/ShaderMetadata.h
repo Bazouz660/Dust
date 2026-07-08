@@ -33,17 +33,6 @@ struct VSConstantBufferInfo
     uint32_t cbSlot = 0;
 };
 
-// Located CB offsets of the deferred sun/lighting PS camera matrices — lets the host
-// read the engine's own camera view-projection (VP = proj * inverse(inverseView))
-// straight from the deferred constant buffer, no geometry reconstruction.
-struct DeferredCamInfo
-{
-    bool     found         = false;
-    uint32_t cbSlot        = 0;
-    uint32_t invViewOffset = 0;   // byte offset of float4x4 inverseView
-    uint32_t projOffset    = 0;   // byte offset of float4x4 proj
-};
-
 namespace ShaderMetadata
 {
     // Called from HookedCreateVertexShader after the VS is created.
@@ -51,12 +40,6 @@ namespace ShaderMetadata
     // Safe to call for any VS — non-GBuffer shaders are stored as UNKNOWN.
     void OnVertexShaderCreated(const void* bytecode, SIZE_T bytecodeSize,
                                ID3D11VertexShader* vs);
-
-    // Called from HookedCreatePixelShader. Reflects the PS; if it is the deferred
-    // sun/lighting PS (float4x4 'proj' + 'inverseView' in one CB), records their
-    // offsets. Idempotent — records the first match and then no-ops.
-    void OnPixelShaderCreated(const void* bytecode, SIZE_T bytecodeSize);
-    const DeferredCamInfo& GetDeferredCam();
 
     // Look up metadata for a VS. Returns nullptr if the VS was never seen.
     const VSConstantBufferInfo* GetVSInfo(ID3D11VertexShader* vs);

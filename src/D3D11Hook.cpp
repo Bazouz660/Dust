@@ -48,11 +48,6 @@ void SetLightVolumeSsaoAo(ID3D11ShaderResourceView* ao, ID3D11ShaderResourceView
 static DustCameraData gCameraData = {};
 static bool gCameraDataExtracted = false; // per-frame flag
 
-// Engine projection matrix, read from the deferred CB (offset located by reflection).
-// With gCameraData.inverseView this gives the exact camera VP = proj * inverse(inverseView).
-static float gCameraProj[16] = {};
-static bool  gCameraProjValid = false;
-
 // VTable indices for swap chain methods (used by both Install() and deferred hooking)
 static const int VTIDX_SC_Present        = 8;
 static const int VTIDX_SC_ResizeBuffers  = 13;
@@ -449,14 +444,6 @@ static void ExtractCameraData(ID3D11DeviceContext* ctx)
         {
             float m[16];
             memcpy(m, (float*)mapped.pData + 32, 64); // c8 offset
-
-            // Read the engine projection matrix too (offset located by PS reflection) so
-            // the MV pass can use the exact camera VP = proj * inverse(inverseView).
-            float proj[16]; bool haveProj = false;
-            const DeferredCamInfo& dc = ShaderMetadata::GetDeferredCam();
-            if (dc.found && dc.projOffset + 64 <= cbDesc.ByteWidth)
-            { memcpy(proj, (const uint8_t*)mapped.pData + dc.projOffset, 64); haveProj = true; }
-
             ctx->Unmap(gCameraStagingCBs[readSlot], 0);
 
             bool valid = true;
@@ -472,29 +459,12 @@ static void ExtractCameraData(ID3D11DeviceContext* ctx)
                 gCameraData.camPosition[0] = m[12]; gCameraData.camPosition[1] = m[13]; gCameraData.camPosition[2] = m[14];
                 gCameraData.valid = 1;
                 gCameraDataExtracted = true;
-
-                if (haveProj)
-                {
-                    bool pv = true;
-                    for (int i = 0; i < 16; i++) if (!isfinite(proj[i])) { pv = false; break; }
-                    if (pv) { memcpy(gCameraProj, proj, 64); gCameraProjValid = true; }
-                }
             }
         }
     }
 
     gCameraStagingSlot = readSlot;
     gCameraStagingReady = true;
-}
-
-// Engine camera matrices for the motion-vector pass. Both are 16-float column-major.
-// True only once both the deferred inverseView and proj have been read this session.
-bool GetDeferredCameraMatrices(float* outInvView, float* outProj)
-{
-    if (!gCameraData.valid || !gCameraProjValid) return false;
-    if (outInvView) memcpy(outInvView, gCameraData.inverseView, 64);
-    if (outProj)    memcpy(outProj, gCameraProj, 64);
-    return true;
 }
 
 // ==================== Original function pointers ====================
@@ -1290,8 +1260,6 @@ static HRESULT STDMETHODCALLTYPE HookedCreatePixelShader(
     if (SUCCEEDED(hr) && ppPixelShader && *ppPixelShader)
     {
         SurveyRecorder::OnPixelShaderCreated(pShaderBytecode, BytecodeLength, *ppPixelShader);
-        // Reflect to locate the deferred camera CB (inverseView + proj) for the MV pass.
-        ShaderMetadata::OnPixelShaderCreated(pShaderBytecode, BytecodeLength);
 
         // Record this shader if it's a patched light_fs. This MUST be reliable: the patched
         // light_fs multiplies each light by t8/t9/t10, so a shader we fail to recognize

@@ -139,51 +139,6 @@ void OnVertexShaderCreated(const void* bytecode, SIZE_T bytecodeSize,
     }
 }
 
-static DeferredCamInfo sDeferredCam;
-
-void OnPixelShaderCreated(const void* bytecode, SIZE_T bytecodeSize)
-{
-    if (sDeferredCam.found || !bytecode || bytecodeSize == 0) return;
-
-    ID3D11ShaderReflection* refl = nullptr;
-    if (FAILED(D3DReflect(bytecode, bytecodeSize, IID_ID3D11ShaderReflection, (void**)&refl)) || !refl)
-        return;
-    D3D11_SHADER_DESC sd;
-    if (FAILED(refl->GetDesc(&sd))) { refl->Release(); return; }
-
-    for (UINT c = 0; c < sd.ConstantBuffers; c++)
-    {
-        ID3D11ShaderReflectionConstantBuffer* cb = refl->GetConstantBufferByIndex(c);
-        D3D11_SHADER_BUFFER_DESC bd;
-        if (!cb || FAILED(cb->GetDesc(&bd)) || bd.Type != D3D_CT_CBUFFER) continue;
-
-        int projOff = -1, invOff = -1;
-        for (UINT v = 0; v < bd.Variables; v++)
-        {
-            ID3D11ShaderReflectionVariable* var = cb->GetVariableByIndex(v);
-            D3D11_SHADER_VARIABLE_DESC vd;
-            if (!var || FAILED(var->GetDesc(&vd))) continue;
-            if      (strcmp(vd.Name, "proj") == 0)        projOff = (int)vd.StartOffset;
-            else if (strcmp(vd.Name, "inverseView") == 0) invOff  = (int)vd.StartOffset;
-        }
-        if (projOff >= 0 && invOff >= 0)
-        {
-            uint32_t slot = 0;
-            FindCBSlot(refl, sd, bd.Name, slot);
-            sDeferredCam.found = true;
-            sDeferredCam.cbSlot = slot;
-            sDeferredCam.projOffset = (uint32_t)projOff;
-            sDeferredCam.invViewOffset = (uint32_t)invOff;
-            Log("ShaderMetadata: deferred camera CB found — slot b%u, inverseView@%u, proj@%u",
-                slot, invOff, projOff);
-            break;
-        }
-    }
-    refl->Release();
-}
-
-const DeferredCamInfo& GetDeferredCam() { return sDeferredCam; }
-
 const VSConstantBufferInfo* GetVSInfo(ID3D11VertexShader* vs)
 {
     auto it = sVSMap.find(vs);
