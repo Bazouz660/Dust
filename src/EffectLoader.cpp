@@ -1,6 +1,8 @@
 #include "EffectLoader.h"
 #include "ResourceRegistry.h"
 #include "D3D11StateBlock.h"
+#include "D3D11Hook.h"
+#include "PssmDetour.h"
 #include "DustLog.h"
 #include <d3dcompiler.h>
 #include <cstring>
@@ -376,6 +378,13 @@ static void HostUpdateConstantBuffer(ID3D11DeviceContext* ctx, ID3D11Buffer* cb,
 
 // ==================== EffectLoader ====================
 
+// SetShadowFar returns false while the CSM splits source is still uncaptured
+// (the request is remembered and lands at capture); surface that as 0/1.
+static int HostSetShadowRange(float farDistance)
+{
+    return PssmDetour::SetShadowFar(farDistance) ? 1 : 0;
+}
+
 void EffectLoader::BuildHostAPI()
 {
     hostAPI_.apiVersion   = DUST_API_VERSION;
@@ -397,6 +406,12 @@ void EffectLoader::BuildHostAPI()
     hostAPI_.CreateConstantBuffer   = HostCreateConstantBuffer;
     hostAPI_.UpdateConstantBuffer   = HostUpdateConstantBuffer;
     hostAPI_.GetPreFogHDR           = HostGetPreFogHDR;
+
+    // v4 additions
+    hostAPI_.SetShadowAtlasResolution = D3D11Hook::SetShadowAtlasResolution;
+    hostAPI_.GetShadowBaseResolution  = D3D11Hook::GetShadowBaseResolution;
+    hostAPI_.SetCascadeLambda         = PssmDetour::SetLambda;
+    hostAPI_.SetShadowRange           = HostSetShadowRange;
 }
 
 // ==================== v3: Config I/O ====================
@@ -746,6 +761,13 @@ int EffectLoader::LoadAll(const char* effectsDir)
             if (GetFileAttributesExA(le.configPath.c_str(), GetFileExInfoStandard, &fad))
                 le.configMtime = fad.ftLastWriteTime;
         }
+
+        // v4: let the effect push config-derived state that must be in place
+        // before the game creates its D3D resources (e.g. the shadow atlas
+        // resolution override — Kenshi builds its atlas between LoadAll and
+        // InitAll, so pushing from Init would be too late).
+        if (le.desc.OnEarlyConfigApply)
+            le.desc.OnEarlyConfigApply(&hostAPI_);
 
         effects_.push_back(std::move(le));
 

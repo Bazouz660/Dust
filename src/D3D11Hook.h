@@ -26,4 +26,13 @@ namespace D3D11Hook
     // we begin teardown must skip our logic to avoid touching freed state.
     void SignalShutdown();
     bool IsShutdownSignaled();
+
+    // Plugin-driven override for the shadow atlas resolution. 0 disables the
+    // override (game default used). The game's atlas is always created at
+    // vanilla size; when the override differs, replacement textures are
+    // created and their views swapped in at bind time starting next frame.
+    void SetShadowAtlasResolution(UINT size);
+    UINT GetShadowAtlasResolution();
+    // Vanilla atlas size the game requested (0 until the atlas exists).
+    UINT GetShadowBaseResolution();
 }

@@ -102,6 +102,7 @@
     <ClCompile Include="SurveyRecorder.cpp" />
     <ClCompile Include="SurveyWriter.cpp" />
     <ClCompile Include="ShaderPatch.cpp" />
+    <ClCompile Include="PssmDetour.cpp" />
     <ClCompile Include="imgui\imgui.cpp" />
     <ClCompile Include="imgui\imgui_draw.cpp" />
     <ClCompile Include="imgui\imgui_tables.cpp" />
@@ -125,6 +126,7 @@
     <ClInclude Include="SurveyRecorder.h" />
     <ClInclude Include="SurveyWriter.h" />
     <ClInclude Include="ShaderPatch.h" />
+    <ClInclude Include="PssmDetour.h" />
     <ClInclude Include="imgui\imgui.h" />
     <ClInclude Include="imgui\backends\imgui_impl_win32.h" />
     <ClInclude Include="imgui\backends\imgui_impl_dx11.h" />

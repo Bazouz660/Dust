@@ -72,7 +72,7 @@
 extern "C" {
 #endif
 
-#define DUST_API_VERSION 3
+#define DUST_API_VERSION 4
 
 // Injection points in the rendering pipeline
 typedef enum DustInjectionPoint {
@@ -170,6 +170,38 @@ typedef struct DustHostAPI {
     // before fog/atmosphere was drawn. Available from POST_FOG and POST_TONEMAP.
     // Returns NULL if POST_LIGHTING hasn't fired yet this frame.
     ID3D11ShaderResourceView* (*GetPreFogHDR)(void);
+
+    // === API v4 additions ===
+
+    // Override the shadow atlas resolution (square, e.g. 8192). Pass 0 to
+    // disable the override. The game's atlas is always created at vanilla
+    // size; when the override differs, the host creates replacement textures
+    // at the requested size and swaps their views in at bind time starting
+    // next frame. Safe to call at any time (early config apply, Init, or a
+    // GUI setting change).
+    void (*SetShadowAtlasResolution)(uint32_t size);
+
+    // Vanilla shadow atlas resolution the game requested before any Dust
+    // override; 0 if the atlas hasn't been created yet. Use this to revert
+    // the override when the effect is disabled.
+    uint32_t (*GetShadowBaseResolution)(void);
+
+    // Live PSSM cascade-split lambda override (CSM shadow mode only; RTWSM
+    // has no cascades). 0.0 = pure linear split distribution, 1.0 = pure
+    // logarithmic. Pass a NEGATIVE value to clear the override and restore
+    // the game's own splits (Kenshi's native distribution does not match the
+    // PSSM formula at any lambda). Clamped to [0, 1]; applies next frame.
+    void (*SetCascadeLambda)(float lambda);
+
+    // Live shadow far-distance override (both shadow modes). Values are
+    // clamped to [1, 100000]; pass a NEGATIVE value to clear the override
+    // and restore the engine's own range + native CSM splits. Returns 1 if
+    // the value reached the engine's CSM splits source; 0 if it was only
+    // stored / applied to the RTWSM shared params (capture still pending —
+    // the value lands once it completes). Note: this changes the LIVE range
+    // only; persisting across restarts is the plugin's job (settings.cfg
+    // "Shadow Range").
+    int (*SetShadowRange)(float farDistance);
 } DustHostAPI;
 
 // Performance impact hint for a single setting (API v3.2+).
@@ -256,6 +288,14 @@ typedef struct DustEffectDesc {
     const char*         configSection;   // INI section name (NULL = use effect name)
     const char*         _effectDir;      // Set by framework after DustEffectCreate — DLL directory (read-only)
     int32_t             priority;        // Dispatch order within same injection point (lower = earlier, default 0)
+
+    // === API v4 additions ===
+    // Called during LoadAll, right after the effect's INI config is loaded
+    // and BEFORE Init. Lets the effect push config-derived state that must
+    // exist before the game creates its D3D resources — e.g. the shadow
+    // atlas resolution override (Kenshi builds its atlas between LoadAll
+    // and InitAll). NULL if unused.
+    void (*OnEarlyConfigApply)(const DustHostAPI* host);
 } DustEffectDesc;
 
 // Every effect DLL must export this function.

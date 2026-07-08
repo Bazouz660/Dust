@@ -10,6 +10,7 @@
 #include "D3D11Hook.h"
 #include "DustGUI.h"
 #include "EffectLoader.h"
+#include "PssmDetour.h"
 
 static HMODULE gDllModule = nullptr;
 
@@ -69,6 +70,9 @@ static std::string BuildCacheStamp(const std::string& modDir)
     std::string stamp = "dust|dev";
 #endif
 
+    // Bump this suffix when ShaderPatch HLSL injection changes, so RE_Kenshi
+    // discards cached bytecode that was compiled with an older injection.
+    stamp += "|patch=shadow-b7-csm-r1";
     return stamp;
 }
 
@@ -206,6 +210,12 @@ __declspec(dllexport) void startPlugin()
     }
 
     Log("Game loop hook installed");
+
+    // PSSM cascade-splits detour (live Cascade Lambda for CSM shadows).
+    // Installs here (early in startPlugin) so it's in place before Kenshi's
+    // shadow node init, which is when the splits are written. Late-stage
+    // installs (post-gGameAlive) miss the capture.
+    PssmDetour::TryInstall();
 
     // Install D3D11 hooks — creates a temporary device to discover function
     // addresses, then hooks them via KenshiLib::AddHook. The real device/context
