@@ -9,6 +9,7 @@
 #include "ShaderPatch.h"
 #include "ShaderMetadata.h"
 #include "GeometryCapture.h"
+#include "MotionVectors.h"
 #include "DustLog.h"
 #include <core/Functions.h>
 #include <d3d11.h>
@@ -46,6 +47,11 @@ void SetLightVolumeSsaoAo(ID3D11ShaderResourceView* ao, ID3D11ShaderResourceView
 // (staging CBs are in gCameraStagingCBs[], declared near ExtractCameraData)
 static DustCameraData gCameraData = {};
 static bool gCameraDataExtracted = false; // per-frame flag
+
+// Engine projection matrix, read from the deferred CB (offset located by reflection).
+// With gCameraData.inverseView this gives the exact camera VP = proj * inverse(inverseView).
+static float gCameraProj[16] = {};
+static bool  gCameraProjValid = false;
 
 // VTable indices for swap chain methods (used by both Install() and deferred hooking)
 static const int VTIDX_SC_Present        = 8;
@@ -443,6 +449,14 @@ static void ExtractCameraData(ID3D11DeviceContext* ctx)
         {
             float m[16];
             memcpy(m, (float*)mapped.pData + 32, 64); // c8 offset
+
+            // Read the engine projection matrix too (offset located by PS reflection) so
+            // the MV pass can use the exact camera VP = proj * inverse(inverseView).
+            float proj[16]; bool haveProj = false;
+            const DeferredCamInfo& dc = ShaderMetadata::GetDeferredCam();
+            if (dc.found && dc.projOffset + 64 <= cbDesc.ByteWidth)
+            { memcpy(proj, (const uint8_t*)mapped.pData + dc.projOffset, 64); haveProj = true; }
+
             ctx->Unmap(gCameraStagingCBs[readSlot], 0);
 
             bool valid = true;
@@ -458,12 +472,29 @@ static void ExtractCameraData(ID3D11DeviceContext* ctx)
                 gCameraData.camPosition[0] = m[12]; gCameraData.camPosition[1] = m[13]; gCameraData.camPosition[2] = m[14];
                 gCameraData.valid = 1;
                 gCameraDataExtracted = true;
+
+                if (haveProj)
+                {
+                    bool pv = true;
+                    for (int i = 0; i < 16; i++) if (!isfinite(proj[i])) { pv = false; break; }
+                    if (pv) { memcpy(gCameraProj, proj, 64); gCameraProjValid = true; }
+                }
             }
         }
     }
 
     gCameraStagingSlot = readSlot;
     gCameraStagingReady = true;
+}
+
+// Engine camera matrices for the motion-vector pass. Both are 16-float column-major.
+// True only once both the deferred inverseView and proj have been read this session.
+bool GetDeferredCameraMatrices(float* outInvView, float* outProj)
+{
+    if (!gCameraData.valid || !gCameraProjValid) return false;
+    if (outInvView) memcpy(outInvView, gCameraData.inverseView, 64);
+    if (outProj)    memcpy(outProj, gCameraProj, 64);
+    return true;
 }
 
 // ==================== Original function pointers ====================
@@ -795,6 +826,8 @@ static void TryCaptureDevice(ID3D11Device* device)
     // ([Upscaling] CaptureGeometry=1). Default OFF — capture is a per-frame cost.
     GeometryCapture::SetDevice(gDevice);
     GeometryCapture::SetResolution(gWidth, gHeight);
+    MotionVectors::SetDevice(gDevice);
+    MotionVectors::OnResolution(gWidth, gHeight);
     {
         std::string iniPath = DustLogDir() + "Dust.ini";
         if (GetPrivateProfileIntA("Upscaling", "CaptureGeometry", 0, iniPath.c_str()))
@@ -1257,6 +1290,8 @@ static HRESULT STDMETHODCALLTYPE HookedCreatePixelShader(
     if (SUCCEEDED(hr) && ppPixelShader && *ppPixelShader)
     {
         SurveyRecorder::OnPixelShaderCreated(pShaderBytecode, BytecodeLength, *ppPixelShader);
+        // Reflect to locate the deferred camera CB (inverseView + proj) for the MV pass.
+        ShaderMetadata::OnPixelShaderCreated(pShaderBytecode, BytecodeLength);
 
         // Record this shader if it's a patched light_fs. This MUST be reliable: the patched
         // light_fs multiplies each light by t8/t9/t10, so a shader we fail to recognize
@@ -1427,6 +1462,7 @@ static void STDMETHODCALLTYPE HookedDraw(
                             gHeight = desc.Height;
                             gEffectLoader.OnResolutionChanged(gDevice, gWidth, gHeight);
                             GeometryCapture::SetResolution(gWidth, gHeight);   // keep MV GBuffer detect in sync
+                            MotionVectors::OnResolution(gWidth, gHeight);      // resize velocity RT
                         }
                         tex->Release();
                     }
@@ -1498,6 +1534,14 @@ static void STDMETHODCALLTYPE HookedDraw(
         // POST: effects that operate after the draw
         fctx.timing = DUST_TIMING_POST;
         gEffectLoader.DispatchPost(dip, &fctx);
+
+        // Motion-vector pass (upscaling A.2b): build the analytic velocity buffer at
+        // POST_LIGHTING (captures complete, camera extracted); blit the debug viz over
+        // the final image at POST_TONEMAP when [Upscaling] ShowMotionVectors=1.
+        if (result.point == InjectionPoint::POST_LIGHTING)
+            MotionVectors::RenderVelocity(pThis);
+        else if (result.point == InjectionPoint::POST_TONEMAP)
+            MotionVectors::DebugBlit(pThis);
     }
     else
     {

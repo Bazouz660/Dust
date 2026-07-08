@@ -11,6 +11,7 @@
 #include "DustGUI.h"
 #include "EffectLoader.h"
 #include "PssmDetour.h"
+#include "CameraAccess.h"
 
 static HMODULE gDllModule = nullptr;
 
@@ -154,6 +155,10 @@ void GameWorld__mainLoop_GPUSensitiveStuff_hook(GameWorld* thisptr, float time)
             (unsigned long long)sLoopCount);
         D3D11Hook::TryRecoverPresent();
     }
+
+    // Hand the GameWorld* to the camera-access helper so the MV pass can read the OGRE
+    // camera's exact view-projection this frame (same thread as the D3D draw hooks).
+    CameraAccess_SetGameWorld(thisptr);
 
     // Reset per-frame state before the game renders
     D3D11Hook::ResetFrameState();

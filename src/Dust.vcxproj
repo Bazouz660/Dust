@@ -104,6 +104,8 @@
     <ClCompile Include="ShaderPatch.cpp" />
     <ClCompile Include="ShaderMetadata.cpp" />
     <ClCompile Include="GeometryCapture.cpp" />
+    <ClCompile Include="MotionVectors.cpp" />
+    <ClCompile Include="CameraAccess.cpp" />
     <ClCompile Include="PssmDetour.cpp" />
     <ClCompile Include="imgui\imgui.cpp" />
     <ClCompile Include="imgui\imgui_draw.cpp" />
@@ -130,6 +132,8 @@
     <ClInclude Include="ShaderPatch.h" />
     <ClInclude Include="ShaderMetadata.h" />
     <ClInclude Include="GeometryCapture.h" />
+    <ClInclude Include="MotionVectors.h" />
+    <ClInclude Include="CameraAccess.h" />
     <ClInclude Include="tracy\Tracy.hpp" />
     <ClInclude Include="PssmDetour.h" />
     <ClInclude Include="imgui\imgui.h" />

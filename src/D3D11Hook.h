@@ -48,4 +48,8 @@ namespace D3D11Hook
     // SSAO publishes its AO map + params here each frame (via SetLightVolumeSsaoAo). Bound at
     // t8/t9 for light_fs, preferred over the deferred-slot snapshot. Cleared per frame.
     void SetLightVolumeSsaoAo(ID3D11ShaderResourceView* ao, ID3D11ShaderResourceView* params);
+
+    // Engine camera matrices (16-float column-major) read from the deferred CB, for the
+    // motion-vector pass: camera VP = proj * inverse(inverseView). False until both read.
+    bool GetDeferredCameraMatrices(float* outInvView, float* outProj);
 }
