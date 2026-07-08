@@ -103,6 +103,10 @@ jobs:
             TAG="${GITHUB_REF#refs/tags/}"
             echo "value=${TAG#v}" >> "$GITHUB_OUTPUT"
             echo "label=$TAG" >> "$GITHUB_OUTPUT"
+          elif [[ "$GITHUB_REF" == refs/tags/beta-* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            echo "value=${TAG#beta-}" >> "$GITHUB_OUTPUT"
+            echo "label=$TAG" >> "$GITHUB_OUTPUT"
           else
             SHORT_SHA="${GITHUB_SHA::7}"
             echo "value=0.0.0-dev.$SHORT_SHA" >> "$GITHUB_OUTPUT"
@@ -222,7 +226,7 @@ jobs:
           /p:Platform=x64
 
       - name: Package release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/beta-')
         run: |
           mkdir release\Dust\effects
           mkdir release\Dust\effects\shaders
@@ -264,7 +268,7 @@ jobs:
           copy mod\RE_Kenshi.json release\Dust\
 
       - name: Upload artifact
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/beta-')
         uses: actions/upload-artifact@v5
         with:
           name: Dust-${{ steps.version.outputs.label }}

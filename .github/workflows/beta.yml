@@ -1,0 +1,59 @@
+name: Beta Release
+
+# Beta previews: triggered by beta-* tags (e.g. beta-0.8.0).
+# Publishes to GitHub (as a prerelease) and Nexus only - never Steam.
+
+on:
+  push:
+    tags:
+      - "beta-*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/build.yml
+
+  # Upload to Nexus under the Misc group so betas never touch the stable Main file.
+  # Each new beta archives the previous one within that group.
+  nexus:
+    needs: build
+    uses: ./.github/workflows/nexus.yml
+    with:
+      file_group_id: "7502747"  # Miscellaneous files update group (betas)
+      file_category: miscellaneous
+      archive_existing_file: true
+    secrets:
+      NEXUSMODS_API_KEY: ${{ secrets.NEXUSMODS_API_KEY }}
+
+  github-release:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          echo "label=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Download artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: Dust-${{ steps.version.outputs.label }}
+          path: release/Dust
+
+      - name: Create zip
+        run: |
+          cd release
+          zip -r ../Dust-${{ steps.version.outputs.label }}.zip Dust
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.label }}
+          name: ${{ steps.version.outputs.label }}
+          files: Dust-${{ steps.version.outputs.label }}.zip
+          generate_release_notes: true
+          prerelease: true
