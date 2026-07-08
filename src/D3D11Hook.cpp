@@ -7,6 +7,8 @@
 #include "SurveyRecorder.h"
 #include "SurveyWriter.h"
 #include "ShaderPatch.h"
+#include "ShaderMetadata.h"
+#include "GeometryCapture.h"
 #include "DustLog.h"
 #include <core/Functions.h>
 #include <d3d11.h>
@@ -366,6 +368,7 @@ void ResetFrameState()
     ApplyPendingShadowResize();
     ClearShadowReplacements();
     gPipelineDetector.ResetFrame();
+    GeometryCapture::ResetFrame();   // release last frame's captured draws (MV pass)
     gResourceRegistry.ResetFrame();
     ReleaseLightVolumeAO();
     SetLightVolumeAoTexture(nullptr);        // clear RTGI's per-light AO; republished each frame
@@ -785,6 +788,20 @@ static void TryCaptureDevice(ID3D11Device* device)
     else
     {
         Log("Detected resolution: %ux%u", gWidth, gHeight);
+    }
+
+    // Motion-vector pass (upscaling): hand the device + GBuffer resolution to the
+    // geometry-capture layer, and opt in only when the user enables it in Dust.ini
+    // ([Upscaling] CaptureGeometry=1). Default OFF — capture is a per-frame cost.
+    GeometryCapture::SetDevice(gDevice);
+    GeometryCapture::SetResolution(gWidth, gHeight);
+    {
+        std::string iniPath = DustLogDir() + "Dust.ini";
+        if (GetPrivateProfileIntA("Upscaling", "CaptureGeometry", 0, iniPath.c_str()))
+        {
+            GeometryCapture::SetCaptureFlags(DUST_CAPTURE_GEOMETRY);
+            Log("Upscaling: geometry capture ENABLED ([Upscaling] CaptureGeometry=1)");
+        }
     }
 
     // Initialize all loaded effect plugins
@@ -1295,7 +1312,12 @@ static HRESULT STDMETHODCALLTYPE HookedCreateVertexShader(
     HRESULT hr = oCreateVertexShader(pThis, pShaderBytecode, BytecodeLength,
                                       pClassLinkage, ppVertexShader);
     if (SUCCEEDED(hr) && ppVertexShader && *ppVertexShader)
+    {
         SurveyRecorder::OnVertexShaderCreated(pShaderBytecode, BytecodeLength, *ppVertexShader);
+        // Reflect the VS CB layout so GeometryCapture can classify draws
+        // (STATIC vs SKINNED) and locate the clip/world matrix for the MV pass.
+        ShaderMetadata::OnVertexShaderCreated(pShaderBytecode, BytecodeLength, *ppVertexShader);
+    }
     return hr;
 }
 
@@ -1404,6 +1426,7 @@ static void STDMETHODCALLTYPE HookedDraw(
                             gWidth = desc.Width;
                             gHeight = desc.Height;
                             gEffectLoader.OnResolutionChanged(gDevice, gWidth, gHeight);
+                            GeometryCapture::SetResolution(gWidth, gHeight);   // keep MV GBuffer detect in sync
                         }
                         tex->Release();
                     }
@@ -1491,6 +1514,11 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     if (Survey::IsActive())
         SurveyRecorder::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 
+    // Motion-vector pass: snapshot this GBuffer draw's transform state. Fast-path
+    // no-op unless capture is enabled AND we're inside the GBuffer pass.
+    if (GeometryCapture::HasActiveCapture())
+        GeometryCapture::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
+
     // Direct-light AO for point/spot lights: for a light_fs draw, swap the AO snapshot
     // into s8/s9 for the draw and restore afterward (scope dtor). gLvAoReady gates the
     // PSGetShader check to the POST_LIGHTING→POST_FOG window.
@@ -1507,6 +1535,13 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
 
     if (Survey::IsActive())
         SurveyRecorder::OnDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
+                                                StartIndexLocation, BaseVertexLocation,
+                                                StartInstanceLocation);
+
+    // Motion-vector pass: snapshot this instanced GBuffer draw (per-instance
+    // transform VB is captured too — see GeometryCapture::CaptureDrawState).
+    if (GeometryCapture::HasActiveCapture())
+        GeometryCapture::OnDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
                                                 StartIndexLocation, BaseVertexLocation,
                                                 StartInstanceLocation);
 
@@ -1595,7 +1630,17 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
     ID3D11RenderTargetView* const* ppRenderTargetViews,
     ID3D11DepthStencilView* pDepthStencilView)
 {
-    if (gShutdownSignaled || !gShadowSwapActive)
+    if (gShutdownSignaled)
+    { oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView); return; }
+
+    // Motion-vector pass: track GBuffer-pass entry/exit — independent of the
+    // shadow-swap feature, so it must run before the !gShadowSwapActive early-out.
+    // No-op (single global read) unless geometry capture is enabled.
+    if (GeometryCapture::GetCaptureFlags() != 0)
+        GeometryCapture::OnOMSetRenderTargetsWithResult(
+            GeometryCapture::CheckGBufferConfig(NumViews, ppRenderTargetViews, pDepthStencilView));
+
+    if (!gShadowSwapActive)
     { oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView); return; }
 
     // Shadow pass detection: DSV match + (RTV match or depth-only), OR
@@ -1680,7 +1725,21 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargetsAndUAV(
     ID3D11UnorderedAccessView* const* ppUnorderedAccessViews,
     const UINT* pUAVInitialCounts)
 {
-    if (gShutdownSignaled || !gShadowSwapActive)
+    if (gShutdownSignaled)
+    {
+        oOMSetRenderTargetsAndUAV(pThis, NumRTVs, ppRenderTargetViews,
+            pDepthStencilView, UAVStartSlot, NumUAVs, ppUnorderedAccessViews,
+            pUAVInitialCounts);
+        return;
+    }
+
+    // Motion-vector pass: GBuffer-pass tracking (see the plain-OMSet hook). OGRE 2.0
+    // binds the GBuffer MRT through this combined call, so detection must live here too.
+    if (GeometryCapture::GetCaptureFlags() != 0)
+        GeometryCapture::OnOMSetRenderTargetsWithResult(
+            GeometryCapture::CheckGBufferConfig(NumRTVs, ppRenderTargetViews, pDepthStencilView));
+
+    if (!gShadowSwapActive)
     {
         oOMSetRenderTargetsAndUAV(pThis, NumRTVs, ppRenderTargetViews,
             pDepthStencilView, UAVStartSlot, NumUAVs, ppUnorderedAccessViews,

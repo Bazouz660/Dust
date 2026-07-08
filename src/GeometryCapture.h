@@ -1,0 +1,157 @@
+#pragma once
+
+#include <d3d11.h>
+#include <cstdint>
+#include <vector>
+#include "ShaderMetadata.h"
+
+// Capture flags (SetCaptureFlags). Any non-zero value enables per-draw geometry
+// capture; the individual bits opt into extra per-draw state. Self-contained here
+// (the dxr tree declared these in DustAPI.h) so the port doesn't expand main's
+// public API surface.
+#ifndef DUST_CAPTURE_PS_RESOURCES
+#define DUST_CAPTURE_PS_RESOURCES  0x1u   // also snapshot PS CBs / SRVs / samplers
+#endif
+#ifndef DUST_CAPTURE_GEOMETRY
+#define DUST_CAPTURE_GEOMETRY      0x2u   // capture IA + VS state (motion-vector pass)
+#endif
+
+// Kenshi GBuffer RT formats: albedo, normals, depth
+static const DXGI_FORMAT GBUFFER_COLOR_FORMATS[3] = {
+    DXGI_FORMAT_B8G8R8A8_UNORM,
+    DXGI_FORMAT_B8G8R8A8_UNORM,
+    DXGI_FORMAT_R32_FLOAT
+};
+
+struct CapturedDraw
+{
+    // Draw call parameters
+    UINT indexCount            = 0;
+    UINT startIndexLocation    = 0;
+    INT  baseVertexLocation    = 0;
+    UINT instanceCount         = 1;
+    UINT startInstanceLocation = 0;
+
+    // Input Assembler vertex-buffer slots. SKINNED meshes split their streams across 4 slots
+    // (RenderDoc-verified): 0=pos/normal, 1=uv/tangent/binormal, 2=BLENDINDICES/BLENDWEIGHT,
+    // 3=uv2. Capturing only 2 dropped the skinning streams -> garbage bones -> collapsed skin.
+    // Slot 1 doubles as instance data for instanced static draws.
+    static const UINT           MAX_VB_SLOTS  = 4;
+    ID3D11Buffer*               vertexBuffers[MAX_VB_SLOTS] = {};
+    UINT                        vbStrides[MAX_VB_SLOTS]     = {};
+    UINT                        vbOffsets[MAX_VB_SLOTS]     = {};
+    ID3D11Buffer*               indexBuffer   = nullptr;
+    DXGI_FORMAT                 indexFormat    = DXGI_FORMAT_R16_UINT;
+    UINT                        ibOffset      = 0;
+    ID3D11InputLayout*          inputLayout   = nullptr;
+    D3D11_PRIMITIVE_TOPOLOGY    topology       = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+
+    // Vertex Shader
+    ID3D11VertexShader*         vs            = nullptr;
+    static const UINT           MAX_VS_CBS    = 4;
+    ID3D11Buffer*               vsCBs[MAX_VS_CBS] = {};
+    // VS-stage resources — needed to replay terrain/skin/foliage whose vertex
+    // shaders fetch from SRVs (heightmap, bone palette, vertex-fetch skinning).
+    static const UINT           MAX_VS_SRVS   = 8;
+    ID3D11ShaderResourceView*   vsSRVs[MAX_VS_SRVS] = {};
+    static const UINT           MAX_VS_SAMPLERS = 4;
+    ID3D11SamplerState*         vsSamplers[MAX_VS_SAMPLERS] = {};
+
+    // Pixel Shader
+    ID3D11PixelShader*          ps            = nullptr;
+    static const UINT           MAX_PS_CBS    = 4;
+    ID3D11Buffer*               psCBs[MAX_PS_CBS] = {};
+    static const UINT           MAX_PS_SRVS   = 8;
+    ID3D11ShaderResourceView*   psSRVs[MAX_PS_SRVS] = {};
+    static const UINT           MAX_PS_SAMPLERS = 4;
+    ID3D11SamplerState*         psSamplers[MAX_PS_SAMPLERS] = {};
+
+    // Shader metadata (non-owning pointer, valid for lifetime of ShaderMetadata registry)
+    const VSConstantBufferInfo* vsMetadata    = nullptr;
+
+    // Staging copy of the VS CB containing the clip/world matrices.
+    // Populated at capture time via CopyResource. By replay time (POST_LIGHTING),
+    // the GPU has finished the copy so Map won't stall.
+    // Null for unclassified draws (UNKNOWN transform type).
+    ID3D11Buffer* cbStagingCopy = nullptr;
+    uint32_t      cbStagingSize = 0;
+
+    // Bindable per-slot snapshots of the OTHER VS CBs, populated only for SKINNED draws.
+    // The bone-palette CB is Map_WRITE_DISCARDed by OGRE every skinned draw, so its live
+    // pointer holds the LAST draw's pose by replay time; the replay rebinds these copies.
+    ID3D11Buffer* cbCopies[MAX_VS_CBS] = {};
+
+    // Bindable snapshot of the per-instance transform vertex buffer (slot 1), populated only
+    // for instanced draws. OGRE recycles the HW-instance buffer per batch, so the live pointer
+    // holds the LAST batch's transforms by replay time -> instanced geometry collapses. The
+    // replay rebinds this copy at slot 1.
+    ID3D11Buffer* instVBCopy = nullptr;
+};
+
+namespace GeometryCapture
+{
+    namespace detail
+    {
+        // Exposed for inline fast-path in HookedDrawIndexed. When neither flag
+        // is set (most game frames — no active capture session), the inline
+        // check below short-circuits the call into OnDrawIndexed entirely.
+        extern bool sInGBufferPass;
+        extern uint32_t sCaptureFlags;
+    }
+
+    // Inline: true when at least one OnDraw call would do meaningful work.
+    // Lets the hooks skip the function call (~5-10ns) for the dominant case.
+    inline bool HasActiveCapture()
+    {
+        return detail::sInGBufferPass && detail::sCaptureFlags != 0;
+    }
+
+    // Called from HookedOMSetRenderTargets to detect GBuffer pass start/end.
+    // Must be called AFTER the original OMSetRenderTargets so the state is committed.
+    void OnOMSetRenderTargets(ID3D11DeviceContext* ctx, UINT numViews,
+                              ID3D11RenderTargetView* const* ppRTVs,
+                              ID3D11DepthStencilView* pDSV);
+
+    // Fast path: update GBuffer tracking with a precomputed CheckGBufferConfig result.
+    void OnOMSetRenderTargetsWithResult(bool isGBuffer);
+
+    // Called from HookedDrawIndexed when a GBuffer draw is detected.
+    void OnDrawIndexed(ID3D11DeviceContext* ctx, UINT indexCount,
+                       UINT startIndexLocation, INT baseVertexLocation);
+
+    // Called from HookedDrawIndexedInstanced when a GBuffer instanced draw is detected.
+    void OnDrawIndexedInstanced(ID3D11DeviceContext* ctx, UINT indexCountPerInstance,
+                                UINT instanceCount, UINT startIndexLocation,
+                                INT baseVertexLocation, UINT startInstanceLocation);
+
+    // Per-frame lifecycle
+    void ResetFrame();
+    void Shutdown();
+
+    // Access captured draws (valid from end of GBuffer pass until ResetFrame)
+    const std::vector<CapturedDraw>& GetCaptures();
+    uint32_t GetCaptureCount();
+
+    // Monotonic counter bumped every ResetFrame — lets consumers (GeometryReplay's
+    // per-frame cache) detect that the captures vector was repopulated even when its
+    // data pointer and size happen to match the previous frame's.
+    uint32_t GetGeneration();
+
+    // Whether we're currently inside a detected GBuffer pass
+    bool IsInGBufferPass();
+
+    // Check if the given RT config matches the GBuffer (does NOT update internal state).
+    bool CheckGBufferConfig(UINT numViews, ID3D11RenderTargetView* const* ppRTVs,
+                            ID3D11DepthStencilView* pDSV);
+
+    // Set the expected GBuffer resolution (called when resolution is detected/changes)
+    void SetResolution(UINT width, UINT height);
+
+    // Cache the device pointer (called once from TryCaptureDevice)
+    void SetDevice(ID3D11Device* device);
+
+    // Capture flags — controls what per-draw state is captured.
+    // Default 0 = lean (IA + VS + PS pointer). DUST_CAPTURE_PS_RESOURCES = full PS state.
+    void SetCaptureFlags(uint32_t flags);
+    uint32_t GetCaptureFlags();
+}
