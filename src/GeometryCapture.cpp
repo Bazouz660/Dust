@@ -14,6 +14,7 @@ using detail::sCaptureFlags;
 static UINT sExpectedWidth  = 0;
 static UINT sExpectedHeight = 0;
 static ID3D11Device* sCachedDevice = nullptr;
+static ID3D11DepthStencilView* sGBufferDSV = nullptr;   // this frame's GBuffer depth (raw, for MV EQUAL pass)
 
 static uint32_t sFramesCaptured = 0;
 static uint32_t sGeneration     = 0;   // bumped every ResetFrame (see GetGeneration)
@@ -437,6 +438,7 @@ void ResetFrame()
 
     ReleaseCaptures();
     sInGBufferPass = false;
+    sGBufferDSV = nullptr;   // raw same-frame ptr; re-captured next frame's GBuffer pass
     sGeneration++;
 }
 
@@ -469,8 +471,15 @@ void SetDevice(ID3D11Device* device)
 bool CheckGBufferConfig(UINT numViews, ID3D11RenderTargetView* const* ppRTVs,
                         ID3D11DepthStencilView* pDSV)
 {
-    return IsGBufferConfig(numViews, ppRTVs, pDSV);
+    bool isGBuffer = IsGBufferConfig(numViews, ppRTVs, pDSV);
+    // Snapshot the GBuffer depth buffer so the MV pass can re-render geometry with
+    // DepthFunc=EQUAL against it (exact visible-surface coverage; alpha cutouts stop
+    // occluding as full quads). Raw ptr, same-frame use, cleared each ResetFrame.
+    if (isGBuffer && pDSV) sGBufferDSV = pDSV;
+    return isGBuffer;
 }
+
+ID3D11DepthStencilView* GetGBufferDSV() { return sGBufferDSV; }
 
 void SetResolution(UINT width, UINT height)
 {

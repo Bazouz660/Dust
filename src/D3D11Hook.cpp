@@ -1524,13 +1524,14 @@ static void STDMETHODCALLTYPE HookedDraw(
         fctx.timing = DUST_TIMING_POST;
         gEffectLoader.DispatchPost(dip, &fctx);
 
-        // Motion-vector pass (upscaling A.2b): build the analytic velocity buffer at
-        // POST_LIGHTING (captures complete, camera extracted); blit the debug viz over
-        // the final image at POST_TONEMAP when [Upscaling] ShowMotionVectors=1.
-        if (result.point == InjectionPoint::POST_LIGHTING)
-            MotionVectors::RenderVelocity(pThis);
-        else if (result.point == InjectionPoint::POST_TONEMAP)
-            MotionVectors::DebugBlit(pThis);
+        // Shader-injected motion vectors: the velocity RT is filled during the real GBuffer pass
+        // (see HookedOMSetRenderTargets + ShaderPatch). Here we only blit the debug viz over the
+        // final image at POST_TONEMAP when [Upscaling] ShowMotionVectors=1, then end the frame.
+        if (result.point == InjectionPoint::POST_TONEMAP)
+        {
+            MotionVectors::InjDebugBlit(pThis);
+            MotionVectors::InjEndFrame();
+        }
     }
     else
     {
@@ -1557,6 +1558,9 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     // PSGetShader check to the POST_LIGHTING→POST_FOG window.
     bool isLV = gLvAoReady && IsLightVolumeDraw(pThis);
     LightVolumeAoScope lvAo(pThis, isLV);
+    // Keep the injected-MV reproj CB pinned at b13 for the patched GBuffer VS (bind AFTER OGRE's
+    // per-draw constant setup; unconditional so the GBuffer-pass gate can't exclude a draw).
+    { ID3D11Buffer* rcb = MotionVectors::GetInjReprojCB(); if (rcb) pThis->VSSetConstantBuffers(13, 1, &rcb); }
     oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 }
 
@@ -1581,6 +1585,7 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
     // Direct-light AO for point/spot lights (instanced light-volume path — see HookedDrawIndexed).
     bool isLV = gLvAoReady && IsLightVolumeDraw(pThis);
     LightVolumeAoScope lvAo(pThis, isLV);
+    { ID3D11Buffer* rcb = MotionVectors::GetInjReprojCB(); if (rcb) pThis->VSSetConstantBuffers(13, 1, &rcb); }
     oDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
                           StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
 }
@@ -1666,12 +1671,28 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
     if (gShutdownSignaled)
     { oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView); return; }
 
-    // Motion-vector pass: track GBuffer-pass entry/exit — independent of the
-    // shadow-swap feature, so it must run before the !gShadowSwapActive early-out.
-    // No-op (single global read) unless geometry capture is enabled.
-    if (GeometryCapture::GetCaptureFlags() != 0)
-        GeometryCapture::OnOMSetRenderTargetsWithResult(
-            GeometryCapture::CheckGBufferConfig(NumViews, ppRenderTargetViews, pDepthStencilView));
+    // Motion-vector pass: track GBuffer-pass entry/exit — independent of the shadow-swap feature,
+    // so it must run before the !gShadowSwapActive early-out. Runs unconditionally now (the injected
+    // MV path needs it even without geometry capture); CheckGBufferConfig is pointer-cached, cheap.
+    bool isGBuf = GeometryCapture::CheckGBufferConfig(NumViews, ppRenderTargetViews, pDepthStencilView);
+    GeometryCapture::OnOMSetRenderTargetsWithResult(isGBuf);
+
+    // Shader-injected motion vectors: append the velocity RT (SV_Target3) to the GBuffer bind, do
+    // the once-per-frame reproj+clear, and bind the reproj CB at b13 for the patched vertex shaders.
+    if (isGBuf && NumViews == 3 && gDevice && ppRenderTargetViews && ppRenderTargetViews[0])
+    {
+        ID3D11RenderTargetView* velRTV = MotionVectors::InjEnsureVelRTV(ppRenderTargetViews[0]);
+        if (velRTV)
+        {
+            MotionVectors::InjBeginGBuffer(pThis);
+            ID3D11Buffer* reprojCB = MotionVectors::GetInjReprojCB();
+            if (reprojCB) pThis->VSSetConstantBuffers(13, 1, &reprojCB);
+            ID3D11RenderTargetView* rtvs4[4] = {
+                ppRenderTargetViews[0], ppRenderTargetViews[1], ppRenderTargetViews[2], velRTV };
+            oOMSetRenderTargets(pThis, 4, rtvs4, pDepthStencilView);
+            return;
+        }
+    }
 
     if (!gShadowSwapActive)
     { oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView); return; }

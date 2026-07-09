@@ -33,6 +33,7 @@ static ID3D11Texture2D*          sVelStaging = nullptr;   // CPU readback for st
 static ID3D11VertexShader*   sVelVS = nullptr;
 static ID3D11PixelShader*    sVelPS = nullptr;
 static ID3D11VertexShader*   sVelSkinVS = nullptr;   // A.3b skinned velocity VS
+static ID3D11VertexShader*   sVelInstVS = nullptr;   // A.4 instanced (per-instance world matrix) VS
 static ID3D11PixelShader*    sFsPS  = nullptr;
 static ID3D11VertexShader*   sFsVS  = nullptr;
 static ID3D11Buffer*         sVelCB = nullptr;
@@ -40,6 +41,9 @@ static ID3D11Buffer*         sCurBoneCB = nullptr;    // 80 float3x4 bone palett
 static ID3D11Buffer*         sPrevBoneCB = nullptr;   // matched previous-frame bone palette
 static ID3D11Buffer*         sVpCB = nullptr;         // { curVP, prevVP } for skinned
 static ID3D11DepthStencilState* sDepthState = nullptr;
+static ID3D11DepthStencilState* sDepthOff   = nullptr;   // no hardware depth (manual PS test vs game depth)
+static ID3D11ShaderResourceView* sGameDepthSRV = nullptr;   // R24_UNORM_X8 view of the game GBuffer depth
+static ID3D11Resource*           sGameDepthTex = nullptr;   // cache key (raw compare only)
 static ID3D11RasterizerState*   sRaster = nullptr;
 static ID3D11BlendState*        sBlend = nullptr;
 static ID3D11SamplerState*      sSampler = nullptr;
@@ -101,9 +105,45 @@ VOut main(float4 iPos : POSITION, float2 iTex : TEXCOORD0, float3 iNrm : NORMAL,
     return o;
 })";
 
+// Instanced velocity VS (A.4): mirrors objects.hlsl INSTANCED main_vs. The per-instance world
+// matrix is 3 float4 ROWS at TEXCOORD1/2/3 (VB slot 1, per-instance); worldPos = mul(worldMatrix,
+// pos); clip = mul(wvp, worldPos) where wvp = the CB worldViewProjMatrix (= VP, since the batch's
+// world is identity for instancing) read COLUMN-major like the static pass. The instance matrix is
+// built from vertex inputs so its convention is fixed by the float4x4(rows) constructor. Instanced
+// objects are static -> prev = global camera reproj. Declare the FULL input signature so the IA
+// fetches the trailing instance rows correctly (same lesson as skinned).
+static const char* kVelInstVS = R"(
+cbuffer VelCB : register(b0) { float4x4 wvp; float4x4 reproj; };
+struct VOut { float4 pos:SV_Position; float4 cur:TEXCOORD0; float4 prev:TEXCOORD1; };
+VOut main(float4 pos:POSITION, float4 nrm:NORMAL, float2 uv:TEXCOORD0, float4 tan:TANGENT,
+          float4 im0:TEXCOORD1, float4 im1:TEXCOORD2, float4 im2:TEXCOORD3) {
+    VOut o;
+    float4x4 wm = float4x4(im0, im1, im2, float4(0,0,0,1));
+    float4 wp  = mul(wm, pos);
+    o.cur  = mul(wvp, wp);
+    o.prev = mul(reproj, o.cur);
+    o.pos  = o.cur;
+    return o;
+})";
+
 static const char* kVelPS = R"(
+Texture2D<float> gameDepth : register(t0);
 struct VOut { float4 pos:SV_Position; float4 cur:TEXCOORD0; float4 prev:TEXCOORD1; };
 float2 main(VOut i) : SV_Target {
+    // Tolerant depth test vs the game's GBuffer depth (replaces brittle hardware EQUAL, which
+    // flickered on opaque geometry because our re-render's depth differs from the game's by a
+    // few ULP / a D24 quantum). Keep the pixel only where THIS draw is the visible surface:
+    // absorbs that tiny mismatch, yet the gap to an alpha card's background is far larger.
+    float gd = gameDepth.Load(int3(int2(i.pos.xy), 0));
+    // ONE-SIDED depth test: discard only where this pixel is meaningfully IN FRONT of the game's
+    // recorded surface (smaller NDC z) — i.e. an alpha card's transparent part covering background.
+    // Occlusion of surfaces BEHIND is handled by our own LESS depth buffer, so we never need the
+    // "farther" side. This never discards the true visible surface (it sits AT gd, not in front of
+    // it), so opaque geometry is immune to the far-plane depth-precision error that caused flicker.
+    // Adaptive margin absorbs that precision error near z->1; the gap to a card's background is far
+    // larger, so cutouts still reject correctly.
+    float eps = 5e-4 + 8e-3 * i.pos.z;
+    if (i.pos.z < gd - eps) discard;
     float2 c = i.cur.xy  / i.cur.w;
     float2 p = i.prev.xy / i.prev.w;
     return (c - p) * float2(0.5, -0.5);   // NDC delta -> UV-space motion
@@ -124,6 +164,7 @@ SamplerState smp : register(s0);
 struct FOut { float4 pos:SV_Position; float2 uv:TEXCOORD0; };
 float4 main(FOut i) : SV_Target {
     float2 mv = velTex.Sample(smp, i.uv);
+    if (mv.x < -100.0) return float4(1.0, 0.0, 0.0, 1.0);   // sentinel => no coverage => REACTIVE (red)
     float s = 40.0;
     float3 col = float3(0.5,0.5,0.5) + float3(mv.x, mv.y, 0.0) * s;
     col.b = saturate(length(mv) * s);
@@ -159,6 +200,10 @@ static void ReleaseTargets()
     if (sVelDSV) { sVelDSV->Release(); sVelDSV = nullptr; }
     if (sVelDepth) { sVelDepth->Release(); sVelDepth = nullptr; }
     if (sVelStaging) { sVelStaging->Release(); sVelStaging = nullptr; }
+    // Invalidate the game-depth SRV cache — on a resize the depth texture is recreated and its
+    // pointer could be reused, which would false-hit the raw-pointer cache key.
+    if (sGameDepthSRV) { sGameDepthSRV->Release(); sGameDepthSRV = nullptr; }
+    sGameDepthTex = nullptr;
 }
 
 static bool EnsureResources()
@@ -190,6 +235,7 @@ static bool EnsureResources()
     if (!sVelVS && !CompileVS(kVelVS, &sVelVS)) return false;
     if (!sVelPS && !CompilePS(kVelPS, &sVelPS)) return false;
     if (!sVelSkinVS && !CompileVS(kVelSkinVS, &sVelSkinVS)) return false;
+    if (!sVelInstVS && !CompileVS(kVelInstVS, &sVelInstVS)) return false;
     if (!sFsVS  && !CompileVS(kFsVS,  &sFsVS))  return false;
     if (!sFsPS  && !CompilePS(kFsPS,  &sFsPS))  return false;
 
@@ -221,6 +267,15 @@ static bool EnsureResources()
         ds.DepthEnable = TRUE; ds.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
         ds.DepthFunc = D3D11_COMPARISON_LESS;
         sDevice->CreateDepthStencilState(&ds, &sDepthState);
+    }
+    if (!sDepthOff)
+    {
+        // No hardware depth test/write — the velocity PS does a TOLERANT compare against the
+        // game's GBuffer depth instead (a draw contributes velocity only at the pixels it owns,
+        // alpha cutouts included, opaque geometry covered without the ULP flicker EQUAL had).
+        D3D11_DEPTH_STENCIL_DESC ds = {};
+        ds.DepthEnable = FALSE; ds.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+        sDevice->CreateDepthStencilState(&ds, &sDepthOff);
     }
     if (!sRaster)
     {
@@ -512,6 +567,29 @@ void RenderVelocity(ID3D11DeviceContext* ctx)
         skinTotal++;
     }
 
+    // --- A.4: gather INSTANCED static draws (buildings/props/rocks/foliage batches). Static ->
+    //     camera reprojection like the static pass, but rendered with the per-instance world
+    //     matrix (objects.hlsl INSTANCED). cur = the CB worldViewProjMatrix (= VP for the batch). ---
+    struct InstItem { const CapturedDraw* d; Mat4 cur; };
+    std::vector<InstItem> instItems;
+    uint32_t instSkipLayout = 0;
+    for (const auto& d : caps)
+    {
+        if (!d.vsMetadata || d.vsMetadata->transformType != VSTransformType::STATIC) continue;
+        if (d.instanceCount <= 1) continue;
+        if (!d.instVBCopy || !d.indexBuffer || !d.inputLayout || !d.cbStagingCopy) continue;
+        // Only handle the objects.hlsl INSTANCED layout: per-instance world rows at TEXCOORD1 slot 1.
+        const auto* el = ShaderMetadata::GetInputLayoutElements(d.inputLayout);
+        bool ok = false;
+        if (el) for (const auto& e : *el)
+            if (e.semantic == "TEXCOORD" && e.semanticIndex == 1 &&
+                e.slotClass == D3D11_INPUT_PER_INSTANCE_DATA && e.inputSlot == 1) { ok = true; break; }
+        if (!ok) { instSkipLayout++; continue; }
+        Mat4 curM, worldM; bool hasW = false;
+        if (!ReadClipWorld(ctx, d, curM, worldM, hasW)) continue;   // curM = worldViewProjMatrix (=VP)
+        instItems.push_back({ &d, curM });
+    }
+
     // reproj = prevVP * inv(curVP), used RAW (no clamp/reuse) so we can see the truth.
     static Mat4 sPrevVP; static bool sHaveVP = false;
     static float sLastReproj[16]; static bool sHaveLast = false;
@@ -536,11 +614,42 @@ void RenderVelocity(ID3D11DeviceContext* ctx)
     ctx->IAGetIndexBuffer(&savedIB, &savedIF, &savedIBOff);
     sState.Capture(ctx);
 
-    float clear[4] = { 0, 0, 0, 0 };
+    // Clear to a sentinel (not 0 — real static velocity is ~0). Any pixel still == sentinel after
+    // the pass got NO coverage (foliage/birds/anything we can't reproduce) => reactive.
+    float clear[4] = { -1000.0f, -1000.0f, 0, 0 };
     ctx->ClearRenderTargetView(sVelRTV, clear);
+
+    // Build (once, cached) an SRV of the game's GBuffer depth so the velocity PS can do a tolerant
+    // depth compare. The depth is R24G8_TYPELESS w/ SHADER_RESOURCE, viewed as R24_UNORM_X8.
+    ID3D11DepthStencilView* gbufDSV = GeometryCapture::GetGBufferDSV();
+    if (gbufDSV)
+    {
+        ID3D11Resource* res = nullptr; gbufDSV->GetResource(&res);
+        if (res)
+        {
+            if (res != sGameDepthTex)   // texture changed (first use / resize) -> rebuild SRV
+            {
+                if (sGameDepthSRV) { sGameDepthSRV->Release(); sGameDepthSRV = nullptr; }
+                D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+                sd.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+                sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                sd.Texture2D.MipLevels = 1;
+                if (FAILED(sDevice->CreateShaderResourceView(res, &sd, &sGameDepthSRV)))
+                    Log("MotionVectors: game-depth SRV creation FAILED");
+                sGameDepthTex = res;   // raw compare key; sGameDepthSRV holds the actual ref
+            }
+            res->Release();
+        }
+    }
+
+    // Occlusion is handled by our OWN depth buffer (LESS + write) — self-consistent across our
+    // re-render, so no see-through and none of the game-depth precision flicker. The tolerant PS
+    // test vs the game depth SRV (t0) is then only used to REJECT alpha-quad-over-background
+    // pixels (large depth gap), which a loose tolerance can do without breaking occlusion.
     ctx->ClearDepthStencilView(sVelDSV, D3D11_CLEAR_DEPTH, 1.0f, 0);
     ctx->OMSetRenderTargets(1, &sVelRTV, sVelDSV);
     ctx->OMSetDepthStencilState(sDepthState, 0);
+    ctx->PSSetShaderResources(0, 1, &sGameDepthSRV);
     ctx->OMSetBlendState(sBlend, nullptr, 0xffffffff);
     ctx->RSSetState(sRaster);
     D3D11_VIEWPORT vp = { 0, 0, (float)sW, (float)sH, 0, 1 };
@@ -621,6 +730,53 @@ void RenderVelocity(ID3D11DeviceContext* ctx)
     if ((sFrame % 60) == 0)
         Log("MV[A.3b]: skinned=%u matched=%u drawn=%u", skinTotal, skinMatched, skinDrawn);
 
+    // --- A.4: render instanced static draws with the per-instance world matrix + global reproj. ---
+    ctx->VSSetShader(sVelInstVS, nullptr, 0);
+    ctx->VSSetConstantBuffers(0, 1, &sVelCB);
+    uint32_t instDrawn = 0;
+    for (const auto& it : instItems)
+    {
+        const CapturedDraw& d = *it.d;
+        VelCB cb; memcpy(cb.cur, it.cur.m, 64); memcpy(cb.reproj, reproj, 64);
+        D3D11_MAPPED_SUBRESOURCE ms;
+        if (SUCCEEDED(ctx->Map(sVelCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms)))
+        { memcpy(ms.pData, &cb, sizeof(cb)); ctx->Unmap(sVelCB, 0); }
+
+        // OGRE recycles the per-instance VB (slot 1) per batch -> bind the captured snapshot there.
+        ID3D11Buffer* vbs[CapturedDraw::MAX_VB_SLOTS];
+        UINT strides[CapturedDraw::MAX_VB_SLOTS], offsets[CapturedDraw::MAX_VB_SLOTS];
+        for (int i = 0; i < (int)CapturedDraw::MAX_VB_SLOTS; i++)
+        { vbs[i] = d.vertexBuffers[i]; strides[i] = d.vbStrides[i]; offsets[i] = d.vbOffsets[i]; }
+        vbs[1] = d.instVBCopy;
+
+        ctx->IASetInputLayout(d.inputLayout);
+        ctx->IASetPrimitiveTopology(d.topology);
+        ctx->IASetVertexBuffers(0, CapturedDraw::MAX_VB_SLOTS, vbs, strides, offsets);
+        ctx->IASetIndexBuffer(d.indexBuffer, d.indexFormat, d.ibOffset);
+        ctx->DrawIndexedInstanced(d.indexCount, d.instanceCount, d.startIndexLocation,
+                                  d.baseVertexLocation, d.startInstanceLocation);
+        instDrawn++;
+    }
+    if ((sFrame % 60) == 0)
+        Log("MV[A.4]: instanced=%zu drawn=%u skipLayout=%u", instItems.size(), instDrawn, instSkipLayout);
+
+    if ((sFrame % 120) == 0)   // coverage census: exactly what the velocity pass is NOT rendering
+    {
+        uint32_t cTot=0,cUnk=0,cStat=0,cInst=0,cNoCB=0,cNoGeom=0,cSkin=0;
+        for (const auto& d : caps)
+        {
+            cTot++;
+            if (!d.vsMetadata || d.vsMetadata->transformType == VSTransformType::UNKNOWN) { cUnk++; continue; }
+            if (d.vsMetadata->transformType == VSTransformType::SKINNED) { cSkin++; continue; }
+            cStat++;
+            if (d.instanceCount != 1) cInst++;
+            else if (!d.indexBuffer || !d.inputLayout) cNoGeom++;
+            else if (!d.cbStagingCopy) cNoCB++;
+        }
+        Log("MV[cov]: total=%u unknown=%u static=%u (skip: inst=%u noCB=%u noGeom=%u) skinned=%u",
+            cTot, cUnk, cStat, cInst, cNoCB, cNoGeom, cSkin);
+    }
+
     if ((sFrame % 300) == 0)   // heavy full-RT readback: rare, so its stall isn't a periodic hitch
         LogStats(ctx, drawn);
 
@@ -654,12 +810,118 @@ void DebugBlit(ID3D11DeviceContext* ctx)
     sState.Restore(ctx);
 }
 
+// ===================== Injected per-object velocity (shader-patched GBuffer output) =====================
+static ID3D11Texture2D*          sInjVelTex = nullptr;
+static ID3D11RenderTargetView*   sInjVelRTV = nullptr;
+static ID3D11ShaderResourceView* sInjVelSRV = nullptr;
+static uint32_t sInjW = 0, sInjH = 0;
+static ID3D11Buffer* sReprojCB = nullptr;                 // b13: float4x4 reproj (column-major)
+static float sInjPrevVP[16]; static bool sInjHavePrev = false;
+static bool sInjBegun = false;
+
+ID3D11RenderTargetView* InjEnsureVelRTV(ID3D11RenderTargetView* refRTV)
+{
+    if (!sDevice || !refRTV) return sInjVelRTV;
+    ID3D11Resource* res = nullptr; refRTV->GetResource(&res);
+    if (!res) return sInjVelRTV;
+    uint32_t w = 0, h = 0;
+    ID3D11Texture2D* tex = nullptr;
+    if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex)) && tex)
+    { D3D11_TEXTURE2D_DESC td; tex->GetDesc(&td); w = td.Width; h = td.Height; tex->Release(); }
+    res->Release();
+    if (w == 0 || h == 0) return sInjVelRTV;
+    if (sInjVelRTV && w == sInjW && h == sInjH) return sInjVelRTV;   // already sized
+
+    if (sInjVelSRV) { sInjVelSRV->Release(); sInjVelSRV = nullptr; }
+    if (sInjVelRTV) { sInjVelRTV->Release(); sInjVelRTV = nullptr; }
+    if (sInjVelTex) { sInjVelTex->Release(); sInjVelTex = nullptr; }
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R16G16_FLOAT; td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (SUCCEEDED(sDevice->CreateTexture2D(&td, nullptr, &sInjVelTex)))
+    {
+        sDevice->CreateRenderTargetView(sInjVelTex, nullptr, &sInjVelRTV);
+        sDevice->CreateShaderResourceView(sInjVelTex, nullptr, &sInjVelSRV);
+        sInjW = w; sInjH = h;
+        Log("MotionVectors[inject]: velocity RT %ux%u created", w, h);
+    }
+    return sInjVelRTV;
+}
+
+ID3D11Buffer* GetInjReprojCB() { return sReprojCB; }
+
+void InjBeginGBuffer(ID3D11DeviceContext* ctx)
+{
+    if (!ctx || !sDevice || sInjBegun) return;
+    sInjBegun = true;
+    if (!sReprojCB)
+    {
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = 64; bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        sDevice->CreateBuffer(&bd, nullptr, &sReprojCB);
+    }
+    // reproj = prevVP * inv(curVP) from the OGRE camera — the exact, frame-consistent, rebase-safe
+    // reprojection from A.2. Applied to a draw's current clip pos it yields its previous clip pos.
+    float curVP[16]; float reproj[16]; Identity(reproj);
+    bool haveVP = CameraAccess_GetViewProj(curVP);
+    if (haveVP && sInjHavePrev)
+    {
+        float invCur[16];
+        if (Inv(curVP, invCur)) Mul(sInjPrevVP, invCur, reproj);
+    }
+    if (haveVP) { memcpy(sInjPrevVP, curVP, 64); sInjHavePrev = true; }
+    if (sReprojCB)
+    {
+        D3D11_MAPPED_SUBRESOURCE ms;
+        if (SUCCEEDED(ctx->Map(sReprojCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms)))
+        { memcpy(ms.pData, reproj, 64); ctx->Unmap(sReprojCB, 0); }
+    }
+    if (sInjVelRTV) { float c[4] = { -1000.f, -1000.f, 0, 0 }; ctx->ClearRenderTargetView(sInjVelRTV, c); }
+}
+
+void InjEndFrame() { sInjBegun = false; }
+
+void InjDebugBlit(ID3D11DeviceContext* ctx)
+{
+    if (!ctx || !DebugVizEnabled() || !sInjVelSRV) return;
+    if (!sFsVS && !CompileVS(kFsVS, &sFsVS)) return;   // blit shaders (independent of replay path)
+    if (!sFsPS && !CompilePS(kFsPS, &sFsPS)) return;
+    if (!sSampler)
+    {
+        D3D11_SAMPLER_DESC smp = {};
+        smp.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+        smp.AddressU = smp.AddressV = smp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sDevice->CreateSamplerState(&smp, &sSampler);
+    }
+    sState.Capture(ctx);
+    ctx->VSSetShader(sFsVS, nullptr, 0);
+    ctx->PSSetShader(sFsPS, nullptr, 0);
+    ctx->PSSetShaderResources(0, 1, &sInjVelSRV);
+    ctx->PSSetSamplers(0, 1, &sSampler);
+    ctx->OMSetDepthStencilState(nullptr, 0);
+    ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+    ctx->IASetInputLayout(nullptr);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11Buffer* nullVB = nullptr; UINT z = 0;
+    ctx->IASetVertexBuffers(0, 1, &nullVB, &z, &z);
+    ctx->Draw(3, 0);
+    sState.Restore(ctx);
+}
+
 void Shutdown()
 {
     ReleaseTargets();
+    if (sInjVelSRV) { sInjVelSRV->Release(); sInjVelSRV = nullptr; }
+    if (sInjVelRTV) { sInjVelRTV->Release(); sInjVelRTV = nullptr; }
+    if (sInjVelTex) { sInjVelTex->Release(); sInjVelTex = nullptr; }
+    if (sReprojCB)  { sReprojCB->Release();  sReprojCB = nullptr; }
     if (sVelVS) { sVelVS->Release(); sVelVS = nullptr; }
     if (sVelPS) { sVelPS->Release(); sVelPS = nullptr; }
     if (sVelSkinVS) { sVelSkinVS->Release(); sVelSkinVS = nullptr; }
+    if (sVelInstVS) { sVelInstVS->Release(); sVelInstVS = nullptr; }
     if (sFsVS)  { sFsVS->Release();  sFsVS = nullptr; }
     if (sFsPS)  { sFsPS->Release();  sFsPS = nullptr; }
     if (sVelCB) { sVelCB->Release(); sVelCB = nullptr; }
@@ -667,6 +929,9 @@ void Shutdown()
     if (sPrevBoneCB) { sPrevBoneCB->Release(); sPrevBoneCB = nullptr; }
     if (sVpCB)  { sVpCB->Release();  sVpCB = nullptr; }
     if (sDepthState) { sDepthState->Release(); sDepthState = nullptr; }
+    if (sDepthOff)   { sDepthOff->Release();   sDepthOff = nullptr; }
+    if (sGameDepthSRV) { sGameDepthSRV->Release(); sGameDepthSRV = nullptr; }
+    sGameDepthTex = nullptr;
     if (sRaster) { sRaster->Release(); sRaster = nullptr; }
     if (sBlend) { sBlend->Release(); sBlend = nullptr; }
     if (sSampler) { sSampler->Release(); sSampler = nullptr; }

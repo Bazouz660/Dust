@@ -653,6 +653,63 @@ static std::string PatchLightVolumeShader(const std::string& src)
     return result;
 }
 
+// ---- Per-object motion vectors: inject a velocity output into the game's own GBuffer shaders ----
+// The robust replacement for the geometry-replay pass. objects.hlsl main_vs carries current +
+// previous clip position (prev = camera reprojection of cur, from a b13 CB); main_ps writes the
+// screen-space velocity to SV_Target3 (the velocity RT appended to the GBuffer). Because it runs in
+// the real GBuffer pass, coverage/alpha/animation are all exact — no depth-matching.
+static bool Has(const std::string& s, const char* a) { return s.find(a) != std::string::npos; }
+
+static std::string InjectObjectsVS(const std::string& src)
+{
+    if (Has(src, "oDustPrev")) return src;                 // already injected
+    std::string s = src;
+    size_t fn = s.find("void main_vs(");
+    if (fn == std::string::npos) return src;
+    s.insert(fn, "cbuffer DustMVCB : register(b13) { float4x4 dust_reproj; };\n");
+
+    const char* outA = "out float3 oWorldPos : TEXCOORD5,";
+    size_t op = s.find(outA);
+    if (op == std::string::npos) return src;
+    op += strlen(outA);
+    s.insert(op, "\n\tout float4 oDustCur : TEXCOORD12,\n\tout float4 oDustPrev : TEXCOORD13,");
+
+    const char* asgn = "oPosition = mul(worldViewProjMatrix, position);";
+    size_t ap = s.find(asgn);
+    if (ap == std::string::npos) return src;
+    ap += strlen(asgn);
+    // Recompute the clip pos into oDustCur (do NOT read the SV_Position output oPosition), and
+    // reproject it to the previous frame's clip for the motion vector.
+    s.insert(ap, "\n\toDustCur = mul(worldViewProjMatrix, position); oDustPrev = mul(dust_reproj, oDustCur);");
+    return s;
+}
+
+static std::string InjectObjectsPS(const std::string& src)
+{
+    if (Has(src, "oDustVel")) return src;
+    std::string s = src;
+    // Insert the interpolant inputs right after worldPos:TEXCOORD5 — the SAME position they occupy
+    // in the VS output list — so the VS-output/PS-input ordering matches.
+    const char* inA = "float3 worldPos : TEXCOORD5,";
+    size_t ip = s.find(inA);
+    if (ip == std::string::npos) return src;
+    ip += strlen(inA);
+    s.insert(ip, "\n\tfloat4 iDustCur : TEXCOORD12,\n\tfloat4 iDustPrev : TEXCOORD13,");
+
+    const char* outA = "out GBuffer buffer";
+    size_t op = s.find(outA);
+    if (op == std::string::npos) return src;
+    s.insert(op, "out float2 oDustVel : SV_Target3,\n\t");
+
+    const char* body = "INITIALISE_OUTPUT( buffer );";
+    size_t bp = s.find(body);
+    if (bp == std::string::npos) return src;
+    bp += strlen(body);
+    // Screen-space motion vector: current NDC minus previous NDC, in UV units.
+    s.insert(bp, "\n\toDustVel = (iDustCur.xy/iDustCur.w - iDustPrev.xy/iDustPrev.w) * float2(0.5, -0.5);");
+    return s;
+}
+
 HRESULT WINAPI HookedD3DCompile(
     LPCVOID pSrcData, SIZE_T SrcDataSize, LPCSTR pSourceName,
     const D3D_SHADER_MACRO* pDefines, ID3DInclude* pInclude,
@@ -664,6 +721,7 @@ HRESULT WINAPI HookedD3DCompile(
         return oD3DCompile(pSrcData, SrcDataSize, pSourceName,
                             pDefines, pInclude, pEntrypoint, pTarget,
                             Flags1, Flags2, ppCode, ppErrorMsgs);
+
 
     // Detect the deferred lighting pixel shader: entry point is "main_fs"
     // and source contains deferred-specific identifiers.
@@ -748,38 +806,71 @@ HRESULT WINAPI HookedD3DCompile(
         }
     }
 
-    // Detect objects shader for foliage alpha fix: entry point is "main_ps"
-    // and source contains the vanilla hard-cutoff alpha test.
+    // objects.hlsl main_vs: inject per-object motion vectors (carry cur + prev clip). InjectObjectsVS
+    // only rewrites when its objects-specific anchors match, so skin/birds/etc. main_vs pass through.
     if (pEntrypoint && pSrcData && SrcDataSize > 0 &&
-        strcmp(pEntrypoint, "main_ps") == 0)
+        strcmp(pEntrypoint, "main_vs") == 0)
     {
         std::string src((const char*)pSrcData, SrcDataSize);
-        if (src.find("clip(normalTex.a - threshold)") != std::string::npos &&
-            src.find("DustStabilizeThreshold") == std::string::npos)
+        if (src.find("worldViewProjMatrix") != std::string::npos && src.find("oDustPrev") == std::string::npos)
         {
-            std::string patched = PatchObjectsShader(src);
-            if (patched.size() != src.size())
+            std::string patched = InjectObjectsVS(src);
+            if (patched != src)
             {
-                Log("ShaderPatch: patched objects main_ps (%zu -> %zu bytes)",
-                    src.size(), patched.size());
                 HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
                                           pDefines, pInclude, pEntrypoint, pTarget,
                                           Flags1, Flags2, ppCode, ppErrorMsgs);
                 if (SUCCEEDED(hr))
                 {
+                    Log("ShaderPatch: injected MV into objects main_vs (%zu -> %zu)", src.size(), patched.size());
                     if (ppCode && *ppCode)
                         SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
                             pEntrypoint, pTarget, pSourceName,
                             (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
                     return hr;
                 }
-
-                Log("ShaderPatch: patched objects shader failed to compile, falling back");
+                Log("ShaderPatch: objects main_vs MV inject failed to compile, falling back");
                 if (ppErrorMsgs && *ppErrorMsgs)
                 {
                     Log("ShaderPatch: error: %s", (const char*)(*ppErrorMsgs)->GetBufferPointer());
-                    (*ppErrorMsgs)->Release();
-                    *ppErrorMsgs = nullptr;
+                    (*ppErrorMsgs)->Release(); *ppErrorMsgs = nullptr;
+                }
+            }
+        }
+    }
+
+    // objects.hlsl main_ps: apply the foliage-alpha fix (when applicable) AND inject the velocity
+    // output (SV_Target3). Fires for ALL objects PS, since every draw needs a motion vector.
+    if (pEntrypoint && pSrcData && SrcDataSize > 0 &&
+        strcmp(pEntrypoint, "main_ps") == 0)
+    {
+        std::string src((const char*)pSrcData, SrcDataSize);
+        if (src.find("INITIALISE_OUTPUT") != std::string::npos && src.find("oDustVel") == std::string::npos)
+        {
+            std::string patched = src;
+            if (patched.find("clip(normalTex.a - threshold)") != std::string::npos &&
+                patched.find("DustStabilizeThreshold") == std::string::npos)
+                patched = PatchObjectsShader(patched);
+            patched = InjectObjectsPS(patched);
+            if (patched != src)
+            {
+                HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
+                                          pDefines, pInclude, pEntrypoint, pTarget,
+                                          Flags1, Flags2, ppCode, ppErrorMsgs);
+                if (SUCCEEDED(hr))
+                {
+                    Log("ShaderPatch: injected MV into objects main_ps (%zu -> %zu)", src.size(), patched.size());
+                    if (ppCode && *ppCode)
+                        SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
+                            pEntrypoint, pTarget, pSourceName,
+                            (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+                    return hr;
+                }
+                Log("ShaderPatch: objects main_ps MV inject failed to compile, falling back");
+                if (ppErrorMsgs && *ppErrorMsgs)
+                {
+                    Log("ShaderPatch: error: %s", (const char*)(*ppErrorMsgs)->GetBufferPointer());
+                    (*ppErrorMsgs)->Release(); *ppErrorMsgs = nullptr;
                 }
             }
         }

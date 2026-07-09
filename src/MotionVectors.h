@@ -27,5 +27,22 @@ namespace MotionVectors
     ID3D11ShaderResourceView* GetVelocitySRV();
     bool DebugVizEnabled();
 
+    // --- Injected per-object velocity (shader-patched GBuffer SV_Target3 output) ---
+    // The robust replacement for the replay pass above. The velocity RT is appended to the live
+    // GBuffer bind, and the game's own (patched) shaders write velocity into it.
+    //
+    // Create/resize the velocity RT to match the GBuffer color target; returns the RTV to bind as
+    // the 4th GBuffer render target (null if not ready).
+    ID3D11RenderTargetView* InjEnsureVelRTV(ID3D11RenderTargetView* refRTV);
+    // The b13 constant buffer holding the camera reprojection (prevVP*inv(curVP)) for the patched VS.
+    ID3D11Buffer* GetInjReprojCB();
+    // Once per frame, at the start of the GBuffer pass: recompute reproj + upload it, and clear the
+    // velocity RT. Safe to call multiple times per frame (only the first does work).
+    void InjBeginGBuffer(ID3D11DeviceContext* ctx);
+    // Reset the once-per-frame guard (call at frame end / POST_TONEMAP).
+    void InjEndFrame();
+    // Blit the injected velocity RT as colour over the bound target (debug viz).
+    void InjDebugBlit(ID3D11DeviceContext* ctx);
+
     void Shutdown();
 }

@@ -144,6 +144,10 @@ namespace GeometryCapture
     bool CheckGBufferConfig(UINT numViews, ID3D11RenderTargetView* const* ppRTVs,
                             ID3D11DepthStencilView* pDSV);
 
+    // The GBuffer depth-stencil view captured this frame (raw, same-frame use only; null if the
+    // GBuffer pass hasn't been seen yet). Used by the MV pass for a DepthFunc=EQUAL re-render.
+    ID3D11DepthStencilView* GetGBufferDSV();
+
     // Set the expected GBuffer resolution (called when resolution is detected/changes)
     void SetResolution(UINT width, UINT height);
 
