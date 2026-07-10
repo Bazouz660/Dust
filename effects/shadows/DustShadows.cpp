@@ -481,8 +481,12 @@ static DustSettingDesc gSettings[] = {
     // === Common (affect both RTWSM and CSM) ===
     { "Common",              DUST_SETTING_SECTION, nullptr,                 0.0f, 0.0f,  nullptr,            nullptr, nullptr, DUST_PERF_NONE },
     { "Enabled",             DUST_SETTING_BOOL,  &gConfig.enabled,          0.0f, 1.0f,  "Enabled",          nullptr, "Enable or disable Dust's improved shadow filtering (RTWSM and CSM). When off, vanilla Kenshi filtering is used.",                                                              DUST_PERF_LOW    },
-    { "Shadow Resolution",   DUST_SETTING_ENUM,  &gConfig.resolutionIndex,  0.0f, 7.0f,  "Resolution",       kShadowResolutionLabels, "Override the shadow atlas resolution. Vanilla = no override (zero overhead). Higher = sharper shadows but the shadow pass costs proportionally more GPU time and VRAM (16384 ~= 1 GB) — 8192+ can visibly destabilize the framerate. Applies next frame.", DUST_PERF_HIGH  },
-    { "Shadow Range",        DUST_SETTING_INT,   &gConfig.shadowRange,      500.0f, 50000.0f, "Range",        nullptr, "Maximum distance shadows render. Bypasses the in-game UI's 9000 cap. Applies live (cascade splits + shadow camera re-derive next frame). Also written to settings.cfg so the value survives a restart. Touching the in-game Shadow Range slider will overwrite this.", DUST_PERF_MEDIUM },
+    // Resolution and Range bridge to player-owned engine/game state (atlas size,
+    // and a Shadow Range that persists to settings.cfg and is overwritten by the
+    // in-game slider). They are PRESET_OPTIONAL: never baked into presets, and a
+    // preset that omits them is not "outdated".
+    { "Shadow Resolution",   DUST_SETTING_ENUM,  &gConfig.resolutionIndex,  0.0f, 7.0f,  "Resolution",       kShadowResolutionLabels, "Override the shadow atlas resolution. Vanilla = no override (zero overhead). Higher = sharper shadows but the shadow pass costs proportionally more GPU time and VRAM (16384 ~= 1 GB) — 8192+ can visibly destabilize the framerate. Applies next frame.", DUST_PERF_HIGH, DUST_SETTING_FLAG_PRESET_OPTIONAL  },
+    { "Shadow Range",        DUST_SETTING_INT,   &gConfig.shadowRange,      500.0f, 50000.0f, "Range",        nullptr, "Maximum distance shadows render. Bypasses the in-game UI's 9000 cap. Applies live (cascade splits + shadow camera re-derive next frame). Also written to settings.cfg so the value survives a restart. Touching the in-game Shadow Range slider will overwrite this.", DUST_PERF_MEDIUM, DUST_SETTING_FLAG_PRESET_OPTIONAL },
 
     // === RTWSM (warped shadow map) ===
     { "RTWSM",               DUST_SETTING_SECTION, nullptr,                 0.0f, 0.0f,  nullptr,            nullptr, nullptr, DUST_PERF_NONE },

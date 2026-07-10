@@ -263,7 +263,16 @@ typedef struct DustSettingDesc {
     const char*     description;    // Tooltip text shown on hover (NULL = no tooltip)
     // v3.2 addition — zero-initialized for older settings (= DUST_PERF_NONE)
     int             perfImpact;     // DustPerfImpact: shown as colored line in the tooltip
+    // v3.3 addition — zero-initialized for older settings (= 0, no flags)
+    int             settingFlags;   // Bitmask of DUST_SETTING_FLAG_* (below)
 } DustSettingDesc;
+
+// Per-setting flags (API v3.3+) for the settingFlags field
+// PRESET_OPTIONAL: the setting is not written into presets and its absence from
+// a preset does not mark that preset "outdated". Use for settings that bridge to
+// player-owned engine/game state (e.g. shadow atlas resolution, shadow range that
+// persists to settings.cfg) which a distributable preset must not silently clobber.
+#define DUST_SETTING_FLAG_PRESET_OPTIONAL  1
 
 // Effect descriptor flags (API v3+)
 #define DUST_FLAG_FRAMEWORK_CONFIG  1   // Framework handles INI load/save/hot-reload from settings array
