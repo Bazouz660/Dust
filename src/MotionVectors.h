@@ -41,6 +41,19 @@ namespace MotionVectors
     void InjBeginGBuffer(ID3D11DeviceContext* ctx);
     // Reset the once-per-frame guard (call at frame end / POST_TONEMAP).
     void InjEndFrame();
+
+    // True skinned-character animation MVs: the patched skin VS skins each vertex with current AND
+    // previous-frame bones (b12). InjFillSkinPrev (POST_LIGHTING) repacks this frame's skinned poses
+    // for next frame; InjBindSkinPrev (per skinned GBuffer draw, after GeometryCapture::OnDrawIndexed)
+    // binds the matched previous pose to b12 before the draw.
+    void InjFillSkinPrev(ID3D11DeviceContext* ctx);
+    void InjBindSkinPrev(ID3D11DeviceContext* ctx);
+
+    // Bone-palette CB shadow, fed from the Map/Unmap hooks. InjBindSkinPrev needs the CURRENT frame's
+    // root bone at draw time (to spatially match prev poses); these snapshot it stall-free. Cheap
+    // no-ops until a skinned draw teaches the shadow which CB is the bone palette.
+    void InjNoteMap(void* resource, void* pData);
+    void InjNoteUnmap(void* resource);
     // Blit the injected velocity RT as colour over the bound target (debug viz).
     void InjDebugBlit(ID3D11DeviceContext* ctx);
 

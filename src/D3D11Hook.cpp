@@ -508,6 +508,13 @@ typedef void(STDMETHODCALLTYPE* PFN_RSSetViewports)(
     ID3D11DeviceContext* pThis, UINT NumViewports,
     const D3D11_VIEWPORT* pViewports);
 
+typedef HRESULT(STDMETHODCALLTYPE* PFN_Map)(
+    ID3D11DeviceContext* pThis, ID3D11Resource* pResource, UINT Subresource,
+    D3D11_MAP MapType, UINT MapFlags, D3D11_MAPPED_SUBRESOURCE* pMappedResource);
+
+typedef void(STDMETHODCALLTYPE* PFN_Unmap)(
+    ID3D11DeviceContext* pThis, ID3D11Resource* pResource, UINT Subresource);
+
 typedef HRESULT(STDMETHODCALLTYPE* PFN_Present)(
     IDXGISwapChain* pThis, UINT SyncInterval, UINT Flags);
 
@@ -523,6 +530,8 @@ static PFN_OMSetRenderTargets       oOMSetRenderTargets = nullptr;
 static PFN_OMSetRenderTargetsAndUAV oOMSetRenderTargetsAndUAV = nullptr;
 static PFN_PSSetShaderResources     oPSSetShaderResources = nullptr;
 static PFN_RSSetViewports           oRSSetViewports = nullptr;
+static PFN_Map                      oMap = nullptr;
+static PFN_Unmap                    oUnmap = nullptr;
 static PFN_Present                  oPresent = nullptr;
 static PFN_ResizeBuffers            oResizeBuffers = nullptr;
 
@@ -1483,7 +1492,12 @@ static void STDMETHODCALLTYPE HookedDraw(
 
         // Extract camera data at POST_LIGHTING (deferred CB is bound)
         if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
+        {
             ExtractCameraData(pThis);
+            // Repack this frame's skinned poses (GBuffer captures are resolved now) so next frame's
+            // patched skin VS can read them as "previous" from b12 and emit true animation velocity.
+            MotionVectors::InjFillSkinPrev(pThis);
+        }
 
         DustFrameContext fctx = {};
         fctx.device = gDevice;
@@ -1551,7 +1565,12 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     // Motion-vector pass: snapshot this GBuffer draw's transform state. Fast-path
     // no-op unless capture is enabled AND we're inside the GBuffer pass.
     if (GeometryCapture::HasActiveCapture())
+    {
         GeometryCapture::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
+        // If that draw was skinned, bind its matched previous-frame bone palette at b12 so the patched
+        // skin VS can emit true animation velocity (must be after OGRE's per-draw constant setup).
+        MotionVectors::InjBindSkinPrev(pThis);
+    }
 
     // Direct-light AO for point/spot lights: for a light_fs draw, swap the AO snapshot
     // into s8/s9 for the draw and restore afterward (scope dtor). gLvAoReady gates the
@@ -1588,6 +1607,28 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
     { ID3D11Buffer* rcb = MotionVectors::GetInjReprojCB(); if (rcb) pThis->VSSetConstantBuffers(13, 1, &rcb); }
     oDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
                           StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+}
+
+// Map/Unmap: shadow the skinned bone-palette CB as OGRE writes it (WRITE_DISCARD before each skin
+// draw), so InjBindSkinPrev can read the CURRENT frame's root bone at draw time — the key to spatial
+// (nearest-root) prev-pose matching without a GPU read-back stall. MotionVectors gates the fast path
+// on having learned a bone CB, so the overhead is one hash lookup per Map/Unmap until then.
+static HRESULT STDMETHODCALLTYPE HookedMap(
+    ID3D11DeviceContext* pThis, ID3D11Resource* pResource, UINT Subresource,
+    D3D11_MAP MapType, UINT MapFlags, D3D11_MAPPED_SUBRESOURCE* pMappedResource)
+{
+    HRESULT hr = oMap(pThis, pResource, Subresource, MapType, MapFlags, pMappedResource);
+    if (!gShutdownSignaled && SUCCEEDED(hr) && Subresource == 0 && pMappedResource)
+        MotionVectors::InjNoteMap(pResource, pMappedResource->pData);
+    return hr;
+}
+
+static void STDMETHODCALLTYPE HookedUnmap(
+    ID3D11DeviceContext* pThis, ID3D11Resource* pResource, UINT Subresource)
+{
+    if (!gShutdownSignaled && Subresource == 0)
+        MotionVectors::InjNoteUnmap(pResource);   // snapshot bytes BEFORE the unmap invalidates pData
+    oUnmap(pThis, pResource, Subresource);
 }
 
 // ==================== Shadow atlas bind-time swap ====================
@@ -2032,6 +2073,8 @@ static const int VTIDX_DEVICE_CreatePixelShader     = 15;
 static const int VTIDX_CTX_PSSetShaderResources     = 8;
 static const int VTIDX_CTX_DrawIndexed              = 12;
 static const int VTIDX_CTX_Draw                     = 13;
+static const int VTIDX_CTX_Map                      = 14;
+static const int VTIDX_CTX_Unmap                    = 15;
 static const int VTIDX_CTX_DrawIndexedInstanced     = 20;
 static const int VTIDX_CTX_OMSetRenderTargets       = 33;
 static const int VTIDX_CTX_OMSetRenderTargetsAndUAV = 34;
@@ -2089,6 +2132,8 @@ bool Install()
     void* addrCreatePS     = devVtable[VTIDX_DEVICE_CreatePixelShader];
     void* addrDraw         = ctxVtable[VTIDX_CTX_Draw];
     void* addrDrawIndexed  = ctxVtable[VTIDX_CTX_DrawIndexed];
+    void* addrMap          = ctxVtable[VTIDX_CTX_Map];
+    void* addrUnmap        = ctxVtable[VTIDX_CTX_Unmap];
     void* addrDrawIdxInst  = ctxVtable[VTIDX_CTX_DrawIndexedInstanced];
     void* addrOMSetRT      = ctxVtable[VTIDX_CTX_OMSetRenderTargets];
     void* addrOMSetRTUAV   = ctxVtable[VTIDX_CTX_OMSetRenderTargetsAndUAV];
@@ -2198,6 +2243,16 @@ bool Install()
     if (KenshiLib::AddHook(addrDrawIdxInst, (void*)HookedDrawIndexedInstanced,
                            (void**)&oDrawIndexedInstanced) != KenshiLib::SUCCESS)
     { Log("ERROR: Failed to hook DrawIndexedInstanced"); ok = false; }
+
+    // Map/Unmap: needed to shadow the skinned bone-palette CB for spatial prev-pose matching.
+    // Non-fatal if it fails — skinned animation MVs just fall back to zero (camera reproj only).
+    if (KenshiLib::AddHook(addrMap, (void*)HookedMap,
+                           (void**)&oMap) != KenshiLib::SUCCESS)
+    { Log("WARNING: Failed to hook Map (skinned animation motion vectors disabled)"); }
+
+    if (KenshiLib::AddHook(addrUnmap, (void*)HookedUnmap,
+                           (void**)&oUnmap) != KenshiLib::SUCCESS)
+    { Log("WARNING: Failed to hook Unmap (skinned animation motion vectors disabled)"); }
 
     if (KenshiLib::AddHook(addrOMSetRT, (void*)HookedOMSetRenderTargets,
                            (void**)&oOMSetRenderTargets) != KenshiLib::SUCCESS)

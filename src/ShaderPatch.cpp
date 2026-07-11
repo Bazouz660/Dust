@@ -727,7 +727,6 @@ static const VSpec kVSpecs[] = {
     { "terrain.hlsl",     "main_vs",      "void main_vs",      "TEXCOORD1,", "oPosition = mul(worldViewProjMatrix, position);", "mul(worldViewProjMatrix, position)" },
     { "triplanar.hlsl",   "triplanar_vs", "void triplanar_vs", "TEXCOORD5,", "oPosition = mul(worldViewProjMatrix, position);", "mul(worldViewProjMatrix, position)" },
     { "mapfeature.hlsl",  "feature_vs",   "void feature_vs",   "TEXCOORD4,", "oPosition = mul(worldViewProj, iPosition);",      "mul(worldViewProj, iPosition)" },
-    { "skin.hlsl",        "main_vs",      "void main_vs",      "TEXCOORD5,", "oPosition = mul(viewProjectionMatrix, blendPos);","mul(viewProjectionMatrix, blendPos)" },   // characters (camera-reproj; anim later)
     { "distant_town.hlsl","main_vs",      "void main_vs",      "TEXCOORD2,", "oPosition = mul(worldViewProjMatrix, position);", "mul(worldViewProjMatrix, position)" },
     { "birds.hlsl",       "main_vs",      "void main_vs",      "TEXCOORD5,", "oPosition = mul(viewProjMatrix, position);",       "mul(viewProjMatrix, position)" },
     { "foliage.hlsl",     "grass_vs",     "void grass_vs",     "TEXCOORD1,", "oPosition = mul(worldViewProj, position);",        "mul(worldViewProj, position)" },   // grass (camera-reproj; wind later)
@@ -752,9 +751,35 @@ static const PSpec kPSpecs[] = {
     { "character.hlsl",  "severed_limb_fs","void severed_limb_fs","TEXCOORD5,","out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
 };
 
+// skin.hlsl main_vs needs TRUE animation MVs, not camera reproj: skin the vertex a second time with
+// the PREVIOUS frame's bone palette (dust_prevBones) and previous VP (dust_prevVP), both from a CB at
+// b12 (b13 is reproj; SM4 has no b14+). WEIGHTS=3, bones row-major (48B) — mirror skin.hlsl exactly.
+static std::string InjSkinVS(const std::string& src)
+{
+    if (Has(src, "oDustPrev")) return src;
+    std::string s = src;
+    size_t fn = s.find("void main_vs");
+    if (fn == std::string::npos) return src;
+    s.insert(fn, "cbuffer DustPrevCB : register(b12) { row_major float3x4 dust_prevBones[60]; row_major float4x4 dust_prevVP; };\n");
+    size_t from = s.find("void main_vs");
+    if (from == std::string::npos) return src;
+    if (!InsAfter(s, from, "TEXCOORD5,", "\n\tout float4 oDustCur : TEXCOORD12,\n\tout float4 oDustPrev : TEXCOORD13,")) return src;
+    std::string prev =
+        "\n\toDustCur = mul(viewProjectionMatrix, blendPos);"
+        "\n\tfloat4 dmvPrev = float4(0,0,0,0);"
+        "\n\t[unroll] for (int dmvI = 0; dmvI < 3; dmvI++) dmvPrev += float4(mul(dust_prevBones[blendIdx[dmvI]], position).xyz, 1.0) * blendWgt[dmvI];"
+        "\n\toDustPrev = mul(dust_prevVP, dmvPrev);"
+        // No prev pose bound this draw (first frame / unmatched / OGRE's reflected zero-buffer at b12)
+        // => dust_prevVP is all-zero => fall back to oDustCur so the velocity reads 0 (no motion), not NaN.
+        "\n\tif (dot(dust_prevVP._m30_m31_m32_m33, dust_prevVP._m30_m31_m32_m33) == 0.0) oDustPrev = oDustCur;";
+    if (!InsAfter(s, from, "oPosition = mul(viewProjectionMatrix, blendPos);", prev)) return src;
+    return s;
+}
+
 static std::string InjectGBufferVS(const std::string& src, const char* entry, const char* srcName)
 {
     if (!srcName) return src;
+    if (strcmp(entry, "main_vs") == 0 && Has(srcName, "skin.hlsl")) return InjSkinVS(src);   // true anim MVs
     for (const VSpec& v : kVSpecs)
         if (strcmp(entry, v.entry) == 0 && Has(srcName, v.srcFile))
             return InjVS(src, v.fnAnchor, v.interp, v.clipAssign, v.clipRHS);

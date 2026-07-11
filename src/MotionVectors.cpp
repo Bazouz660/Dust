@@ -819,6 +819,34 @@ static ID3D11Buffer* sReprojCB = nullptr;                 // b13: float4x4 repro
 static float sInjPrevVP[16]; static bool sInjHavePrev = false;
 static bool sInjBegun = false;
 
+// --- Injected skinned prev-bones provisioning (b12 = DustPrevCB: float3x4 bones[60] + float4x4 VP) ---
+// The patched skin VS skins each vertex twice — current bones (b0, oDustCur) and the PREVIOUS frame's
+// bones (b12, oDustPrev) — to get TRUE animation motion (camera reproj alone gives zero MV for a
+// character walking while the camera is still). Prev poses are matched SPATIALLY (mesh identity +
+// nearest root bone), exactly like the verified replay path: draw-order matching flashes because the
+// game reorders/culls the hundreds of skinned draws per frame. A zero b12 => the shader's guard falls
+// back to oDustCur (MV 0), so unmatched / first-frame / not-yet-shadowed draws are safe.
+static const uint32_t kB12Size = 60 * 48 + 64;            // 2944: float3x4[60] (row-major, 48B) + float4x4
+static ID3D11Buffer*  sInjSkinB12 = nullptr;              // re-Map_WRITE_DISCARDed per skinned draw
+
+struct SkinPose {
+    std::vector<uint8_t> b12;      // b12 layout: bones @0 (2880B) + viewProjectionMatrix @2880 (64B)
+    float root[3] = {0,0,0};       // bone0 translation (rebased world) — the spatial match key
+    ID3D11Buffer* ib = nullptr;    // mesh identity (raw ptr; OGRE reuses the same IB per mesh)
+    uint32_t idxCount = 0;
+    int32_t  baseVtx = 0;
+};
+static std::vector<SkinPose>   sPrevSkinPoses;            // last frame's skinned poses (match targets)
+static std::vector<uint8_t>    sPrevClaimed;              // one-to-one matching: prev pose already taken
+
+// Bone-palette CB shadow: OGRE Map_WRITE_DISCARDs the skin CB (bones + VP) just before each skin draw.
+// We snapshot those bytes at Unmap so InjBindSkinPrev can read THIS frame's root bone at draw time
+// (needed to spatially match against last frame) without a GPU read-back stall.
+static bool sBoneShadowActive = false;                                        // gate the Map/Unmap fast path
+static std::unordered_map<const void*, uint32_t>            sKnownBoneCB;      // buffer -> byte size
+static std::unordered_map<const void*, void*>              sMapPending;        // buffer -> pData (Map..Unmap)
+static std::unordered_map<const void*, std::vector<uint8_t>> sBoneShadow;      // buffer -> last-unmapped bytes
+
 ID3D11RenderTargetView* InjEnsureVelRTV(ID3D11RenderTargetView* refRTV)
 {
     if (!sDevice || !refRTV) return sInjVelRTV;
@@ -884,6 +912,127 @@ void InjBeginGBuffer(ID3D11DeviceContext* ctx)
 
 void InjEndFrame() { sInjBegun = false; }
 
+// Map/Unmap shadow: snapshot the bytes of a known bone-palette CB as OGRE writes them (WRITE_DISCARD
+// just before each skin draw), so InjBindSkinPrev can read the current root bone at draw time.
+void InjNoteMap(void* resource, void* pData)
+{
+    if (!sBoneShadowActive || !resource || !pData) return;
+    if (sKnownBoneCB.find((const void*)resource) == sKnownBoneCB.end()) return;
+    sMapPending[(const void*)resource] = pData;
+}
+void InjNoteUnmap(void* resource)
+{
+    if (!sBoneShadowActive || !resource) return;
+    auto itp = sMapPending.find((const void*)resource);
+    if (itp == sMapPending.end()) return;
+    uint32_t sz = sKnownBoneCB[(const void*)resource];
+    std::vector<uint8_t>& dst = sBoneShadow[(const void*)resource];
+    if (dst.size() != sz) dst.resize(sz);
+    if (sz && itp->second) memcpy(dst.data(), itp->second, sz);
+    sMapPending.erase(itp);
+}
+
+// POST_LIGHTING: snapshot THIS frame's skinned poses (bones+VP repacked to b12 layout, plus the root
+// bone and mesh identity) as the SPATIAL match targets for next frame. GeometryCapture's cbStagingCopy
+// is resolved by now, so Map(READ) doesn't stall.
+void InjFillSkinPrev(ID3D11DeviceContext* ctx)
+{
+    if (!ctx) return;
+    sPrevSkinPoses.clear();
+    const auto& caps = GeometryCapture::GetCaptures();
+    for (const auto& d : caps)
+    {
+        if (!d.vsMetadata || d.vsMetadata->transformType != VSTransformType::SKINNED) continue;
+        if (!d.cbStagingCopy || !d.indexBuffer) continue;
+        uint32_t clipOff = d.vsMetadata->clipMatrixOffset;
+        uint32_t boneOff = d.vsMetadata->boneArrayOffset;
+        uint32_t boneCnt = d.vsMetadata->boneCount;
+        if (boneCnt == 0) continue;
+        if (boneCnt > 60) boneCnt = 60;           // b12 declares [60]; blendIdx never exceeds it
+        uint32_t bonesLen = boneCnt * 48;
+        if (clipOff + 64 > d.cbStagingSize || boneOff + bonesLen > d.cbStagingSize) continue;
+
+        D3D11_MAPPED_SUBRESOURCE ms;
+        if (FAILED(ctx->Map(d.cbStagingCopy, 0, D3D11_MAP_READ, 0, &ms))) continue;
+        SkinPose p;
+        p.b12.assign(kB12Size, 0);
+        memcpy(p.b12.data(),        (const uint8_t*)ms.pData + boneOff, bonesLen);   // bones @ 0
+        memcpy(p.b12.data() + 2880, (const uint8_t*)ms.pData + clipOff, 64);         // VP    @ 2880
+        const float* bf = (const float*)((const uint8_t*)ms.pData + boneOff);
+        p.root[0] = bf[3]; p.root[1] = bf[7]; p.root[2] = bf[11];   // bone0 translation (rebased world)
+        ctx->Unmap(d.cbStagingCopy, 0);
+        p.ib = d.indexBuffer; p.idxCount = d.indexCount; p.baseVtx = d.baseVertexLocation;
+        sPrevSkinPoses.push_back(std::move(p));
+    }
+    sPrevClaimed.assign(sPrevSkinPoses.size(), 0);
+}
+
+// Draw hook (right after GeometryCapture::OnDrawIndexed): if the just-captured draw is skinned, read
+// its CURRENT root bone from the CB shadow, spatially match it to a same-mesh previous pose, and bind
+// that pose to b12 before the draw. Match by mesh identity (ib+idxCount+baseVtx) + nearest root, with a
+// one-to-one claim and a distance gate — the verified A.3b scheme (draw-order flashes at 100s of draws).
+void InjBindSkinPrev(ID3D11DeviceContext* ctx)
+{
+    if (!ctx || !sDevice) return;
+    const auto& caps = GeometryCapture::GetCaptures();
+    if (caps.empty()) return;
+    const CapturedDraw& d = caps.back();
+    if (!d.vsMetadata || d.vsMetadata->transformType != VSTransformType::SKINNED) return;
+
+    uint32_t boneOff = d.vsMetadata->boneArrayOffset;
+    uint32_t cbSlot  = d.vsMetadata->cbSlot;
+
+    // Learn this draw's bone-palette CB so the Map/Unmap shadow starts capturing it next frame.
+    ID3D11Buffer* boneCB = nullptr;
+    ctx->VSGetConstantBuffers(cbSlot, 1, &boneCB);
+    if (!boneCB) return;
+    if (sKnownBoneCB.find((const void*)boneCB) == sKnownBoneCB.end())
+    {
+        if (sKnownBoneCB.size() > 64) { sKnownBoneCB.clear(); sBoneShadow.clear(); sMapPending.clear(); }  // churn backstop
+        D3D11_BUFFER_DESC bd; boneCB->GetDesc(&bd);
+        sKnownBoneCB[(const void*)boneCB] = bd.ByteWidth;
+        sBoneShadowActive = true;
+    }
+    auto its = sBoneShadow.find((const void*)boneCB);
+    boneCB->Release();
+    if (its == sBoneShadow.end()) return;                 // not shadowed yet (warmup) -> guard -> MV 0
+    const std::vector<uint8_t>& cur = its->second;
+    if ((size_t)boneOff + 48 > cur.size()) return;
+
+    const float* bf = (const float*)(cur.data() + boneOff);
+    float cr[3] = { bf[3], bf[7], bf[11] };               // current root (bone0 translation, rebased world)
+
+    // Nearest same-mesh previous pose whose root is closest (characters barely move frame-to-frame).
+    const float kGate2 = 25.0f * 25.0f;                   // rebased world units^2; rejects wrong-char / resnap
+    int best = -1; float bestD = 1e30f;
+    for (size_t j = 0; j < sPrevSkinPoses.size(); j++)
+    {
+        if (sPrevClaimed[j]) continue;
+        const SkinPose& p = sPrevSkinPoses[j];
+        if (p.ib != d.indexBuffer || p.idxCount != d.indexCount || p.baseVtx != d.baseVertexLocation) continue;
+        float dx = cr[0]-p.root[0], dy = cr[1]-p.root[1], dz = cr[2]-p.root[2];
+        float dd = dx*dx + dy*dy + dz*dz;
+        if (dd < bestD) { bestD = dd; best = (int)j; }
+    }
+    if (best < 0 || bestD > kGate2) return;               // no confident prev -> guard -> MV 0
+    sPrevClaimed[best] = 1;
+
+    if (!sInjSkinB12)
+    {
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = kB12Size; bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(sDevice->CreateBuffer(&bd, nullptr, &sInjSkinB12))) return;
+    }
+    D3D11_MAPPED_SUBRESOURCE ms;
+    if (SUCCEEDED(ctx->Map(sInjSkinB12, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms)))
+    {
+        memcpy(ms.pData, sPrevSkinPoses[best].b12.data(), kB12Size);
+        ctx->Unmap(sInjSkinB12, 0);
+        ctx->VSSetConstantBuffers(12, 1, &sInjSkinB12);
+    }
+}
+
 void InjDebugBlit(ID3D11DeviceContext* ctx)
 {
     if (!ctx || !DebugVizEnabled() || !sInjVelSRV) return;
@@ -918,6 +1067,10 @@ void Shutdown()
     if (sInjVelRTV) { sInjVelRTV->Release(); sInjVelRTV = nullptr; }
     if (sInjVelTex) { sInjVelTex->Release(); sInjVelTex = nullptr; }
     if (sReprojCB)  { sReprojCB->Release();  sReprojCB = nullptr; }
+    if (sInjSkinB12){ sInjSkinB12->Release();sInjSkinB12 = nullptr; }
+    sBoneShadowActive = false;
+    sKnownBoneCB.clear(); sMapPending.clear(); sBoneShadow.clear();
+    sPrevSkinPoses.clear(); sPrevClaimed.clear();
     if (sVelVS) { sVelVS->Release(); sVelVS = nullptr; }
     if (sVelPS) { sVelPS->Release(); sVelPS = nullptr; }
     if (sVelSkinVS) { sVelSkinVS->Release(); sVelSkinVS = nullptr; }
