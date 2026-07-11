@@ -262,7 +262,8 @@ Each effect has its own `.ini` file generated automatically in the `effects/` fo
 
 ```ini
 [Dust]
-Logging=0
+FileLogging=1         # timestamped logs in logs/ next to the DLL (on by default)
+MaxLogFiles=10        # log sessions kept before the oldest are deleted (1-100)
 StartupMessage=1
 Theme=kenshi          # "kenshi" (warm parchment palette) or "dark" (ImGui default)
 ToggleKey=122         # VK code for the overlay toggle (122 = VK_F11)

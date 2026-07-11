@@ -81,6 +81,31 @@ static void BootLog(const char* fmt, ...)
     }
 }
 
+// Delete the oldest DustBoot logs so at most maxKeep remain (this session's
+// log brings the total back up). Timestamped names => lexical == chronological.
+static void BootLogRotate(const std::string& logsDir, int maxKeep)
+{
+    for (;;)
+    {
+        int count = 0;
+        std::string oldest;
+        WIN32_FIND_DATAA fd;
+        HANDLE h = FindFirstFileA((logsDir + "\\DustBoot_*.log").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return;
+        do
+        {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            count++;
+            if (oldest.empty() || strcmp(fd.cFileName, oldest.c_str()) < 0)
+                oldest = fd.cFileName;
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+
+        if (count <= maxKeep || oldest.empty()) return;
+        if (!DeleteFileA((logsDir + "\\" + oldest).c_str())) return;
+    }
+}
+
 static void BootLogInit()
 {
     char path[MAX_PATH];
@@ -92,8 +117,15 @@ static void BootLogInit()
 
     BootLogDir() = dir;
 
+    // FileLogging: on by default (v0.8+) so bug reports always have logs.
+    // The pre-v0.8 "Logging" key is deliberately ignored — see DustLog.h.
     std::string ini = dir + "Dust.ini";
-    BootLogEnabled() = GetPrivateProfileIntA("Dust", "Logging", 0, ini.c_str()) != 0;
+    BootLogEnabled() = GetPrivateProfileIntA("Dust", "FileLogging", 1, ini.c_str()) != 0;
+
+    int maxFiles = GetPrivateProfileIntA("Dust", "MaxLogFiles", 10, ini.c_str());
+    if (maxFiles < 1)   maxFiles = 1;
+    if (maxFiles > 100) maxFiles = 100;
+    BootLogRotate(dir + "logs", maxFiles - 1);
 }
 
 // ==================== Captured state ====================

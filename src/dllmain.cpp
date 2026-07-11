@@ -173,7 +173,8 @@ __declspec(dllexport) void startPlugin()
     // still surface their dialog.
     gPreviousExceptionFilter = SetUnhandledExceptionFilter(DustShutdownExceptionFilter);
 
-    // Init logging (reads Logging=1/0 from Dust.ini next to the DLL)
+    // Init logging (on by default; FileLogging=0 in Dust.ini opts out) and
+    // rotate old logs so at most MaxLogFiles (default 10) sessions are kept
     DustLogInit(gDllModule);
 
 #define DUST_STR2(x) #x

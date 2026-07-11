@@ -5,14 +5,14 @@
 #include "FilePicker.h"
 #include "Survey.h"
 #include "SurveyRecorder.h"
+#include "BugReport.h"
 #include "imgui/imgui.h"
 #include "imgui/backends/imgui_impl_win32.h"
 #include "imgui/backends/imgui_impl_dx11.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
-#include "discord_logo.h"
-#include "github_logo.h"
+#include "resource.h"
 
 #include <vector>
 #include <string>
@@ -94,6 +94,7 @@ static volatile bool gResizeInProgress = false;
 static HWND gHWnd = nullptr;
 static float gOsDpiScale = 1.0f;   // window's OS/monitor DPI scale, captured at init
 static bool gFontRebuildPending = false;  // rebuild atlas at top of next Render (scale changed)
+static bool gEmojiFontLoaded = false;     // Segoe UI Emoji merged into the atlas (bug button glyph)
 static WNDPROC oWndProc = nullptr;
 static ID3D11Device* gDevice = nullptr;
 static ID3D11DeviceContext* gContext = nullptr;
@@ -565,6 +566,31 @@ static void RebuildFontAtlas()
         io.Fonts->AddFontDefault(&cfg);
         Log("GUI: Segoe UI unavailable, using built-in font");
     }
+
+    // Merge the emoji glyphs we use (bug-report button) from Segoe UI Emoji.
+    // stb_truetype rasterizes the font's monochrome outline layer, so the
+    // glyph tints with the text color like any other character. Needs
+    // IMGUI_USE_WCHAR32 (imconfig.h) because emoji live outside the BMP.
+    gEmojiFontLoaded = false;
+    {
+        static const ImWchar kEmojiRanges[] = { 0x1F41B, 0x1F41E, 0 }; // bug..lady beetle
+        char emojiPath[MAX_PATH] = {};
+        UINT m = GetWindowsDirectoryA(emojiPath, MAX_PATH);
+        if (m > 0 && m + 20 < MAX_PATH)
+        {
+            strcat_s(emojiPath, sizeof(emojiPath), "\\Fonts\\seguiemj.ttf");
+            if (GetFileAttributesA(emojiPath) != INVALID_FILE_ATTRIBUTES)
+            {
+                ImFontConfig cfg;
+                cfg.MergeMode = true;
+                gEmojiFontLoaded =
+                    (io.Fonts->AddFontFromFileTTF(emojiPath, px, &cfg, kEmojiRanges) != nullptr);
+            }
+        }
+        if (!gEmojiFontLoaded)
+            Log("GUI: Segoe UI Emoji unavailable, bug button falls back to text");
+    }
+
     io.Fonts->Build();
 }
 
@@ -660,7 +686,10 @@ static ImVec4 DustHeadingColor()
 static void LoadFrameworkConfig()
 {
     gDustIniPath = DustLogDir() + "Dust.ini";
-    gFwConfig.logging = GetPrivateProfileIntA("Dust", "Logging", 0, gDustIniPath.c_str()) != 0;
+    // FileLogging replaced "Logging" in v0.8: on by default so bug reports
+    // always have logs (the old key auto-saved 0 as a default, which was
+    // never a deliberate user choice — hence the rename instead of a flip).
+    gFwConfig.logging = GetPrivateProfileIntA("Dust", "FileLogging", 1, gDustIniPath.c_str()) != 0;
     gFwConfig.showStartupMessage = GetPrivateProfileIntA("Dust", "ShowStartupMessage", 1, gDustIniPath.c_str()) != 0;
     gFwConfig.showSurvey = GetPrivateProfileIntA("Dust", "ShowSurvey", 0, gDustIniPath.c_str()) != 0;
 
@@ -708,7 +737,8 @@ static void LoadFrameworkConfig()
 
 static void SaveFrameworkConfig()
 {
-    WritePrivateProfileStringA("Dust", "Logging", gFwConfig.logging ? "1" : "0", gDustIniPath.c_str());
+    WritePrivateProfileStringA("Dust", "FileLogging", gFwConfig.logging ? "1" : "0", gDustIniPath.c_str());
+    WritePrivateProfileStringA("Dust", "Logging", nullptr, gDustIniPath.c_str()); // remove pre-v0.8 key
     WritePrivateProfileStringA("Dust", "ShowStartupMessage", gFwConfig.showStartupMessage ? "1" : "0", gDustIniPath.c_str());
     WritePrivateProfileStringA("Dust", "ShowSurvey", gFwConfig.showSurvey ? "1" : "0", gDustIniPath.c_str());
     char keyBuf[16];
@@ -834,7 +864,9 @@ static void DrawFrameworkSection()
 
     ImGui::Checkbox("Logging", &gFwConfig.logging);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Write timestamped logs to logs/ folder next to the DLL");
+        ImGui::SetTooltip("Write timestamped logs to the logs/ folder next to the DLL.\n"
+                          "Only the 10 newest sessions are kept (20 MB max each), so disk\n"
+                          "usage stays bounded. Needed for useful bug reports.");
 
     ImGui::Checkbox("Startup Message", &gFwConfig.showStartupMessage);
     if (ImGui::IsItemHovered())
@@ -1581,6 +1613,116 @@ static void DrawPerformanceSection()
     ImGui::Text("Display: %.0fx%.0f", io.DisplaySize.x, io.DisplaySize.y);
 }
 
+// ==================== Bug report ====================
+
+// Set by the footer button; consumed at window level in Render() so the
+// popup is opened in a stable ID scope (the footer lives inside a child).
+static bool gBugReportOpenRequested = false;
+
+static void DrawBugReportModal()
+{
+    if (gBugReportOpenRequested)
+    {
+        gBugReportOpenRequested = false;
+        ImGui::OpenPopup("Report a Bug##DustBugReport");
+    }
+
+    // Center on first appearance
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
+                            ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(460, 0), ImGuiCond_Appearing);
+
+    if (!ImGui::BeginPopupModal("Report a Bug##DustBugReport", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize))
+        return;
+
+    ImGui::TextWrapped("Spotted a bug? Join the Discord server or create an issue on GitHub.");
+    ImGui::Spacing();
+    ImGui::TextWrapped("To help me fix it fast, Dust can bundle a diagnostic report (.zip) containing:");
+    ImGui::BulletText("Dust logs, framework config and live effect settings");
+    ImGui::BulletText("Active preset files");
+    ImGui::BulletText("Kenshi graphics settings and mod load order");
+    ImGui::BulletText("Hardware info (GPU, driver, monitors, CPU, RAM, OS)");
+    ImGui::BulletText("Detected overlays (ReShade, RTSS, ...) and RE_Kenshi info");
+    ImGui::TextDisabled("No personal data is collected; file paths are visible in logs.");
+
+    if (!DustLogEnabled())
+    {
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.8f, 0.2f, 1.0f));
+        ImGui::TextWrapped("[!] Logging is disabled. For the most useful report, enable "
+                           "Logging in the left panel, reproduce the bug, then generate the report.");
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    BugReport::Status status = BugReport::GetStatus();
+    bool busy = (status == BugReport::Status::Running);
+
+    PushVisualDisabled(busy);
+    if (ImGui::Button(busy ? "Generating..." : "Generate Report", ImVec2(160, 0)) && !busy)
+    {
+        BugReport::LiveStats stats;
+        stats.device      = gDevice;
+        stats.fps         = gDisplayFps;
+        stats.frameTimeMs = ImGui::GetIO().DeltaTime * 1000.0f;
+        stats.displayW    = io.DisplaySize.x;
+        stats.displayH    = io.DisplaySize.y;
+        BugReport::StartGeneration(stats);
+    }
+    PopVisualDisabled(busy);
+    if (ImGui::IsItemHovered() && !busy)
+        ImGui::SetTooltip("Write a DustReport_<date>.zip into the bug_reports folder next to the DLL");
+
+    if (status == BugReport::Status::Done)
+    {
+        std::string path = BugReport::GetResultPath();
+        std::string name = path;
+        auto pos = name.find_last_of("\\/");
+        if (pos != std::string::npos) name = name.substr(pos + 1);
+
+        ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "Report created: %s", name.c_str());
+
+        if (ImGui::Button("Show in Folder", ImVec2(160, 0)))
+        {
+            std::string args = "/select,\"" + path + "\"";
+            ShellExecuteA(nullptr, "open", "explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Copy Summary", ImVec2(160, 0)))
+            ImGui::SetClipboardText(BugReport::GetSummary().c_str());
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Copy a short system summary to the clipboard (paste into Discord)");
+
+        ImGui::Spacing();
+        ImGui::TextWrapped("Attach the .zip to your Discord post or GitHub issue:");
+        if (ImGui::Button("Create GitHub Issue", ImVec2(160, 0)))
+            ShellExecuteA(nullptr, "open", BugReport::BuildGitHubIssueURL().c_str(),
+                          nullptr, nullptr, SW_SHOWNORMAL);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Opens a pre-filled bug report form on GitHub — drag the .zip into it");
+        ImGui::SameLine();
+        if (ImGui::Button("Join Discord", ImVec2(160, 0)))
+            ShellExecuteA(nullptr, "open", "https://discord.gg/3fd3c7EFvT",
+                          nullptr, nullptr, SW_SHOWNORMAL);
+    }
+    else if (status == BugReport::Status::Failed)
+    {
+        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.4f, 1.0f), "%s", BugReport::GetError().c_str());
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    if (ImGui::Button("Close", ImVec2(80, 0)))
+        ImGui::CloseCurrentPopup();
+
+    ImGui::EndPopup();
+}
+
 // ==================== Startup toast ====================
 
 static void RenderToast()
@@ -1655,10 +1797,31 @@ static ID3D11ShaderResourceView* LoadTextureFromMemory(const unsigned char* data
     return srv;
 }
 
+// Load a PNG embedded in Dust.dll's resources (see Dust.rc / resource.h).
+static ID3D11ShaderResourceView* LoadTextureFromResource(int resourceId)
+{
+    // Module handle of Dust.dll itself (not the game exe) — resolved from an
+    // address inside this module so no dllmain global is needed.
+    HMODULE mod = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCSTR)&LoadTextureFromResource, &mod);
+
+    HRSRC res = FindResourceA(mod, MAKEINTRESOURCEA(resourceId), (LPCSTR)RT_RCDATA);
+    if (!res) { Log("GUI: resource %d not found", resourceId); return nullptr; }
+
+    HGLOBAL handle = LoadResource(mod, res);
+    DWORD size = SizeofResource(mod, res);
+    const unsigned char* bytes = handle ? (const unsigned char*)LockResource(handle) : nullptr;
+    if (!bytes || !size) { Log("GUI: resource %d failed to load", resourceId); return nullptr; }
+
+    return LoadTextureFromMemory(bytes, (int)size);
+}
+
 static void LoadLogoTextures()
 {
-    gDiscordLogoSRV = LoadTextureFromMemory(kDiscordLogoPng, (int)kDiscordLogoPngSize);
-    gGithubLogoSRV  = LoadTextureFromMemory(kGithubLogoPng,  (int)kGithubLogoPngSize);
+    gDiscordLogoSRV = LoadTextureFromResource(IDR_DISCORD_LOGO_PNG);
+    gGithubLogoSRV  = LoadTextureFromResource(IDR_GITHUB_LOGO_PNG);
 }
 
 // ==================== Init / Shutdown / Render ====================
@@ -1944,6 +2107,45 @@ void Render()
             }
 
             ImGui::PopStyleColor(3);
+
+            ImGui::SameLine();
+            // Report-a-Bug button: bug emoji (U+1F41B, merged from Segoe UI
+            // Emoji) + label that adapts to the space left by the logos — one
+            // line if it fits, two lines if narrow, emoji only when squeezed.
+            // "###reportbug" keeps the ImGui ID stable across label switches.
+            {
+                const ImGuiStyle& style = ImGui::GetStyle();
+                // Match the logos' height (+FramePadding*2, as ImageButton pads around the image)
+                ImVec2 btnSize(ImGui::GetContentRegionAvail().x,
+                               logoSize + style.FramePadding.y * 2.0f);
+                float contentW = btnSize.x - style.FramePadding.x * 2.0f;
+
+                #define DUST_BUG_EMOJI "\xF0\x9F\x90\x9B"  // UTF-8 U+1F41B
+                const char* candidates[3];
+                int n = 0;
+                if (gEmojiFontLoaded)
+                {
+                    candidates[n++] = DUST_BUG_EMOJI "  Report a Bug###reportbug";
+                    candidates[n++] = DUST_BUG_EMOJI " Report\na Bug###reportbug";
+                    candidates[n++] = DUST_BUG_EMOJI "###reportbug";
+                }
+                else
+                {
+                    candidates[n++] = "Report a Bug###reportbug";
+                    candidates[n++] = "Report\na Bug###reportbug";
+                }
+                const char* label = candidates[n - 1];
+                for (int c = 0; c < n; c++)
+                {
+                    if (ImGui::CalcTextSize(candidates[c], nullptr, true).x <= contentW)
+                    { label = candidates[c]; break; }
+                }
+
+                if (ImGui::Button(label, btnSize))
+                    gBugReportOpenRequested = true;
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Spotted a bug? Generate a diagnostic report to share on Discord or GitHub");
+            }
         }
 
         ImGui::EndChild(); // ##left
@@ -2031,6 +2233,10 @@ void Render()
         }
 
         ImGui::EndChild(); // ##right
+
+        // Bug-report popup (opened by the footer button, drawn at window level
+        // so the modal survives the footer's child ID scope)
+        DrawBugReportModal();
 
         ImGui::End();
     }

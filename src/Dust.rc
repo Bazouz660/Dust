@@ -1,0 +1,7 @@
+// Binary assets embedded into Dust.dll by the resource compiler at build time.
+// Paths are relative to this file. To add an icon: drop the PNG into assets/,
+// add an ID to resource.h and a line here, then load it via resource ID.
+#include "resource.h"
+
+IDR_DISCORD_LOGO_PNG RCDATA "..\\assets\\discord-logo.png"
+IDR_GITHUB_LOGO_PNG  RCDATA "..\\assets\\github-logo.png"

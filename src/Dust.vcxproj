@@ -89,6 +89,8 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp" />
+    <ClCompile Include="BugReport.cpp" />
+    <ClCompile Include="..\external\miniz\miniz.c" />
     <ClCompile Include="D3D11Hook.cpp" />
     <ClCompile Include="D3D11StateBlock.cpp" />
     <ClCompile Include="PipelineDetector.cpp" />
@@ -112,6 +114,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="DustAPI.h" />
+    <ClInclude Include="BugReport.h" />
     <ClInclude Include="DustLog.h" />
     <ClInclude Include="DustGUI.h" />
     <ClInclude Include="DustGUI_DInputHook.h" />
@@ -131,8 +134,10 @@
     <ClInclude Include="imgui\backends\imgui_impl_win32.h" />
     <ClInclude Include="imgui\backends\imgui_impl_dx11.h" />
     <ClInclude Include="stb_image.h" />
-    <ClInclude Include="discord_logo.h" />
-    <ClInclude Include="github_logo.h" />
+    <ClInclude Include="resource.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="Dust.rc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

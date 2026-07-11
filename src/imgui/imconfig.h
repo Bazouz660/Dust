@@ -14,6 +14,10 @@
 
 #pragma once
 
+//---- [Dust] 32-bit ImWchar so glyphs outside the Basic Multilingual Plane can
+// be loaded — the Report-a-Bug button renders U+1F41B from Segoe UI Emoji.
+#define IMGUI_USE_WCHAR32
+
 //---- Define assertion handler. Defaults to calling assert().
 // If your macro uses multiple statements, make sure is enclosed in a 'do { .. } while (0)' block so it can be used as a single statement.
 //#define IM_ASSERT(_EXPR)  MyAssert(_EXPR)
