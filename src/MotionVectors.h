@@ -26,6 +26,7 @@ namespace MotionVectors
 
     ID3D11ShaderResourceView* GetVelocitySRV();
     bool DebugVizEnabled();
+    void SetDebugViz(bool on);   // runtime toggle (GUI)
 
     // --- Injected per-object velocity (shader-patched GBuffer SV_Target3 output) ---
     // The robust replacement for the replay pass above. The velocity RT is appended to the live
@@ -56,6 +57,14 @@ namespace MotionVectors
     void InjNoteUnmap(void* resource);
     // Blit the injected velocity RT as colour over the bound target (debug viz).
     void InjDebugBlit(ID3D11DeviceContext* ctx);
+
+    // The injected velocity texture as a plain resource, for handing to the upscaler (DLSS/FSR) as
+    // its motion-vector input. Null until the RT has been created. Also expose its dimensions.
+    ID3D11Resource* GetInjVelResource();
+
+    // Contrast-limited sharpen of srcSRV into dstRTV (display res), for the DLSS output. amount in [0,1].
+    void SharpenBlit(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* srcSRV,
+                     ID3D11RenderTargetView* dstRTV, float amount, uint32_t w, uint32_t h);
 
     void Shutdown();
 }

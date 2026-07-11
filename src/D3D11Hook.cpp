@@ -10,6 +10,8 @@
 #include "ShaderMetadata.h"
 #include "GeometryCapture.h"
 #include "MotionVectors.h"
+#include "Upscaler.h"
+#include "UpscalerFSR2.h"
 #include "DustLog.h"
 #include <core/Functions.h>
 #include <d3d11.h>
@@ -80,6 +82,15 @@ typedef HRESULT(STDMETHODCALLTYPE* PFN_CreateTexture2D)(
     ID3D11Device*, const D3D11_TEXTURE2D_DESC*,
     const D3D11_SUBRESOURCE_DATA*, ID3D11Texture2D**);
 static PFN_CreateTexture2D oCreateTexture2D = nullptr;
+
+// DLSS texture MIP-LOD bias: DLSS/DLAA supersamples, so NVIDIA's guide prescribes biasing texture
+// sampling by log2(render/display) - 1 = -1.0 for DLAA. gDlssWanted (read from the ini at device
+// capture) gates a CreateSamplerState hook that adds this to every sampler.
+static bool  gDlssWanted   = false;
+static const float kDlssMipBias = -1.0f;
+typedef HRESULT(STDMETHODCALLTYPE* PFN_CreateSamplerState)(
+    ID3D11Device*, const D3D11_SAMPLER_DESC*, ID3D11SamplerState**);
+static PFN_CreateSamplerState oCreateSamplerState = nullptr;
 
 UINT GetShadowAtlasResolution()          { return gShadowAtlasOverride; }
 
@@ -364,6 +375,31 @@ static void ClearShadowReplacements()
     }
 }
 
+// ===================== Temporal sub-pixel jitter (for DLSS/FSR upscaling) =====================
+// When enabled, the main GBuffer scene viewport is offset by a Halton(2,3) sub-pixel amount each
+// frame so the temporal upscaler accumulates new sub-pixel samples. Applied at the VIEWPORT (post
+// clip-space), so our injected motion vectors — computed from clip-space cur/prev in the VS — stay
+// jitter-free, which is exactly the upscaler input contract. Recovered from the TSSAA stash@{0}.
+static bool  gJitterEnabled = false;
+static float gJitterPxX = 0.0f;   // this frame's jitter, in pixels [-0.5, 0.5]
+static float gJitterPxY = 0.0f;
+
+static float HaltonSeq(uint32_t i, uint32_t b)
+{
+    float f = 1.0f, r = 0.0f;
+    while (i > 0) { f /= (float)b; r += f * (float)(i % b); i /= b; }
+    return r;
+}
+
+void SetTemporalJitter(int enabled)
+{
+    gJitterEnabled = (enabled != 0);
+    if (!gJitterEnabled) gJitterPxX = gJitterPxY = 0.0f;
+}
+
+// The jitter applied to the frame currently being built (pixels). Read by the upscaler resolve.
+void GetTemporalJitter(float& x, float& y) { x = gJitterPxX; y = gJitterPxY; }
+
 void ResetFrameState()
 {
     ApplyPendingShadowResize();
@@ -379,7 +415,233 @@ void ResetFrameState()
     gCameraDataExtracted = false;
     gDeviceRemovedThisFrame = false;
     gFrameIndex++;
+
+    // Advance the per-frame sub-pixel jitter (16-frame Halton(2,3) sequence, centred to [-0.5,0.5]).
+    if (gJitterEnabled)
+    {
+        uint32_t i = (uint32_t)(gFrameIndex % 16) + 1;
+        gJitterPxX = HaltonSeq(i, 2) - 0.5f;
+        gJitterPxY = HaltonSeq(i, 3) - 0.5f;
+    }
+    else
+    {
+        gJitterPxX = gJitterPxY = 0.0f;
+    }
 }
+
+// ===================== DLSS/FSR upscaling resolve (Milestone B: DLAA at native res) =====================
+// At POST_TONEMAP (scene tonemapped, before UI) hand DLSS the color + depth + our injected motion-vector
+// RT, and copy its anti-aliased output back over the scene color so the UI + present use it. Gated on
+// [Upscaling] DLSS=1; degrades to a no-op if NGX/DLSS isn't available (non-NVIDIA / old driver / no dll).
+static bool             sUpsConfigRead = false;
+static bool             sUpsEnabled    = false;   // runtime DLSS on/off (seeded from [Upscaling] DLSS)
+static int              sUpsPresetIdx  = 1;        // Upscaler::PRESET_K
+static float            sUpsSharpness  = 0.0f;     // [0,1]
+static int              sUpsBackend    = 0;        // 0 = DLSS, 1 = FSR2
+static int              sUpsActiveBackend = -1;    // currently-initialized backend (detect GUI switch)
+static bool             sUpsInitTried  = false;    // NGX availability probed
+static int              sUpsFeaturePreset = -1;    // preset the live feature was created with (-1 = none)
+static bool             sUpsJitterOn   = false;    // tracked so we toggle jitter cleanly on enable/disable
+static bool             sUpsResetNext  = false;    // discard DLSS history on the next frame (enable/recreate)
+static ID3D11Texture2D*          sUpsOut    = nullptr; // DLSS output (UAV); copied/sharpened back to scene color
+static ID3D11ShaderResourceView* sUpsOutSRV = nullptr; // SRV of sUpsOut, for the sharpen pass to sample
+static uint32_t         sUpsOutW = 0, sUpsOutH = 0;
+static const void*               sUpsPrevColorRTV = nullptr; // detect pipeline rebuild (settings change)
+static ID3D11Texture2D*          sUpsColorSR  = nullptr; // shader-readable copy of the scene color for NGX
+static uint32_t         sUpsColorW = 0, sUpsColorH = 0;
+static bool             sUpsDescLogged = false;
+
+// Width/height of a resource (0/false if not a Texture2D). Used to skip the resolve when the color,
+// depth and MV inputs momentarily disagree (e.g. mid-pipeline-rebuild) instead of freezing the image.
+static bool TexDim(ID3D11Resource* res, uint32_t& w, uint32_t& h)
+{
+    if (!res) return false;
+    ID3D11Texture2D* t = nullptr;
+    if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&t)) || !t) return false;
+    D3D11_TEXTURE2D_DESC d; t->GetDesc(&d); t->Release();
+    w = d.Width; h = d.Height; return true;
+}
+
+static void ReleaseUpscalerTargets()   // drop derived textures so they rebuild against the new pipeline
+{
+    if (sUpsOutSRV) { sUpsOutSRV->Release(); sUpsOutSRV = nullptr; }
+    if (sUpsOut)    { sUpsOut->Release();    sUpsOut = nullptr; }    sUpsOutW = sUpsOutH = 0;
+    if (sUpsColorSR){ sUpsColorSR->Release();sUpsColorSR = nullptr; } sUpsColorW = sUpsColorH = 0;
+}
+
+// One-shot diagnostic: log a resource's format + bind flags (NGX PlatformError is usually a bind-flag gap).
+static void LogTexDesc(const char* label, ID3D11Resource* res)
+{
+    if (!res) { Log("Upscaler[desc] %s = NULL", label); return; }
+    ID3D11Texture2D* t = nullptr;
+    if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&t)) && t)
+    {
+        D3D11_TEXTURE2D_DESC d; t->GetDesc(&d); t->Release();
+        Log("Upscaler[desc] %s: %ux%u fmt=%u bind=0x%x samples=%u", label, d.Width, d.Height,
+            (unsigned)d.Format, (unsigned)d.BindFlags, d.SampleDesc.Count);
+    }
+    else Log("Upscaler[desc] %s = not a Texture2D", label);
+}
+
+// Ensure an SHADER_RESOURCE-bindable texture matching src's format/size; returns it after copying src in.
+static ID3D11Texture2D* EnsureColorSR(ID3D11DeviceContext* ctx, ID3D11Resource* colorRes)
+{
+    ID3D11Texture2D* colorTex = nullptr;
+    if (FAILED(colorRes->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&colorTex)) || !colorTex) return nullptr;
+    D3D11_TEXTURE2D_DESC cd; colorTex->GetDesc(&cd); colorTex->Release();
+    if (!sUpsColorSR || sUpsColorW != cd.Width || sUpsColorH != cd.Height)
+    {
+        if (sUpsColorSR) { sUpsColorSR->Release(); sUpsColorSR = nullptr; }
+        D3D11_TEXTURE2D_DESC sd = {};
+        sd.Width = cd.Width; sd.Height = cd.Height; sd.MipLevels = 1; sd.ArraySize = 1;
+        sd.Format = cd.Format; sd.SampleDesc.Count = 1; sd.Usage = D3D11_USAGE_DEFAULT;
+        sd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(gDevice->CreateTexture2D(&sd, nullptr, &sUpsColorSR))) { sUpsColorSR = nullptr; return nullptr; }
+        sUpsColorW = cd.Width; sUpsColorH = cd.Height;
+    }
+    ctx->CopyResource(sUpsColorSR, colorRes);   // shader-readable snapshot NGX can bind as its color SRV
+    return sUpsColorSR;
+}
+
+// Create/resize the DLSS output texture to match the scene color target (display res for DLAA).
+static ID3D11Texture2D* EnsureUpscalerOutput(ID3D11Resource* colorRes)
+{
+    ID3D11Texture2D* colorTex = nullptr;
+    if (FAILED(colorRes->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&colorTex)) || !colorTex) return nullptr;
+    D3D11_TEXTURE2D_DESC cd; colorTex->GetDesc(&cd); colorTex->Release();
+    if (sUpsOut && sUpsOutW == cd.Width && sUpsOutH == cd.Height) return sUpsOut;
+    if (sUpsOutSRV) { sUpsOutSRV->Release(); sUpsOutSRV = nullptr; }
+    if (sUpsOut) { sUpsOut->Release(); sUpsOut = nullptr; }
+    D3D11_TEXTURE2D_DESC od = {};
+    od.Width = cd.Width; od.Height = cd.Height; od.MipLevels = 1; od.ArraySize = 1;
+    od.Format = cd.Format; od.SampleDesc.Count = 1; od.Usage = D3D11_USAGE_DEFAULT;
+    od.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;   // DLSS writes via compute UAV
+    if (FAILED(gDevice->CreateTexture2D(&od, nullptr, &sUpsOut))) { sUpsOut = nullptr; return nullptr; }
+    gDevice->CreateShaderResourceView(sUpsOut, nullptr, &sUpsOutSRV);          // for the sharpen pass
+    sUpsOutW = cd.Width; sUpsOutH = cd.Height;
+    Log("Upscaler: output texture %ux%u created", cd.Width, cd.Height);
+    return sUpsOut;
+}
+
+static void RunUpscaler(ID3D11DeviceContext* ctx)
+{
+    if (!sUpsConfigRead)
+    {
+        sUpsConfigRead = true;
+        std::string iniPath = DustLogDir() + "Dust.ini";
+        sUpsEnabled   = GetPrivateProfileIntA("Upscaling", "DLSS", 0, iniPath.c_str()) != 0;   // "enabled"
+        sUpsPresetIdx = GetPrivateProfileIntA("Upscaling", "DLSSPreset", 1, iniPath.c_str());          // 1 = K
+        sUpsSharpness = GetPrivateProfileIntA("Upscaling", "DLSSSharpness", 0, iniPath.c_str()) / 100.0f;
+        sUpsBackend   = GetPrivateProfileIntA("Upscaling", "Backend", 0, iniPath.c_str());     // 0=DLSS 1=FSR2
+    }
+    if (!gDevice || gWidth == 0 || gHeight == 0) return;
+
+    const bool fsr = (sUpsBackend == 1);
+
+    // Backend switched in the GUI: tear the old one down, force re-init + feature recreate + jitter reset.
+    if (sUpsActiveBackend != sUpsBackend)
+    {
+        Upscaler::Shutdown();
+        UpscalerFSR2::Shutdown();
+        ReleaseUpscalerTargets();
+        sUpsActiveBackend = sUpsBackend;
+        sUpsInitTried     = false;
+        sUpsFeaturePreset = -1;
+        if (sUpsJitterOn) { SetTemporalJitter(0); sUpsJitterOn = false; }
+    }
+
+    // Probe/init the active backend once (so the GUI can report availability before it's switched on).
+    if (!sUpsInitTried)
+    {
+        sUpsInitTried = true;
+        if (fsr) UpscalerFSR2::Init(gDevice);
+        else { std::string modDir = DustLogDir(); std::wstring wdir(modDir.begin(), modDir.end());
+               Upscaler::Init(gDevice, wdir.c_str(), wdir.c_str()); }
+    }
+
+    const bool avail = fsr ? UpscalerFSR2::IsAvailable() : Upscaler::IsAvailable();
+
+    // Disabled or unavailable: ensure jitter is off (no shimmer) and skip the resolve.
+    if (!sUpsEnabled || !avail)
+    {
+        if (sUpsJitterOn) { SetTemporalJitter(0); sUpsJitterOn = false; }
+        return;
+    }
+
+    // (Re)create the feature on first enable or when the preset changed in the GUI.
+    if (sUpsFeaturePreset != sUpsPresetIdx)
+    {
+        bool created = fsr
+            ? UpscalerFSR2::CreateFeature(ctx, gWidth, gHeight, gWidth, gHeight, false, false, sUpsPresetIdx)
+            : Upscaler::CreateFeature(ctx, gWidth, gHeight, gWidth, gHeight, false, false, sUpsPresetIdx);
+        if (created) { sUpsFeaturePreset = sUpsPresetIdx; sUpsResetNext = true; }
+        else { sUpsEnabled = false; if (sUpsJitterOn) { SetTemporalJitter(0); sUpsJitterOn = false; } return; }
+    }
+    if (!sUpsJitterOn) { SetTemporalJitter(1); sUpsJitterOn = true; sUpsResetNext = true; }  // fresh history
+
+    ID3D11RenderTargetView*   colorRTV = gResourceRegistry.GetRTV(ResourceName::LDR_RTV);
+    ID3D11ShaderResourceView* depthSRV = gResourceRegistry.GetSRV(ResourceName::DEPTH_SRV);
+    ID3D11Resource*           mv       = MotionVectors::GetInjVelResource();
+    if (!colorRTV || !depthSRV || !mv) return;
+
+    // Pipeline-rebuild robustness: a vanilla settings change (FXAA, HeatHaze, ...) rebuilds OGRE's
+    // compositor and re-registers new render targets. If our color target changed, drop the derived
+    // textures (they rebuild against the new one) and reset DLSS history — otherwise we resolve stale
+    // content / blend a dead history, which froze the image.
+    if ((const void*)colorRTV != sUpsPrevColorRTV)
+    {
+        sUpsPrevColorRTV = (const void*)colorRTV;
+        ReleaseUpscalerTargets();
+        sUpsResetNext = true;
+        Log("Upscaler: color target changed (pipeline rebuild) — reset DLSS history + textures");
+    }
+
+    ID3D11Resource* color = nullptr; colorRTV->GetResource(&color);
+    ID3D11Resource* depth = nullptr; depthSRV->GetResource(&depth);
+
+    // Inputs must agree in size; if not (e.g. one frame mid-rebuild), skip so the game's own image shows
+    // through instead of freezing on a stale resolve.
+    uint32_t cw=0,ch=0, dw=0,dh=0, vw=0,vh=0;
+    bool dimsOk = TexDim(color, cw, ch) && TexDim(depth, dw, dh) && TexDim(mv, vw, vh) &&
+                  cw == dw && ch == dh && cw == vw && ch == vh;
+    if (color && depth && dimsOk)
+    {
+        ID3D11Texture2D* out   = EnsureUpscalerOutput(color);
+        ID3D11Texture2D* colSR = EnsureColorSR(ctx, color);   // NGX needs a shader-readable color input
+        if (!sUpsDescLogged)
+        {
+            sUpsDescLogged = true;
+            LogTexDesc("color(ldr_rt)", color);
+            LogTexDesc("depth",         depth);
+            LogTexDesc("motionVec",     mv);
+            LogTexDesc("output",        out);
+            LogTexDesc("colorSRcopy",   colSR);
+        }
+        if (out && colSR)
+        {
+            float jx, jy; GetTemporalJitter(jx, jy);
+            // Our MV texel is (curUV - prevUV) in UV space. The upscaler wants (prevUV - curUV) in render
+            // pixels (the vector from a pixel to where it was last frame), so MV_Scale is NEGATIVE display
+            // size. Wrong sign => history reprojected backwards => ghosting on camera motion + softness.
+            // Sharpness goes to our own RCAS-lite pass, so pass 0 to the upscaler.
+            const float mvsx = -(float)gWidth, mvsy = -(float)gHeight;
+            bool ok = fsr
+                ? UpscalerFSR2::Evaluate(ctx, colSR, depth, mv, out, jx, jy, mvsx, mvsy, 0.0f, sUpsResetNext, nullptr)
+                : Upscaler::Evaluate(ctx, colSR, depth, mv, out, jx, jy, mvsx, mvsy, 0.0f, sUpsResetNext, nullptr);
+            if (ok)
+            {
+                if (sUpsSharpness > 0.0f && sUpsOutSRV)
+                    MotionVectors::SharpenBlit(ctx, sUpsOutSRV, colorRTV, sUpsSharpness, gWidth, gHeight);
+                else
+                    ctx->CopyResource(color, out);   // AA'd image back into the scene color for UI + present
+            }
+            sUpsResetNext = false;
+        }
+    }
+    if (color) color->Release();
+    if (depth) depth->Release();
+}
+
 
 // Extract camera basis vectors from the game's deferred lighting PS constant buffer.
 // The inverse view matrix sits at register c8 (offset 128 bytes / 32 floats).
@@ -814,6 +1076,9 @@ static void TryCaptureDevice(ID3D11Device* device)
             GeometryCapture::SetCaptureFlags(DUST_CAPTURE_GEOMETRY);
             Log("Upscaling: geometry capture ENABLED ([Upscaling] CaptureGeometry=1)");
         }
+        // Read DLSS intent early (before OGRE creates its samplers) so the mip-bias hook can apply.
+        gDlssWanted = GetPrivateProfileIntA("Upscaling", "DLSS", 0, iniPath.c_str()) != 0;
+        if (gDlssWanted) Log("Upscaling: DLSS on -> applying %.1f texture mip bias to new samplers", kDlssMipBias);
     }
 
     // Initialize all loaded effect plugins
@@ -868,6 +1133,20 @@ static bool IsShadowAtlasDesc(const D3D11_TEXTURE2D_DESC* d)
     if (d->Format == DXGI_FORMAT_R32_FLOAT && hasRTV && hasSRV) return true;
     if (d->Format == DXGI_FORMAT_R32_TYPELESS && hasDSV && hasSRV) return true;
     return false;
+}
+
+static HRESULT STDMETHODCALLTYPE HookedCreateSamplerState(
+    ID3D11Device* pThis, const D3D11_SAMPLER_DESC* pDesc, ID3D11SamplerState** ppSamplerState)
+{
+    // When DLSS is on, sharpen by exposing ~1 extra mip of texture detail for it to resolve. Harmless
+    // on point/no-mip samplers (the driver ignores the bias there), so it's applied unconditionally.
+    if (!gShutdownSignaled && gDlssWanted && pDesc)
+    {
+        D3D11_SAMPLER_DESC d = *pDesc;
+        d.MipLODBias += kDlssMipBias;
+        return oCreateSamplerState(pThis, &d, ppSamplerState);
+    }
+    return oCreateSamplerState(pThis, pDesc, ppSamplerState);
 }
 
 static HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
@@ -1543,7 +1822,8 @@ static void STDMETHODCALLTYPE HookedDraw(
         // final image at POST_TONEMAP when [Upscaling] ShowMotionVectors=1, then end the frame.
         if (result.point == InjectionPoint::POST_TONEMAP)
         {
-            MotionVectors::InjDebugBlit(pThis);
+            RunUpscaler(pThis);                  // DLSS DLAA resolve (no-op unless [Upscaling] DLSS=1)
+            MotionVectors::InjDebugBlit(pThis);  // MV debug viz (only if ShowMotionVectors=1)
             MotionVectors::InjEndFrame();
         }
     }
@@ -1950,26 +2230,45 @@ static void STDMETHODCALLTYPE HookedRSSetViewports(
     ID3D11DeviceContext* pThis, UINT NumViewports,
     const D3D11_VIEWPORT* pViewports)
 {
-    if (!gInShadowPass || !gShadowSwapActive || gShutdownSignaled ||
-        !pViewports || NumViewports == 0)
+    // Shadow-atlas resolution override: scale the shadow-pass viewport to the resized atlas.
+    if (gInShadowPass && gShadowSwapActive && !gShutdownSignaled && pViewports && NumViewports > 0)
     {
-        oRSSetViewports(pThis, NumViewports, pViewports);
+        D3D11_VIEWPORT scaled[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+        UINT n = (NumViewports <= D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE)
+               ? NumViewports : D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+        float s = gShadowViewportScale;
+        for (UINT i = 0; i < n; i++)
+        {
+            scaled[i] = pViewports[i];
+            scaled[i].TopLeftX *= s;
+            scaled[i].TopLeftY *= s;
+            scaled[i].Width    *= s;
+            scaled[i].Height   *= s;
+        }
+        oRSSetViewports(pThis, n, scaled);
         return;
     }
 
-    D3D11_VIEWPORT scaled[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
-    UINT n = (NumViewports <= D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE)
-           ? NumViewports : D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
-    float s = gShadowViewportScale;
-    for (UINT i = 0; i < n; i++)
+    // Temporal upscaling: offset the main GBuffer scene viewport by this frame's sub-pixel jitter.
+    // Gated to the GBuffer pass so shadow/fullscreen/UI viewports are untouched.
+    if (gJitterEnabled && !gShutdownSignaled && !gInShadowPass &&
+        (gJitterPxX != 0.0f || gJitterPxY != 0.0f) &&
+        pViewports && NumViewports > 0 && GeometryCapture::IsInGBufferPass())
     {
-        scaled[i] = pViewports[i];
-        scaled[i].TopLeftX *= s;
-        scaled[i].TopLeftY *= s;
-        scaled[i].Width    *= s;
-        scaled[i].Height   *= s;
+        D3D11_VIEWPORT j[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+        UINT n = (NumViewports <= D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE)
+               ? NumViewports : D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+        for (UINT i = 0; i < n; i++)
+        {
+            j[i] = pViewports[i];
+            j[i].TopLeftX += gJitterPxX;
+            j[i].TopLeftY += gJitterPxY;
+        }
+        oRSSetViewports(pThis, n, j);
+        return;
     }
-    oRSSetViewports(pThis, n, scaled);
+
+    oRSSetViewports(pThis, NumViewports, pViewports);
 }
 
 // ==================== Swap chain hooks (ImGui) ====================
@@ -2067,6 +2366,7 @@ static HRESULT STDMETHODCALLTYPE HookedResizeBuffers(
 // ==================== Install ====================
 
 static const int VTIDX_DEVICE_CreateTexture2D       = 5;
+static const int VTIDX_DEVICE_CreateSamplerState    = 23;
 static const int VTIDX_DEVICE_CreateInputLayout     = 11;
 static const int VTIDX_DEVICE_CreateVertexShader    = 12;
 static const int VTIDX_DEVICE_CreatePixelShader     = 15;
@@ -2127,6 +2427,7 @@ bool Install()
     void** scVtable  = *reinterpret_cast<void***>(tmpSwapChain);
 
     void* addrCreateTex2D  = devVtable[VTIDX_DEVICE_CreateTexture2D];
+    void* addrCreateSampler= devVtable[VTIDX_DEVICE_CreateSamplerState];
     void* addrCreateInpLay = devVtable[VTIDX_DEVICE_CreateInputLayout];
     void* addrCreateVS     = devVtable[VTIDX_DEVICE_CreateVertexShader];
     void* addrCreatePS     = devVtable[VTIDX_DEVICE_CreatePixelShader];
@@ -2220,6 +2521,11 @@ bool Install()
                            (void**)&oCreateTexture2D) != KenshiLib::SUCCESS)
     { Log("ERROR: Failed to hook CreateTexture2D"); ok = false; }
 
+    // Non-fatal: only affects the DLSS mip-bias sharpening.
+    if (KenshiLib::AddHook(addrCreateSampler, (void*)HookedCreateSamplerState,
+                           (void**)&oCreateSamplerState) != KenshiLib::SUCCESS)
+    { Log("WARNING: Failed to hook CreateSamplerState (DLSS mip-bias sharpening disabled)"); }
+
     if (KenshiLib::AddHook(addrCreateInpLay, (void*)HookedCreateInputLayout,
                            (void**)&oCreateInputLayout) != KenshiLib::SUCCESS)
     { Log("WARNING: Failed to hook CreateInputLayout (vertex-declaration RE disabled)"); }
@@ -2297,3 +2603,18 @@ bool IsShutdownSignaled()
 }
 
 } // namespace D3D11Hook
+
+// Runtime control surface for the GUI. Global namespace (matches UpscalerControl.h); the resolve state
+// lives as file-static in D3D11Hook, reachable by qualified name from this same translation unit.
+namespace UpscalerControl
+{
+    bool  Available()          { return Upscaler::IsAvailable(); }
+    bool  GetEnabled()         { return D3D11Hook::sUpsEnabled; }
+    void  SetEnabled(bool e)   { D3D11Hook::sUpsEnabled = e; }
+    int   GetPreset()          { return D3D11Hook::sUpsPresetIdx; }
+    void  SetPreset(int p)     { if (p >= 0 && p < Upscaler::PRESET_COUNT) D3D11Hook::sUpsPresetIdx = p; }
+    float GetSharpness()       { return D3D11Hook::sUpsSharpness; }
+    void  SetSharpness(float s){ D3D11Hook::sUpsSharpness = s < 0 ? 0 : (s > 1 ? 1 : s); }
+    int   GetBackend()         { return D3D11Hook::sUpsBackend; }
+    void  SetBackend(int b)    { D3D11Hook::sUpsBackend = (b == 1) ? 1 : 0; }
+}

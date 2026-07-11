@@ -36,6 +36,8 @@ static ID3D11VertexShader*   sVelSkinVS = nullptr;   // A.3b skinned velocity VS
 static ID3D11VertexShader*   sVelInstVS = nullptr;   // A.4 instanced (per-instance world matrix) VS
 static ID3D11PixelShader*    sFsPS  = nullptr;
 static ID3D11VertexShader*   sFsVS  = nullptr;
+static ID3D11PixelShader*    sSharpenPS = nullptr;   // RCAS-lite sharpen for the DLSS output
+static ID3D11Buffer*         sSharpenCB = nullptr;   // { float2 invRes; float amount; float pad; }
 static ID3D11Buffer*         sVelCB = nullptr;
 static ID3D11Buffer*         sCurBoneCB = nullptr;    // 80 float3x4 bone palette (this frame)
 static ID3D11Buffer*         sPrevBoneCB = nullptr;   // matched previous-frame bone palette
@@ -170,6 +172,29 @@ float4 main(FOut i) : SV_Target {
     col.b = saturate(length(mv) * s);
     return float4(saturate(col), 1.0);
 })";
+
+// Contrast-limited sharpen (RCAS-lite) for the DLSS output: adds crispness without ringing/halos or the
+// local-contrast boost that a plain unsharp/Clarity pass produces. The sharpened value is clamped to the
+// 3x3-cross min/max so it can only recover detail, never overshoot => no dark/bright rims.
+static const char* kSharpenPS = R"(
+Texture2D<float4> tex : register(t0);
+SamplerState smp : register(s0);
+cbuffer CB : register(b0) { float2 invRes; float amount; float _pad; };
+struct FOut { float4 pos:SV_Position; float2 uv:TEXCOORD0; };
+float4 main(FOut i) : SV_Target {
+    float3 c = tex.Sample(smp, i.uv).rgb;
+    float3 n = tex.Sample(smp, i.uv + float2(0, -invRes.y)).rgb;
+    float3 s = tex.Sample(smp, i.uv + float2(0,  invRes.y)).rgb;
+    float3 e = tex.Sample(smp, i.uv + float2( invRes.x, 0)).rgb;
+    float3 w = tex.Sample(smp, i.uv + float2(-invRes.x, 0)).rgb;
+    float3 avg   = (n + s + e + w) * 0.25;
+    float3 sharp = c + (c - avg) * (amount * 2.0);
+    float3 mn = min(c, min(min(n, s), min(e, w)));
+    float3 mx = max(c, max(max(n, s), max(e, w)));
+    return float4(clamp(sharp, mn, mx), 1.0);
+})";
+
+
 
 static bool CompileVS(const char* src, ID3D11VertexShader** out)
 {
@@ -429,6 +454,8 @@ bool DebugVizEnabled()
     }
     return sDebugViz == 1;
 }
+
+void SetDebugViz(bool on) { sDebugViz = on ? 1 : 0; }   // runtime toggle from the GUI
 
 ID3D11ShaderResourceView* GetVelocitySRV() { return sVelSRV; }
 
@@ -882,6 +909,8 @@ ID3D11RenderTargetView* InjEnsureVelRTV(ID3D11RenderTargetView* refRTV)
 
 ID3D11Buffer* GetInjReprojCB() { return sReprojCB; }
 
+ID3D11Resource* GetInjVelResource() { return sInjVelTex; }
+
 void InjBeginGBuffer(ID3D11DeviceContext* ctx)
 {
     if (!ctx || !sDevice || sInjBegun) return;
@@ -909,7 +938,11 @@ void InjBeginGBuffer(ID3D11DeviceContext* ctx)
         if (SUCCEEDED(ctx->Map(sReprojCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms)))
         { memcpy(ms.pData, reproj, 64); ctx->Unmap(sReprojCB, 0); }
     }
-    if (sInjVelRTV) { float c[4] = { -1000.f, -1000.f, 0, 0 }; ctx->ClearRenderTargetView(sInjVelRTV, c); }
+    // Clear to ZERO (static), not a sentinel: un-covered pixels (sky, particles, transparents) are read
+    // by DLSS as its motion-vector input. A sentinel there becomes a giant bogus MV -> DLSS fetches
+    // garbage history -> the sky and object/sky edges shimmer. Zero = "not moving" (correct for a still
+    // camera, a safe approximation when panning). The game shaders overwrite covered pixels with real MVs.
+    if (sInjVelRTV) { float c[4] = { 0.f, 0.f, 0.f, 0.f }; ctx->ClearRenderTargetView(sInjVelRTV, c); }
 }
 
 void InjEndFrame() { sInjBegun = false; }
@@ -1072,9 +1105,58 @@ void InjDebugBlit(ID3D11DeviceContext* ctx)
     sState.Restore(ctx);
 }
 
+// Sharpen srcSRV into dstRTV (both display-res) with the contrast-limited sharpen. amount in [0,1];
+// amount<=0 is a no-op (the caller does a plain copy instead). src and dst MUST be different resources.
+void SharpenBlit(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* srcSRV,
+                 ID3D11RenderTargetView* dstRTV, float amount, uint32_t w, uint32_t h)
+{
+    if (!ctx || !srcSRV || !dstRTV || amount <= 0.0f || w == 0 || h == 0) return;
+    if (!sFsVS && !CompileVS(kFsVS, &sFsVS)) return;
+    if (!sSharpenPS && !CompilePS(kSharpenPS, &sSharpenPS)) return;
+    if (!sSampler)
+    {
+        D3D11_SAMPLER_DESC smp = {};
+        smp.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+        smp.AddressU = smp.AddressV = smp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sDevice->CreateSamplerState(&smp, &sSampler);
+    }
+    if (!sSharpenCB)
+    {
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = 16; bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(sDevice->CreateBuffer(&bd, nullptr, &sSharpenCB))) return;
+    }
+    struct { float invW, invH, amt, pad; } cb = { 1.0f / w, 1.0f / h, amount, 0.0f };
+    D3D11_MAPPED_SUBRESOURCE ms;
+    if (SUCCEEDED(ctx->Map(sSharpenCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms)))
+    { memcpy(ms.pData, &cb, sizeof(cb)); ctx->Unmap(sSharpenCB, 0); }
+
+    sState.Capture(ctx);
+    ID3D11RenderTargetView* rtv = dstRTV;
+    ctx->OMSetRenderTargets(1, &rtv, nullptr);
+    D3D11_VIEWPORT vp = { 0, 0, (float)w, (float)h, 0, 1 };
+    ctx->RSSetViewports(1, &vp);
+    ctx->VSSetShader(sFsVS, nullptr, 0);
+    ctx->PSSetShader(sSharpenPS, nullptr, 0);
+    ctx->PSSetShaderResources(0, 1, &srcSRV);
+    ctx->PSSetSamplers(0, 1, &sSampler);
+    ctx->PSSetConstantBuffers(0, 1, &sSharpenCB);
+    ctx->OMSetDepthStencilState(nullptr, 0);
+    ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+    ctx->IASetInputLayout(nullptr);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11Buffer* nullVB = nullptr; UINT z = 0;
+    ctx->IASetVertexBuffers(0, 1, &nullVB, &z, &z);
+    ctx->Draw(3, 0);
+    sState.Restore(ctx);
+}
+
 void Shutdown()
 {
     ReleaseTargets();
+    if (sSharpenPS) { sSharpenPS->Release(); sSharpenPS = nullptr; }
+    if (sSharpenCB) { sSharpenCB->Release(); sSharpenCB = nullptr; }
     if (sInjVelSRV) { sInjVelSRV->Release(); sInjVelSRV = nullptr; }
     if (sInjVelRTV) { sInjVelRTV->Release(); sInjVelRTV = nullptr; }
     if (sInjVelTex) { sInjVelTex->Release(); sInjVelTex = nullptr; }
