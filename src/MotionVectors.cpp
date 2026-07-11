@@ -838,6 +838,8 @@ struct SkinPose {
 };
 static std::vector<SkinPose>   sPrevSkinPoses;            // last frame's skinned poses (match targets)
 static std::vector<uint8_t>    sPrevClaimed;              // one-to-one matching: prev pose already taken
+static uint32_t sSkinTotalFrame = 0, sSkinMatchedFrame = 0, sSkinShadowMissFrame = 0;   // per-frame diag
+static uint32_t sSkinDiagFrame = 0;
 
 // Bone-palette CB shadow: OGRE Map_WRITE_DISCARDs the skin CB (bones + VP) just before each skin draw.
 // We snapshot those bytes at Unmap so InjBindSkinPrev can read THIS frame's root bone at draw time
@@ -938,6 +940,14 @@ void InjNoteUnmap(void* resource)
 void InjFillSkinPrev(ID3D11DeviceContext* ctx)
 {
     if (!ctx) return;
+    // Per-frame match diagnostic (this frame's draws matched against last frame's poses). A low
+    // matched/total ratio => flashing (misses fall back to camera reproj). shadowMiss = warmup/churn.
+    if ((sSkinDiagFrame++ % 120) == 0 && sSkinTotalFrame > 0)
+        Log("MV[skin]: matched=%u/%u (%.0f%%) shadowMiss=%u prevPoses=%zu",
+            sSkinMatchedFrame, sSkinTotalFrame,
+            100.0f * sSkinMatchedFrame / sSkinTotalFrame, sSkinShadowMissFrame, sPrevSkinPoses.size());
+    sSkinTotalFrame = 0; sSkinMatchedFrame = 0; sSkinShadowMissFrame = 0;
+
     sPrevSkinPoses.clear();
     const auto& caps = GeometryCapture::GetCaptures();
     for (const auto& d : caps)
@@ -978,6 +988,7 @@ void InjBindSkinPrev(ID3D11DeviceContext* ctx)
     if (caps.empty()) return;
     const CapturedDraw& d = caps.back();
     if (!d.vsMetadata || d.vsMetadata->transformType != VSTransformType::SKINNED) return;
+    sSkinTotalFrame++;
 
     uint32_t boneOff = d.vsMetadata->boneArrayOffset;
     uint32_t cbSlot  = d.vsMetadata->cbSlot;
@@ -995,7 +1006,7 @@ void InjBindSkinPrev(ID3D11DeviceContext* ctx)
     }
     auto its = sBoneShadow.find((const void*)boneCB);
     boneCB->Release();
-    if (its == sBoneShadow.end()) return;                 // not shadowed yet (warmup) -> guard -> MV 0
+    if (its == sBoneShadow.end()) { sSkinShadowMissFrame++; return; }   // not shadowed yet (warmup) -> reproj
     const std::vector<uint8_t>& cur = its->second;
     if ((size_t)boneOff + 48 > cur.size()) return;
 
@@ -1014,8 +1025,9 @@ void InjBindSkinPrev(ID3D11DeviceContext* ctx)
         float dd = dx*dx + dy*dy + dz*dz;
         if (dd < bestD) { bestD = dd; best = (int)j; }
     }
-    if (best < 0 || bestD > kGate2) return;               // no confident prev -> guard -> MV 0
+    if (best < 0 || bestD > kGate2) return;               // no confident prev -> shader guard -> camera reproj
     sPrevClaimed[best] = 1;
+    sSkinMatchedFrame++;
 
     if (!sInjSkinB12)
     {

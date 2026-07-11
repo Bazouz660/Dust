@@ -760,7 +760,8 @@ static std::string InjSkinVS(const std::string& src)
     std::string s = src;
     size_t fn = s.find("void main_vs");
     if (fn == std::string::npos) return src;
-    s.insert(fn, "cbuffer DustPrevCB : register(b12) { row_major float3x4 dust_prevBones[60]; row_major float4x4 dust_prevVP; };\n");
+    s.insert(fn, "cbuffer DustPrevCB : register(b12) { row_major float3x4 dust_prevBones[60]; row_major float4x4 dust_prevVP; };\n"
+                 "cbuffer DustMVCB : register(b13) { column_major float4x4 dust_reproj; };\n");
     size_t from = s.find("void main_vs");
     if (from == std::string::npos) return src;
     if (!InsAfter(s, from, "TEXCOORD5,", "\n\tout float4 oDustCur : TEXCOORD12,\n\tout float4 oDustPrev : TEXCOORD13,")) return src;
@@ -770,8 +771,10 @@ static std::string InjSkinVS(const std::string& src)
         "\n\t[unroll] for (int dmvI = 0; dmvI < 3; dmvI++) dmvPrev += float4(mul(dust_prevBones[blendIdx[dmvI]], position).xyz, 1.0) * blendWgt[dmvI];"
         "\n\toDustPrev = mul(dust_prevVP, dmvPrev);"
         // No prev pose bound this draw (first frame / unmatched / OGRE's reflected zero-buffer at b12)
-        // => dust_prevVP is all-zero => fall back to oDustCur so the velocity reads 0 (no motion), not NaN.
-        "\n\tif (dot(dust_prevVP._m30_m31_m32_m33, dust_prevVP._m30_m31_m32_m33) == 0.0) oDustPrev = oDustCur;";
+        // => dust_prevVP is all-zero => fall back to CAMERA REPROJECTION (b13), not zero: a missed match
+        // then looks like the character just didn't animate that frame (subtle) instead of didn't move at
+        // all (a jarring flash under camera motion). Correct for a still character; ~right when moving.
+        "\n\tif (dot(dust_prevVP._m30_m31_m32_m33, dust_prevVP._m30_m31_m32_m33) == 0.0) oDustPrev = mul(dust_reproj, oDustCur);";
     if (!InsAfter(s, from, "oPosition = mul(viewProjectionMatrix, blendPos);", prev)) return src;
     return s;
 }
