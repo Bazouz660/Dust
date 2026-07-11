@@ -167,6 +167,9 @@ void EffectLoader::EffectConfigSaveTo(LoadedEffect& le, const std::string& prese
         const DustSettingDesc& s = le.desc.settings[i];
         if (s.type == DUST_SETTING_SECTION) continue;
         if (!s.valuePtr) continue;
+        // Preset-optional settings bridge to player-owned state; never bake them
+        // into a preset (see DUST_SETTING_FLAG_PRESET_OPTIONAL).
+        if (s.settingFlags & DUST_SETTING_FLAG_PRESET_OPTIONAL) continue;
 
         const char* key = s.iniKey ? s.iniKey : s.name;
         if (!key) continue;
@@ -266,7 +269,11 @@ void EffectLoader::ValidatePreset(int presetIdx)
             if (s.type == DUST_SETTING_SECTION) continue;
             const char* key = s.iniKey ? s.iniKey : s.name;
             if (!key) continue;
-            expectedKeys.push_back(key);
+            expectedKeys.push_back(key); // known key: recognized here even if optional/absent
+
+            // Preset-optional settings bridge to player-owned state and are never
+            // written into presets, so their absence must not flag "outdated".
+            if (s.settingFlags & DUST_SETTING_FLAG_PRESET_OPTIONAL) continue;
 
             char probe[64];
             GetPrivateProfileStringA(section, key, sentinel, probe, sizeof(probe), iniPath.c_str());
