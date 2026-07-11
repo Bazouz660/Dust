@@ -63,6 +63,23 @@ static float  sOrigRtwRange      = 0.0f;   // shadow_range at capture (for rever
 // Kenshi's native value alone.
 static std::atomic<float> sRequestedFar{std::numeric_limits<float>::quiet_NaN()};
 
+// Last values we wrote into the splits array while an override was active.
+// Kenshi re-derives the splits on a shadow-mode switch / scene re-init and
+// stomps our override; the per-frame pos==24 hook compares the array against
+// these (exact bits — anything Kenshi writes differs) and re-applies.
+static float sAppliedSplits[3] = {};
+static float sAppliedNear = 0.0f;
+static float sAppliedFar  = 0.0f;
+static bool  sAppliedValid = false;
+
+// GpuSharedParameters destructor hook: deterministic staleness signal. OGRE
+// destroys and recreates the shared-params blocks when the user switches
+// shadow type in the options; without this, the cached RTWSM float pointer
+// dangled and the per-frame range re-apply wrote freed memory. (A read probe
+// can't catch this case — freed heap is usually still readable.)
+typedef void (*GSPDestructorFn)(void* self);
+static GSPDestructorFn sOrig_GSP_Destructor = nullptr;
+
 // Getter intercepts: override the shadow far distance for any OGRE code that
 // queries it (shadow camera setup, auto-constants, etc.). Self-compare is the
 // NaN check.
@@ -114,7 +131,13 @@ static bool RecomputeSplits()
         float logT = n * powf(f / n, r);
         float linT = n + (f - n) * r;
         sSplitsArray[i] = lambda * logT + (1.0f - lambda) * linT;
+        sAppliedSplits[i - 1] = sSplitsArray[i];
     }
+    // Record what we applied so the per-frame pos==24 check can detect
+    // Kenshi stomping the array (shadow-mode switch re-derives the splits).
+    sAppliedNear  = n;
+    sAppliedFar   = f;
+    sAppliedValid = true;
     return true;
 }
 
@@ -129,13 +152,26 @@ static void PushSplitsToSharedParams()
         dest[i*4 + 0] = sSplitsArray[i+1] - sCachedNear;
 }
 
+static bool ProbeCachedSplits();  // SEH-guarded liveness check, defined below
+
+// Drop the cached splits pointer if it no longer reads as plausible — the
+// orchestrator's array can be freed on a scene/shadow rebuild between the
+// per-frame hook validations, and SetLambda/SetShadowFar write it directly.
+static void ValidateSplitsCache()
+{
+    if (sSplitsArray && !ProbeCachedSplits())
+        sSplitsArray = nullptr;  // pending overrides re-apply at next capture
+}
+
 void SetLambda(float lambda)
 {
+    ValidateSplitsCache();
     if (lambda < 0.0f)
     {
         // Clear the override: restore Kenshi's own splits.
         if (!sLambdaActive.load()) return;
         sLambdaActive.store(false);
+        sAppliedValid = false;
         if (sSplitsArray)
         {
             for (int i = 0; i < 3; i++)
@@ -155,6 +191,7 @@ float GetLambda() { return sLambda.load(); }
 
 bool SetShadowFar(float farDistance)
 {
+    ValidateSplitsCache();
     if (farDistance < 0.0f)
     {
         // Clear the override: restore Kenshi's own values.
@@ -169,6 +206,7 @@ bool SetShadowFar(float farDistance)
         sCachedFar      = sOrigFar;
         if (!sLambdaActive.load())
         {
+            sAppliedValid = false;
             for (int i = 0; i < 3; i++)
                 sSplitsArray[i + 1] = sOrigSplits[i];
         }
@@ -277,9 +315,24 @@ static void TryCaptureSplitsSource(void* self)
                     sSplitsArray  = fp;
                     sCachedNear   = nearD;
                     sCachedFar    = farD;
-                    sOrigFar      = farD;
-                    for (int i = 0; i < 3; i++)
-                        sOrigSplits[i] = fp[i + 1];
+
+                    // Record "native" values only when no override can have
+                    // contaminated them: with a far override active Kenshi
+                    // derives its splits THROUGH our getter intercepts (so
+                    // farD here IS the override), and with a lambda override
+                    // active the array may still hold our formula splits. On
+                    // a re-capture (shadow-mode switch) keep the clean
+                    // boot-time originals so clearing the override later
+                    // restores the true values.
+                    float pendingFar = sRequestedFar.load();
+                    bool overrideActive = sLambdaActive.load() ||
+                                          (pendingFar == pendingFar);
+                    if (!overrideActive || !(sOrigFar > 0.0f))
+                    {
+                        sOrigFar = farD;
+                        for (int i = 0; i < 3; i++)
+                            sOrigSplits[i] = fp[i + 1];
+                    }
 
                     if (firstTime)
                         Log("PssmDetour: splits captured=[%g, %g, %g, %g, %g] "
@@ -322,23 +375,114 @@ static void TryCaptureSplitsSource(void* self)
     }
 }
 
+// Re-assert active lambda/far overrides against the splits array. Kenshi
+// re-derives the splits on a shadow-mode switch (RTWSM<->CSM) or scene
+// re-init and stomps whatever we wrote; nothing else re-applies (SetLambda /
+// SetShadowFar only run on GUI changes). Runs on every validated pos==24
+// call, but is exact-bit compares only in steady state — the recompute fires
+// solely when the array no longer holds what we last applied.
+static void EnforceSplitOverrides()
+{
+    float pending = sRequestedFar.load();
+    bool farActive = (pending == pending);
+    if (!farActive && !sLambdaActive.load())
+    {
+        sAppliedValid = false;
+        return;
+    }
+
+    // Adopt Kenshi's current near; adopt its far too unless we override it.
+    float curNear = sSplitsArray[0];
+    float curFar  = sSplitsArray[4];
+    if (!(curNear > 0.0f) || !(curFar > curNear)) return;
+    float wantFar = curFar;
+    if (farActive)
+    {
+        wantFar = pending;
+        float minFar = curNear + 1.0f;
+        if (wantFar < minFar) wantFar = minFar;
+    }
+
+    bool stomped = !sAppliedValid ||
+                   curNear         != sAppliedNear      ||
+                   curFar          != sAppliedFar       ||
+                   sSplitsArray[1] != sAppliedSplits[0] ||
+                   sSplitsArray[2] != sAppliedSplits[1] ||
+                   sSplitsArray[3] != sAppliedSplits[2];
+    if (!stomped) return;
+
+    sCachedNear     = curNear;
+    sCachedFar      = wantFar;
+    sSplitsArray[4] = wantFar;
+    if (RecomputeSplits())
+    {
+        PushSplitsToSharedParams();
+        // Capped: if an engine path ever rewrites the array per frame this
+        // must not become per-frame log traffic (see the r3 AV-spam lesson).
+        static int sReapplyLogs = 0;
+        if (sReapplyLogs < 8)
+        {
+            ++sReapplyLogs;
+            Log("PssmDetour: splits override re-applied after engine rewrite "
+                "(near=%g far=%g lambda=%s)%s",
+                (double)curNear, (double)wantFar,
+                sLambdaActive.load() ? "active" : "native-formula",
+                sReapplyLogs == 8 ? " — further occurrences not logged" : "");
+        }
+    }
+}
+
+// Clears caches when OGRE destroys a shared-params instance we captured —
+// the deterministic invalidation for shadow-mode switches. Body must stay
+// branch-only: this fires for every GpuSharedParameters destruction.
+static void Hook_GSP_Destructor(void* self)
+{
+    if (self == sRtwsmSharedParams)
+    {
+        sRtwsmSharedParams = nullptr;
+        sRtwsmFloatsBase   = nullptr;
+        Log("PssmDetour: RTWSM shared params destroyed — cache cleared");
+    }
+    if (self == sSharedParams)
+    {
+        sSharedParams = nullptr;
+        sSplitsArray  = nullptr;   // re-captured from the next pos==24 call
+        sAppliedValid = false;
+        Log("PssmDetour: CSM shared params destroyed — splits cache cleared");
+    }
+    sOrig_GSP_Destructor(self);
+}
+
 static float* Hook_getFloatPointer(void* self, size_t pos)
 {
     // pos==5 is the RTWSM shared params (shadow_range at float[0]). Kenshi
     // rewrites the block every frame, so re-apply a pending far override on
-    // each call.
+    // each call. Capture rules mirror pos==24: first plausible caller wins,
+    // a different instance is ignored while the capture is live, and the
+    // destructor hook clears the capture when the block is destroyed (mode
+    // switch) so the next RTWSM block re-captures cleanly.
     if (pos == 5)
     {
         if (!sRtwsmSharedParams)
         {
-            sRtwsmSharedParams = self;
-            sRtwsmFloatsBase = sOrig_getFloatPointer(self, 0);
-            if (sRtwsmFloatsBase)
+            // Never adopt the CSM block, and sanity-check that float[0]
+            // looks like a shadow range before trusting a first caller.
+            float* base = (self != sSharedParams)
+                        ? sOrig_getFloatPointer(self, 0) : nullptr;
+            if (base && base[0] > 0.0f && base[0] < 1.0e6f)
             {
-                sOrigRtwRange = sRtwsmFloatsBase[0];
+                sRtwsmSharedParams = self;
+                sRtwsmFloatsBase   = base;
+                sOrigRtwRange      = base[0];
                 Log("PssmDetour: RTWSM shared params captured, shadow_range=%g",
                     (double)sOrigRtwRange);
             }
+        }
+        else if (self == sRtwsmSharedParams)
+        {
+            // Refresh the base pointer — the float array can reallocate
+            // while the instance survives (addConstantDefinition).
+            sRtwsmFloatsBase = sOrig_getFloatPointer(self, 0);
         }
         if (sRtwsmFloatsBase)
         {
@@ -355,7 +499,8 @@ static float* Hook_getFloatPointer(void* self, size_t pos)
     //   - No valid capture yet  -> attempt capture from this call.
     //   - Same instance we captured from -> verify the pointer is still live
     //     (two guarded reads); if it went stale (scene rebuild), drop it so
-    //     the next call re-captures.
+    //     the next call re-captures. While live, re-assert any active
+    //     overrides the engine may have stomped (mode switch re-derivation).
     //   - A DIFFERENT instance while we already hold a valid capture -> ignore
     //     entirely. Unwinding here every frame for an unrelated shared-params
     //     block was a periodic frame-time spike.
@@ -363,8 +508,13 @@ static float* Hook_getFloatPointer(void* self, size_t pos)
     {
         if (!sSplitsArray)
             TryCaptureSplitsSource(self);
-        else if (self == sSharedParams && !ProbeCachedSplits())
-            sSplitsArray = nullptr;  // stale; re-capture on a later call
+        else if (self == sSharedParams)
+        {
+            if (!ProbeCachedSplits())
+                sSplitsArray = nullptr;  // stale; re-capture on a later call
+            else
+                EnforceSplitOverrides();
+        }
     }
 
     return sOrig_getFloatPointer(self, pos);
@@ -407,6 +557,14 @@ bool TryInstall()
         (void*)&Hook_getFloatPointer,
         (void**)&sOrig_getFloatPointer))
         return false;
+
+    // GpuSharedParameters destructor — deterministic invalidation of the
+    // captured RTWSM/CSM blocks when OGRE rebuilds them (shadow-mode switch).
+    // Non-fatal if missing: the read-probe staleness paths still apply.
+    InstallOne(m,
+        "??1GpuSharedParameters@Ogre@@UEAA@XZ",
+        (void*)&Hook_GSP_Destructor,
+        (void**)&sOrig_GSP_Destructor);
 
     // Far-distance getter intercepts — override any OGRE code reading the
     // shadow far distance (shadow camera setup, auto-constants). Rare calls

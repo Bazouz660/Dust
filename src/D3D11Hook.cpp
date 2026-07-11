@@ -92,6 +92,9 @@ struct ShadowAtlasEntry {
     ID3D11DepthStencilView*   newDSV;
     ID3D11RenderTargetView*   newRTV;
     ID3D11ShaderResourceView* newSRV;
+    IUnknown*                 newIdentity;  // weak; newTex's identity, registered for
+                                            // shadow-pass detection — must be removed
+                                            // from the identity list when newTex dies
     ID3D11Texture2D*          companionDepthTex;  // standalone depth for color-only entries
     ID3D11DepthStencilView*   companionDSV;       // DSV for companion depth
 };
@@ -162,8 +165,30 @@ static int FindShadowEntry(ID3D11Resource* res)
     return -1;
 }
 
+// Remove one identity from the shadow-pass detection list (swap-remove).
+// Without this, every resize/mode-switch left the released replacement's
+// identity behind: a dangling weak pointer (false-positive shadow-pass
+// detection if the allocation is recycled) and, once the 8-slot list
+// filled up, silent registration failure — the new replacement DSV was
+// never recognized as a shadow target, so caster viewports stopped being
+// scaled and the resolution override visibly broke.
+static void RemoveShadowIdentity(IUnknown* id)
+{
+    if (!id) return;
+    size_t count = gShadowAtlasIdentityCount.load(std::memory_order_acquire);
+    for (size_t i = 0; i < count; i++)
+    {
+        if (gShadowAtlasIdentities[i] != id) continue;
+        gShadowAtlasIdentities[i] = gShadowAtlasIdentities[count - 1];
+        gShadowAtlasIdentities[count - 1] = nullptr;
+        gShadowAtlasIdentityCount.store(count - 1, std::memory_order_release);
+        return;
+    }
+}
+
 static void ReleaseShadowReplacement(ShadowAtlasEntry& e)
 {
+    if (e.newIdentity) { RemoveShadowIdentity(e.newIdentity); e.newIdentity = nullptr; }
     if (e.companionDSV)      { e.companionDSV->Release();      e.companionDSV = nullptr; }
     if (e.companionDepthTex) { e.companionDepthTex->Release();  e.companionDepthTex = nullptr; }
     if (e.newDSV)  { e.newDSV->Release();  e.newDSV = nullptr; }
@@ -265,7 +290,10 @@ static void ApplyPendingShadowResize()
                     Log("  entry %zu: CreateSRV (depth) FAILED (0x%08X)", i, hr);
             }
 
-            // Register new depth identity for shadow-pass detection
+            // Register new depth identity for shadow-pass detection. Remember
+            // it on the entry so ReleaseShadowReplacement can take it back out
+            // of the list when this replacement dies (next resize / disable /
+            // workspace recreate).
             IUnknown* nid = nullptr;
             e.newTex->QueryInterface(IID_IUnknown, (void**)&nid);
             if (nid)
@@ -275,6 +303,7 @@ static void ApplyPendingShadowResize()
                 {
                     gShadowAtlasIdentities[sidx] = nid;
                     gShadowAtlasIdentityCount.store(sidx + 1, std::memory_order_release);
+                    e.newIdentity = nid;  // weak ref, backed by e.newTex
                 }
                 nid->Release();
             }

@@ -153,8 +153,13 @@ static std::string PatchDeferredShader(const std::string& src)
             "\tb += edgeBias * (edge.x + edge.y);\n"
             "\tfloat sd = saturate(mul(shadowMatrix, float4(worldPos, 1)).z);\n"
             "\n"
-            "\tfloat sinSlope = sqrt(1.0 - NdotL * NdotL);\n"
-            "\tb += dustRtwSlopeBias * sinSlope / max(NdotL, 0.01);\n"
+            // Slope bias = tan(angle to light) * vanilla-scale step. The NdotL
+            // floor at 0.15 caps the term at ~6.6x its 45-degree value: with the
+            // old 0.01 floor a grazing surface got a bias of ~0.1 depth units —
+            // 3000x the vanilla shadow_bias (0.00003) — which un-shadowed
+            // everything within hundreds of world units behind an occluder.
+            "\tfloat sinSlope = sqrt(saturate(1.0 - NdotL * NdotL));\n"
+            "\tb += dustRtwSlopeBias * sinSlope / max(NdotL, 0.15);\n"
             "\n"
             + steepBlock +
             "\tif (dustRtwCliffFixEnabled > 0.5) {\n"
@@ -185,9 +190,15 @@ static std::string PatchDeferredShader(const std::string& src)
             "\t\tfloat2(-0.791559, -0.597705)\n"
             "\t};\n"
             "\n"
+            // Bias Scale adds multiples of the vanilla shadow_bias (0.00003,
+            // rtwshadows.program). This must NOT be tied to the filter radius:
+            // fr is a UV-space length, and the old `b += fr * biasScale` added
+            // 0.001+ to a DEPTH bias — 33x vanilla — wiping out character-scale
+            // self-shadowing (body-thickness depth deltas are ~0.00005), which
+            // read as "glossy" characters lit through their own bodies.
             "\tfloat fr = dustRtwFilterRadius;\n"
             "\tfloat ls = dustRtwLightSize;\n"
-            "\tb += fr * dustRtwBiasScale;\n"
+            "\tb += 0.00003 * dustRtwBiasScale;\n"
             "\n"
             // Early-out: most pixels are fully lit. 3 taps catches them.
             "\tfloat centerD = tex2Dlod(sMap, float4(center, 0, 0)).x;\n"

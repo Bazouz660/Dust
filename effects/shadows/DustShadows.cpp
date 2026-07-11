@@ -378,7 +378,10 @@ static void ShadowPreExecute(const DustFrameContext* ctx, const DustHostAPI* hos
     data.rtwCliffFixEnabled  = gConfig.cliffFix ? 1.0f : 0.0f;
     data.rtwCliffFixDistance = gConfig.cliffFixDistance;
     data.rtwNormalBias       = gConfig.normalBias;
-    data.rtwSlopeBias        = gConfig.slopeBias * 0.001f;
+    // Slope bias steps in multiples of the vanilla RTW shadow_bias (0.00003,
+    // rtwshadows.program). The old 0.001 factor was ~33x vanilla per slider
+    // unit and erased character self-shadowing ("glossy" characters).
+    data.rtwSlopeBias        = gConfig.slopeBias * 0.00003f;
     // CSM filter radius scales csmParams[i][1] (the per-cascade PCF radius the
     // engine baked into the lighting cbuffer). 1.0 = vanilla taper.
     data.csmFilterRadius     = gConfig.csmFilterRadius;
