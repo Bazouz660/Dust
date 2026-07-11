@@ -362,9 +362,15 @@ static std::string PatchDeferredShader(const std::string& src)
             "\t\t\tfloat avgDelta = blockerDeltaSum / blockerCnt;\n"
             "\t\t\tfloat receiver = max(shadowUv.z, 0.001);\n"
             "\t\t\tfloat pen = (avgDelta / (receiver - avgDelta)) * (dustCsmLightSize * baseRadius);\n"
-            // This is the FAR cascade (4-tap). Its huge texels already look
-            // soft, so keep the penumbra tight (1.5x) to avoid over-blur.
-            "\t\t\tradius = clamp(pen, baseRadius * 0.5, baseRadius * 1.5);\n"
+            // This is the FAR cascade (4-tap). Its base filter is already at
+            // the ~1-texel resolution floor, and one texel here is several
+            // meters of WORLD space (measured ~5.7m at split 375->4999), so
+            // the base penumbra is already ~7x the near cascades'. Allowing
+            // PCSS to grow it (the old 1.5x) only pushed that further past the
+            // floor with no benefit — contact-hardening is meaningless when a
+            // texel spans meters. Cap growth at 1.0x so PCSS may only tighten
+            // (down to 0.5x), never soften past the texel-floor base.
+            "\t\t\tradius = clamp(pen, baseRadius * 0.5, baseRadius * 1.0);\n"
             "\t\t}\n"
             "\t}\n"
             "\n"

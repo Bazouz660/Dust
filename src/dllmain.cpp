@@ -72,7 +72,7 @@ static std::string BuildCacheStamp(const std::string& modDir)
 
     // Bump this suffix when ShaderPatch HLSL injection changes, so RE_Kenshi
     // discards cached bytecode that was compiled with an older injection.
-    stamp += "|patch=shadow-b7-csm-r3";
+    stamp += "|patch=shadow-b7-csm-r4";
     return stamp;
 }
 
