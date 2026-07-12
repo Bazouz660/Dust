@@ -28,10 +28,6 @@ struct ShadowConfig {
     float filterRadius      = 1.0f;   // RTW UV-space filter radius (scaled by 0.001 * resScale)
     float lightSize         = 3.0f;   // RTW PCSS light size
     bool  pcssEnabled       = true;   // RTW PCSS toggle
-    float biasScale         = 1.0f;
-    float normalBias        = 1.5f;   // world-space offset along surface normal before
-                                      // shadow lookup; prevents self-shadowing (acne)
-    float slopeBias         = 1.0f;   // extra depth bias on surfaces at grazing angles
     bool  cliffFix          = false;  // off by default: previous always-on caused
                                       // close-range vertical shadows to disappear
     float cliffFixDistance  = 0.10f;  // fraction of shadow range where the bias
@@ -314,18 +310,14 @@ struct alignas(16) ShadowCBData {
     float rtwFilterRadius;
     float rtwLightSize;
     float rtwPcssEnabled;
-    float rtwBiasScale;
     float rtwCliffFixEnabled;
     float rtwCliffFixDistance;
-    float rtwNormalBias;
-    float rtwSlopeBias;
     float csmFilterRadius;
     float csmLightSize;
     float csmPcssEnabled;
     float csmBlendEnabled;
     float csmBlendWidth;
     float rtwQuality;
-    float pad0;
 };
 
 static int ShadowInit(ID3D11Device* device, uint32_t w, uint32_t h, const DustHostAPI* host)
@@ -374,14 +366,8 @@ static void ShadowPreExecute(const DustFrameContext* ctx, const DustHostAPI* hos
     data.rtwFilterRadius     = gConfig.filterRadius * 0.001f * resScale;
     data.rtwLightSize        = gConfig.lightSize * 0.001f * resScale;
     data.rtwPcssEnabled      = gConfig.pcssEnabled ? 1.0f : 0.0f;
-    data.rtwBiasScale        = gConfig.biasScale;
     data.rtwCliffFixEnabled  = gConfig.cliffFix ? 1.0f : 0.0f;
     data.rtwCliffFixDistance = gConfig.cliffFixDistance;
-    data.rtwNormalBias       = gConfig.normalBias;
-    // Slope bias steps in multiples of the vanilla RTW shadow_bias (0.00003,
-    // rtwshadows.program). The old 0.001 factor was ~33x vanilla per slider
-    // unit and erased character self-shadowing ("glossy" characters).
-    data.rtwSlopeBias        = gConfig.slopeBias * 0.00003f;
     // CSM filter radius scales csmParams[i][1] (the per-cascade PCF radius the
     // engine baked into the lighting cbuffer). 1.0 = vanilla taper.
     data.csmFilterRadius     = gConfig.csmFilterRadius;
@@ -496,9 +482,6 @@ static DustSettingDesc gSettings[] = {
     { "Filter Radius",       DUST_SETTING_FLOAT, &gConfig.filterRadius,     0.1f, 5.0f,  "FilterRadius",     nullptr, "Size of the shadow softening filter (RTWSM only).",                                                                                                                           DUST_PERF_NONE   },
     { "Light Size",          DUST_SETTING_FLOAT, &gConfig.lightSize,        0.5f, 10.0f, "LightSize",        nullptr, "Simulated light source size for contact-hardening shadows (RTWSM PCSS).",                                                                                                     DUST_PERF_NONE   },
     { "PCSS",                DUST_SETTING_BOOL,  &gConfig.pcssEnabled,      0.0f, 1.0f,  "PCSS",             nullptr, "Enable Percentage-Closer Soft Shadows for RTWSM (distance-based softness).",                                                                                                  DUST_PERF_MEDIUM },
-    { "Bias Scale",          DUST_SETTING_FLOAT, &gConfig.biasScale,        0.0f, 3.0f,  "BiasScale",        nullptr, "Shadow bias multiplier to reduce RTWSM acne artifacts.",                                                                                                                      DUST_PERF_NONE },
-    { "Normal Bias",         DUST_SETTING_FLOAT, &gConfig.normalBias,       0.0f, 5.0f,  "NormalBias",       nullptr, "Offsets the shadow lookup along the surface normal to prevent self-shadowing. Higher = fewer shadow acne artifacts on detailed geometry, but shadows detach slightly from contact edges.", DUST_PERF_NONE },
-    { "Slope Bias",          DUST_SETTING_FLOAT, &gConfig.slopeBias,        0.0f, 5.0f,  "SlopeBias",        nullptr, "Extra depth bias on surfaces at grazing angles to the light. Reduces acne on near-vertical faces without affecting flat surfaces.",                                          DUST_PERF_NONE },
     { "Cliff Shadow Fix",    DUST_SETTING_BOOL,  &gConfig.cliffFix,         0.0f, 1.0f,  "CliffFix",         nullptr, "Reduce shadow acne on steep cliffs and vertical faces (RTWSM only). Can make close-range vertical shadows fade out. Integration of Crunk Aint Dead's Cliff Face Shadow Fix mod.", DUST_PERF_NONE },
     { "Cliff Fix Distance",  DUST_SETTING_FLOAT, &gConfig.cliffFixDistance, 0.0f, 1.0f,  "CliffFixDistance", nullptr, "Fraction of shadow range where the cliff fix smoothly ramps in (higher = preserves more close-range vertical shadows).",                                                    DUST_PERF_NONE },
 

@@ -23,10 +23,6 @@ struct RTGIConfig
     float bounceIntensity = 0.3f;  // multi-bounce feedback (0 = single bounce only)
     float saturation    = 1.0f;    // color saturation of indirect light
 
-    // Temporal — residual smoothing only; the bitmask trace uses static
-    // spatial noise, so convergence does not depend on accumulation.
-    float temporalBlend = 0.9f;    // accumulation factor (higher = smoother, more ghosting)
-
     // Denoise (SVGF)
     int   denoiseSteps  = 4;       // a-trous filter iterations (1-5)
     float depthSigma    = 2.0f;    // depth weight sensitivity (higher = more permissive on smooth surfaces)

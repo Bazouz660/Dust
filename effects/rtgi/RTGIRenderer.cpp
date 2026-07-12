@@ -754,7 +754,10 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
         cb.invViewportSize[1] = 1.0f / (float)gRenderHeight;
         cb.tanHalfFov = gRTGIConfig.tanHalfFov;
         cb.aspectRatio = aspect;
-        cb.temporalBlend = gHasPrevFrame ? gRTGIConfig.temporalBlend : 0.0f;
+        // Fixed residual-smoothing factor (0.9). Baked in: it sat at the
+        // shader's 0.08 alpha floor across the whole shipped slider range, so
+        // it was never a meaningful knob. 0.0 on history reset flushes accum.
+        cb.temporalBlend = gHasPrevFrame ? 0.9f : 0.0f;
         cb.frameIndex = (float)gFrameIndex;
         if (gHasPrevFrame)
         {

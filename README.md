@@ -133,7 +133,7 @@ The host provides a `DustHostAPI` struct with functions for logging, resource ac
 - **Improved shadow filtering**: Replaces the game's basic shadow sampling with PCSS (Percentage-Closer Soft Shadows) via the RTWSM warp map
 - **Variable penumbra**: Light size parameter controls how much shadows soften with distance from the caster
 - **12-sample Poisson disk**: Jittered per-pixel rotation for smooth, low-noise shadow edges
-- **Configurable**: Filter radius, light size, PCSS toggle, bias scale
+- **Configurable**: Filter radius, light size, PCSS toggle
 - **Cliff Shadow Fix (optional)**: Adds a small steep-surface bias that suppresses shadow acne on cliffs and vertical faces. Off by default since enabling it can fade close-range vertical shadows; the start distance is a smooth ramp controlled by a slider
 - **Shadow map resolution override**: Configurable in the GUI (2048–16384), requires restart
 
@@ -344,7 +344,6 @@ FadeDistance=1.0
 BounceIntensity=0.5
 AOIntensity=1.5
 GIIntensity=1.0
-TemporalBlend=0.95
 ResolutionMode=1
 DenoiseSteps=4
 DebugView=0
@@ -358,7 +357,6 @@ Enabled=1
 FilterRadius=1.0
 LightSize=3.0
 PCSS=1
-BiasScale=1.0
 CliffFix=0
 CliffFixDistance=0.10
 ```
