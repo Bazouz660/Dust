@@ -1,6 +1,8 @@
 #include "CameraAccess.h"
 
 #include <cstdint>
+#include <cmath>
+#include <cstring>
 
 // KenshiLib reconstructed structs + OGRE + the resolved-function API.
 #include <kenshi/GameWorld.h>
@@ -45,7 +47,9 @@ static PfnGetCamera ResolveGetCamera()
     return fn;
 }
 
-static bool GetViewProjRaw(float outVP[16])
+// Walk GameWorld -> player -> camera -> Ogre::Camera and read the view + projection matrices as raw
+// 16-float row-major arrays (Matrix4 = Real m[4][4], row-major). Shared by the VP and param getters.
+static bool GetCameraMatricesRaw(float outView[16], float outProj[16])
 {
     sStep = 1;
     if (!LooksLikePtr(sGameWorld)) return false;
@@ -74,10 +78,17 @@ static bool GetViewProjRaw(float outVP[16])
     const Ogre::Matrix4& projM = cam->getProjectionMatrixWithRSDepth();
     sStep = 7;
 
-    // Matrix4 is a 16-float POD (Real m[4][4], row-major). Read raw to avoid the dllimport
-    // arithmetic methods. VP = P*V (column-vector), stored TRANSPOSED to column-major.
-    const float* V = reinterpret_cast<const float*>(&viewM);   // V[row*4+col]
-    const float* P = reinterpret_cast<const float*>(&projM);
+    memcpy(outView, reinterpret_cast<const float*>(&viewM), 16 * sizeof(float));
+    memcpy(outProj, reinterpret_cast<const float*>(&projM), 16 * sizeof(float));
+    return true;
+}
+
+static bool GetViewProjRaw(float outVP[16])
+{
+    float V[16], P[16];
+    if (!GetCameraMatricesRaw(V, P)) return false;
+
+    // VP = P*V (column-vector), stored TRANSPOSED to column-major. V[row*4+col], P[row*4+col].
     for (int r = 0; r < 4; r++)
         for (int c = 0; c < 4; c++)
         {
@@ -89,15 +100,36 @@ static bool GetViewProjRaw(float outVP[16])
     return true;
 }
 
+// Extract near/far/fovY from the OGRE D3D-RSDepth perspective projection (row-major m[row][col]):
+//   m[2][2] = -far/(far-near), m[2][3] = -far*near/(far-near)  =>  near = m23/m22, far = m23/(m22+1)
+//   m[1][1] = 1/tan(fovY/2)                                     =>  fovY = 2*atan(1/m11)
+static bool GetCameraParamsRaw(float* nearZ, float* farZ, float* fovY)
+{
+    float V[16], P[16];
+    if (!GetCameraMatricesRaw(V, P)) return false;
+
+    float m22 = P[2 * 4 + 2], m23 = P[2 * 4 + 3], m11 = P[1 * 4 + 1];
+    if (m22 == 0.0f || (m22 + 1.0f) == 0.0f || m11 == 0.0f) return false;
+    float n = m23 / m22;
+    float f = m23 / (m22 + 1.0f);
+    float fov = 2.0f * atanf(1.0f / m11);
+    // Sanity gate — reject nonsense (infinite/reversed-Z or a faulted read).
+    if (!(n > 0.0f && f > n && fov > 0.05f && fov < 3.14f)) return false;
+    if (nearZ) *nearZ = n;
+    if (farZ)  *farZ  = f;
+    if (fovY)  *fovY  = fov;
+    sStep = 8;
+    return true;
+}
+
 bool CameraAccess_GetViewProj(float outVP[16])
 {
-    __try
-    {
-        return GetViewProjRaw(outVP);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        sStep = -sStep;
-        return false;
-    }
+    __try { return GetViewProjRaw(outVP); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { sStep = -sStep; return false; }
+}
+
+bool CameraAccess_GetCameraParams(float* nearZ, float* farZ, float* fovYRadians)
+{
+    __try { return GetCameraParamsRaw(nearZ, farZ, fovYRadians); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { sStep = -sStep; return false; }
 }

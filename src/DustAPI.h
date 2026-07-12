@@ -72,7 +72,7 @@
 extern "C" {
 #endif
 
-#define DUST_API_VERSION 7
+#define DUST_API_VERSION 8
 
 // Injection points in the rendering pipeline
 typedef enum DustInjectionPoint {
@@ -101,6 +101,11 @@ typedef struct DustCameraData {
     float   camForward[3];     // View Z axis (behind camera) in world space — OGRE RH convention
     float   camPosition[3];    // Camera position in world space
     float   inverseView[16];   // Raw 4x4 inverse view matrix (row-major in memory)
+    // API v8+: camera projection parameters (from the OGRE projection matrix). All 0 if unavailable
+    // (check nearZ > 0). tanHalfFov = tan(fovY/2), ready for depth->view-space reconstruction.
+    float   nearZ;             // Near clip distance
+    float   farZ;              // Far clip distance
+    float   tanHalfFov;        // tan(vertical FOV / 2)
 } DustCameraData;
 
 // Per-frame context passed to effect callbacks

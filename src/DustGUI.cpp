@@ -789,7 +789,7 @@ static void DrawUpscalingSection()
                 WritePrivateProfileStringA("Upscaling", "DLSSPreset", b, gDustIniPath.c_str());
             }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("DLSS model. K = the DLSS-4 transformer (best quality, recommended). Changing it rebuilds the feature next frame.");
+                ImGui::SetTooltip("DLSS model. F = CNN DLAA (recommended). K/J are the DLSS-4 transformer: sharpest in theory, but blur the whole image when the scene is static in this integration. Changing it rebuilds the feature next frame.");
         }
 
         float sh = UpscalerControl::GetSharpness();

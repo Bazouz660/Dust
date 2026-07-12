@@ -12,7 +12,9 @@
 #include "MotionVectors.h"
 #include "Upscaler.h"
 #include "UpscalerFSR2.h"
+#include "CameraAccess.h"
 #include "DustLog.h"
+#include <cmath>
 #include <core/Functions.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
@@ -383,6 +385,7 @@ static void ClearShadowReplacements()
 static bool  gJitterEnabled = false;
 static float gJitterPxX = 0.0f;   // this frame's jitter, in pixels [-0.5, 0.5]
 static float gJitterPxY = 0.0f;
+static int   sUpsBackend = 0;     // 0 = DLSS, 1 = FSR2 (declared early so the jitter advance can pick FSR2's sequence)
 
 static float HaltonSeq(uint32_t i, uint32_t b)
 {
@@ -416,12 +419,20 @@ void ResetFrameState()
     gDeviceRemovedThisFrame = false;
     gFrameIndex++;
 
-    // Advance the per-frame sub-pixel jitter (16-frame Halton(2,3) sequence, centred to [-0.5,0.5]).
+    // Advance the per-frame sub-pixel jitter. FSR2's temporal accumulation is tuned to its own jitter
+    // sequence, so use it when FSR2 is the active backend; otherwise Halton(2,3) (fine for DLSS).
     if (gJitterEnabled)
     {
-        uint32_t i = (uint32_t)(gFrameIndex % 16) + 1;
-        gJitterPxX = HaltonSeq(i, 2) - 0.5f;
-        gJitterPxY = HaltonSeq(i, 3) - 0.5f;
+        if (sUpsBackend == 1 && gWidth > 0)
+        {
+            UpscalerFSR2::ComputeJitter(gFrameIndex, gWidth, gWidth, &gJitterPxX, &gJitterPxY);
+        }
+        else
+        {
+            uint32_t i = (uint32_t)(gFrameIndex % 16) + 1;
+            gJitterPxX = HaltonSeq(i, 2) - 0.5f;
+            gJitterPxY = HaltonSeq(i, 3) - 0.5f;
+        }
     }
     else
     {
@@ -435,9 +446,8 @@ void ResetFrameState()
 // [Upscaling] DLSS=1; degrades to a no-op if NGX/DLSS isn't available (non-NVIDIA / old driver / no dll).
 static bool             sUpsConfigRead = false;
 static bool             sUpsEnabled    = false;   // runtime DLSS on/off (seeded from [Upscaling] DLSS)
-static int              sUpsPresetIdx  = 1;        // Upscaler::PRESET_K
+static int              sUpsPresetIdx  = 3;        // Upscaler::PRESET_F (CNN DLAA; K blurs the static image in our D3D11 NGX integration)
 static float            sUpsSharpness  = 0.0f;     // [0,1]
-static int              sUpsBackend    = 0;        // 0 = DLSS, 1 = FSR2
 static int              sUpsActiveBackend = -1;    // currently-initialized backend (detect GUI switch)
 static bool             sUpsInitTried  = false;    // NGX availability probed
 static int              sUpsFeaturePreset = -1;    // preset the live feature was created with (-1 = none)
@@ -530,7 +540,7 @@ static void RunUpscaler(ID3D11DeviceContext* ctx)
         sUpsConfigRead = true;
         std::string iniPath = DustLogDir() + "Dust.ini";
         sUpsEnabled   = GetPrivateProfileIntA("Upscaling", "DLSS", 0, iniPath.c_str()) != 0;   // "enabled"
-        sUpsPresetIdx = GetPrivateProfileIntA("Upscaling", "DLSSPreset", 1, iniPath.c_str());          // 1 = K
+        sUpsPresetIdx = GetPrivateProfileIntA("Upscaling", "DLSSPreset", 3, iniPath.c_str());          // 3 = F (K blurs static image)
         sUpsSharpness = GetPrivateProfileIntA("Upscaling", "DLSSSharpness", 0, iniPath.c_str()) / 100.0f;
         sUpsBackend   = GetPrivateProfileIntA("Upscaling", "Backend", 0, iniPath.c_str());     // 0=DLSS 1=FSR2
     }
@@ -719,6 +729,15 @@ static void ExtractCameraData(ID3D11DeviceContext* ctx)
                 gCameraData.camUp[0]      = m[1]; gCameraData.camUp[1]      = m[5]; gCameraData.camUp[2]      = m[9];
                 gCameraData.camForward[0] = m[2]; gCameraData.camForward[1] = m[6]; gCameraData.camForward[2] = m[10];
                 gCameraData.camPosition[0] = m[12]; gCameraData.camPosition[1] = m[13]; gCameraData.camPosition[2] = m[14];
+                // Projection params (API v8) from the OGRE camera — real near/far/fov for effects (RTGI)
+                // and the upscaler. Left 0 if the camera walk isn't reachable this frame.
+                float camN = 0.0f, camF = 0.0f, camFov = 0.0f;
+                if (CameraAccess_GetCameraParams(&camN, &camF, &camFov))
+                {
+                    gCameraData.nearZ = camN;
+                    gCameraData.farZ  = camF;
+                    gCameraData.tanHalfFov = tanf(camFov * 0.5f);
+                }
                 gCameraData.valid = 1;
                 gCameraDataExtracted = true;
             }

@@ -13,6 +13,11 @@ void CameraAccess_SetGameWorld(void* gameWorld);
 // Returns false if the camera isn't reachable yet (menu / loading) or an access faulted.
 bool CameraAccess_GetViewProj(float outVP[16]);
 
+// Camera near/far clip distances and vertical FOV (radians), extracted from the OGRE projection
+// matrix (D3D RSDepth). Used by the upscaler (FSR2 needs them) and exposed to effects via the API.
+// Returns false (and leaves outputs untouched) if the camera isn't reachable or values look invalid.
+bool CameraAccess_GetCameraParams(float* nearZ, float* farZ, float* fovYRadians);
+
 // Diagnostic: last step reached in the camera walk (1..8 = OK progression; a NEGATIVE value
 // means an access violation was caught at that step — e.g. -5 = faulted calling getViewMatrix).
 int CameraAccess_Status();

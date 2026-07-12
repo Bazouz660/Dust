@@ -729,7 +729,6 @@ static const VSpec kVSpecs[] = {
     { "mapfeature.hlsl",  "feature_vs",   "void feature_vs",   "TEXCOORD4,", "oPosition = mul(worldViewProj, iPosition);",      "mul(worldViewProj, iPosition)" },
     { "distant_town.hlsl","main_vs",      "void main_vs",      "TEXCOORD2,", "oPosition = mul(worldViewProjMatrix, position);", "mul(worldViewProjMatrix, position)" },
     { "birds.hlsl",       "main_vs",      "void main_vs",      "TEXCOORD5,", "oPosition = mul(viewProjMatrix, position);",       "mul(viewProjMatrix, position)" },
-    { "foliage.hlsl",     "grass_vs",     "void grass_vs",     "TEXCOORD1,", "oPosition = mul(worldViewProj, position);",        "mul(worldViewProj, position)" },   // grass (camera-reproj; wind later)
     { "foliage.hlsl",     "farm_vs",      "void farm_vs",      "TEXCOORD5,", "oPosition = mul(viewProjMatrix, float4(finalPos, 1));", "mul(viewProjMatrix, float4(finalPos, 1))" },   // crops
     { "character.hlsl",   "severed_limb_vs","void severed_limb_vs","TEXCOORD5,","oPosition = mul(worldViewProjMatrix, position);","mul(worldViewProjMatrix, position)" },
 };
@@ -779,10 +778,36 @@ static std::string InjSkinVS(const std::string& src)
     return s;
 }
 
+// foliage.hlsl grass_vs sways the top verts by direction*sin(time + x*frequency). Camera reprojection
+// alone gives ~0 MV for a still camera, so the swaying grass over-accumulates in the upscaler and blurs.
+// Inject TRUE wind MVs: recompute the sway at the PREVIOUS frame's time (the shader's own `time` uniform
+// minus dust_windDelta, the host's frame-time delta riding in the b13 CB after dust_reproj), build that
+// previous clip position, then camera-reproject it. dmvPrev mirrors grass_vs's own position math exactly.
+static std::string InjGrassVS(const std::string& src)
+{
+    if (Has(src, "oDustPrev")) return src;
+    std::string s = src;
+    size_t fn = s.find("void grass_vs");
+    if (fn == std::string::npos) return src;
+    s.insert(fn, "cbuffer DustMVCB : register(b13) { column_major float4x4 dust_reproj; float dust_windDelta; };\n");
+    size_t from = s.find("void grass_vs");
+    if (from == std::string::npos) return src;
+    if (!InsAfter(s, from, "TEXCOORD1,", "\n\tout float4 oDustCur : TEXCOORD12,\n\tout float4 oDustPrev : TEXCOORD13,")) return src;
+    std::string prev =
+        "\n\toDustCur = mul(worldViewProj, position);"
+        "\n\tfloat4 dmvPrev = iPosition;"
+        "\n\tif (iTexCoord.y == 0.0f) dmvPrev.xyz += direction * sin(time - dust_windDelta + iPosition.x * frequency);"
+        "\n\tdmvPrev.y -= grassHeight * clamp(offset, 0, 1);"   // same distance fade as the current position
+        "\n\toDustPrev = mul(dust_reproj, mul(worldViewProj, dmvPrev));";
+    if (!InsAfter(s, from, "oPosition = mul(worldViewProj, position);", prev)) return src;
+    return s;
+}
+
 static std::string InjectGBufferVS(const std::string& src, const char* entry, const char* srcName)
 {
     if (!srcName) return src;
     if (strcmp(entry, "main_vs") == 0 && Has(srcName, "skin.hlsl")) return InjSkinVS(src);   // true anim MVs
+    if (strcmp(entry, "grass_vs") == 0 && Has(srcName, "foliage.hlsl")) return InjGrassVS(src);   // wind MVs
     for (const VSpec& v : kVSpecs)
         if (strcmp(entry, v.entry) == 0 && Has(srcName, v.srcFile))
             return InjVS(src, v.fnAnchor, v.interp, v.clipAssign, v.clipRHS);

@@ -72,7 +72,7 @@ bool Init(ID3D11Device* device, const wchar_t* dllSearchPath, const wchar_t* app
 
 bool IsAvailable() { return sAvailable; }
 
-static const char* kPresetLabels[] = { "Default", "K (transformer, best)", "J", "F", "E" };
+static const char* kPresetLabels[] = { "Default", "K (transformer, blurs when static)", "J", "F (DLAA, recommended)", "E (CNN)" };
 const char* const* PresetLabels() { return kPresetLabels; }
 
 static unsigned int PresetToNgx(int p)
@@ -104,7 +104,8 @@ bool CreateFeature(ID3D11DeviceContext* ctx, uint32_t renderW, uint32_t renderH,
     if (isHDR)         flags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
     if (depthInverted) flags |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
 
-    // Set the render preset (K = transformer, best quality) before feature create. Recreate to change.
+    // Set the render preset before feature create (recreate to change). Default is F (CNN DLAA): the
+    // transformer presets K/J blur the whole image when the scene is static in this D3D11 NGX integration.
     NVSDK_NGX_Parameter_SetUI(sParams, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, PresetToNgx(preset));
 
     NVSDK_NGX_DLSS_Create_Params cp = {};
@@ -177,7 +178,7 @@ bool Init(ID3D11Device*, const wchar_t*, const wchar_t*)
     return false;
 }
 bool IsAvailable() { return false; }
-static const char* kPresetLabels[] = { "Default", "K (transformer, best)", "J", "F", "E" };
+static const char* kPresetLabels[] = { "Default", "K (transformer, blurs when static)", "J", "F (DLAA, recommended)", "E (CNN)" };
 const char* const* PresetLabels() { return kPresetLabels; }
 bool CreateFeature(ID3D11DeviceContext*, uint32_t, uint32_t, uint32_t, uint32_t, bool, bool, int) { return false; }
 bool Evaluate(ID3D11DeviceContext*, ID3D11Resource*, ID3D11Resource*, ID3D11Resource*,

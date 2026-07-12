@@ -1,4 +1,5 @@
 #include "UpscalerFSR2.h"
+#include "CameraAccess.h"
 #include "DustLog.h"
 
 // DUST_HAVE_FSR2 is defined by the build only when the FSR2-DX11 libs are present. Without it the whole
@@ -90,13 +91,27 @@ bool Evaluate(ID3D11DeviceContext* ctx,
     dd.frameTimeDelta     = 16.6f;        // ms — a real delta only affects auto-exposure/reactive pacing
     dd.preExposure        = 1.0f;
     dd.reset              = reset;
-    dd.cameraNear         = 0.1f;         // TODO: pull real near/far/fov from CameraAccess for best quality
-    dd.cameraFar          = 10000.0f;
-    dd.cameraFovAngleVertical = 1.0f;     // radians
+    // Real camera near/far/fov from the OGRE projection (FSR2 uses these for disocclusion); safe
+    // defaults if the camera isn't reachable this frame.
+    float camN = 0.1f, camF = 10000.0f, camFov = 1.0f;
+    CameraAccess_GetCameraParams(&camN, &camF, &camFov);
+    dd.cameraNear         = camN;
+    dd.cameraFar          = camF;
+    dd.cameraFovAngleVertical = camFov;   // radians
 
     FfxErrorCode err = ffxFsr2ContextDispatch(&sContext, &dd);
     if (err != FFX_OK) { Log("Upscaler[FSR2]: Dispatch failed (%d)", (int)err); return false; }
     return true;
+}
+
+void ComputeJitter(uint32_t frameIndex, uint32_t renderW, uint32_t displayW, float* jx, float* jy)
+{
+    int32_t phaseCount = ffxFsr2GetJitterPhaseCount((int32_t)renderW, (int32_t)displayW);
+    if (phaseCount < 1) phaseCount = 1;
+    float x = 0.0f, y = 0.0f;
+    ffxFsr2GetJitterOffset(&x, &y, (int32_t)(frameIndex % (uint32_t)phaseCount), phaseCount);
+    if (jx) *jx = x;
+    if (jy) *jy = y;
 }
 
 void Shutdown()
@@ -121,6 +136,7 @@ bool IsAvailable() { return false; }
 bool CreateFeature(ID3D11DeviceContext*, uint32_t, uint32_t, uint32_t, uint32_t, bool, bool, int) { return false; }
 bool Evaluate(ID3D11DeviceContext*, ID3D11Resource*, ID3D11Resource*, ID3D11Resource*,
               ID3D11Resource*, float, float, float, float, float, bool, ID3D11Resource*) { return false; }
+void ComputeJitter(uint32_t, uint32_t, uint32_t, float* jx, float* jy) { if (jx) *jx = 0.0f; if (jy) *jy = 0.0f; }
 void Shutdown() {}
 }
 

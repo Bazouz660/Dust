@@ -22,4 +22,8 @@ namespace UpscalerFSR2
                   ID3D11Resource* reactiveMask);
 
     void Shutdown();
+
+    // FSR2's recommended jitter sequence (its temporal accumulation is tuned to it — using a different
+    // jitter makes FSR2 shimmer). Fills jx/jy in unit pixel space [-0.5, 0.5]. No-op stub without the SDK.
+    void ComputeJitter(uint32_t frameIndex, uint32_t renderW, uint32_t displayW, float* jx, float* jy);
 }

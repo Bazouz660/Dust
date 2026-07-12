@@ -580,6 +580,11 @@ void UpdateCameraData(const DustCameraData* camera)
 {
     if (!camera || !camera->valid) return;
 
+    // API v8: use the real camera FOV (from the OGRE projection) instead of the manual TanHalfFov
+    // setting. Gate on the host version so we never read the field from an older, smaller struct.
+    if (gHost && gHost->apiVersion >= 8 && camera->tanHalfFov > 0.0f)
+        gRTGIConfig.tanHalfFov = camera->tanHalfFov;
+
     memcpy(gPrevInverseView, gInverseView, sizeof(gInverseView));
     memcpy(gInverseView, camera->inverseView, sizeof(gInverseView));
 

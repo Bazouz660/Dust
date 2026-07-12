@@ -918,7 +918,7 @@ void InjBeginGBuffer(ID3D11DeviceContext* ctx)
     if (!sReprojCB)
     {
         D3D11_BUFFER_DESC bd = {};
-        bd.ByteWidth = 64; bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.ByteWidth = 80; bd.Usage = D3D11_USAGE_DYNAMIC;   // 64 reproj + float dust_windDelta (pad to 80)
         bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         sDevice->CreateBuffer(&bd, nullptr, &sReprojCB);
     }
@@ -932,11 +932,28 @@ void InjBeginGBuffer(ID3D11DeviceContext* ctx)
         if (Inv(curVP, invCur)) Mul(sInjPrevVP, invCur, reproj);
     }
     if (haveVP) { memcpy(sInjPrevVP, curVP, 64); sInjHavePrev = true; }
+    // Wind-MV time delta: grass_vs recomputes its sway at (time - dust_windDelta) for the previous frame.
+    // Kenshi's grass `time` is OGRE ACT_TIME (real render seconds), so a real wall-clock frame delta is the
+    // matching unit. Clamp out hitches/first-frame so a stall can't fling the grass MV.
+    static LARGE_INTEGER sQpcFreq = {}, sQpcPrev = {};
+    if (sQpcFreq.QuadPart == 0) QueryPerformanceFrequency(&sQpcFreq);
+    LARGE_INTEGER qpcNow; QueryPerformanceCounter(&qpcNow);
+    float windDelta = 1.0f / 60.0f;
+    if (sQpcPrev.QuadPart != 0 && sQpcFreq.QuadPart != 0)
+    {
+        double dt = double(qpcNow.QuadPart - sQpcPrev.QuadPart) / double(sQpcFreq.QuadPart);
+        if (dt > 0.0 && dt < 0.1) windDelta = (float)dt;   // ignore >100ms hitches
+    }
+    sQpcPrev = qpcNow;
     if (sReprojCB)
     {
         D3D11_MAPPED_SUBRESOURCE ms;
         if (SUCCEEDED(ctx->Map(sReprojCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms)))
-        { memcpy(ms.pData, reproj, 64); ctx->Unmap(sReprojCB, 0); }
+        {
+            memcpy(ms.pData, reproj, 64);
+            memcpy((uint8_t*)ms.pData + 64, &windDelta, sizeof(float));   // dust_windDelta @ 64
+            ctx->Unmap(sReprojCB, 0);
+        }
     }
     // Clear to ZERO (static), not a sentinel: un-covered pixels (sky, particles, transparents) are read
     // by DLSS as its motion-vector input. A sentinel there becomes a giant bogus MV -> DLSS fetches
