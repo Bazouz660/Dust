@@ -35,6 +35,7 @@ namespace
     UINT64                     gFenceVal  = 0;
     HANDLE                     gFenceEvent = nullptr;  // CPU wait for allocator-reset safety
     UINT64                     gLastDone   = 0;        // fence value the previous frame's D3D12 work signals
+    ID3D11DeviceContext4*      gCtx4Frame  = nullptr;  // held between BeginD3D12Work and SubmitD3D12Work
 
     // Shared textures (lazily (re)created for the current ldr size/format). Each is a D3D11 texture on the
     // game device AND, opened from the same NT handle, a D3D12 resource on our side. They are plain
@@ -310,19 +311,68 @@ bool RunTintTest(ID3D11DeviceContext* ctx, ID3D11Resource* ldrColor, uint32_t w,
 
     if (!EnsureSharedTextures(w, h, sd.Format)) return false;
 
+    // Copy the game color into the shared input, then run the fence-synced D3D12 bracket.
+    ctx->CopyResource(gShared11In, ldrColor);
+    ID3D12GraphicsCommandList* list = BeginD3D12Work(ctx);
+    if (!list) return false;
+
+    // Read gSharedIn (SRV), tint into gComputeOut (UAV), then copy gComputeOut -> gSharedOut for D3D11.
+    Barrier(gSharedIn,   D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    Barrier(gComputeOut, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    list->SetPipelineState(gPso);
+    ID3D12DescriptorHeap* heaps[] = { gHeap };
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRootSignature(gRootSig);
+    float tint[4] = { 0.3f, 1.0f, 0.3f, (float)w * 0.5f };   // xyz tint, w = split X
+    list->SetComputeRoot32BitConstants(0, 4, tint, 0);
+    list->SetComputeRootDescriptorTable(1, gHeap->GetGPUDescriptorHandleForHeapStart());
+    list->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+
+    Barrier(gComputeOut, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,         D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Barrier(gSharedOut,  D3D12_RESOURCE_STATE_COMMON,                   D3D12_RESOURCE_STATE_COPY_DEST);
+    list->CopyResource(gSharedOut, gComputeOut);
+
+    Barrier(gSharedIn,   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    Barrier(gComputeOut, D3D12_RESOURCE_STATE_COPY_SOURCE,               D3D12_RESOURCE_STATE_COMMON);
+    Barrier(gSharedOut,  D3D12_RESOURCE_STATE_COPY_DEST,                 D3D12_RESOURCE_STATE_COMMON);
+
+    if (!SubmitD3D12Work(ctx)) return false;
+    ctx->CopyResource(ldrColor, gShared11Out);   // tinted result back into the scene color
+    return true;
+}
+
+// ---- Reusable primitives ----
+
+ID3D12Device* GetDevice() { return gDev; }
+
+bool CreateSharedTexture(uint32_t w, uint32_t h, uint32_t fmt,
+                         ID3D11Texture2D** outD3D11, ID3D12Resource** outD3D12)
+{
+    if (!gReady || !outD3D11 || !outD3D12) return false;
+    return CreateSharedTex(w, h, (DXGI_FORMAT)fmt, outD3D12, outD3D11);
+}
+
+void Transition(ID3D12Resource* r, uint32_t fromState, uint32_t toState)
+{
+    if (r && gList) Barrier(r, (D3D12_RESOURCE_STATES)fromState, (D3D12_RESOURCE_STATES)toState);
+}
+
+ID3D12GraphicsCommandList* BeginD3D12Work(ID3D11DeviceContext* ctx)
+{
+    if (!gReady || !ctx || gCtx4Frame) return nullptr;   // gCtx4Frame set => a bracket is already open
+
     ID3D11DeviceContext4* ctx4 = nullptr;
     ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), (void**)&ctx4);
-    if (!ctx4) { Log("D3D12Interop: ID3D11DeviceContext4 unavailable (no D3D11.4 Signal/Wait)"); gReady = false; return false; }
+    if (!ctx4) { Log("D3D12Interop: ID3D11DeviceContext4 unavailable (no D3D11.4 Signal/Wait)"); gReady = false; return nullptr; }
 
-    // --- D3D11: hand the color to the shared texture, signal "ready" on the shared fence ---
-    ctx->CopyResource(gShared11In, ldrColor);
+    // D3D11 signals that the caller's copies into the shared inputs are done; the D3D12 queue waits for it.
     UINT64 vReady = ++gFenceVal;
     ctx4->Signal(gFence11, vReady);
+    gQueue->Wait(gFence, vReady);
 
-    // --- D3D12: wait for the color, tint it, signal "done" ---
-    // First make it safe to recycle the command allocator: the GPU must have finished LAST frame's list
-    // before Reset(). Wait on the CPU for the previous submission (bounded, so a stall can't hang the
-    // render thread). By now the prior frame's Present has flushed its D3D11 signal, so this returns fast.
+    // Allocator-reset safety: the GPU must have finished LAST frame's list before Reset(). Bounded CPU wait
+    // (the prior frame's Present has already flushed its D3D11 signal, so this returns fast in practice).
     if (gLastDone && gFence->GetCompletedValue() < gLastDone)
     {
         gFence->SetEventOnCompletion(gLastDone, gFenceEvent);
@@ -330,52 +380,37 @@ bool RunTintTest(ID3D11DeviceContext* ctx, ID3D11Resource* ldrColor, uint32_t w,
         {
             Log("D3D12Interop: fence wait timed out — skipping frame (allocator busy)");
             ctx4->Release();
-            return false;   // don't Reset a possibly in-flight allocator
+            return nullptr;   // don't Reset a possibly in-flight allocator
         }
     }
 
-    gQueue->Wait(gFence, vReady);
-
     gAlloc->Reset();
-    gList->Reset(gAlloc, gPso);
+    gList->Reset(gAlloc, nullptr);   // caller sets its own PSO
+    gCtx4Frame = ctx4;               // released in SubmitD3D12Work
+    return gList;
+}
 
-    // Read gSharedIn (SRV), tint into gComputeOut (UAV), then copy gComputeOut -> gSharedOut for D3D11.
-    Barrier(gSharedIn,   D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    Barrier(gComputeOut, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+bool SubmitD3D12Work(ID3D11DeviceContext* ctx)
+{
+    (void)ctx;
+    if (!gReady || !gCtx4Frame) return false;
 
-    ID3D12DescriptorHeap* heaps[] = { gHeap };
-    gList->SetDescriptorHeaps(1, heaps);
-    gList->SetComputeRootSignature(gRootSig);
-    float tint[4] = { 0.3f, 1.0f, 0.3f, (float)w * 0.5f };   // xyz tint, w = split X
-    gList->SetComputeRoot32BitConstants(0, 4, tint, 0);
-    gList->SetComputeRootDescriptorTable(1, gHeap->GetGPUDescriptorHandleForHeapStart());
-    gList->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
-
-    Barrier(gComputeOut, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,         D3D12_RESOURCE_STATE_COPY_SOURCE);
-    Barrier(gSharedOut,  D3D12_RESOURCE_STATE_COMMON,                   D3D12_RESOURCE_STATE_COPY_DEST);
-    gList->CopyResource(gSharedOut, gComputeOut);
-
-    Barrier(gSharedIn,   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    Barrier(gComputeOut, D3D12_RESOURCE_STATE_COPY_SOURCE,               D3D12_RESOURCE_STATE_COMMON);
-    Barrier(gSharedOut,  D3D12_RESOURCE_STATE_COPY_DEST,                 D3D12_RESOURCE_STATE_COMMON);
     gList->Close();
-
     ID3D12CommandList* lists[] = { gList };
     gQueue->ExecuteCommandLists(1, lists);
     UINT64 vDone = ++gFenceVal;
     gQueue->Signal(gFence, vDone);
-    gLastDone = vDone;   // next frame's allocator reset waits on this
+    gLastDone = vDone;               // next frame's allocator reset waits on this
 
-    // --- D3D11: wait for D3D12, copy the tinted result back into the scene color ---
-    ctx4->Wait(gFence11, vDone);
-    ctx->CopyResource(ldrColor, gShared11Out);
-
-    ctx4->Release();
+    gCtx4Frame->Wait(gFence11, vDone);   // D3D11 waits for the D3D12 work before the caller reads the output
+    gCtx4Frame->Release();
+    gCtx4Frame = nullptr;
     return true;
 }
 
 void Shutdown()
 {
+    SafeRelease(gCtx4Frame);
     ReleaseSharedTextures();
     SafeRelease(gFence11);
     SafeRelease(gFence);

@@ -3,6 +3,12 @@
 #include <d3d11.h>
 #include <cstdint>
 
+// Forward-declare the D3D12 interfaces at GLOBAL scope so the header doesn't need <d3d12.h> (and so the
+// pointer types match ::ID3D12Device etc. — declaring them inside the namespace would make distinct types).
+struct ID3D12Device;
+struct ID3D12Resource;
+struct ID3D12GraphicsCommandList;
+
 // D.0 interop spike for FSR 3.1 / FSR 4 (both are DX12-only — there is no D3D11 FSR3 backend).
 // Proves the bridge those upscalers need: a background D3D12 device on the game's own adapter that
 // receives a D3D11 render target, runs a compute pass on it, and hands the result back — all without
@@ -29,4 +35,30 @@ namespace D3D12Interop
     bool RunTintTest(ID3D11DeviceContext* ctx, ID3D11Resource* ldrColor, uint32_t w, uint32_t h);
 
     void Shutdown();
+
+    // ---- Reusable primitives (used by the FSR3/FSR4 backend, which runs on this same side-device) ----
+
+    // The D3D12 device on the game's adapter (null until Init succeeds). FFX etc. create contexts on it.
+    ID3D12Device* GetDevice();
+
+    // Create a shared texture pair (a D3D11 texture on the game device + the same memory as a D3D12
+    // resource, via one NT handle). SRV + copy usable on both sides (no UAV bind — keep those D3D12-local).
+    // Used to marshal game color/depth/MV across and the upscaled result back. Returns false on failure.
+    bool CreateSharedTexture(uint32_t w, uint32_t h, uint32_t /*DXGI_FORMAT*/ fmt,
+                             ID3D11Texture2D** outD3D11, ID3D12Resource** outD3D12);
+
+    // Fence-synced D3D12 work bracket. Sequence per frame:
+    //   1. caller queues D3D11 CopyResource(sharedInput, gameTex) calls on `ctx`
+    //   2. list = BeginD3D12Work(ctx)  -> signals inputs-ready, waits on the D3D12 queue, waits the
+    //      allocator free, resets and returns a command list (null on failure - then do nothing)
+    //   3. caller records D3D12 work into `list` (barriers + ffxDispatch + copy result to shared output)
+    //   4. SubmitD3D12Work(ctx)        -> executes, signals done, makes the D3D11 context wait for it
+    //   5. caller queues D3D11 CopyResource(gameTex, sharedOutput) on `ctx`
+    ID3D12GraphicsCommandList* BeginD3D12Work(ID3D11DeviceContext* ctx);
+    bool SubmitD3D12Work(ID3D11DeviceContext* ctx);
+
+    // Record a COMMON<->state transition on the in-flight BeginD3D12Work list (exposes the internal helper
+    // so the FSR backend can transition shared/compute resources around its dispatch). fromState/toState
+    // are D3D12_RESOURCE_STATES. No-op if there is no open list.
+    void Transition(ID3D12Resource* r, uint32_t fromState, uint32_t toState);
 }

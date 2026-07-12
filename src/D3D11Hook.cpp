@@ -12,6 +12,7 @@
 #include "MotionVectors.h"
 #include "Upscaler.h"
 #include "UpscalerFSR2.h"
+#include "UpscalerFSR3.h"
 #include "D3D12Interop.h"
 #include "CameraAccess.h"
 #include "DustLog.h"
@@ -572,17 +573,18 @@ static void RunUpscaler(ID3D11DeviceContext* ctx)
         sUpsEnabled   = GetPrivateProfileIntA("Upscaling", "DLSS", 0, iniPath.c_str()) != 0;   // "enabled"
         sUpsPresetIdx = GetPrivateProfileIntA("Upscaling", "DLSSPreset", 3, iniPath.c_str());          // 3 = F (K blurs static image)
         sUpsSharpness = GetPrivateProfileIntA("Upscaling", "DLSSSharpness", 0, iniPath.c_str()) / 100.0f;
-        sUpsBackend   = GetPrivateProfileIntA("Upscaling", "Backend", 0, iniPath.c_str());     // 0=DLSS 1=FSR2
+        sUpsBackend   = GetPrivateProfileIntA("Upscaling", "Backend", 0, iniPath.c_str());     // 0=DLSS 1=FSR2 2=FSR3
     }
     if (!gDevice || gWidth == 0 || gHeight == 0) return;
 
-    const bool fsr = (sUpsBackend == 1);
+    const int backend = sUpsBackend;   // 0=DLSS 1=FSR2 2=FSR3/FSR4 (D3D12 side-device)
 
     // Backend switched in the GUI: tear the old one down, force re-init + feature recreate + jitter reset.
     if (sUpsActiveBackend != sUpsBackend)
     {
         Upscaler::Shutdown();
         UpscalerFSR2::Shutdown();
+        UpscalerFSR3::Shutdown();
         ReleaseUpscalerTargets();
         sUpsActiveBackend = sUpsBackend;
         sUpsInitTried     = false;
@@ -594,12 +596,15 @@ static void RunUpscaler(ID3D11DeviceContext* ctx)
     if (!sUpsInitTried)
     {
         sUpsInitTried = true;
-        if (fsr) UpscalerFSR2::Init(gDevice);
-        else { std::string modDir = DustLogDir(); std::wstring wdir(modDir.begin(), modDir.end());
-               Upscaler::Init(gDevice, wdir.c_str(), wdir.c_str()); }
+        std::string modDir = DustLogDir(); std::wstring wdir(modDir.begin(), modDir.end());
+        if      (backend == 1) UpscalerFSR2::Init(gDevice);
+        else if (backend == 2) UpscalerFSR3::Init(gDevice, wdir.c_str());
+        else                   Upscaler::Init(gDevice, wdir.c_str(), wdir.c_str());
     }
 
-    const bool avail = fsr ? UpscalerFSR2::IsAvailable() : Upscaler::IsAvailable();
+    const bool avail = backend == 1 ? UpscalerFSR2::IsAvailable()
+                     : backend == 2 ? UpscalerFSR3::IsAvailable()
+                     :                 Upscaler::IsAvailable();
 
     // Disabled or unavailable: ensure jitter is off (no shimmer) and skip the resolve.
     if (!sUpsEnabled || !avail)
@@ -611,9 +616,9 @@ static void RunUpscaler(ID3D11DeviceContext* ctx)
     // (Re)create the feature on first enable or when the preset changed in the GUI.
     if (sUpsFeaturePreset != sUpsPresetIdx)
     {
-        bool created = fsr
-            ? UpscalerFSR2::CreateFeature(ctx, gWidth, gHeight, gWidth, gHeight, false, false, sUpsPresetIdx)
-            : Upscaler::CreateFeature(ctx, gWidth, gHeight, gWidth, gHeight, false, false, sUpsPresetIdx);
+        bool created = backend == 1 ? UpscalerFSR2::CreateFeature(ctx, gWidth, gHeight, gWidth, gHeight, false, false, sUpsPresetIdx)
+                     : backend == 2 ? UpscalerFSR3::CreateFeature(ctx, gWidth, gHeight, gWidth, gHeight, false, false, sUpsPresetIdx)
+                     :                 Upscaler::CreateFeature(ctx, gWidth, gHeight, gWidth, gHeight, false, false, sUpsPresetIdx);
         if (created) { sUpsFeaturePreset = sUpsPresetIdx; sUpsResetNext = true; }
         else { sUpsEnabled = false; if (sUpsJitterOn) { SetTemporalJitter(0); sUpsJitterOn = false; } return; }
     }
@@ -665,9 +670,9 @@ static void RunUpscaler(ID3D11DeviceContext* ctx)
             // size. Wrong sign => history reprojected backwards => ghosting on camera motion + softness.
             // Sharpness goes to our own RCAS-lite pass, so pass 0 to the upscaler.
             const float mvsx = -(float)gWidth, mvsy = -(float)gHeight;
-            bool ok = fsr
-                ? UpscalerFSR2::Evaluate(ctx, colSR, depth, mv, out, jx, jy, mvsx, mvsy, 0.0f, sUpsResetNext, nullptr)
-                : Upscaler::Evaluate(ctx, colSR, depth, mv, out, jx, jy, mvsx, mvsy, 0.0f, sUpsResetNext, nullptr);
+            bool ok = backend == 1 ? UpscalerFSR2::Evaluate(ctx, colSR, depth, mv, out, jx, jy, mvsx, mvsy, 0.0f, sUpsResetNext, nullptr)
+                    : backend == 2 ? UpscalerFSR3::Evaluate(ctx, colSR, depth, mv, out, jx, jy, mvsx, mvsy, 0.0f, sUpsResetNext, nullptr)
+                    :                 Upscaler::Evaluate(ctx, colSR, depth, mv, out, jx, jy, mvsx, mvsy, 0.0f, sUpsResetNext, nullptr);
             if (ok)
             {
                 if (sUpsSharpness > 0.0f && sUpsOutSRV)
@@ -2696,5 +2701,5 @@ namespace UpscalerControl
     float GetSharpness()       { return D3D11Hook::sUpsSharpness; }
     void  SetSharpness(float s){ D3D11Hook::sUpsSharpness = s < 0 ? 0 : (s > 1 ? 1 : s); }
     int   GetBackend()         { return D3D11Hook::sUpsBackend; }
-    void  SetBackend(int b)    { D3D11Hook::sUpsBackend = (b == 1) ? 1 : 0; }
+    void  SetBackend(int b)    { D3D11Hook::sUpsBackend = (b >= 0 && b <= 2) ? b : 0; }
 }
