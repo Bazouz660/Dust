@@ -757,6 +757,7 @@ static const PSpec kPSpecs[] = {
     { "triplanar.hlsl",  "triplanar_ps",  "void triplanar_ps",  "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
     { "mapfeature.hlsl", "terrain_fs",    "void terrain_fs",    "TEXCOORD4,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
     { "skin.hlsl",       "main_fs",       "void main_fs",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // skinned clothes
+    { "creature.hlsl",   "main_fs",       "void main_fs",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // creatures/animals (skin.hlsl main_vs, BLOOD variant). MUST be injected: its VS is the skinned VS, so leaving the PS un-injected mis-registers its wet(TEXCOORD6)/blood(TEXCOORD7) inputs -> garbage blood coords -> a tiled blood overlay on every creature.
     { "distant_town.hlsl","main_fs",      "void main_fs",       "TEXCOORD2,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
     { "foliage.hlsl",    "grass_fs",      "void grass_fs",      "TEXCOORD1,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // grass
     { "foliage.hlsl",    "foliage_fs",    "void foliage_fs",    "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // crops (farm_vs)
