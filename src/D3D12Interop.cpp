@@ -345,6 +345,7 @@ bool RunTintTest(ID3D11DeviceContext* ctx, ID3D11Resource* ldrColor, uint32_t w,
 // ---- Reusable primitives ----
 
 ID3D12Device* GetDevice() { return gDev; }
+ID3D12CommandQueue* GetQueue() { return gQueue; }
 
 bool CreateSharedTexture(uint32_t w, uint32_t h, uint32_t fmt,
                          ID3D11Texture2D** outD3D11, ID3D12Resource** outD3D12)

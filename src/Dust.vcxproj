@@ -164,6 +164,7 @@
     <ClCompile Include="UpscalerFSR2.cpp" />
     <ClCompile Include="UpscalerFSR3.cpp" />
     <ClCompile Include="D3D12Interop.cpp" />
+    <ClCompile Include="FrameGen.cpp" />
     <ClCompile Include="CameraAccess.cpp" />
     <ClCompile Include="PssmDetour.cpp" />
     <ClCompile Include="imgui\imgui.cpp" />
@@ -195,6 +196,7 @@
     <ClInclude Include="MotionVectors.h" />
     <ClInclude Include="D3D12Interop.h" />
     <ClInclude Include="UpscalerFSR3.h" />
+    <ClInclude Include="FrameGen.h" />
     <ClInclude Include="CameraAccess.h" />
     <ClInclude Include="tracy\Tracy.hpp" />
     <ClInclude Include="PssmDetour.h" />

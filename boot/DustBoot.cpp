@@ -20,6 +20,15 @@
 
 static HMODULE gDllModule = nullptr;
 
+// Frame-gen present-takeover toggle ([Upscaling] FrameGen=1), read early in BootLogInit.
+static bool gFrameGenWanted = false;
+// When Dust.dll creates ITS OWN swap chain (via the hooked CreateSwapChain* on the shared vtable), it
+// suspends capture so DustBoot doesn't redirect/AddRef our swap chain as if it were the game's.
+static bool gSuspendCapture = false;
+// Whether the swap chain Dust currently hooks was a redirected (real display) one — so a later 1x1/temp
+// swap chain (Kenshi creates one under the frame-gen redirect) can't steal the hook + the GUI target.
+static bool gCapturedIsRedirected = false;
+
 static bool& BootLogEnabled()
 {
     static bool enabled = false;
@@ -121,6 +130,7 @@ static void BootLogInit()
     // The pre-v0.8 "Logging" key is deliberately ignored — see DustLog.h.
     std::string ini = dir + "Dust.ini";
     BootLogEnabled() = GetPrivateProfileIntA("Dust", "FileLogging", 1, ini.c_str()) != 0;
+    gFrameGenWanted  = GetPrivateProfileIntA("Upscaling", "FrameGen", 0, ini.c_str()) != 0;
 
     int maxFiles = GetPrivateProfileIntA("Dust", "MaxLogFiles", 10, ini.c_str());
     if (maxFiles < 1)   maxFiles = 1;
@@ -133,6 +143,31 @@ static void BootLogInit()
 static IDXGISwapChain* gCapturedSwapChain = nullptr;
 static HWND             gCapturedHWND      = nullptr;
 static bool             gHooked            = false;
+
+// ---- Frame generation present-takeover ([Upscaling] FrameGen=1) ----
+// When enabled, redirect the game's swap chain(s) to a hidden off-screen window so the real HWND is free
+// for Dust.dll's own D3D12 swap chain (DXGI allows only one flip swap chain per HWND). We remember which
+// real HWND each redirected swap chain was meant for, so Dust.dll can present the game's frames there.
+struct ScRedirect { IDXGISwapChain* sc; HWND realHwnd; };
+static ScRedirect gScRedirects[8] = {};
+static int        gScRedirectCount = 0;
+
+// A single hidden, off-screen window the redirected swap chains present into (invisible). Its size only
+// needs to be >= the largest swap-chain buffer; DXGI is happy presenting buffers into it.
+static HWND GetDummyPresentWindow()
+{
+    static HWND s = nullptr;
+    if (s) return s;
+    WNDCLASSEXA wc = {};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = DefWindowProcA;
+    wc.lpszClassName = "DustFGDummy";
+    wc.hInstance = GetModuleHandleA(nullptr);
+    RegisterClassExA(&wc);
+    s = CreateWindowExA(WS_EX_TOOLWINDOW, "DustFGDummy", "", WS_POPUP,
+                        -32000, -32000, 2560, 1440, nullptr, nullptr, wc.hInstance, nullptr);
+    return s;
+}
 
 // ==================== Hook trampolines ====================
 
@@ -161,17 +196,54 @@ static HRESULT STDMETHODCALLTYPE HookedCreateSwapChain(
     IDXGIFactory* pThis, IUnknown* pDevice,
     DXGI_SWAP_CHAIN_DESC* pDesc, IDXGISwapChain** ppSwapChain)
 {
-    HRESULT hr = oCreateSwapChain(pThis, pDevice, pDesc, ppSwapChain);
+    if (gSuspendCapture)   // Dust.dll is creating its own swap chain — don't touch it
+        return oCreateSwapChain(pThis, pDevice, pDesc, ppSwapChain);
+
+    HWND realHwnd = pDesc ? pDesc->OutputWindow : nullptr;
+    // Redirect every real-window swap chain (Kenshi makes >1, and the one Dust hooks may be created small
+    // then resized). Skip only tiny/temp surfaces. FrameGen takes over whichever one the game presents to.
+    bool redirect = gFrameGenWanted && pDesc && realHwnd &&
+                    pDesc->BufferDesc.Width >= 200 && pDesc->BufferDesc.Height >= 200;
+
+    // Frame-gen takeover: create the game's swap chain on a hidden window so Dust.dll can own the real
+    // HWND with a D3D12 swap chain. Modify a COPY of the desc (the game may reuse its own struct).
+    DXGI_SWAP_CHAIN_DESC local;
+    DXGI_SWAP_CHAIN_DESC* useDesc = pDesc;
+    if (redirect)
+    {
+        local = *pDesc;
+        local.OutputWindow = GetDummyPresentWindow();
+        local.Windowed     = TRUE;   // never let the hidden window take exclusive fullscreen
+        useDesc = &local;
+        BootLog("FrameGen: redirecting swap chain (real HWND=%p -> dummy) %ux%u",
+                realHwnd, pDesc->BufferDesc.Width, pDesc->BufferDesc.Height);
+    }
+
+    HRESULT hr = oCreateSwapChain(pThis, pDevice, useDesc, ppSwapChain);
 
     if (SUCCEEDED(hr) && ppSwapChain && *ppSwapChain)
     {
-        if (gCapturedSwapChain)
-            gCapturedSwapChain->Release();
-        gCapturedSwapChain = *ppSwapChain;
-        gCapturedSwapChain->AddRef();
-        gCapturedHWND = pDesc ? pDesc->OutputWindow : nullptr;
-        BootLog("Captured swap chain %p (HWND=%p, AddRef'd) via CreateSwapChain",
-                gCapturedSwapChain, gCapturedHWND);
+        if (redirect && gScRedirectCount < 8)
+        {
+            gScRedirects[gScRedirectCount].sc = *ppSwapChain;
+            gScRedirects[gScRedirectCount].realHwnd = realHwnd;
+            gScRedirectCount++;
+        }
+        // Prefer a redirected (real display) swap chain as the one Dust hooks; don't let a later 1x1/temp
+        // swap chain overwrite it. (Without frame gen, redirect is always false — behaves as before.)
+        if (!gCapturedIsRedirected || redirect)
+        {
+            if (gCapturedSwapChain)
+                gCapturedSwapChain->Release();
+            gCapturedSwapChain = *ppSwapChain;
+            gCapturedSwapChain->AddRef();
+            gCapturedHWND = realHwnd;   // keep the REAL window for Dust's other uses
+            gCapturedIsRedirected = redirect;
+        }
+        BootLog("Captured swap chain %p (HWND=%p, %ux%u, AddRef'd) via CreateSwapChain%s",
+                gCapturedSwapChain, gCapturedHWND,
+                pDesc ? pDesc->BufferDesc.Width : 0, pDesc ? pDesc->BufferDesc.Height : 0,
+                redirect ? " [redirected]" : "");
     }
     else
     {
@@ -190,6 +262,9 @@ static HRESULT STDMETHODCALLTYPE HookedCreateSwapChainForHwnd(
     HRESULT hr = oCreateSwapChainForHwnd(pThis, pDevice, hWnd,
                                           pDesc, pFullscreenDesc,
                                           pRestrictToOutput, ppSwapChain);
+
+    if (gSuspendCapture)   // Dust.dll's own swap chain — don't capture it
+        return hr;
 
     if (SUCCEEDED(hr) && ppSwapChain && *ppSwapChain)
     {
@@ -251,6 +326,25 @@ extern "C" __declspec(dllexport) HWND DustBoot_GetHWND()
 extern "C" __declspec(dllexport) bool DustBoot_IsHooked()
 {
     return gHooked;
+}
+
+// Frame-gen takeover: did the user enable it, and which real HWND was this (redirected) swap chain meant
+// for? Dust.dll presents that swap chain's frames to the real HWND via its own D3D12 swap chain.
+extern "C" __declspec(dllexport) bool DustBoot_FrameGenWanted()
+{
+    return gFrameGenWanted;
+}
+
+extern "C" __declspec(dllexport) HWND DustBoot_LookupRealHwnd(IDXGISwapChain* sc)
+{
+    for (int i = 0; i < gScRedirectCount; i++)
+        if (gScRedirects[i].sc == sc) return gScRedirects[i].realHwnd;
+    return nullptr;
+}
+
+extern "C" __declspec(dllexport) void DustBoot_SuspendCapture(bool suspend)
+{
+    gSuspendCapture = suspend;
 }
 
 // ==================== Hook installation ====================

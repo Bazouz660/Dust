@@ -14,6 +14,7 @@
 #include "UpscalerFSR2.h"
 #include "UpscalerFSR3.h"
 #include "D3D12Interop.h"
+#include "FrameGen.h"
 #include "CameraAccess.h"
 #include "DustLog.h"
 #include <cmath>
@@ -2415,6 +2416,11 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(
     IDXGISwapChain* pThis, UINT SyncInterval, UINT Flags)
 {
     if (!gShutdownSignaled) TickGuiOnPresent(pThis, "Present");
+    // Frame-gen present-takeover: after the GUI is drawn, present the frame through our D3D12 swap chain
+    // on the real HWND; the game's own swap chain (now on a hidden window) presents fast + invisibly.
+    if (!gShutdownSignaled && FrameGen::IsWanted() &&
+        FrameGen::PresentTakeover(gDevice, gContext, pThis, SyncInterval))
+        return oPresent(pThis, 0, Flags);
     return oPresent(pThis, SyncInterval, Flags);
 }
 
@@ -2423,6 +2429,9 @@ static HRESULT STDMETHODCALLTYPE HookedPresent1(
     const DXGI_PRESENT_PARAMETERS* pPresentParameters)
 {
     if (!gShutdownSignaled) TickGuiOnPresent(pThis, "Present1");
+    if (!gShutdownSignaled && FrameGen::IsWanted() &&
+        FrameGen::PresentTakeover(gDevice, gContext, pThis, SyncInterval))
+        return oPresent1(pThis, 0, PresentFlags, pPresentParameters);
     return oPresent1(pThis, SyncInterval, PresentFlags, pPresentParameters);
 }
 
