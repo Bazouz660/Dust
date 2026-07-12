@@ -7,7 +7,14 @@
 #include "SurveyRecorder.h"
 #include "SurveyWriter.h"
 #include "ShaderPatch.h"
+#include "ShaderMetadata.h"
+#include "GeometryCapture.h"
+#include "MotionVectors.h"
+#include "Upscaler.h"
+#include "UpscalerFSR2.h"
+#include "CameraAccess.h"
 #include "DustLog.h"
+#include <cmath>
 #include <core/Functions.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
@@ -77,6 +84,15 @@ typedef HRESULT(STDMETHODCALLTYPE* PFN_CreateTexture2D)(
     ID3D11Device*, const D3D11_TEXTURE2D_DESC*,
     const D3D11_SUBRESOURCE_DATA*, ID3D11Texture2D**);
 static PFN_CreateTexture2D oCreateTexture2D = nullptr;
+
+// DLSS texture MIP-LOD bias: DLSS/DLAA supersamples, so NVIDIA's guide prescribes biasing texture
+// sampling by log2(render/display) - 1 = -1.0 for DLAA. gDlssWanted (read from the ini at device
+// capture) gates a CreateSamplerState hook that adds this to every sampler.
+static bool  gDlssWanted   = false;
+static const float kDlssMipBias = -1.0f;
+typedef HRESULT(STDMETHODCALLTYPE* PFN_CreateSamplerState)(
+    ID3D11Device*, const D3D11_SAMPLER_DESC*, ID3D11SamplerState**);
+static PFN_CreateSamplerState oCreateSamplerState = nullptr;
 
 UINT GetShadowAtlasResolution()          { return gShadowAtlasOverride; }
 
@@ -390,11 +406,38 @@ static void ClearShadowReplacements()
     }
 }
 
+// ===================== Temporal sub-pixel jitter (for DLSS/FSR upscaling) =====================
+// When enabled, the main GBuffer scene viewport is offset by a Halton(2,3) sub-pixel amount each
+// frame so the temporal upscaler accumulates new sub-pixel samples. Applied at the VIEWPORT (post
+// clip-space), so our injected motion vectors — computed from clip-space cur/prev in the VS — stay
+// jitter-free, which is exactly the upscaler input contract. Recovered from the TSSAA stash@{0}.
+static bool  gJitterEnabled = false;
+static float gJitterPxX = 0.0f;   // this frame's jitter, in pixels [-0.5, 0.5]
+static float gJitterPxY = 0.0f;
+static int   sUpsBackend = 0;     // 0 = DLSS, 1 = FSR2 (declared early so the jitter advance can pick FSR2's sequence)
+
+static float HaltonSeq(uint32_t i, uint32_t b)
+{
+    float f = 1.0f, r = 0.0f;
+    while (i > 0) { f /= (float)b; r += f * (float)(i % b); i /= b; }
+    return r;
+}
+
+void SetTemporalJitter(int enabled)
+{
+    gJitterEnabled = (enabled != 0);
+    if (!gJitterEnabled) gJitterPxX = gJitterPxY = 0.0f;
+}
+
+// The jitter applied to the frame currently being built (pixels). Read by the upscaler resolve.
+void GetTemporalJitter(float& x, float& y) { x = gJitterPxX; y = gJitterPxY; }
+
 void ResetFrameState()
 {
     ApplyPendingShadowResize();
     ClearShadowReplacements();
     gPipelineDetector.ResetFrame();
+    GeometryCapture::ResetFrame();   // release last frame's captured draws (MV pass)
     gResourceRegistry.ResetFrame();
     ReleaseLightVolumeAO();
     SetLightVolumeAoTexture(nullptr);        // clear RTGI's per-light AO; republished each frame
@@ -404,7 +447,240 @@ void ResetFrameState()
     gCameraDataExtracted = false;
     gDeviceRemovedThisFrame = false;
     gFrameIndex++;
+
+    // Advance the per-frame sub-pixel jitter. FSR2's temporal accumulation is tuned to its own jitter
+    // sequence, so use it when FSR2 is the active backend; otherwise Halton(2,3) (fine for DLSS).
+    if (gJitterEnabled)
+    {
+        if (sUpsBackend == 1 && gWidth > 0)
+        {
+            UpscalerFSR2::ComputeJitter(gFrameIndex, gWidth, gWidth, &gJitterPxX, &gJitterPxY);
+        }
+        else
+        {
+            uint32_t i = (uint32_t)(gFrameIndex % 16) + 1;
+            gJitterPxX = HaltonSeq(i, 2) - 0.5f;
+            gJitterPxY = HaltonSeq(i, 3) - 0.5f;
+        }
+    }
+    else
+    {
+        gJitterPxX = gJitterPxY = 0.0f;
+    }
 }
+
+// ===================== DLSS/FSR upscaling resolve (Milestone B: DLAA at native res) =====================
+// At POST_TONEMAP (scene tonemapped, before UI) hand DLSS the color + depth + our injected motion-vector
+// RT, and copy its anti-aliased output back over the scene color so the UI + present use it. Gated on
+// [Upscaling] DLSS=1; degrades to a no-op if NGX/DLSS isn't available (non-NVIDIA / old driver / no dll).
+static bool             sUpsConfigRead = false;
+static bool             sUpsEnabled    = false;   // runtime DLSS on/off (seeded from [Upscaling] DLSS)
+static int              sUpsPresetIdx  = 3;        // Upscaler::PRESET_F (CNN DLAA; K blurs the static image in our D3D11 NGX integration)
+static float            sUpsSharpness  = 0.0f;     // [0,1]
+static int              sUpsActiveBackend = -1;    // currently-initialized backend (detect GUI switch)
+static bool             sUpsInitTried  = false;    // NGX availability probed
+static int              sUpsFeaturePreset = -1;    // preset the live feature was created with (-1 = none)
+static bool             sUpsJitterOn   = false;    // tracked so we toggle jitter cleanly on enable/disable
+static bool             sUpsResetNext  = false;    // discard DLSS history on the next frame (enable/recreate)
+static ID3D11Texture2D*          sUpsOut    = nullptr; // DLSS output (UAV); copied/sharpened back to scene color
+static ID3D11ShaderResourceView* sUpsOutSRV = nullptr; // SRV of sUpsOut, for the sharpen pass to sample
+static uint32_t         sUpsOutW = 0, sUpsOutH = 0;
+static const void*               sUpsPrevColorRTV = nullptr; // detect pipeline rebuild (settings change)
+static ID3D11Texture2D*          sUpsColorSR  = nullptr; // shader-readable copy of the scene color for NGX
+static uint32_t         sUpsColorW = 0, sUpsColorH = 0;
+static bool             sUpsDescLogged = false;
+
+// Width/height of a resource (0/false if not a Texture2D). Used to skip the resolve when the color,
+// depth and MV inputs momentarily disagree (e.g. mid-pipeline-rebuild) instead of freezing the image.
+static bool TexDim(ID3D11Resource* res, uint32_t& w, uint32_t& h)
+{
+    if (!res) return false;
+    ID3D11Texture2D* t = nullptr;
+    if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&t)) || !t) return false;
+    D3D11_TEXTURE2D_DESC d; t->GetDesc(&d); t->Release();
+    w = d.Width; h = d.Height; return true;
+}
+
+static void ReleaseUpscalerTargets()   // drop derived textures so they rebuild against the new pipeline
+{
+    if (sUpsOutSRV) { sUpsOutSRV->Release(); sUpsOutSRV = nullptr; }
+    if (sUpsOut)    { sUpsOut->Release();    sUpsOut = nullptr; }    sUpsOutW = sUpsOutH = 0;
+    if (sUpsColorSR){ sUpsColorSR->Release();sUpsColorSR = nullptr; } sUpsColorW = sUpsColorH = 0;
+}
+
+// One-shot diagnostic: log a resource's format + bind flags (NGX PlatformError is usually a bind-flag gap).
+static void LogTexDesc(const char* label, ID3D11Resource* res)
+{
+    if (!res) { Log("Upscaler[desc] %s = NULL", label); return; }
+    ID3D11Texture2D* t = nullptr;
+    if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&t)) && t)
+    {
+        D3D11_TEXTURE2D_DESC d; t->GetDesc(&d); t->Release();
+        Log("Upscaler[desc] %s: %ux%u fmt=%u bind=0x%x samples=%u", label, d.Width, d.Height,
+            (unsigned)d.Format, (unsigned)d.BindFlags, d.SampleDesc.Count);
+    }
+    else Log("Upscaler[desc] %s = not a Texture2D", label);
+}
+
+// Ensure an SHADER_RESOURCE-bindable texture matching src's format/size; returns it after copying src in.
+static ID3D11Texture2D* EnsureColorSR(ID3D11DeviceContext* ctx, ID3D11Resource* colorRes)
+{
+    ID3D11Texture2D* colorTex = nullptr;
+    if (FAILED(colorRes->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&colorTex)) || !colorTex) return nullptr;
+    D3D11_TEXTURE2D_DESC cd; colorTex->GetDesc(&cd); colorTex->Release();
+    if (!sUpsColorSR || sUpsColorW != cd.Width || sUpsColorH != cd.Height)
+    {
+        if (sUpsColorSR) { sUpsColorSR->Release(); sUpsColorSR = nullptr; }
+        D3D11_TEXTURE2D_DESC sd = {};
+        sd.Width = cd.Width; sd.Height = cd.Height; sd.MipLevels = 1; sd.ArraySize = 1;
+        sd.Format = cd.Format; sd.SampleDesc.Count = 1; sd.Usage = D3D11_USAGE_DEFAULT;
+        sd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(gDevice->CreateTexture2D(&sd, nullptr, &sUpsColorSR))) { sUpsColorSR = nullptr; return nullptr; }
+        sUpsColorW = cd.Width; sUpsColorH = cd.Height;
+    }
+    ctx->CopyResource(sUpsColorSR, colorRes);   // shader-readable snapshot NGX can bind as its color SRV
+    return sUpsColorSR;
+}
+
+// Create/resize the DLSS output texture to match the scene color target (display res for DLAA).
+static ID3D11Texture2D* EnsureUpscalerOutput(ID3D11Resource* colorRes)
+{
+    ID3D11Texture2D* colorTex = nullptr;
+    if (FAILED(colorRes->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&colorTex)) || !colorTex) return nullptr;
+    D3D11_TEXTURE2D_DESC cd; colorTex->GetDesc(&cd); colorTex->Release();
+    if (sUpsOut && sUpsOutW == cd.Width && sUpsOutH == cd.Height) return sUpsOut;
+    if (sUpsOutSRV) { sUpsOutSRV->Release(); sUpsOutSRV = nullptr; }
+    if (sUpsOut) { sUpsOut->Release(); sUpsOut = nullptr; }
+    D3D11_TEXTURE2D_DESC od = {};
+    od.Width = cd.Width; od.Height = cd.Height; od.MipLevels = 1; od.ArraySize = 1;
+    od.Format = cd.Format; od.SampleDesc.Count = 1; od.Usage = D3D11_USAGE_DEFAULT;
+    od.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;   // DLSS writes via compute UAV
+    if (FAILED(gDevice->CreateTexture2D(&od, nullptr, &sUpsOut))) { sUpsOut = nullptr; return nullptr; }
+    gDevice->CreateShaderResourceView(sUpsOut, nullptr, &sUpsOutSRV);          // for the sharpen pass
+    sUpsOutW = cd.Width; sUpsOutH = cd.Height;
+    Log("Upscaler: output texture %ux%u created", cd.Width, cd.Height);
+    return sUpsOut;
+}
+
+static void RunUpscaler(ID3D11DeviceContext* ctx)
+{
+    if (!sUpsConfigRead)
+    {
+        sUpsConfigRead = true;
+        std::string iniPath = DustLogDir() + "Dust.ini";
+        sUpsEnabled   = GetPrivateProfileIntA("Upscaling", "DLSS", 0, iniPath.c_str()) != 0;   // "enabled"
+        sUpsPresetIdx = GetPrivateProfileIntA("Upscaling", "DLSSPreset", 3, iniPath.c_str());          // 3 = F (K blurs static image)
+        sUpsSharpness = GetPrivateProfileIntA("Upscaling", "DLSSSharpness", 0, iniPath.c_str()) / 100.0f;
+        sUpsBackend   = GetPrivateProfileIntA("Upscaling", "Backend", 0, iniPath.c_str());     // 0=DLSS 1=FSR2
+    }
+    if (!gDevice || gWidth == 0 || gHeight == 0) return;
+
+    const bool fsr = (sUpsBackend == 1);
+
+    // Backend switched in the GUI: tear the old one down, force re-init + feature recreate + jitter reset.
+    if (sUpsActiveBackend != sUpsBackend)
+    {
+        Upscaler::Shutdown();
+        UpscalerFSR2::Shutdown();
+        ReleaseUpscalerTargets();
+        sUpsActiveBackend = sUpsBackend;
+        sUpsInitTried     = false;
+        sUpsFeaturePreset = -1;
+        if (sUpsJitterOn) { SetTemporalJitter(0); sUpsJitterOn = false; }
+    }
+
+    // Probe/init the active backend once (so the GUI can report availability before it's switched on).
+    if (!sUpsInitTried)
+    {
+        sUpsInitTried = true;
+        if (fsr) UpscalerFSR2::Init(gDevice);
+        else { std::string modDir = DustLogDir(); std::wstring wdir(modDir.begin(), modDir.end());
+               Upscaler::Init(gDevice, wdir.c_str(), wdir.c_str()); }
+    }
+
+    const bool avail = fsr ? UpscalerFSR2::IsAvailable() : Upscaler::IsAvailable();
+
+    // Disabled or unavailable: ensure jitter is off (no shimmer) and skip the resolve.
+    if (!sUpsEnabled || !avail)
+    {
+        if (sUpsJitterOn) { SetTemporalJitter(0); sUpsJitterOn = false; }
+        return;
+    }
+
+    // (Re)create the feature on first enable or when the preset changed in the GUI.
+    if (sUpsFeaturePreset != sUpsPresetIdx)
+    {
+        bool created = fsr
+            ? UpscalerFSR2::CreateFeature(ctx, gWidth, gHeight, gWidth, gHeight, false, false, sUpsPresetIdx)
+            : Upscaler::CreateFeature(ctx, gWidth, gHeight, gWidth, gHeight, false, false, sUpsPresetIdx);
+        if (created) { sUpsFeaturePreset = sUpsPresetIdx; sUpsResetNext = true; }
+        else { sUpsEnabled = false; if (sUpsJitterOn) { SetTemporalJitter(0); sUpsJitterOn = false; } return; }
+    }
+    if (!sUpsJitterOn) { SetTemporalJitter(1); sUpsJitterOn = true; sUpsResetNext = true; }  // fresh history
+
+    ID3D11RenderTargetView*   colorRTV = gResourceRegistry.GetRTV(ResourceName::LDR_RTV);
+    ID3D11ShaderResourceView* depthSRV = gResourceRegistry.GetSRV(ResourceName::DEPTH_SRV);
+    ID3D11Resource*           mv       = MotionVectors::GetInjVelResource();
+    if (!colorRTV || !depthSRV || !mv) return;
+
+    // Pipeline-rebuild robustness: a vanilla settings change (FXAA, HeatHaze, ...) rebuilds OGRE's
+    // compositor and re-registers new render targets. If our color target changed, drop the derived
+    // textures (they rebuild against the new one) and reset DLSS history — otherwise we resolve stale
+    // content / blend a dead history, which froze the image.
+    if ((const void*)colorRTV != sUpsPrevColorRTV)
+    {
+        sUpsPrevColorRTV = (const void*)colorRTV;
+        ReleaseUpscalerTargets();
+        sUpsResetNext = true;
+        Log("Upscaler: color target changed (pipeline rebuild) — reset DLSS history + textures");
+    }
+
+    ID3D11Resource* color = nullptr; colorRTV->GetResource(&color);
+    ID3D11Resource* depth = nullptr; depthSRV->GetResource(&depth);
+
+    // Inputs must agree in size; if not (e.g. one frame mid-rebuild), skip so the game's own image shows
+    // through instead of freezing on a stale resolve.
+    uint32_t cw=0,ch=0, dw=0,dh=0, vw=0,vh=0;
+    bool dimsOk = TexDim(color, cw, ch) && TexDim(depth, dw, dh) && TexDim(mv, vw, vh) &&
+                  cw == dw && ch == dh && cw == vw && ch == vh;
+    if (color && depth && dimsOk)
+    {
+        ID3D11Texture2D* out   = EnsureUpscalerOutput(color);
+        ID3D11Texture2D* colSR = EnsureColorSR(ctx, color);   // NGX needs a shader-readable color input
+        if (!sUpsDescLogged)
+        {
+            sUpsDescLogged = true;
+            LogTexDesc("color(ldr_rt)", color);
+            LogTexDesc("depth",         depth);
+            LogTexDesc("motionVec",     mv);
+            LogTexDesc("output",        out);
+            LogTexDesc("colorSRcopy",   colSR);
+        }
+        if (out && colSR)
+        {
+            float jx, jy; GetTemporalJitter(jx, jy);
+            // Our MV texel is (curUV - prevUV) in UV space. The upscaler wants (prevUV - curUV) in render
+            // pixels (the vector from a pixel to where it was last frame), so MV_Scale is NEGATIVE display
+            // size. Wrong sign => history reprojected backwards => ghosting on camera motion + softness.
+            // Sharpness goes to our own RCAS-lite pass, so pass 0 to the upscaler.
+            const float mvsx = -(float)gWidth, mvsy = -(float)gHeight;
+            bool ok = fsr
+                ? UpscalerFSR2::Evaluate(ctx, colSR, depth, mv, out, jx, jy, mvsx, mvsy, 0.0f, sUpsResetNext, nullptr)
+                : Upscaler::Evaluate(ctx, colSR, depth, mv, out, jx, jy, mvsx, mvsy, 0.0f, sUpsResetNext, nullptr);
+            if (ok)
+            {
+                if (sUpsSharpness > 0.0f && sUpsOutSRV)
+                    MotionVectors::SharpenBlit(ctx, sUpsOutSRV, colorRTV, sUpsSharpness, gWidth, gHeight);
+                else
+                    ctx->CopyResource(color, out);   // AA'd image back into the scene color for UI + present
+            }
+            sUpsResetNext = false;
+        }
+    }
+    if (color) color->Release();
+    if (depth) depth->Release();
+}
+
 
 // Extract camera basis vectors from the game's deferred lighting PS constant buffer.
 // The inverse view matrix sits at register c8 (offset 128 bytes / 32 floats).
@@ -482,6 +758,15 @@ static void ExtractCameraData(ID3D11DeviceContext* ctx)
                 gCameraData.camUp[0]      = m[1]; gCameraData.camUp[1]      = m[5]; gCameraData.camUp[2]      = m[9];
                 gCameraData.camForward[0] = m[2]; gCameraData.camForward[1] = m[6]; gCameraData.camForward[2] = m[10];
                 gCameraData.camPosition[0] = m[12]; gCameraData.camPosition[1] = m[13]; gCameraData.camPosition[2] = m[14];
+                // Projection params (API v8) from the OGRE camera — real near/far/fov for effects (RTGI)
+                // and the upscaler. Left 0 if the camera walk isn't reachable this frame.
+                float camN = 0.0f, camF = 0.0f, camFov = 0.0f;
+                if (CameraAccess_GetCameraParams(&camN, &camF, &camFov))
+                {
+                    gCameraData.nearZ = camN;
+                    gCameraData.farZ  = camF;
+                    gCameraData.tanHalfFov = tanf(camFov * 0.5f);
+                }
                 gCameraData.valid = 1;
                 gCameraDataExtracted = true;
             }
@@ -533,6 +818,13 @@ typedef void(STDMETHODCALLTYPE* PFN_RSSetViewports)(
     ID3D11DeviceContext* pThis, UINT NumViewports,
     const D3D11_VIEWPORT* pViewports);
 
+typedef HRESULT(STDMETHODCALLTYPE* PFN_Map)(
+    ID3D11DeviceContext* pThis, ID3D11Resource* pResource, UINT Subresource,
+    D3D11_MAP MapType, UINT MapFlags, D3D11_MAPPED_SUBRESOURCE* pMappedResource);
+
+typedef void(STDMETHODCALLTYPE* PFN_Unmap)(
+    ID3D11DeviceContext* pThis, ID3D11Resource* pResource, UINT Subresource);
+
 typedef HRESULT(STDMETHODCALLTYPE* PFN_Present)(
     IDXGISwapChain* pThis, UINT SyncInterval, UINT Flags);
 
@@ -548,6 +840,8 @@ static PFN_OMSetRenderTargets       oOMSetRenderTargets = nullptr;
 static PFN_OMSetRenderTargetsAndUAV oOMSetRenderTargetsAndUAV = nullptr;
 static PFN_PSSetShaderResources     oPSSetShaderResources = nullptr;
 static PFN_RSSetViewports           oRSSetViewports = nullptr;
+static PFN_Map                      oMap = nullptr;
+static PFN_Unmap                    oUnmap = nullptr;
 static PFN_Present                  oPresent = nullptr;
 static PFN_ResizeBuffers            oResizeBuffers = nullptr;
 
@@ -816,6 +1110,25 @@ static void TryCaptureDevice(ID3D11Device* device)
         Log("Detected resolution: %ux%u", gWidth, gHeight);
     }
 
+    // Motion-vector pass (upscaling): hand the device + GBuffer resolution to the
+    // geometry-capture layer, and opt in only when the user enables it in Dust.ini
+    // ([Upscaling] CaptureGeometry=1). Default OFF — capture is a per-frame cost.
+    GeometryCapture::SetDevice(gDevice);
+    GeometryCapture::SetResolution(gWidth, gHeight);
+    MotionVectors::SetDevice(gDevice);
+    MotionVectors::OnResolution(gWidth, gHeight);
+    {
+        std::string iniPath = DustLogDir() + "Dust.ini";
+        if (GetPrivateProfileIntA("Upscaling", "CaptureGeometry", 0, iniPath.c_str()))
+        {
+            GeometryCapture::SetCaptureFlags(DUST_CAPTURE_GEOMETRY);
+            Log("Upscaling: geometry capture ENABLED ([Upscaling] CaptureGeometry=1)");
+        }
+        // Read DLSS intent early (before OGRE creates its samplers) so the mip-bias hook can apply.
+        gDlssWanted = GetPrivateProfileIntA("Upscaling", "DLSS", 0, iniPath.c_str()) != 0;
+        if (gDlssWanted) Log("Upscaling: DLSS on -> applying %.1f texture mip bias to new samplers", kDlssMipBias);
+    }
+
     // Initialize all loaded effect plugins
     if (!gEffectLoader.InitAll(gDevice, gWidth, gHeight))
         Log("WARNING: One or more effect plugins failed to initialize");
@@ -868,6 +1181,20 @@ static bool IsShadowAtlasDesc(const D3D11_TEXTURE2D_DESC* d)
     if (d->Format == DXGI_FORMAT_R32_FLOAT && hasRTV && hasSRV) return true;
     if (d->Format == DXGI_FORMAT_R32_TYPELESS && hasDSV && hasSRV) return true;
     return false;
+}
+
+static HRESULT STDMETHODCALLTYPE HookedCreateSamplerState(
+    ID3D11Device* pThis, const D3D11_SAMPLER_DESC* pDesc, ID3D11SamplerState** ppSamplerState)
+{
+    // When DLSS is on, sharpen by exposing ~1 extra mip of texture detail for it to resolve. Harmless
+    // on point/no-mip samplers (the driver ignores the bias there), so it's applied unconditionally.
+    if (!gShutdownSignaled && gDlssWanted && pDesc)
+    {
+        D3D11_SAMPLER_DESC d = *pDesc;
+        d.MipLODBias += kDlssMipBias;
+        return oCreateSamplerState(pThis, &d, ppSamplerState);
+    }
+    return oCreateSamplerState(pThis, pDesc, ppSamplerState);
 }
 
 static HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
@@ -1305,6 +1632,27 @@ static HRESULT STDMETHODCALLTYPE HookedCreatePixelShader(
     return hr;
 }
 
+// ==================== CreateInputLayout hook (records vertex declarations) ====================
+
+typedef HRESULT(STDMETHODCALLTYPE* PFN_CreateInputLayout)(
+    ID3D11Device* pThis, const D3D11_INPUT_ELEMENT_DESC* pInputElementDescs, UINT NumElements,
+    const void* pShaderBytecodeWithInputSignature, SIZE_T BytecodeLength,
+    ID3D11InputLayout** ppInputLayout);
+
+static PFN_CreateInputLayout oCreateInputLayout = nullptr;
+
+static HRESULT STDMETHODCALLTYPE HookedCreateInputLayout(
+    ID3D11Device* pThis, const D3D11_INPUT_ELEMENT_DESC* pInputElementDescs, UINT NumElements,
+    const void* pShaderBytecodeWithInputSignature, SIZE_T BytecodeLength,
+    ID3D11InputLayout** ppInputLayout)
+{
+    HRESULT hr = oCreateInputLayout(pThis, pInputElementDescs, NumElements,
+                                    pShaderBytecodeWithInputSignature, BytecodeLength, ppInputLayout);
+    if (!gShutdownSignaled && SUCCEEDED(hr) && ppInputLayout && *ppInputLayout)
+        ShaderMetadata::OnInputLayoutCreated(*ppInputLayout, pInputElementDescs, NumElements);
+    return hr;
+}
+
 // ==================== CreateVertexShader hook (for shader source tracking) ====================
 
 typedef HRESULT(STDMETHODCALLTYPE* PFN_CreateVertexShader)(
@@ -1324,7 +1672,12 @@ static HRESULT STDMETHODCALLTYPE HookedCreateVertexShader(
     HRESULT hr = oCreateVertexShader(pThis, pShaderBytecode, BytecodeLength,
                                       pClassLinkage, ppVertexShader);
     if (SUCCEEDED(hr) && ppVertexShader && *ppVertexShader)
+    {
         SurveyRecorder::OnVertexShaderCreated(pShaderBytecode, BytecodeLength, *ppVertexShader);
+        // Reflect the VS CB layout so GeometryCapture can classify draws
+        // (STATIC vs SKINNED) and locate the clip/world matrix for the MV pass.
+        ShaderMetadata::OnVertexShaderCreated(pShaderBytecode, BytecodeLength, *ppVertexShader);
+    }
     return hr;
 }
 
@@ -1433,6 +1786,8 @@ static void STDMETHODCALLTYPE HookedDraw(
                             gWidth = desc.Width;
                             gHeight = desc.Height;
                             gEffectLoader.OnResolutionChanged(gDevice, gWidth, gHeight);
+                            GeometryCapture::SetResolution(gWidth, gHeight);   // keep MV GBuffer detect in sync
+                            MotionVectors::OnResolution(gWidth, gHeight);      // resize velocity RT
                         }
                         tex->Release();
                     }
@@ -1464,7 +1819,12 @@ static void STDMETHODCALLTYPE HookedDraw(
 
         // Extract camera data at POST_LIGHTING (deferred CB is bound)
         if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
+        {
             ExtractCameraData(pThis);
+            // Repack this frame's skinned poses (GBuffer captures are resolved now) so next frame's
+            // patched skin VS can read them as "previous" from b12 and emit true animation velocity.
+            MotionVectors::InjFillSkinPrev(pThis);
+        }
 
         DustFrameContext fctx = {};
         fctx.device = gDevice;
@@ -1504,6 +1864,16 @@ static void STDMETHODCALLTYPE HookedDraw(
         // POST: effects that operate after the draw
         fctx.timing = DUST_TIMING_POST;
         gEffectLoader.DispatchPost(dip, &fctx);
+
+        // Shader-injected motion vectors: the velocity RT is filled during the real GBuffer pass
+        // (see HookedOMSetRenderTargets + ShaderPatch). Here we only blit the debug viz over the
+        // final image at POST_TONEMAP when [Upscaling] ShowMotionVectors=1, then end the frame.
+        if (result.point == InjectionPoint::POST_TONEMAP)
+        {
+            RunUpscaler(pThis);                  // DLSS DLAA resolve (no-op unless [Upscaling] DLSS=1)
+            MotionVectors::InjDebugBlit(pThis);  // MV debug viz (only if ShowMotionVectors=1)
+            MotionVectors::InjEndFrame();
+        }
     }
     else
     {
@@ -1520,11 +1890,24 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     if (Survey::IsActive())
         SurveyRecorder::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 
+    // Motion-vector pass: snapshot this GBuffer draw's transform state. Fast-path
+    // no-op unless capture is enabled AND we're inside the GBuffer pass.
+    if (GeometryCapture::HasActiveCapture())
+    {
+        GeometryCapture::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
+        // If that draw was skinned, bind its matched previous-frame bone palette at b12 so the patched
+        // skin VS can emit true animation velocity (must be after OGRE's per-draw constant setup).
+        MotionVectors::InjBindSkinPrev(pThis);
+    }
+
     // Direct-light AO for point/spot lights: for a light_fs draw, swap the AO snapshot
     // into s8/s9 for the draw and restore afterward (scope dtor). gLvAoReady gates the
     // PSGetShader check to the POST_LIGHTING→POST_FOG window.
     bool isLV = gLvAoReady && IsLightVolumeDraw(pThis);
     LightVolumeAoScope lvAo(pThis, isLV);
+    // Keep the injected-MV reproj CB pinned at b13 for the patched GBuffer VS (bind AFTER OGRE's
+    // per-draw constant setup; unconditional so the GBuffer-pass gate can't exclude a draw).
+    { ID3D11Buffer* rcb = MotionVectors::GetInjReprojCB(); if (rcb) pThis->VSSetConstantBuffers(13, 1, &rcb); }
     oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 }
 
@@ -1539,11 +1922,41 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
                                                 StartIndexLocation, BaseVertexLocation,
                                                 StartInstanceLocation);
 
+    // Motion-vector pass: snapshot this instanced GBuffer draw (per-instance
+    // transform VB is captured too — see GeometryCapture::CaptureDrawState).
+    if (GeometryCapture::HasActiveCapture())
+        GeometryCapture::OnDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
+                                                StartIndexLocation, BaseVertexLocation,
+                                                StartInstanceLocation);
+
     // Direct-light AO for point/spot lights (instanced light-volume path — see HookedDrawIndexed).
     bool isLV = gLvAoReady && IsLightVolumeDraw(pThis);
     LightVolumeAoScope lvAo(pThis, isLV);
+    { ID3D11Buffer* rcb = MotionVectors::GetInjReprojCB(); if (rcb) pThis->VSSetConstantBuffers(13, 1, &rcb); }
     oDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
                           StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+}
+
+// Map/Unmap: shadow the skinned bone-palette CB as OGRE writes it (WRITE_DISCARD before each skin
+// draw), so InjBindSkinPrev can read the CURRENT frame's root bone at draw time — the key to spatial
+// (nearest-root) prev-pose matching without a GPU read-back stall. MotionVectors gates the fast path
+// on having learned a bone CB, so the overhead is one hash lookup per Map/Unmap until then.
+static HRESULT STDMETHODCALLTYPE HookedMap(
+    ID3D11DeviceContext* pThis, ID3D11Resource* pResource, UINT Subresource,
+    D3D11_MAP MapType, UINT MapFlags, D3D11_MAPPED_SUBRESOURCE* pMappedResource)
+{
+    HRESULT hr = oMap(pThis, pResource, Subresource, MapType, MapFlags, pMappedResource);
+    if (!gShutdownSignaled && SUCCEEDED(hr) && Subresource == 0 && pMappedResource)
+        MotionVectors::InjNoteMap(pResource, pMappedResource->pData);
+    return hr;
+}
+
+static void STDMETHODCALLTYPE HookedUnmap(
+    ID3D11DeviceContext* pThis, ID3D11Resource* pResource, UINT Subresource)
+{
+    if (!gShutdownSignaled && Subresource == 0)
+        MotionVectors::InjNoteUnmap(pResource);   // snapshot bytes BEFORE the unmap invalidates pData
+    oUnmap(pThis, pResource, Subresource);
 }
 
 // ==================== Shadow atlas bind-time swap ====================
@@ -1624,7 +2037,33 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
     ID3D11RenderTargetView* const* ppRenderTargetViews,
     ID3D11DepthStencilView* pDepthStencilView)
 {
-    if (gShutdownSignaled || !gShadowSwapActive)
+    if (gShutdownSignaled)
+    { oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView); return; }
+
+    // Motion-vector pass: track GBuffer-pass entry/exit — independent of the shadow-swap feature,
+    // so it must run before the !gShadowSwapActive early-out. Runs unconditionally now (the injected
+    // MV path needs it even without geometry capture); CheckGBufferConfig is pointer-cached, cheap.
+    bool isGBuf = GeometryCapture::CheckGBufferConfig(NumViews, ppRenderTargetViews, pDepthStencilView);
+    GeometryCapture::OnOMSetRenderTargetsWithResult(isGBuf);
+
+    // Shader-injected motion vectors: append the velocity RT (SV_Target3) to the GBuffer bind, do
+    // the once-per-frame reproj+clear, and bind the reproj CB at b13 for the patched vertex shaders.
+    if (isGBuf && NumViews == 3 && gDevice && ppRenderTargetViews && ppRenderTargetViews[0])
+    {
+        ID3D11RenderTargetView* velRTV = MotionVectors::InjEnsureVelRTV(ppRenderTargetViews[0]);
+        if (velRTV)
+        {
+            MotionVectors::InjBeginGBuffer(pThis);
+            ID3D11Buffer* reprojCB = MotionVectors::GetInjReprojCB();
+            if (reprojCB) pThis->VSSetConstantBuffers(13, 1, &reprojCB);
+            ID3D11RenderTargetView* rtvs4[4] = {
+                ppRenderTargetViews[0], ppRenderTargetViews[1], ppRenderTargetViews[2], velRTV };
+            oOMSetRenderTargets(pThis, 4, rtvs4, pDepthStencilView);
+            return;
+        }
+    }
+
+    if (!gShadowSwapActive)
     { oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView); return; }
 
     // Shadow pass detection: DSV match + (RTV match or depth-only), OR
@@ -1709,7 +2148,21 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargetsAndUAV(
     ID3D11UnorderedAccessView* const* ppUnorderedAccessViews,
     const UINT* pUAVInitialCounts)
 {
-    if (gShutdownSignaled || !gShadowSwapActive)
+    if (gShutdownSignaled)
+    {
+        oOMSetRenderTargetsAndUAV(pThis, NumRTVs, ppRenderTargetViews,
+            pDepthStencilView, UAVStartSlot, NumUAVs, ppUnorderedAccessViews,
+            pUAVInitialCounts);
+        return;
+    }
+
+    // Motion-vector pass: GBuffer-pass tracking (see the plain-OMSet hook). OGRE 2.0
+    // binds the GBuffer MRT through this combined call, so detection must live here too.
+    if (GeometryCapture::GetCaptureFlags() != 0)
+        GeometryCapture::OnOMSetRenderTargetsWithResult(
+            GeometryCapture::CheckGBufferConfig(NumRTVs, ppRenderTargetViews, pDepthStencilView));
+
+    if (!gShadowSwapActive)
     {
         oOMSetRenderTargetsAndUAV(pThis, NumRTVs, ppRenderTargetViews,
             pDepthStencilView, UAVStartSlot, NumUAVs, ppUnorderedAccessViews,
@@ -1825,26 +2278,45 @@ static void STDMETHODCALLTYPE HookedRSSetViewports(
     ID3D11DeviceContext* pThis, UINT NumViewports,
     const D3D11_VIEWPORT* pViewports)
 {
-    if (!gInShadowPass || !gShadowSwapActive || gShutdownSignaled ||
-        !pViewports || NumViewports == 0)
+    // Shadow-atlas resolution override: scale the shadow-pass viewport to the resized atlas.
+    if (gInShadowPass && gShadowSwapActive && !gShutdownSignaled && pViewports && NumViewports > 0)
     {
-        oRSSetViewports(pThis, NumViewports, pViewports);
+        D3D11_VIEWPORT scaled[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+        UINT n = (NumViewports <= D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE)
+               ? NumViewports : D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+        float s = gShadowViewportScale;
+        for (UINT i = 0; i < n; i++)
+        {
+            scaled[i] = pViewports[i];
+            scaled[i].TopLeftX *= s;
+            scaled[i].TopLeftY *= s;
+            scaled[i].Width    *= s;
+            scaled[i].Height   *= s;
+        }
+        oRSSetViewports(pThis, n, scaled);
         return;
     }
 
-    D3D11_VIEWPORT scaled[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
-    UINT n = (NumViewports <= D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE)
-           ? NumViewports : D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
-    float s = gShadowViewportScale;
-    for (UINT i = 0; i < n; i++)
+    // Temporal upscaling: offset the main GBuffer scene viewport by this frame's sub-pixel jitter.
+    // Gated to the GBuffer pass so shadow/fullscreen/UI viewports are untouched.
+    if (gJitterEnabled && !gShutdownSignaled && !gInShadowPass &&
+        (gJitterPxX != 0.0f || gJitterPxY != 0.0f) &&
+        pViewports && NumViewports > 0 && GeometryCapture::IsInGBufferPass())
     {
-        scaled[i] = pViewports[i];
-        scaled[i].TopLeftX *= s;
-        scaled[i].TopLeftY *= s;
-        scaled[i].Width    *= s;
-        scaled[i].Height   *= s;
+        D3D11_VIEWPORT j[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+        UINT n = (NumViewports <= D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE)
+               ? NumViewports : D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+        for (UINT i = 0; i < n; i++)
+        {
+            j[i] = pViewports[i];
+            j[i].TopLeftX += gJitterPxX;
+            j[i].TopLeftY += gJitterPxY;
+        }
+        oRSSetViewports(pThis, n, j);
+        return;
     }
-    oRSSetViewports(pThis, n, scaled);
+
+    oRSSetViewports(pThis, NumViewports, pViewports);
 }
 
 // ==================== Swap chain hooks (ImGui) ====================
@@ -1942,11 +2414,15 @@ static HRESULT STDMETHODCALLTYPE HookedResizeBuffers(
 // ==================== Install ====================
 
 static const int VTIDX_DEVICE_CreateTexture2D       = 5;
+static const int VTIDX_DEVICE_CreateSamplerState    = 23;
+static const int VTIDX_DEVICE_CreateInputLayout     = 11;
 static const int VTIDX_DEVICE_CreateVertexShader    = 12;
 static const int VTIDX_DEVICE_CreatePixelShader     = 15;
 static const int VTIDX_CTX_PSSetShaderResources     = 8;
 static const int VTIDX_CTX_DrawIndexed              = 12;
 static const int VTIDX_CTX_Draw                     = 13;
+static const int VTIDX_CTX_Map                      = 14;
+static const int VTIDX_CTX_Unmap                    = 15;
 static const int VTIDX_CTX_DrawIndexedInstanced     = 20;
 static const int VTIDX_CTX_OMSetRenderTargets       = 33;
 static const int VTIDX_CTX_OMSetRenderTargetsAndUAV = 34;
@@ -1999,10 +2475,14 @@ bool Install()
     void** scVtable  = *reinterpret_cast<void***>(tmpSwapChain);
 
     void* addrCreateTex2D  = devVtable[VTIDX_DEVICE_CreateTexture2D];
+    void* addrCreateSampler= devVtable[VTIDX_DEVICE_CreateSamplerState];
+    void* addrCreateInpLay = devVtable[VTIDX_DEVICE_CreateInputLayout];
     void* addrCreateVS     = devVtable[VTIDX_DEVICE_CreateVertexShader];
     void* addrCreatePS     = devVtable[VTIDX_DEVICE_CreatePixelShader];
     void* addrDraw         = ctxVtable[VTIDX_CTX_Draw];
     void* addrDrawIndexed  = ctxVtable[VTIDX_CTX_DrawIndexed];
+    void* addrMap          = ctxVtable[VTIDX_CTX_Map];
+    void* addrUnmap        = ctxVtable[VTIDX_CTX_Unmap];
     void* addrDrawIdxInst  = ctxVtable[VTIDX_CTX_DrawIndexedInstanced];
     void* addrOMSetRT      = ctxVtable[VTIDX_CTX_OMSetRenderTargets];
     void* addrOMSetRTUAV   = ctxVtable[VTIDX_CTX_OMSetRenderTargetsAndUAV];
@@ -2089,6 +2569,15 @@ bool Install()
                            (void**)&oCreateTexture2D) != KenshiLib::SUCCESS)
     { Log("ERROR: Failed to hook CreateTexture2D"); ok = false; }
 
+    // Non-fatal: only affects the DLSS mip-bias sharpening.
+    if (KenshiLib::AddHook(addrCreateSampler, (void*)HookedCreateSamplerState,
+                           (void**)&oCreateSamplerState) != KenshiLib::SUCCESS)
+    { Log("WARNING: Failed to hook CreateSamplerState (DLSS mip-bias sharpening disabled)"); }
+
+    if (KenshiLib::AddHook(addrCreateInpLay, (void*)HookedCreateInputLayout,
+                           (void**)&oCreateInputLayout) != KenshiLib::SUCCESS)
+    { Log("WARNING: Failed to hook CreateInputLayout (vertex-declaration RE disabled)"); }
+
     if (KenshiLib::AddHook(addrCreateVS, (void*)HookedCreateVertexShader,
                            (void**)&oCreateVertexShader) != KenshiLib::SUCCESS)
     { Log("WARNING: Failed to hook CreateVertexShader (shader source tracking for VS disabled)"); }
@@ -2108,6 +2597,16 @@ bool Install()
     if (KenshiLib::AddHook(addrDrawIdxInst, (void*)HookedDrawIndexedInstanced,
                            (void**)&oDrawIndexedInstanced) != KenshiLib::SUCCESS)
     { Log("ERROR: Failed to hook DrawIndexedInstanced"); ok = false; }
+
+    // Map/Unmap: needed to shadow the skinned bone-palette CB for spatial prev-pose matching.
+    // Non-fatal if it fails — skinned animation MVs just fall back to zero (camera reproj only).
+    if (KenshiLib::AddHook(addrMap, (void*)HookedMap,
+                           (void**)&oMap) != KenshiLib::SUCCESS)
+    { Log("WARNING: Failed to hook Map (skinned animation motion vectors disabled)"); }
+
+    if (KenshiLib::AddHook(addrUnmap, (void*)HookedUnmap,
+                           (void**)&oUnmap) != KenshiLib::SUCCESS)
+    { Log("WARNING: Failed to hook Unmap (skinned animation motion vectors disabled)"); }
 
     if (KenshiLib::AddHook(addrOMSetRT, (void*)HookedOMSetRenderTargets,
                            (void**)&oOMSetRenderTargets) != KenshiLib::SUCCESS)
@@ -2152,3 +2651,18 @@ bool IsShutdownSignaled()
 }
 
 } // namespace D3D11Hook
+
+// Runtime control surface for the GUI. Global namespace (matches UpscalerControl.h); the resolve state
+// lives as file-static in D3D11Hook, reachable by qualified name from this same translation unit.
+namespace UpscalerControl
+{
+    bool  Available()          { return Upscaler::IsAvailable(); }
+    bool  GetEnabled()         { return D3D11Hook::sUpsEnabled; }
+    void  SetEnabled(bool e)   { D3D11Hook::sUpsEnabled = e; }
+    int   GetPreset()          { return D3D11Hook::sUpsPresetIdx; }
+    void  SetPreset(int p)     { if (p >= 0 && p < Upscaler::PRESET_COUNT) D3D11Hook::sUpsPresetIdx = p; }
+    float GetSharpness()       { return D3D11Hook::sUpsSharpness; }
+    void  SetSharpness(float s){ D3D11Hook::sUpsSharpness = s < 0 ? 0 : (s > 1 ? 1 : s); }
+    int   GetBackend()         { return D3D11Hook::sUpsBackend; }
+    void  SetBackend(int b)    { D3D11Hook::sUpsBackend = (b == 1) ? 1 : 0; }
+}

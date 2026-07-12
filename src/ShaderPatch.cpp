@@ -670,6 +670,175 @@ static std::string PatchLightVolumeShader(const std::string& src)
     return result;
 }
 
+// ---- Per-object motion vectors: inject a velocity output into the game's own GBuffer shaders ----
+// The robust replacement for the geometry-replay pass. objects.hlsl main_vs carries current +
+// previous clip position (prev = camera reprojection of cur, from a b13 CB); main_ps writes the
+// screen-space velocity to SV_Target3 (the velocity RT appended to the GBuffer). Because it runs in
+// the real GBuffer pass, coverage/alpha/animation are all exact — no depth-matching.
+static bool Has(const std::string& s, const char* a) { return s.find(a) != std::string::npos; }
+
+// Insert `text` after the first occurrence of `anchor` AT OR AFTER `from` (the .hlsl file contains
+// BOTH the VS and PS, so every anchor search must be scoped to the target entry function). Advances
+// `from` to just past the insertion so subsequent inserts stay ordered. Returns false on miss.
+static bool InsAfter(std::string& s, size_t& from, const char* anchor, const std::string& text)
+{
+    size_t p = s.find(anchor, from);
+    if (p == std::string::npos) return false;
+    p += strlen(anchor);
+    s.insert(p, text);
+    from = p + text.size();
+    return true;
+}
+static bool InsBefore(std::string& s, size_t& from, const char* anchor, const std::string& text)
+{
+    size_t p = s.find(anchor, from);
+    if (p == std::string::npos) return false;
+    s.insert(p, text);
+    from = p + text.size();
+    return true;
+}
+
+// Generic velocity injection into a GBuffer VS. fnAnchor = entry-fn start; interp = a semantic at the
+// SAME spot in this shader's VS-out and PS-in lists (e.g. "TEXCOORD5,"); clipAssign = the clip-output
+// assignment; clipRHS = its RHS (recomputed into oDustCur — never read the SV_Position output).
+static std::string InjVS(const std::string& src, const char* fnAnchor, const char* interp,
+                         const char* clipAssign, const char* clipRHS)
+{
+    if (Has(src, "oDustPrev")) return src;
+    std::string s = src;
+    size_t fn = s.find(fnAnchor);
+    if (fn == std::string::npos) return src;
+    // column_major is explicit: the reproj CB is uploaded column-major, but shaders differ in default
+    // matrix packing (objects.hlsl column, skin.hlsl row) — without this, row-major shaders read it
+    // transposed and produce garbage MVs.
+    s.insert(fn, "cbuffer DustMVCB : register(b13) { column_major float4x4 dust_reproj; };\n");
+    size_t from = s.find(fnAnchor);                    // scope all searches to the entry function
+    if (from == std::string::npos) return src;
+    if (!InsAfter(s, from, interp, "\n\tout float4 oDustCur : TEXCOORD12,\n\tout float4 oDustPrev : TEXCOORD13,")) return src;
+    std::string asgn = std::string("\n\toDustCur = ") + clipRHS + "; oDustPrev = mul(dust_reproj, oDustCur);";
+    if (!InsAfter(s, from, clipAssign, asgn)) return src;
+    return s;
+}
+
+// Generic velocity injection into a GBuffer PS. interp MUST match the VS interp position.
+static std::string InjPS(const std::string& src, const char* fnAnchor, const char* interp,
+                         const char* gbufOut, const char* body)
+{
+    if (Has(src, "oDustVel")) return src;
+    std::string s = src;
+    size_t from = s.find(fnAnchor);
+    if (from == std::string::npos) return src;
+    if (!InsAfter(s, from, interp, "\n\tfloat4 iDustCur : TEXCOORD12,\n\tfloat4 iDustPrev : TEXCOORD13,")) return src;
+    if (!InsBefore(s, from, gbufOut, "out float2 oDustVel : SV_Target3,\n\t")) return src;
+    if (!InsAfter(s, from, body, "\n\toDustVel = (iDustCur.xy/iDustCur.w - iDustPrev.xy/iDustPrev.w) * float2(0.5, -0.5);")) return src;
+    return s;
+}
+
+// Per-shader anchor tables, keyed by SOURCE FILE + entry point. Filename disambiguates the many
+// .hlsl that share the "main_vs"/"main_ps"/"main_fs" entry names (objects/terrain/skin/birds/...).
+struct VSpec { const char* srcFile; const char* entry; const char* fnAnchor; const char* interp; const char* clipAssign; const char* clipRHS; };
+struct PSpec { const char* srcFile; const char* entry; const char* fnAnchor; const char* interp; const char* gbufOut; const char* body; };
+
+static const VSpec kVSpecs[] = {
+    { "objects.hlsl",     "main_vs",      "void main_vs",      "TEXCOORD5,", "oPosition = mul(worldViewProjMatrix, position);", "mul(worldViewProjMatrix, position)" },
+    { "terrain.hlsl",     "main_vs",      "void main_vs",      "TEXCOORD1,", "oPosition = mul(worldViewProjMatrix, position);", "mul(worldViewProjMatrix, position)" },
+    { "triplanar.hlsl",   "triplanar_vs", "void triplanar_vs", "TEXCOORD5,", "oPosition = mul(worldViewProjMatrix, position);", "mul(worldViewProjMatrix, position)" },
+    { "mapfeature.hlsl",  "feature_vs",   "void feature_vs",   "TEXCOORD4,", "oPosition = mul(worldViewProj, iPosition);",      "mul(worldViewProj, iPosition)" },
+    { "distant_town.hlsl","main_vs",      "void main_vs",      "TEXCOORD2,", "oPosition = mul(worldViewProjMatrix, position);", "mul(worldViewProjMatrix, position)" },
+    { "birds.hlsl",       "main_vs",      "void main_vs",      "TEXCOORD5,", "oPosition = mul(viewProjMatrix, position);",       "mul(viewProjMatrix, position)" },
+    { "foliage.hlsl",     "farm_vs",      "void farm_vs",      "TEXCOORD5,", "oPosition = mul(viewProjMatrix, float4(finalPos, 1));", "mul(viewProjMatrix, float4(finalPos, 1))" },   // crops
+    { "character.hlsl",   "severed_limb_vs","void severed_limb_vs","TEXCOORD5,","oPosition = mul(worldViewProjMatrix, position);","mul(worldViewProjMatrix, position)" },
+};
+static const PSpec kPSpecs[] = {
+    { "objects.hlsl",    "main_ps",       "void main_ps",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
+    { "terrain.hlsl",    "simple_fs",     "void simple_fs",     "TEXCOORD1,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // LOD terrain
+    { "terrainfp4.hlsl", "main_fs",       "void main_fs",       "TEXCOORD1,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // near terrain (pairs w/ terrain.hlsl main_vs)
+    { "terrainfp4.hlsl", "mapfeature_fs", "void mapfeature_fs", "TEXCOORD4,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // pairs w/ mapfeature feature_vs
+    { "triplanar.hlsl",  "triplanar_ps",  "void triplanar_ps",  "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
+    { "mapfeature.hlsl", "terrain_fs",    "void terrain_fs",    "TEXCOORD4,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
+    { "skin.hlsl",       "main_fs",       "void main_fs",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // skinned clothes
+    { "distant_town.hlsl","main_fs",      "void main_fs",       "TEXCOORD2,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
+    { "foliage.hlsl",    "grass_fs",      "void grass_fs",      "TEXCOORD1,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // grass
+    { "foliage.hlsl",    "foliage_fs",    "void foliage_fs",    "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // crops (farm_vs)
+    { "character.hlsl",  "main_fs",       "void main_fs",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // character body (skin.hlsl main_vs)
+    { "character.hlsl",  "hair_fs",       "void hair_fs",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
+    { "character.hlsl",  "zero_fs",       "void zero_fs",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
+    { "character.hlsl",  "distant_fs",    "void distant_fs",    "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
+    { "character.hlsl",  "severed_limb_fs","void severed_limb_fs","TEXCOORD5,","out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
+};
+
+// skin.hlsl main_vs needs TRUE animation MVs, not camera reproj: skin the vertex a second time with
+// the PREVIOUS frame's bone palette (dust_prevBones) and previous VP (dust_prevVP), both from a CB at
+// b12 (b13 is reproj; SM4 has no b14+). WEIGHTS=3, bones row-major (48B) — mirror skin.hlsl exactly.
+static std::string InjSkinVS(const std::string& src)
+{
+    if (Has(src, "oDustPrev")) return src;
+    std::string s = src;
+    size_t fn = s.find("void main_vs");
+    if (fn == std::string::npos) return src;
+    s.insert(fn, "cbuffer DustPrevCB : register(b12) { row_major float3x4 dust_prevBones[60]; row_major float4x4 dust_prevVP; };\n"
+                 "cbuffer DustMVCB : register(b13) { column_major float4x4 dust_reproj; };\n");
+    size_t from = s.find("void main_vs");
+    if (from == std::string::npos) return src;
+    if (!InsAfter(s, from, "TEXCOORD5,", "\n\tout float4 oDustCur : TEXCOORD12,\n\tout float4 oDustPrev : TEXCOORD13,")) return src;
+    std::string prev =
+        "\n\toDustCur = mul(viewProjectionMatrix, blendPos);"
+        "\n\tfloat4 dmvPrev = float4(0,0,0,0);"
+        "\n\t[unroll] for (int dmvI = 0; dmvI < 3; dmvI++) dmvPrev += float4(mul(dust_prevBones[blendIdx[dmvI]], position).xyz, 1.0) * blendWgt[dmvI];"
+        "\n\toDustPrev = mul(dust_prevVP, dmvPrev);"
+        // No prev pose bound this draw (first frame / unmatched / OGRE's reflected zero-buffer at b12)
+        // => dust_prevVP is all-zero => fall back to CAMERA REPROJECTION (b13), not zero: a missed match
+        // then looks like the character just didn't animate that frame (subtle) instead of didn't move at
+        // all (a jarring flash under camera motion). Correct for a still character; ~right when moving.
+        "\n\tif (dot(dust_prevVP._m30_m31_m32_m33, dust_prevVP._m30_m31_m32_m33) == 0.0) oDustPrev = mul(dust_reproj, oDustCur);";
+    if (!InsAfter(s, from, "oPosition = mul(viewProjectionMatrix, blendPos);", prev)) return src;
+    return s;
+}
+
+// foliage.hlsl grass_vs sways the top verts by direction*sin(time + x*frequency). Camera reprojection
+// alone gives ~0 MV for a still camera, so the swaying grass over-accumulates in the upscaler and blurs.
+// Inject TRUE wind MVs: recompute the sway at the PREVIOUS frame's time (the shader's own `time` uniform
+// minus dust_windDelta, the host's frame-time delta riding in the b13 CB after dust_reproj), build that
+// previous clip position, then camera-reproject it. dmvPrev mirrors grass_vs's own position math exactly.
+static std::string InjGrassVS(const std::string& src)
+{
+    if (Has(src, "oDustPrev")) return src;
+    std::string s = src;
+    size_t fn = s.find("void grass_vs");
+    if (fn == std::string::npos) return src;
+    s.insert(fn, "cbuffer DustMVCB : register(b13) { column_major float4x4 dust_reproj; float dust_windDelta; };\n");
+    size_t from = s.find("void grass_vs");
+    if (from == std::string::npos) return src;
+    if (!InsAfter(s, from, "TEXCOORD1,", "\n\tout float4 oDustCur : TEXCOORD12,\n\tout float4 oDustPrev : TEXCOORD13,")) return src;
+    std::string prev =
+        "\n\toDustCur = mul(worldViewProj, position);"
+        "\n\tfloat4 dmvPrev = iPosition;"
+        "\n\tif (iTexCoord.y == 0.0f) dmvPrev.xyz += direction * sin(time - dust_windDelta + iPosition.x * frequency);"
+        "\n\tdmvPrev.y -= grassHeight * clamp(offset, 0, 1);"   // same distance fade as the current position
+        "\n\toDustPrev = mul(dust_reproj, mul(worldViewProj, dmvPrev));";
+    if (!InsAfter(s, from, "oPosition = mul(worldViewProj, position);", prev)) return src;
+    return s;
+}
+
+static std::string InjectGBufferVS(const std::string& src, const char* entry, const char* srcName)
+{
+    if (!srcName) return src;
+    if (strcmp(entry, "main_vs") == 0 && Has(srcName, "skin.hlsl")) return InjSkinVS(src);   // true anim MVs
+    if (strcmp(entry, "grass_vs") == 0 && Has(srcName, "foliage.hlsl")) return InjGrassVS(src);   // wind MVs
+    for (const VSpec& v : kVSpecs)
+        if (strcmp(entry, v.entry) == 0 && Has(srcName, v.srcFile))
+            return InjVS(src, v.fnAnchor, v.interp, v.clipAssign, v.clipRHS);
+    return src;
+}
+static std::string InjectGBufferPS(const std::string& src, const char* entry, const char* srcName)
+{
+    if (!srcName) return src;
+    for (const PSpec& ps : kPSpecs)
+        if (strcmp(entry, ps.entry) == 0 && Has(srcName, ps.srcFile))
+            return InjPS(src, ps.fnAnchor, ps.interp, ps.gbufOut, ps.body);
+    return src;
+}
+
 HRESULT WINAPI HookedD3DCompile(
     LPCVOID pSrcData, SIZE_T SrcDataSize, LPCSTR pSourceName,
     const D3D_SHADER_MACRO* pDefines, ID3DInclude* pInclude,
@@ -681,6 +850,7 @@ HRESULT WINAPI HookedD3DCompile(
         return oD3DCompile(pSrcData, SrcDataSize, pSourceName,
                             pDefines, pInclude, pEntrypoint, pTarget,
                             Flags1, Flags2, ppCode, ppErrorMsgs);
+
 
     // Detect the deferred lighting pixel shader: entry point is "main_fs"
     // and source contains deferred-specific identifiers.
@@ -765,39 +935,38 @@ HRESULT WINAPI HookedD3DCompile(
         }
     }
 
-    // Detect objects shader for foliage alpha fix: entry point is "main_ps"
-    // and source contains the vanilla hard-cutoff alpha test.
-    if (pEntrypoint && pSrcData && SrcDataSize > 0 &&
-        strcmp(pEntrypoint, "main_ps") == 0)
+    // Inject per-object motion vectors into GBuffer shaders (velocity -> SV_Target3). Table-driven:
+    // InjectGBufferVS/PS only rewrite when a shader's anchors match (see kVSpecs/kPSpecs), so all
+    // unrelated shaders pass straight through. The objects foliage-alpha fix composes with the PS.
+    if (pEntrypoint && pTarget && pSrcData && SrcDataSize > 0 && (pTarget[0] == 'v' || pTarget[0] == 'p'))
     {
+        bool isVS = pTarget[0] == 'v';
         std::string src((const char*)pSrcData, SrcDataSize);
-        if (src.find("clip(normalTex.a - threshold)") != std::string::npos &&
-            src.find("DustStabilizeThreshold") == std::string::npos)
+        std::string patched = src;
+        if (!isVS && patched.find("clip(normalTex.a - threshold)") != std::string::npos &&
+            patched.find("DustStabilizeThreshold") == std::string::npos)
+            patched = PatchObjectsShader(patched);
+        patched = isVS ? InjectGBufferVS(patched, pEntrypoint, pSourceName) : InjectGBufferPS(patched, pEntrypoint, pSourceName);
+        if (patched != src)
         {
-            std::string patched = PatchObjectsShader(src);
-            if (patched.size() != src.size())
+            HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
+                                      pDefines, pInclude, pEntrypoint, pTarget,
+                                      Flags1, Flags2, ppCode, ppErrorMsgs);
+            if (SUCCEEDED(hr))
             {
-                Log("ShaderPatch: patched objects main_ps (%zu -> %zu bytes)",
-                    src.size(), patched.size());
-                HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
-                                          pDefines, pInclude, pEntrypoint, pTarget,
-                                          Flags1, Flags2, ppCode, ppErrorMsgs);
-                if (SUCCEEDED(hr))
-                {
-                    if (ppCode && *ppCode)
-                        SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
-                            pEntrypoint, pTarget, pSourceName,
-                            (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
-                    return hr;
-                }
-
-                Log("ShaderPatch: patched objects shader failed to compile, falling back");
-                if (ppErrorMsgs && *ppErrorMsgs)
-                {
-                    Log("ShaderPatch: error: %s", (const char*)(*ppErrorMsgs)->GetBufferPointer());
-                    (*ppErrorMsgs)->Release();
-                    *ppErrorMsgs = nullptr;
-                }
+                Log("ShaderPatch: injected MV into %s %s (%zu -> %zu)",
+                    pSourceName ? pSourceName : "?", pEntrypoint, src.size(), patched.size());
+                if (ppCode && *ppCode)
+                    SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
+                        pEntrypoint, pTarget, pSourceName,
+                        (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+                return hr;
+            }
+            Log("ShaderPatch: MV inject failed to compile (%s), falling back", pEntrypoint);
+            if (ppErrorMsgs && *ppErrorMsgs)
+            {
+                Log("ShaderPatch: error: %s", (const char*)(*ppErrorMsgs)->GetBufferPointer());
+                (*ppErrorMsgs)->Release(); *ppErrorMsgs = nullptr;
             }
         }
     }

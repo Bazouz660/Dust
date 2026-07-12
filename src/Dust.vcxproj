@@ -87,6 +87,46 @@
       <AdditionalDependencies>KenshiLib.lib;d3d11.lib;dxgi.lib;d3dcompiler.lib;dinput8.lib;dxguid.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
+  <!-- DLSS/NGX: only wired in when the SDK is present (external/DLSS is gitignored). When absent,
+       DUST_HAVE_DLSS stays undefined so Upscaler.cpp compiles to stubs and the repo still builds.
+       Fetch the SDK with a shallow git clone of github.com/NVIDIA/DLSS into external/DLSS. -->
+  <PropertyGroup>
+    <HaveDlss Condition="Exists('$(ProjectDir)..\external\DLSS\include\nvsdk_ngx.h')">true</HaveDlss>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(HaveDlss)'=='true'">
+    <ClCompile>
+      <PreprocessorDefinitions>DUST_HAVE_DLSS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\external\DLSS\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(ProjectDir)..\external\DLSS\lib\Windows_x86_64\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(HaveDlss)'=='true' And '$(Configuration)'=='Release'">
+    <Link>
+      <AdditionalDependencies>nvsdk_ngx_d.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(HaveDlss)'=='true' And '$(Configuration)'=='Debug'">
+    <Link>
+      <AdditionalDependencies>nvsdk_ngx_d_dbg.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <!-- FSR2 native-D3D11 backend (optiscaler/FidelityFX-FSR2-DX11). Absent => DUST_HAVE_FSR2 undefined =>
+       UpscalerFSR2.cpp compiles to stubs. Build libs: external/FSR2-DX11/build BuildLibs (DX11). -->
+  <PropertyGroup>
+    <HaveFsr2 Condition="Exists('$(ProjectDir)..\external\FSR2-DX11\src\ffx-fsr2-api\bin\ffx_fsr2_api\ffx_fsr2_api_dx11_x64.lib')">true</HaveFsr2>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(HaveFsr2)'=='true'">
+    <ClCompile>
+      <PreprocessorDefinitions>DUST_HAVE_FSR2;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\external\FSR2-DX11\src\ffx-fsr2-api;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(ProjectDir)..\external\FSR2-DX11\src\ffx-fsr2-api\bin\ffx_fsr2_api;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>ffx_fsr2_api_x64.lib;ffx_fsr2_api_dx11_x64.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="BugReport.cpp" />
@@ -104,6 +144,12 @@
     <ClCompile Include="SurveyRecorder.cpp" />
     <ClCompile Include="SurveyWriter.cpp" />
     <ClCompile Include="ShaderPatch.cpp" />
+    <ClCompile Include="ShaderMetadata.cpp" />
+    <ClCompile Include="GeometryCapture.cpp" />
+    <ClCompile Include="MotionVectors.cpp" />
+    <ClCompile Include="Upscaler.cpp" />
+    <ClCompile Include="UpscalerFSR2.cpp" />
+    <ClCompile Include="CameraAccess.cpp" />
     <ClCompile Include="PssmDetour.cpp" />
     <ClCompile Include="imgui\imgui.cpp" />
     <ClCompile Include="imgui\imgui_draw.cpp" />
@@ -129,6 +175,11 @@
     <ClInclude Include="SurveyRecorder.h" />
     <ClInclude Include="SurveyWriter.h" />
     <ClInclude Include="ShaderPatch.h" />
+    <ClInclude Include="ShaderMetadata.h" />
+    <ClInclude Include="GeometryCapture.h" />
+    <ClInclude Include="MotionVectors.h" />
+    <ClInclude Include="CameraAccess.h" />
+    <ClInclude Include="tracy\Tracy.hpp" />
     <ClInclude Include="PssmDetour.h" />
     <ClInclude Include="imgui\imgui.h" />
     <ClInclude Include="imgui\backends\imgui_impl_win32.h" />

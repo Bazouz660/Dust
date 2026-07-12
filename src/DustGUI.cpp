@@ -6,6 +6,9 @@
 #include "Survey.h"
 #include "SurveyRecorder.h"
 #include "BugReport.h"
+#include "UpscalerControl.h"
+#include "Upscaler.h"
+#include "MotionVectors.h"
 #include "imgui/imgui.h"
 #include "imgui/backends/imgui_impl_win32.h"
 #include "imgui/backends/imgui_impl_dx11.h"
@@ -778,6 +781,70 @@ static bool IsFrameworkDirty()
 }
 
 // ==================== Drawing: Framework pane ====================
+
+static void DrawUpscalingSection()
+{
+    ImGui::TextColored(DustHeadingColor(), "Upscaling");
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // One selector = enable + backend: Disabled / DLSS / FSR2. Selecting a backend turns it on; there is
+    // no separate on/off checkbox. Switching rebuilds the pipeline next frame.
+    int sel = !UpscalerControl::GetEnabled() ? 0 : (UpscalerControl::GetBackend() == 1 ? 2 : 1);
+    const char* items[] = { "Disabled", "DLSS", "FSR2" };
+    if (ImGui::Combo("##upscaler", &sel, items, 3))
+    {
+        bool en      = (sel != 0);
+        int  backend = (sel == 2) ? 1 : 0;
+        UpscalerControl::SetEnabled(en);
+        UpscalerControl::SetBackend(backend);
+        WritePrivateProfileStringA("Upscaling", "DLSS",    en ? "1" : "0",            gDustIniPath.c_str());
+        WritePrivateProfileStringA("Upscaling", "Backend", backend == 1 ? "1" : "0", gDustIniPath.c_str());
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Temporal anti-aliasing / upscaling. DLSS = NVIDIA RTX only (best quality). FSR2 = any GPU. Disabled = off.");
+
+    if (sel == 1 && !UpscalerControl::Available())
+        ImGui::TextDisabled("DLSS unavailable (needs NVIDIA RTX + recent driver)");
+
+    if (sel != 0)
+    {
+        if (sel == 1)   // DLSS-only: model preset (FSR2 has no presets)
+        {
+            int preset = UpscalerControl::GetPreset();
+            if (ImGui::Combo("Preset", &preset, Upscaler::PresetLabels(), Upscaler::PRESET_COUNT))
+            {
+                UpscalerControl::SetPreset(preset);
+                char b[8]; snprintf(b, sizeof(b), "%d", preset);
+                WritePrivateProfileStringA("Upscaling", "DLSSPreset", b, gDustIniPath.c_str());
+            }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("DLSS model. F = CNN DLAA (recommended). K/J are the DLSS-4 transformer: sharpest in theory, but blur the whole image when the scene is static in this integration. Changing it rebuilds the feature next frame.");
+        }
+
+        float sh = UpscalerControl::GetSharpness();
+        if (ImGui::SliderFloat("Sharpness", &sh, 0.0f, 1.0f, "%.2f"))
+        {
+            UpscalerControl::SetSharpness(sh);
+            char b[8]; snprintf(b, sizeof(b), "%d", (int)(sh * 100.0f + 0.5f));
+            WritePrivateProfileStringA("Upscaling", "DLSSSharpness", b, gDustIniPath.c_str());
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Contrast-limited sharpen (RCAS) on the upscaled output — adds detail without Clarity's contrast/halo boost. Higher values can reintroduce some aliasing.");
+    }
+
+    ImGui::Spacing();
+    {
+        bool mv = MotionVectors::DebugVizEnabled();
+        if (ImGui::Checkbox("Show Motion Vectors", &mv))
+        {
+            MotionVectors::SetDebugViz(mv);
+            WritePrivateProfileStringA("Upscaling", "ShowMotionVectors", mv ? "1" : "0", gDustIniPath.c_str());
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Debug overlay of the motion-vector buffer: grey = still, colour = motion dir/magnitude, red = no MV.\nWatch grass/foliage while moving — if it stays grey while swaying, it has no valid MV and will ghost under DLSS (that's what a reactive mask would fix).");
+    }
+}
 
 static void DrawFrameworkSection()
 {
@@ -2069,6 +2136,12 @@ void Render()
 
         // Framework settings
         DrawFrameworkSection();
+
+        ImGui::Spacing();
+        ImGui::Spacing();
+
+        // Upscaling (DLSS) + motion-vector debug
+        DrawUpscalingSection();
 
         ImGui::Spacing();
         ImGui::Spacing();

@@ -54,6 +54,11 @@ Copy-Item "$Root\src\build\Release\Dust.dll"  "$ModDir\"
 Copy-Item "$Root\mod\RE_Kenshi.json"          "$ModDir\"
 Copy-Item "$Root\mod\Dust.mod"                "$ModDir\"
 
+# DLSS runtime model — only when the NGX SDK is vendored (external/DLSS is gitignored). NGX loads it
+# from the mod dir via the path Upscaler::Init passes.
+$NgxDll = "$Root\external\DLSS\lib\Windows_x86_64\rel\nvngx_dlss.dll"
+if (Test-Path $NgxDll) { Copy-Item $NgxDll "$ModDir\"; Write-Host "    + nvngx_dlss.dll (DLSS runtime)" -ForegroundColor DarkGray }
+
 foreach ($effect in $Effects) {
     $dll = Get-ChildItem "$Root\effects\$effect\build\Release\Dust*.dll" | Select-Object -First 1
     Copy-Item $dll.FullName "$ModDir\effects\"
