@@ -14,6 +14,16 @@ namespace FrameGen
 {
     bool IsWanted();   // [Upscaling] FrameGen=1 (read from DustBoot)
 
+    // True while we're inside a takeover — i.e. our own gSwap->Present is re-entering the shared-vtable
+    // Present hook. The Present hook must skip ALL its per-present work (GUI build + input + takeover) on
+    // that nested call, or the GUI + input run twice per frame (double input cancels toggles).
+    bool InTakeover();
+
+    // The REAL game window a redirected swap chain was meant for. The GUI/input must hook this, not the
+    // swap chain's OutputWindow (which under frame gen is the hidden redirect window that has no focus).
+    // Returns null if this swap chain wasn't redirected / frame gen is off.
+    HWND RealHwndFor(IDXGISwapChain* swapChain);
+
     // Called from the game's Present hook, after the GUI is drawn onto the game's backbuffer. Copies the
     // game's frame across to our D3D12 swap chain on the real HWND and presents it. Returns true once it
     // has taken over presentation (so the caller can present the game's own swap chain harmlessly/fast).

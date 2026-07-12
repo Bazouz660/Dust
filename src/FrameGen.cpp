@@ -92,6 +92,15 @@ bool IsWanted()
     return gBootWanted && gBootWanted();
 }
 
+bool InTakeover() { return gInPresent; }
+
+HWND RealHwndFor(IDXGISwapChain* swapChain)
+{
+    ResolveBoot();
+    if (!gBootWanted || !gBootWanted() || !gBootLookup || !swapChain) return nullptr;
+    return gBootLookup(swapChain);
+}
+
 bool PresentTakeover(ID3D11Device* /*devIgnored*/, ID3D11DeviceContext* /*ctxIgnored*/,
                      IDXGISwapChain* gameSwapChain, uint32_t syncInterval)
 {

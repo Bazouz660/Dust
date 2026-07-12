@@ -2415,12 +2415,21 @@ static void TickGuiOnPresent(IDXGISwapChain* swapChain, const char* via)
 static HRESULT STDMETHODCALLTYPE HookedPresent(
     IDXGISwapChain* pThis, UINT SyncInterval, UINT Flags)
 {
+    // Skip our own gSwap->Present re-entering here — otherwise the GUI build + input run twice per frame.
+    if (FrameGen::IsWanted() && FrameGen::InTakeover())
+        return oPresent(pThis, SyncInterval, Flags);
+
     if (!gShutdownSignaled) TickGuiOnPresent(pThis, "Present");
     // Frame-gen present-takeover: after the GUI is drawn, present the frame through our D3D12 swap chain
     // on the real HWND; the game's own swap chain (now on a hidden window) presents fast + invisibly.
-    if (!gShutdownSignaled && FrameGen::IsWanted() &&
-        FrameGen::PresentTakeover(gDevice, gContext, pThis, SyncInterval))
-        return oPresent(pThis, 0, Flags);
+    if (!gShutdownSignaled && FrameGen::IsWanted())
+    {
+        bool took = FrameGen::PresentTakeover(gDevice, gContext, pThis, SyncInterval);
+        static void* sLastSC = nullptr; static int sLastTook = -1;
+        if ((void*)pThis != sLastSC || (int)took != sLastTook)
+        { sLastSC = pThis; sLastTook = took; Log("FG-diag: Present on swapchain %p takeover=%d", (void*)pThis, (int)took); }
+        if (took) return oPresent(pThis, 0, Flags);
+    }
     return oPresent(pThis, SyncInterval, Flags);
 }
 
@@ -2428,6 +2437,9 @@ static HRESULT STDMETHODCALLTYPE HookedPresent1(
     IDXGISwapChain1* pThis, UINT SyncInterval, UINT PresentFlags,
     const DXGI_PRESENT_PARAMETERS* pPresentParameters)
 {
+    if (FrameGen::IsWanted() && FrameGen::InTakeover())
+        return oPresent1(pThis, SyncInterval, PresentFlags, pPresentParameters);
+
     if (!gShutdownSignaled) TickGuiOnPresent(pThis, "Present1");
     if (!gShutdownSignaled && FrameGen::IsWanted() &&
         FrameGen::PresentTakeover(gDevice, gContext, pThis, SyncInterval))
@@ -2440,6 +2452,8 @@ static HRESULT STDMETHODCALLTYPE HookedResizeBuffers(
     DXGI_FORMAT NewFormat, UINT SwapChainFlags)
 {
     if (gShutdownSignaled) return oResizeBuffers(pThis, BufferCount, Width, Height, NewFormat, SwapChainFlags);
+
+    if (FrameGen::IsWanted()) Log("FG-diag: ResizeBuffers on swapchain %p -> %ux%u", (void*)pThis, Width, Height);
 
     // Block Render() while we tear down and recreate the back buffer
     DustGUI::SetResizeInProgress(true);
