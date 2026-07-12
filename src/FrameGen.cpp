@@ -1,6 +1,7 @@
 #include "FrameGen.h"
 #include "DustLog.h"
 #include "D3D12Interop.h"
+#include "CameraAccess.h"
 
 #include <d3d11_4.h>
 #include <d3d12.h>
@@ -80,6 +81,100 @@ namespace
         if (!gFfxCreate || !gFfxDispatch || !gFfxDestroy) { Log("FrameGen: ffx-api entry points missing"); return false; }
         gFfxLoaded = true;
         Log("FrameGen: ffx-api FG runtime loaded");
+        return true;
+    }
+
+    // --- FrameGeneration context (interpolation) + per-frame inputs ---
+    ffxContext    gFgContext = nullptr;
+    bool          gFgTried   = false;
+    uint64_t      gFrameID   = 0;
+    LARGE_INTEGER gQpcFreq = {}, gQpcPrev = {};
+    // Depth + motion vectors marshaled D3D11 -> D3D12 (like the colour), for the FG prepare dispatch.
+    ID3D11Texture2D* gShDepth11 = nullptr; ID3D12Resource* gShDepth12 = nullptr;
+    ID3D11Texture2D* gShMV11    = nullptr; ID3D12Resource* gShMV12    = nullptr;
+    DXGI_FORMAT      gDepthFmt = DXGI_FORMAT_UNKNOWN, gMvFmt = DXGI_FORMAT_UNKNOWN;
+
+    // The FG swapchain calls this during Present to dispatch interpolation on its own command list.
+    ffxReturnCode_t FgGenCallback(ffxDispatchDescFrameGeneration* params, void* userCtx)
+    {
+        ffxReturnCode_t rc = gFfxDispatch((ffxContext*)userCtx, &params->header);
+        static int sN = 0;
+        if (sN < 3) { sN++; Log("FrameGen: FG generation callback FIRED (numGenerated=%u, dispatch rc=%u)", params->numGeneratedFrames, rc); }
+        return rc;
+    }
+
+    bool EnsureFgContext(UINT w, UINT h, DXGI_FORMAT fmt)
+    {
+        if (gFgTried) return gFgContext != nullptr;
+        gFgTried = true;
+        ID3D12Device* dev = D3D12Interop::GetDevice();
+        if (!dev || !gFfxCreate) return false;
+
+        ffxCreateBackendDX12Desc backend = {};
+        backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
+        backend.device      = dev;
+
+        ffxCreateContextDescFrameGeneration createFg = {};
+        createFg.header.type      = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
+        createFg.header.pNext     = &backend.header;
+        createFg.displaySize      = { w, h };
+        createFg.maxRenderSize    = { w, h };   // render == display (Dust's FG doesn't upscale)
+        createFg.backBufferFormat = ffxApiGetSurfaceFormatDX12(fmt);
+        createFg.flags            = 0;          // Kenshi depth 0=near (not inverted); post-tonemap LDR
+
+        ffxReturnCode_t rc = gFfxCreate(&gFgContext, &createFg.header, nullptr);
+        if (rc != FFX_API_RETURN_OK) { Log("FrameGen: FrameGeneration context create failed (%u)", rc); gFgContext = nullptr; return false; }
+        Log("FrameGen: FrameGeneration context created (%ux%u) — interpolation ready", w, h);
+        return true;
+    }
+
+    // FSR debug tear/pacing lines on generated frames — [Upscaling] FrameGenDebug=1 (default off).
+    uint32_t gFgFlags = 0; bool gFgFlagsRead = false;
+    uint32_t FgDebugFlags()
+    {
+        if (!gFgFlagsRead)
+        {
+            gFgFlagsRead = true;
+            if (GetPrivateProfileIntA("Upscaling", "FrameGenDebug", 0, (DustLogDir() + "Dust.ini").c_str()))
+                gFgFlags = FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES | FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_PACING_LINES;
+        }
+        return gFgFlags;
+    }
+
+    float FrameDeltaMs()
+    {
+        if (gQpcFreq.QuadPart == 0) QueryPerformanceFrequency(&gQpcFreq);
+        LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        float ms = 16.7f;
+        if (gQpcPrev.QuadPart && gQpcFreq.QuadPart) ms = (float)((now.QuadPart - gQpcPrev.QuadPart) * 1000.0 / gQpcFreq.QuadPart);
+        gQpcPrev = now;
+        return (ms < 1.0f) ? 1.0f : (ms > 200.0f ? 200.0f : ms);
+    }
+
+    bool TexDesc2D(ID3D11Resource* r, D3D11_TEXTURE2D_DESC& out)
+    {
+        if (!r) return false;
+        ID3D11Texture2D* t = nullptr;
+        r->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&t);
+        if (!t) return false;
+        t->GetDesc(&out); t->Release();
+        return true;
+    }
+
+    // Shared depth + MV textures matching the game buffers (created once for the current size/format).
+    UINT gMotionW = 0, gMotionH = 0;
+    bool EnsureMotionTextures(ID3D11Resource* depth, ID3D11Resource* mv)
+    {
+        D3D11_TEXTURE2D_DESC dd, md;
+        if (!TexDesc2D(depth, dd) || !TexDesc2D(mv, md)) return false;
+        if (gShDepth11 && gShMV11 && dd.Format == gDepthFmt && md.Format == gMvFmt &&
+            dd.Width == gMotionW && dd.Height == gMotionH) return true;
+        SafeRelease(gShDepth11); SafeRelease(gShDepth12); SafeRelease(gShMV11); SafeRelease(gShMV12);
+        if (!D3D12Interop::CreateSharedTexture(dd.Width, dd.Height, (uint32_t)dd.Format, &gShDepth11, &gShDepth12)) return false;
+        if (!D3D12Interop::CreateSharedTexture(md.Width, md.Height, (uint32_t)md.Format, &gShMV11, &gShMV12))
+        { SafeRelease(gShDepth11); SafeRelease(gShDepth12); return false; }
+        gDepthFmt = dd.Format; gMvFmt = md.Format; gMotionW = dd.Width; gMotionH = dd.Height;
+        Log("FrameGen: depth(%d)+MV(%d) marshaling textures ready (%ux%u)", (int)dd.Format, (int)md.Format, dd.Width, dd.Height);
         return true;
     }
 #endif
@@ -175,8 +270,8 @@ HWND RealHwndFor(IDXGISwapChain* swapChain)
     return gBootLookup(swapChain);
 }
 
-bool PresentTakeover(ID3D11Device* /*devIgnored*/, ID3D11DeviceContext* /*ctxIgnored*/,
-                     IDXGISwapChain* gameSwapChain, uint32_t syncInterval)
+bool PresentTakeover(IDXGISwapChain* gameSwapChain, uint32_t syncInterval,
+                     ID3D11Resource* depth, ID3D11Resource* motionVectors)
 {
     ResolveBoot();
     if (gInPresent || !gBootWanted || !gBootWanted() || !gameSwapChain) return false;
@@ -191,22 +286,19 @@ bool PresentTakeover(ID3D11Device* /*devIgnored*/, ID3D11DeviceContext* /*ctxIgn
     gInPresent = true;
     struct PresentGuard { ~PresentGuard() { gInPresent = false; } } presentGuard;
 
-    // Get the device + immediate context straight from the swap chain — do NOT depend on Dust's POST_LIGHTING
-    // device capture, which hasn't happened yet at menu time (the earlier chicken-and-egg black screen).
+    // Device + immediate context straight from the swap chain (works at menu time, no capture dependency).
     ID3D11Device* dev = nullptr;
     gameSwapChain->GetDevice(__uuidof(ID3D11Device), (void**)&dev);
     if (!dev) return false;
     ID3D11DeviceContext* ctx = nullptr;
     dev->GetImmediateContext(&ctx);
     if (!ctx) { dev->Release(); return false; }
-    // Release dev+ctx (both AddRef'd above) on every exit path.
     struct Rel { ID3D11Device* d; ID3D11DeviceContext* c; ~Rel() { if (c) c->Release(); if (d) d->Release(); } } rel{ dev, ctx };
 
     if (!gInitTried)
     {
         gInitTried = true;
         if (!D3D12Interop::IsReady() && !D3D12Interop::Init(dev)) { Log("FrameGen: D3D12 side-device unavailable"); return false; }
-
         ID3D11Texture2D* bb = nullptr;
         gameSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&bb);
         if (!bb) { Log("FrameGen: GetBuffer(game) failed"); return false; }
@@ -216,21 +308,29 @@ bool PresentTakeover(ID3D11Device* /*devIgnored*/, ID3D11DeviceContext* /*ctxIgn
     }
     if (!gReady || !gSwap) return false;
 
-    // The game's just-rendered backbuffer (the GUI was drawn onto it right before this present).
     ID3D11Texture2D* gameBB = nullptr;
     gameSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**)&gameBB);
     if (!gameBB) return false;
-
     if (!gShared11 && !D3D12Interop::CreateSharedTexture(gW, gH, (uint32_t)gFmt, &gShared11, &gShared12))
     { gameBB->Release(); return false; }
 
-    // D3D11: copy the game frame into the shared bridge texture, then run the fence-synced D3D12 work.
+    // Whether frame interpolation runs this frame: we have depth + MV and the FG context is up.
+    bool fgActive = false;
+#ifdef DUST_HAVE_FSR3
+    fgActive = depth && motionVectors && EnsureMotionTextures(depth, motionVectors) && EnsureFgContext(gW, gH, gFmt);
+#endif
+
+    // D3D11: marshal the game frame (+ depth/MV) into the shared bridge textures.
     ctx->CopyResource(gShared11, gameBB);
     gameBB->Release();
+#ifdef DUST_HAVE_FSR3
+    if (fgActive) { ctx->CopyResource(gShDepth11, depth); ctx->CopyResource(gShMV11, motionVectors); }
+#endif
 
     ID3D12GraphicsCommandList* list = D3D12Interop::BeginD3D12Work(ctx);
     if (!list) return false;
 
+    // Copy the game frame into the FG swap chain's current backbuffer (the "real" present frame).
     UINT idx = gSwap->GetCurrentBackBufferIndex();
     ID3D12Resource* scBB = nullptr;
     gSwap->GetBuffer(idx, __uuidof(ID3D12Resource), (void**)&scBB);
@@ -244,10 +344,59 @@ bool PresentTakeover(ID3D11Device* /*devIgnored*/, ID3D11DeviceContext* /*ctxIgn
         Transition(gShared12, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     }
 
-    D3D12Interop::SubmitD3D12Work(ctx);   // executes the copy on the present queue
+#ifdef DUST_HAVE_FSR3
+    // FG prepare: dilate depth + MV (feeds the interpolation the swap chain runs during Present).
+    if (fgActive)
+    {
+        ffxDispatchDescFrameGenerationPrepareV2 prep = {};
+        prep.header.type   = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
+        prep.commandList   = list;
+        prep.flags         = FgDebugFlags();
+        prep.frameID       = gFrameID;
+        prep.renderSize    = { gMotionW, gMotionH };
+        prep.depth         = ffxApiGetResourceDX12(gShDepth12, FFX_API_RESOURCE_STATE_COMMON);
+        prep.motionVectors = ffxApiGetResourceDX12(gShMV12,    FFX_API_RESOURCE_STATE_COMMON);
+        prep.jitterOffset      = { 0.0f, 0.0f };                       // Dust's injected MVs are jitter-free
+        prep.motionVectorScale = { -(float)gMotionW, -(float)gMotionH };// our MV = curUV-prevUV -> pixels (neg, like DLSS)
+        prep.frameTimeDelta    = FrameDeltaMs();
+        float camN = 0, camF = 0, camFov = 0; CameraAccess_GetCameraParams(&camN, &camF, &camFov);
+        prep.cameraNear = camN; prep.cameraFar = camF; prep.cameraFovAngleVertical = camFov;
+        prep.viewSpaceToMetersFactor = 0.0f;
+        prep.reset = false;
+        ffxReturnCode_t rcPrep = gFfxDispatch(&gFgContext, &prep.header);
+        static int sPrepN = 0;
+        if (rcPrep != FFX_API_RETURN_OK && sPrepN < 3) { sPrepN++; Log("FrameGen: FG prepare dispatch FAILED (%u)", rcPrep); }
+    }
+#endif
+
+    D3D12Interop::SubmitD3D12Work(ctx);   // executes copy + FG prepare on the present queue
     SafeRelease(scBB);
 
-    gSwap->Present(syncInterval, 0);      // GPU-ordered after the copy on the same queue
+#ifdef DUST_HAVE_FSR3
+    // Configure FG for this present (the swap chain's Present then generates the in-between frame).
+    if (fgActive)
+    {
+        ffxConfigureDescFrameGeneration cfg = {};
+        cfg.header.type                        = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+        cfg.swapChain                          = gSwap;
+        cfg.frameGenerationEnabled             = true;
+        cfg.frameGenerationCallback            = FgGenCallback;
+        cfg.frameGenerationCallbackUserContext = &gFgContext;
+        cfg.presentCallback                    = nullptr;   // D.3.1c: UI composition (HUD-less)
+        cfg.presentCallbackUserContext         = nullptr;
+        cfg.HUDLessColor                       = FfxApiResource{};
+        cfg.flags                              = FgDebugFlags();
+        cfg.onlyPresentGenerated               = false;
+        cfg.generationRect                     = { 0, 0, (int32_t)gW, (int32_t)gH };
+        cfg.frameID                            = gFrameID;
+        ffxReturnCode_t rcCfg = gFfxConfigure(&gFgContext, &cfg.header);
+        static int sCfgN = 0;
+        if (sCfgN < 5) { sCfgN++; Log("FrameGen: FG configure rc=%u (swapChain=%p frameID=%llu)", rcCfg, (void*)gSwap, (unsigned long long)gFrameID); }
+        gFrameID++;   // increment only on FG frames -> exact +1 per generated frame (FFX requirement)
+    }
+#endif
+
+    gSwap->Present(syncInterval, 0);      // FG swap chain interpolates + paces (GPU-ordered after the copy)
     return true;
 }
 
@@ -256,7 +405,10 @@ void Shutdown()
     SafeRelease(gShared11);
     SafeRelease(gShared12);
 #ifdef DUST_HAVE_FSR3
-    if (gSwapChainCtx && gFfxDestroy) { gFfxDestroy(&gSwapChainCtx, nullptr); gSwapChainCtx = nullptr; gSwap = nullptr; }
+    SafeRelease(gShDepth11); SafeRelease(gShDepth12);
+    SafeRelease(gShMV11);    SafeRelease(gShMV12);
+    if (gFgContext && gFfxDestroy)      { gFfxDestroy(&gFgContext, nullptr);   gFgContext = nullptr; }
+    if (gSwapChainCtx && gFfxDestroy)   { gFfxDestroy(&gSwapChainCtx, nullptr); gSwapChainCtx = nullptr; gSwap = nullptr; }
 #endif
     SafeRelease(gSwap);   // plain-path swapchain (no-op if the FG path already nulled it)
     gReady = false;

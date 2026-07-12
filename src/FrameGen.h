@@ -25,10 +25,12 @@ namespace FrameGen
     HWND RealHwndFor(IDXGISwapChain* swapChain);
 
     // Called from the game's Present hook, after the GUI is drawn onto the game's backbuffer. Copies the
-    // game's frame across to our D3D12 swap chain on the real HWND and presents it. Returns true once it
-    // has taken over presentation (so the caller can present the game's own swap chain harmlessly/fast).
-    bool PresentTakeover(ID3D11Device* dev, ID3D11DeviceContext* ctx,
-                         IDXGISwapChain* gameSwapChain, uint32_t syncInterval);
+    // game's frame across to our D3D12 swap chain on the real HWND and presents it (through the FSR3-FG
+    // swap chain, which interpolates when fed depth + motion vectors). depth/motionVectors are Dust's DLAA
+    // buffers (D3D11, render==display res); null = passthrough (no interpolation this frame). Returns true
+    // once it has taken over presentation.
+    bool PresentTakeover(IDXGISwapChain* gameSwapChain, uint32_t syncInterval,
+                         ID3D11Resource* depth, ID3D11Resource* motionVectors);
 
     void Shutdown();
 }

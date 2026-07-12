@@ -2420,14 +2420,20 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(
         return oPresent(pThis, SyncInterval, Flags);
 
     if (!gShutdownSignaled) TickGuiOnPresent(pThis, "Present");
-    // Frame-gen present-takeover: after the GUI is drawn, present the frame through our D3D12 swap chain
-    // on the real HWND; the game's own swap chain (now on a hidden window) presents fast + invisibly.
+    // Frame-gen present-takeover: present the frame through our FSR3-FG swap chain on the real HWND, fed
+    // Dust's DLAA depth + motion vectors so it can interpolate. The game's own (hidden) swap chain presents
+    // fast + invisibly.
     if (!gShutdownSignaled && FrameGen::IsWanted())
     {
-        bool took = FrameGen::PresentTakeover(gDevice, gContext, pThis, SyncInterval);
-        static void* sLastSC = nullptr; static int sLastTook = -1;
-        if ((void*)pThis != sLastSC || (int)took != sLastTook)
-        { sLastSC = pThis; sLastTook = took; Log("FG-diag: Present on swapchain %p takeover=%d", (void*)pThis, (int)took); }
+        ID3D11Resource* fgDepth = nullptr;
+        if (ID3D11ShaderResourceView* dsv = gResourceRegistry.GetSRV(ResourceName::DEPTH_SRV)) dsv->GetResource(&fgDepth);
+        ID3D11Resource* fgMV = MotionVectors::GetInjVelResource();
+        bool took = FrameGen::PresentTakeover(pThis, SyncInterval, fgDepth, fgMV);
+        static void* sLastSC = nullptr; static int sLastState = -1;
+        int state = (int)took | ((fgDepth && fgMV) ? 2 : 0);
+        if ((void*)pThis != sLastSC || state != sLastState)
+        { sLastSC = pThis; sLastState = state; Log("FG-diag: Present sc=%p takeover=%d fg-inputs=%d", (void*)pThis, (int)took, (int)(fgDepth && fgMV)); }
+        if (fgDepth) fgDepth->Release();
         if (took) return oPresent(pThis, 0, Flags);
     }
     return oPresent(pThis, SyncInterval, Flags);
@@ -2441,9 +2447,15 @@ static HRESULT STDMETHODCALLTYPE HookedPresent1(
         return oPresent1(pThis, SyncInterval, PresentFlags, pPresentParameters);
 
     if (!gShutdownSignaled) TickGuiOnPresent(pThis, "Present1");
-    if (!gShutdownSignaled && FrameGen::IsWanted() &&
-        FrameGen::PresentTakeover(gDevice, gContext, pThis, SyncInterval))
-        return oPresent1(pThis, 0, PresentFlags, pPresentParameters);
+    if (!gShutdownSignaled && FrameGen::IsWanted())
+    {
+        ID3D11Resource* fgDepth = nullptr;
+        if (ID3D11ShaderResourceView* dsv = gResourceRegistry.GetSRV(ResourceName::DEPTH_SRV)) dsv->GetResource(&fgDepth);
+        ID3D11Resource* fgMV = MotionVectors::GetInjVelResource();
+        bool took = FrameGen::PresentTakeover(pThis, SyncInterval, fgDepth, fgMV);
+        if (fgDepth) fgDepth->Release();
+        if (took) return oPresent1(pThis, 0, PresentFlags, pPresentParameters);
+    }
     return oPresent1(pThis, SyncInterval, PresentFlags, pPresentParameters);
 }
 
