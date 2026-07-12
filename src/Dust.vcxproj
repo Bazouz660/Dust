@@ -68,7 +68,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>KenshiLib.lib;d3d11.lib;dxgi.lib;d3dcompiler.lib;dinput8.lib;dxguid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>KenshiLib.lib;d3d11.lib;d3d12.lib;dxgi.lib;d3dcompiler.lib;dinput8.lib;dxguid.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -84,7 +84,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>KenshiLib.lib;d3d11.lib;dxgi.lib;d3dcompiler.lib;dinput8.lib;dxguid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>KenshiLib.lib;d3d11.lib;d3d12.lib;dxgi.lib;d3dcompiler.lib;dinput8.lib;dxguid.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <!-- DLSS/NGX: only wired in when the SDK is present (external/DLSS is gitignored). When absent,
@@ -149,6 +149,7 @@
     <ClCompile Include="MotionVectors.cpp" />
     <ClCompile Include="Upscaler.cpp" />
     <ClCompile Include="UpscalerFSR2.cpp" />
+    <ClCompile Include="D3D12Interop.cpp" />
     <ClCompile Include="CameraAccess.cpp" />
     <ClCompile Include="PssmDetour.cpp" />
     <ClCompile Include="imgui\imgui.cpp" />
@@ -178,6 +179,7 @@
     <ClInclude Include="ShaderMetadata.h" />
     <ClInclude Include="GeometryCapture.h" />
     <ClInclude Include="MotionVectors.h" />
+    <ClInclude Include="D3D12Interop.h" />
     <ClInclude Include="CameraAccess.h" />
     <ClInclude Include="tracy\Tracy.hpp" />
     <ClInclude Include="PssmDetour.h" />

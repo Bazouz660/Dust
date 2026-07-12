@@ -12,6 +12,7 @@
 #include "MotionVectors.h"
 #include "Upscaler.h"
 #include "UpscalerFSR2.h"
+#include "D3D12Interop.h"
 #include "CameraAccess.h"
 #include "DustLog.h"
 #include <cmath>
@@ -679,6 +680,36 @@ static void RunUpscaler(ID3D11DeviceContext* ctx)
     }
     if (color) color->Release();
     if (depth) depth->Release();
+}
+
+
+// D.0 FSR3/FSR4 interop spike (the de-risking gate). FSR 3.1 / FSR 4 are DX12-only, so they need a
+// D3D12 side-device fed by shared textures. Before building any of that, prove the bridge round-trips
+// the scene color through a D3D12 compute pass. Gated by [Upscaling] D3D12InteropSpike=1 (off by
+// default). When on, the LEFT HALF of the screen turns green; a clean split == device + shared-texture
+// + shared-fence sync + compute dispatch all work. If the D3D12 side never inits (old OS / Proton
+// without the interop), IsReady() stays false and this is a silent no-op.
+static bool sInteropSpikeRead = false;
+static bool sInteropSpike     = false;
+static bool sInteropInitTried = false;
+
+static void RunInteropSpike(ID3D11DeviceContext* ctx)
+{
+    if (!sInteropSpikeRead)
+    {
+        sInteropSpikeRead = true;
+        std::string iniPath = DustLogDir() + "Dust.ini";
+        sInteropSpike = GetPrivateProfileIntA("Upscaling", "D3D12InteropSpike", 0, iniPath.c_str()) != 0;
+    }
+    if (!sInteropSpike || !gDevice || gWidth == 0 || gHeight == 0) return;
+
+    if (!sInteropInitTried) { sInteropInitTried = true; D3D12Interop::Init(gDevice); }
+    if (!D3D12Interop::IsReady()) return;
+
+    ID3D11RenderTargetView* colorRTV = gResourceRegistry.GetRTV(ResourceName::LDR_RTV);
+    if (!colorRTV) return;
+    ID3D11Resource* color = nullptr; colorRTV->GetResource(&color);
+    if (color) { D3D12Interop::RunTintTest(ctx, color, gWidth, gHeight); color->Release(); }
 }
 
 
@@ -1871,6 +1902,7 @@ static void STDMETHODCALLTYPE HookedDraw(
         if (result.point == InjectionPoint::POST_TONEMAP)
         {
             RunUpscaler(pThis);                  // DLSS DLAA resolve (no-op unless [Upscaling] DLSS=1)
+            RunInteropSpike(pThis);              // FSR3/4 D3D12 interop spike (no-op unless D3D12InteropSpike=1)
             MotionVectors::InjDebugBlit(pThis);  // MV debug viz (only if ShowMotionVectors=1)
             MotionVectors::InjEndFrame();
         }
