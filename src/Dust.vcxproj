@@ -137,7 +137,7 @@
   <ItemDefinitionGroup Condition="'$(HaveFsr3)'=='true'">
     <ClCompile>
       <PreprocessorDefinitions>DUST_HAVE_FSR3;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(ProjectDir)..\external\FidelityFX-SDK\Kits\FidelityFX\api\include;$(ProjectDir)..\external\FidelityFX-SDK\Kits\FidelityFX\upscalers\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\external\FidelityFX-SDK\Kits\FidelityFX\api\include;$(ProjectDir)..\external\FidelityFX-SDK\Kits\FidelityFX\upscalers\include;$(ProjectDir)..\external\FidelityFX-SDK\Kits\FidelityFX\framegeneration\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>

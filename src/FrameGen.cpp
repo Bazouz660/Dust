@@ -5,6 +5,14 @@
 #include <d3d11_4.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
+#include <string>
+
+#ifdef DUST_HAVE_FSR3
+#include "ffx_api.h"
+#include "dx12/ffx_api_dx12.h"
+#include "dx12/ffx_api_framegeneration_dx12.h"
+#include "ffx_framegeneration.h"
+#endif
 
 // D.3.0 present-takeover spike. All D3D12 work rides D3D12Interop's device/queue/fence, so a present
 // issued after SubmitD3D12Work is GPU-ordered behind the copy that filled the backbuffer.
@@ -46,16 +54,39 @@ namespace
     ID3D11Texture2D* gShared11 = nullptr;   // game backbuffer is copied here (D3D11) then read on D3D12
     ID3D12Resource*  gShared12 = nullptr;
 
-    bool CreateSwap(HWND hwnd, UINT w, UINT h, DXGI_FORMAT fmt)
+#ifdef DUST_HAVE_FSR3
+    // ffx-api (FidelityFX FG). Loaded at runtime from the mod dir (loader dispatches to the FG provider).
+    HMODULE              gFfxLoaderDll = nullptr, gFfxFgDll = nullptr;
+    PfnFfxCreateContext  gFfxCreate    = nullptr;
+    PfnFfxDestroyContext gFfxDestroy   = nullptr;
+    PfnFfxConfigure      gFfxConfigure = nullptr;
+    PfnFfxDispatch       gFfxDispatch  = nullptr;
+    ffxContext           gSwapChainCtx = nullptr;   // the FG swapchain context (owns the proxy swapchain)
+    bool                 gFfxTried = false, gFfxLoaded = false;
+
+    bool LoadFfx()
     {
-        ID3D12CommandQueue* q = D3D12Interop::GetQueue();
-        if (!q) { Log("FrameGen: no D3D12 queue"); return false; }
+        if (gFfxTried) return gFfxLoaded;
+        gFfxTried = true;
+        std::string mod = DustLogDir();
+        std::wstring dir(mod.begin(), mod.end());
+        gFfxFgDll     = LoadLibraryW((dir + L"amd_fidelityfx_framegeneration_dx12.dll").c_str());
+        gFfxLoaderDll = LoadLibraryW((dir + L"amd_fidelityfx_loader_dx12.dll").c_str());
+        if (!gFfxFgDll || !gFfxLoaderDll) { Log("FrameGen: FFX FG DLLs not found in mod dir — using plain passthrough"); return false; }
+        gFfxCreate    = (PfnFfxCreateContext) GetProcAddress(gFfxLoaderDll, "ffxCreateContext");
+        gFfxDestroy   = (PfnFfxDestroyContext)GetProcAddress(gFfxLoaderDll, "ffxDestroyContext");
+        gFfxConfigure = (PfnFfxConfigure)     GetProcAddress(gFfxLoaderDll, "ffxConfigure");
+        gFfxDispatch  = (PfnFfxDispatch)      GetProcAddress(gFfxLoaderDll, "ffxDispatch");
+        if (!gFfxCreate || !gFfxDispatch || !gFfxDestroy) { Log("FrameGen: ffx-api entry points missing"); return false; }
+        gFfxLoaded = true;
+        Log("FrameGen: ffx-api FG runtime loaded");
+        return true;
+    }
+#endif
 
-        IDXGIFactory4* factory = nullptr;
-        if (FAILED(CreateDXGIFactory2(0, __uuidof(IDXGIFactory4), (void**)&factory)) || !factory)
-        { Log("FrameGen: CreateDXGIFactory2 failed"); return false; }
-
-        DXGI_SWAP_CHAIN_DESC1 sd = {};
+    void FillSwapDesc(DXGI_SWAP_CHAIN_DESC1& sd, UINT w, UINT h, DXGI_FORMAT fmt)
+    {
+        sd = {};
         sd.Width            = w;
         sd.Height           = h;
         sd.Format           = fmt;   // flip model supports B8G8R8A8_UNORM
@@ -65,24 +96,67 @@ namespace
         sd.SwapEffect       = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         sd.Scaling          = DXGI_SCALING_STRETCH;
         sd.AlphaMode        = DXGI_ALPHA_MODE_IGNORE;
+    }
 
-        // Suspend DustBoot's capture: CreateSwapChainForHwnd is hooked on the shared DXGI vtable, so
-        // without this DustBoot would redirect/AddRef our own swap chain as if it were the game's (crash).
-        IDXGISwapChain1* sc1 = nullptr;
-        if (gBootSuspend) gBootSuspend(true);
-        HRESULT hr = factory->CreateSwapChainForHwnd(q, hwnd, &sd, nullptr, nullptr, &sc1);
-        if (gBootSuspend) gBootSuspend(false);
+    bool CreateSwap(HWND hwnd, UINT w, UINT h, DXGI_FORMAT fmt)
+    {
+        ID3D12CommandQueue* q = D3D12Interop::GetQueue();
+        if (!q) { Log("FrameGen: no D3D12 queue"); return false; }
+
+        IDXGIFactory4* factory = nullptr;
+        if (FAILED(CreateDXGIFactory2(0, __uuidof(IDXGIFactory4), (void**)&factory)) || !factory)
+        { Log("FrameGen: CreateDXGIFactory2 failed"); return false; }
+
+        DXGI_SWAP_CHAIN_DESC1 sd; FillSwapDesc(sd, w, h, fmt);
+        bool created = false;
+
+#ifdef DUST_HAVE_FSR3
+        // D.3.1a: create the FSR3 frame-generation proxy swapchain (interpolation stays OFF until it's
+        // configured in D.3.1b — so this is still passthrough, just through the FG swapchain). It calls
+        // CreateSwapChainForHwnd internally on the shared vtable, so suspend DustBoot's capture around it.
+        if (LoadFfx())
+        {
+            IDXGISwapChain4* fgSwap = nullptr;
+            ffxCreateContextDescFrameGenerationSwapChainForHwndDX12 scDesc = {};
+            scDesc.header.type    = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_FOR_HWND_DX12;
+            scDesc.swapchain      = &fgSwap;
+            scDesc.hwnd           = hwnd;
+            scDesc.desc           = &sd;
+            scDesc.fullscreenDesc = nullptr;
+            scDesc.dxgiFactory    = factory;
+            scDesc.gameQueue      = q;
+            if (gBootSuspend) gBootSuspend(true);
+            ffxReturnCode_t rc = gFfxCreate(&gSwapChainCtx, &scDesc.header, nullptr);
+            if (gBootSuspend) gBootSuspend(false);
+            if (rc == FFX_API_RETURN_OK && fgSwap)
+            {
+                gSwap = fgSwap;   // IDXGISwapChain3* <- IDXGISwapChain4* (upcast; present uses inherited methods)
+                created = true;
+                Log("FrameGen: FSR3-FG swapchain created on HWND %p (%ux%u) — interpolation OFF (passthrough)", hwnd, w, h);
+            }
+            else Log("FrameGen: ffx FG swapchain create failed (%u) — falling back to plain D3D12", rc);
+        }
+#endif
+
+        if (!created)   // plain D3D12 passthrough swapchain (D.3.0 path / no SDK / ffx failed)
+        {
+            IDXGISwapChain1* sc1 = nullptr;
+            if (gBootSuspend) gBootSuspend(true);
+            HRESULT hr = factory->CreateSwapChainForHwnd(q, hwnd, &sd, nullptr, nullptr, &sc1);
+            if (gBootSuspend) gBootSuspend(false);
+            if (SUCCEEDED(hr) && sc1)
+            {
+                hr = sc1->QueryInterface(__uuidof(IDXGISwapChain3), (void**)&gSwap);
+                sc1->Release();
+                if (SUCCEEDED(hr) && gSwap) { created = true; Log("FrameGen: plain D3D12 present swapchain on HWND %p (%ux%u)", hwnd, w, h); }
+            }
+            if (!created) Log("FrameGen: CreateSwapChainForHwnd failed 0x%08X", hr);
+        }
+
         factory->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
         factory->Release();
-        if (FAILED(hr) || !sc1) { Log("FrameGen: CreateSwapChainForHwnd failed 0x%08X", hr); return false; }
-
-        hr = sc1->QueryInterface(__uuidof(IDXGISwapChain3), (void**)&gSwap);
-        sc1->Release();
-        if (FAILED(hr) || !gSwap) { Log("FrameGen: QI IDXGISwapChain3 failed 0x%08X", hr); return false; }
-
-        gHwnd = hwnd; gW = w; gH = h; gFmt = fmt;
-        Log("FrameGen: D3D12 present swap chain on HWND %p (%ux%u fmt=%d) — takeover active", hwnd, w, h, (int)fmt);
-        return true;
+        if (created) { gHwnd = hwnd; gW = w; gH = h; gFmt = fmt; }
+        return created;
     }
 }
 
@@ -181,7 +255,10 @@ void Shutdown()
 {
     SafeRelease(gShared11);
     SafeRelease(gShared12);
-    SafeRelease(gSwap);
+#ifdef DUST_HAVE_FSR3
+    if (gSwapChainCtx && gFfxDestroy) { gFfxDestroy(&gSwapChainCtx, nullptr); gSwapChainCtx = nullptr; gSwap = nullptr; }
+#endif
+    SafeRelease(gSwap);   // plain-path swapchain (no-op if the FG path already nulled it)
     gReady = false;
 }
 
