@@ -1738,47 +1738,54 @@ static void STDMETHODCALLTYPE HookedDraw(
         return;
     }
 
-    // Capture device from the rendering context on first fullscreen draw.
-    // This is the actual game device, not a temporary enumeration device.
-    if (!gDeviceCaptured)
-    {
-        ID3D11Device* ctxDevice = nullptr;
-        pThis->GetDevice(&ctxDevice);
-        if (ctxDevice)
-        {
-            TryCaptureDevice(ctxDevice);
-            ctxDevice->Release();
-        }
-
-        if (!gDeviceCaptured)
-        {
-            oDraw(pThis, VertexCount, StartVertexLocation);
-            return;
-        }
-    }
-
-    // Check device health once per frame, not per draw call.
-    // GetDeviceRemovedReason can cause driver synchronization on some hardware.
-    if (!gDeviceRemovedThisFrame)
-    {
-        HRESULT removeReason = gDevice->GetDeviceRemovedReason();
-        if (removeReason != S_OK)
-        {
-            Log("Device removed (0x%08X), skipping draw hook entirely", removeReason);
-            gDeviceRemovedThisFrame = true;
-        }
-    }
-    if (gDeviceRemovedThisFrame)
-    {
-        oDraw(pThis, VertexCount, StartVertexLocation);
-        return;
-    }
-
-    // Detect render pass from GPU state
+    // Detect the render pass from GPU state. This reads ONLY the context's pipeline state (no
+    // device needed), so it runs even before we've captured a device — which is exactly how we pick
+    // the RIGHT device. Injected overlays (NVIDIA Smooth Motion, App/Freestyle, Steam/Discord, RTSS)
+    // spawn a SECOND D3D11 device and also issue fullscreen draws; capturing on the first raw draw
+    // could grab that device, and at the world lighting pass the game's real device differs ->
+    // cross-device resource binding -> DXGI_ERROR_DEVICE_REMOVED (which Kenshi's catch-all misreports
+    // as "ran out of video memory"). Only Kenshi's deferred pipeline produces this GBuffer/lighting
+    // signature, so capturing on a CONFIRMED detection is overlay-proof by construction.
     auto result = gPipelineDetector.OnFullscreenDraw(pThis);
 
     if (result.detected)
     {
+        // First confirmed game-pipeline draw: capture the device from THIS context. It just produced
+        // Kenshi's own render signature, so it is guaranteed to be the game device, never an overlay's.
+        if (!gDeviceCaptured)
+        {
+            ID3D11Device* ctxDevice = nullptr;
+            pThis->GetDevice(&ctxDevice);
+            if (ctxDevice)
+            {
+                Log("Capturing device at CONFIRMED Kenshi pipeline point (%d) — overlay-proof (device=%p)",
+                    (int)result.point, ctxDevice);
+                TryCaptureDevice(ctxDevice);
+                ctxDevice->Release();
+            }
+            if (!gDeviceCaptured)
+            {
+                oDraw(pThis, VertexCount, StartVertexLocation);
+                return;
+            }
+        }
+
+        // Check device health once per frame (now that gDevice is valid, and only where it matters —
+        // effects dispatch below). GetDeviceRemovedReason can force driver sync, so gate it per-frame.
+        if (!gDeviceRemovedThisFrame)
+        {
+            HRESULT removeReason = gDevice->GetDeviceRemovedReason();
+            if (removeReason != S_OK)
+            {
+                Log("Device removed (0x%08X), skipping draw hook entirely", removeReason);
+                gDeviceRemovedThisFrame = true;
+            }
+        }
+        if (gDeviceRemovedThisFrame)
+        {
+            oDraw(pThis, VertexCount, StartVertexLocation);
+            return;
+        }
         // Verify the context's device matches our captured device (one-time check)
         {
             static bool sDeviceChecked = false;
