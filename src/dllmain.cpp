@@ -24,10 +24,39 @@ static HMODULE gDllModule = nullptr;
 
 static LPTOP_LEVEL_EXCEPTION_FILTER gPreviousExceptionFilter = nullptr;
 
+// Log the faulting module + offset on a real (non-shutdown) crash, then chain to the
+// previous filter so the normal crash path still runs. Turns "the game crashed" into a
+// precise location — Dust.dll (resolvable with Dust.pdb), an FSR/DXGI DLL, or the game.
+static void DustLogCrashContext(EXCEPTION_POINTERS* ep)
+{
+    static bool logged = false;
+    if (logged || !ep || !ep->ExceptionRecord) return;
+    logged = true;
+    const EXCEPTION_RECORD* er = ep->ExceptionRecord;
+    void* addr = er->ExceptionAddress;
+    HMODULE mod = nullptr;
+    wchar_t path[MAX_PATH] = L"?";
+    size_t off = 0;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCWSTR)addr, &mod) && mod)
+    {
+        GetModuleFileNameW(mod, path, MAX_PATH);
+        off = (size_t)((uintptr_t)addr - (uintptr_t)mod);
+    }
+    const wchar_t* base = wcsrchr(path, L'\\'); base = base ? base + 1 : path;
+    unsigned long long avRW = 0, avAddr = 0;
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2)
+    { avRW = er->ExceptionInformation[0]; avAddr = (unsigned long long)er->ExceptionInformation[1]; }
+    Log("*** CRASH code=0x%08X addr=%p module=%S +0x%IX (access-violation %s @ 0x%llX)",
+        (unsigned)er->ExceptionCode, addr, base, off,
+        (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ? (avRW == 1 ? "WRITE" : "READ") : "n/a"), avAddr);
+}
+
 static LONG WINAPI DustShutdownExceptionFilter(EXCEPTION_POINTERS* ep)
 {
     if (D3D11Hook::IsShutdownSignaled())
         TerminateProcess(GetCurrentProcess(), 0);
+    DustLogCrashContext(ep);   // real crash: record faulting module+offset before chaining
     return gPreviousExceptionFilter ? gPreviousExceptionFilter(ep)
                                     : EXCEPTION_CONTINUE_SEARCH;
 }

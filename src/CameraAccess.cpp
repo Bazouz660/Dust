@@ -16,10 +16,15 @@
 static GameWorld* sGameWorld = nullptr;
 static volatile int sStep = 0;   // last step reached; negative = access-violation caught at that step
 
+static unsigned long long sGameLoopTick = 0;
+
 void CameraAccess_SetGameWorld(void* gameWorld)
 {
     sGameWorld = reinterpret_cast<GameWorld*>(gameWorld);
+    ++sGameLoopTick;   // advances only while the game is actively simulating (stalls during load/menu)
 }
+
+unsigned long long CameraAccess_GameLoopTick() { return sGameLoopTick; }
 
 int CameraAccess_Status() { return sStep; }
 

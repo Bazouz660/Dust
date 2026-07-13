@@ -99,7 +99,7 @@ namespace
     {
         ffxReturnCode_t rc = gFfxDispatch((ffxContext*)userCtx, &params->header);
         static int sN = 0;
-        if (sN < 3) { sN++; Log("FrameGen: FG generation callback FIRED (numGenerated=%u, dispatch rc=%u)", params->numGeneratedFrames, rc); }
+        if (sN < 6) { sN++; Log("FrameGen: FG generation callback FIRED (numGenerated=%u, dispatch rc=%u, tid=%lu)", params->numGeneratedFrames, rc, GetCurrentThreadId()); }
         return rc;
     }
 
@@ -187,7 +187,7 @@ namespace
         sd.Format           = fmt;   // flip model supports B8G8R8A8_UNORM
         sd.SampleDesc.Count = 1;
         sd.BufferUsage      = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        sd.BufferCount      = 2;
+        sd.BufferCount      = 3;   // FG needs >=3 to pace real+generated frames; 2 stalls the ring after ~3 presents
         sd.SwapEffect       = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         sd.Scaling          = DXGI_SCALING_STRETCH;
         sd.AlphaMode        = DXGI_ALPHA_MODE_IGNORE;
@@ -314,19 +314,67 @@ bool PresentTakeover(IDXGISwapChain* gameSwapChain, uint32_t syncInterval,
     if (!gShared11 && !D3D12Interop::CreateSharedTexture(gW, gH, (uint32_t)gFmt, &gShared11, &gShared12))
     { gameBB->Release(); return false; }
 
-    // Whether frame interpolation runs this frame: we have depth + MV and the FG context is up.
+    // Only interpolate once the game is actually SIMULATING. During load the depth/MV resources
+    // churn (recreated as the GBuffer/shaders stream in) and feeding those to FG crashes the D3D11
+    // driver (nvwgf2umx WRITE AV). GameWorld::mainLoop ticks only in live gameplay, so we require it
+    // to have advanced within the last few presents AND to be past the sparse early-load ticks. The
+    // takeover (backbuffer copy + present) stays on regardless — the swapchain is redirected, so it
+    // must present through us or the screen goes black; the backbuffer-only path is load-stable.
+    static unsigned long long sLastTick = 0;
+    static int sTickStale = 100000;
+    unsigned long long tick = CameraAccess_GameLoopTick();
+    if (tick != sLastTick) { sLastTick = tick; sTickStale = 0; } else if (sTickStale < 100000) sTickStale++;
+    bool inGameplay = (sTickStale < 8) && (tick >= 16);
+
+    // Whether frame interpolation runs this frame: gameplay + we have depth + MV and the FG context is up.
     bool fgActive = false;
 #ifdef DUST_HAVE_FSR3
-    fgActive = depth && motionVectors && EnsureMotionTextures(depth, motionVectors) && EnsureFgContext(gW, gH, gFmt);
+    fgActive = inGameplay && depth && motionVectors && EnsureMotionTextures(depth, motionVectors) && EnsureFgContext(gW, gH, gFmt);
+    { static bool sAnnounced = false; if (fgActive && !sAnnounced) { sAnnounced = true; Log("FrameGen: gameplay reached (tick=%llu) — FG interpolation ON", tick); } }
 #endif
 
     // D3D11: marshal the game frame (+ depth/MV) into the shared bridge textures.
+    static int gDbgFgFrame = 0; bool dbg = fgActive && gDbgFgFrame < 40;
+    if (dbg) Log("FG step: copy backbuffer src=%p dst=%p", (void*)gameBB, (void*)gShared11);
     ctx->CopyResource(gShared11, gameBB);
     gameBB->Release();
 #ifdef DUST_HAVE_FSR3
-    if (fgActive) { ctx->CopyResource(gShDepth11, depth); ctx->CopyResource(gShMV11, motionVectors); }
+    if (fgActive)
+    {
+        if (dbg) Log("FG step: copy depth src=%p dst=%p", (void*)depth, (void*)gShDepth11);
+        ctx->CopyResource(gShDepth11, depth);
+        if (dbg) Log("FG step: copy mv src=%p dst=%p", (void*)motionVectors, (void*)gShMV11);
+        ctx->CopyResource(gShMV11, motionVectors);
+        if (dbg) Log("FG step: depth/mv copies OK");
+    }
+
+    // Configure FG BEFORE recording prepare. The FFX sample order is configure -> prepare ->
+    // present, and the runtime keys its frame-history ring on the CONFIGURED frameID. Configuring
+    // AFTER prepare made every prepare record against the previous frame's config: fine until the
+    // swapchain's buffer ring (depth 3) fills, then the generation callback stalls and it crashes
+    // (matches the log: callback fires 3x, then stops). Configure is a CPU state-set (no cmd list).
+    if (fgActive)
+    {
+        ffxConfigureDescFrameGeneration cfg = {};
+        cfg.header.type                        = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+        cfg.swapChain                          = gSwap;
+        cfg.frameGenerationEnabled             = true;
+        cfg.frameGenerationCallback            = FgGenCallback;
+        cfg.frameGenerationCallbackUserContext = &gFgContext;
+        cfg.presentCallback                    = nullptr;   // D.3.1c: UI composition (HUD-less)
+        cfg.presentCallbackUserContext         = nullptr;
+        cfg.HUDLessColor                       = FfxApiResource{};
+        cfg.flags                              = FgDebugFlags();
+        cfg.onlyPresentGenerated               = false;
+        cfg.generationRect                     = { 0, 0, (int32_t)gW, (int32_t)gH };
+        cfg.frameID                            = gFrameID;
+        ffxReturnCode_t rcCfg = gFfxConfigure(&gFgContext, &cfg.header);
+        static int sCfgN = 0;
+        if (sCfgN < 5) { sCfgN++; Log("FrameGen: FG configure rc=%u (swapChain=%p frameID=%llu)", rcCfg, (void*)gSwap, (unsigned long long)gFrameID); }
+    }
 #endif
 
+    if (dbg) Log("FG step: BeginD3D12Work");
     ID3D12GraphicsCommandList* list = D3D12Interop::BeginD3D12Work(ctx);
     if (!list) return false;
 
@@ -362,41 +410,35 @@ bool PresentTakeover(IDXGISwapChain* gameSwapChain, uint32_t syncInterval,
         float camN = 0, camF = 0, camFov = 0; CameraAccess_GetCameraParams(&camN, &camF, &camFov);
         prep.cameraNear = camN; prep.cameraFar = camF; prep.cameraFovAngleVertical = camFov;
         prep.viewSpaceToMetersFactor = 0.0f;
-        prep.reset = false;
+        prep.reset = (gFrameID == 0);   // clear stale history on the first generated frame
+        if (dbg) Log("FG step: prepare dispatch (frameID=%llu)", (unsigned long long)gFrameID);
         ffxReturnCode_t rcPrep = gFfxDispatch(&gFgContext, &prep.header);
         static int sPrepN = 0;
         if (rcPrep != FFX_API_RETURN_OK && sPrepN < 3) { sPrepN++; Log("FrameGen: FG prepare dispatch FAILED (%u)", rcPrep); }
     }
 #endif
 
+    if (dbg) Log("FG step: SubmitD3D12Work");
     D3D12Interop::SubmitD3D12Work(ctx);   // executes copy + FG prepare on the present queue
     SafeRelease(scBB);
 
-#ifdef DUST_HAVE_FSR3
-    // Configure FG for this present (the swap chain's Present then generates the in-between frame).
-    if (fgActive)
-    {
-        ffxConfigureDescFrameGeneration cfg = {};
-        cfg.header.type                        = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
-        cfg.swapChain                          = gSwap;
-        cfg.frameGenerationEnabled             = true;
-        cfg.frameGenerationCallback            = FgGenCallback;
-        cfg.frameGenerationCallbackUserContext = &gFgContext;
-        cfg.presentCallback                    = nullptr;   // D.3.1c: UI composition (HUD-less)
-        cfg.presentCallbackUserContext         = nullptr;
-        cfg.HUDLessColor                       = FfxApiResource{};
-        cfg.flags                              = FgDebugFlags();
-        cfg.onlyPresentGenerated               = false;
-        cfg.generationRect                     = { 0, 0, (int32_t)gW, (int32_t)gH };
-        cfg.frameID                            = gFrameID;
-        ffxReturnCode_t rcCfg = gFfxConfigure(&gFgContext, &cfg.header);
-        static int sCfgN = 0;
-        if (sCfgN < 5) { sCfgN++; Log("FrameGen: FG configure rc=%u (swapChain=%p frameID=%llu)", rcCfg, (void*)gSwap, (unsigned long long)gFrameID); }
-        gFrameID++;   // increment only on FG frames -> exact +1 per generated frame (FFX requirement)
-    }
-#endif
-
+    if (dbg) Log("FG step: gSwap->Present CALL");
     gSwap->Present(syncInterval, 0);      // FG swap chain interpolates + paces (GPU-ordered after the copy)
+    if (dbg) { Log("FG step: gSwap->Present RETURNED"); gDbgFgFrame++; }
+    {
+        static int sPresN = 0, sFgPresN = 0;
+        if (fgActive && sFgPresN < 20)
+        {
+            sFgPresN++;
+            unsigned dr = 0;
+            if (ID3D12Device* d12 = D3D12Interop::GetDevice()) dr = (unsigned)d12->GetDeviceRemovedReason();
+            Log("FrameGen: FG present #%d tid=%lu d12removed=0x%08X", sFgPresN, GetCurrentThreadId(), dr);
+        }
+        else if (!fgActive && sPresN < 4) { sPresN++; Log("FrameGen: passthrough Present #%d", sPresN); }
+    }
+#ifdef DUST_HAVE_FSR3
+    if (fgActive) gFrameID++;             // exact +1 per generated frame (FFX requirement), after present
+#endif
     return true;
 }
 

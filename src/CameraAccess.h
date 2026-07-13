@@ -8,6 +8,12 @@
 // Called from the game-loop hook with the GameWorld* it receives (as void*).
 void CameraAccess_SetGameWorld(void* gameWorld);
 
+// Monotonic tick that advances once per GameWorld::mainLoop — i.e. only while the game is
+// actively simulating; it stalls during load/menu. FrameGen watches this to tell gameplay from
+// loading, so frame-gen interpolation only engages once the world is really running (avoids the
+// load-phase driver crash where depth/MV resources are still churning).
+unsigned long long CameraAccess_GameLoopTick();
+
 // Fills outVP with the camera view-projection as 16 column-major floats (ready for a D3D
 // constant buffer / HLSL default packing, same convention as the game's worldViewProjMatrix).
 // Returns false if the camera isn't reachable yet (menu / loading) or an access faulted.
