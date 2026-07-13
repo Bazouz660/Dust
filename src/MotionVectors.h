@@ -50,6 +50,13 @@ namespace MotionVectors
     void InjFillSkinPrev(ID3D11DeviceContext* ctx);
     void InjBindSkinPrev(ID3D11DeviceContext* ctx);
 
+    // A.5 rigid moving-object velocity (weapons/tools/props on animated bones, objects.hlsl). Per-draw
+    // previous WVP bound at b12, spatially matched cross-frame; camera-reproj fallback on any miss.
+    // InjBindRigidPrev = per STATIC GBuffer draw (after GeometryCapture::OnDrawIndexed); InjFillRigidPrev
+    // = POST_LIGHTING (promote this frame's draws to next frame's match targets).
+    void InjBindRigidPrev(ID3D11DeviceContext* ctx);
+    void InjFillRigidPrev(ID3D11DeviceContext* ctx);
+
     // Bone-palette CB shadow, fed from the Map/Unmap hooks. InjBindSkinPrev needs the CURRENT frame's
     // root bone at draw time (to spatially match prev poses); these snapshot it stall-free. Cheap
     // no-ops until a skinned draw teaches the shadow which CB is the bone palette.
@@ -65,6 +72,11 @@ namespace MotionVectors
     // Contrast-limited sharpen of srcSRV into dstRTV (display res), for the DLSS output. amount in [0,1].
     void SharpenBlit(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* srcSRV,
                      ID3D11RenderTargetView* dstRTV, float amount, uint32_t w, uint32_t h);
+
+    // Fill camera-only MV into the velocity buffer for sky / far-depth pixels, so the upscaler can
+    // reproject the sky under camera motion (kills sky ghosting + object/sky edge shimmer). Call at
+    // POST_TONEMAP after the scene is rendered, just before the upscaler reads the velocity buffer.
+    void InjFillSkyMV(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* depthSRV, uint32_t w, uint32_t h);
 
     void Shutdown();
 }

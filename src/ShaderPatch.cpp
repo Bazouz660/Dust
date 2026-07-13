@@ -704,6 +704,35 @@ static std::string InjVS(const std::string& src, const char* fnAnchor, const cha
     return s;
 }
 
+// Velocity injection for RIGID objects that can MOVE independently of the camera (objects.hlsl:
+// weapons/tools attached to animated character bones, doors, moving props). The generic InjVS uses
+// camera-only reproj (dust_reproj), which is correct only if the object's WORLD transform didn't
+// change -> a swinging weapon ghosts. Here oDustPrev is the vertex reprojected by the object's OWN
+// PREVIOUS world-view-proj (dust_prevWVP, bound per-draw from a spatial cross-frame match in
+// MotionVectors). posExpr is the vertex position fed to the clip transform. When no match was bound
+// (all-zero matrix: new object / first frame / churn) we fall back to camera reproj, exactly like the
+// skinned path — so this NEVER regresses static objects (whose prevWVP equals the camera reproj anyway).
+static std::string InjRigidVS(const std::string& src, const char* fnAnchor, const char* interp,
+                              const char* clipAssign, const char* clipRHS, const char* posExpr)
+{
+    if (Has(src, "oDustPrev")) return src;
+    std::string s = src;
+    size_t fn = s.find(fnAnchor);
+    if (fn == std::string::npos) return src;
+    s.insert(fn, "cbuffer DustMVCB : register(b13) { column_major float4x4 dust_reproj; };\n"
+                 "cbuffer DustPrevWVPCB : register(b12) { column_major float4x4 dust_prevWVP; };\n");
+    size_t from = s.find(fnAnchor);
+    if (from == std::string::npos) return src;
+    if (!InsAfter(s, from, interp, "\n\tout float4 oDustCur : TEXCOORD12,\n\tout float4 oDustPrev : TEXCOORD13,")) return src;
+    std::string asgn = std::string("\n\toDustCur = ") + clipRHS + ";"
+        "\n\toDustPrev = mul(dust_prevWVP, " + posExpr + ");"
+        // No per-object prev bound this draw => dust_prevWVP all-zero (its perspective row is 0) =>
+        // fall back to camera reproj (correct for a still object, ~right for a moving one that missed).
+        "\n\tif (dot(dust_prevWVP._m30_m31_m32_m33, dust_prevWVP._m30_m31_m32_m33) == 0.0) oDustPrev = mul(dust_reproj, oDustCur);";
+    if (!InsAfter(s, from, clipAssign, asgn)) return src;
+    return s;
+}
+
 // Generic velocity injection into a GBuffer PS. interp MUST match the VS interp position.
 static std::string InjPS(const std::string& src, const char* fnAnchor, const char* interp,
                          const char* gbufOut, const char* body)
@@ -810,6 +839,8 @@ static std::string InjectGBufferVS(const std::string& src, const char* entry, co
     if (!srcName) return src;
     if (strcmp(entry, "main_vs") == 0 && Has(srcName, "skin.hlsl")) return InjSkinVS(src);   // true anim MVs
     if (strcmp(entry, "grass_vs") == 0 && Has(srcName, "foliage.hlsl")) return InjGrassVS(src);   // wind MVs
+    // (objects.hlsl per-object previous-WVP / InjRigidVS is SHELVED — unreliable cross-frame identity
+    //  regressed static geometry. objects.hlsl falls through to the generic camera-reproj InjVS below.)
     for (const VSpec& v : kVSpecs)
         if (strcmp(entry, v.entry) == 0 && Has(srcName, v.srcFile))
             return InjVS(src, v.fnAnchor, v.interp, v.clipAssign, v.clipRHS);

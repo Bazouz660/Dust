@@ -664,6 +664,10 @@ static void RunUpscaler(ID3D11DeviceContext* ctx)
         }
         if (out && colSR)
         {
+            // Fill camera-only MV for the sky/far-depth pixels (the sky is a forward pass with no MV
+            // injection, so it's velocity 0 -> ghosts under camera motion). Must run here, after the
+            // scene + sky are drawn and before the upscaler reads the velocity buffer.
+            MotionVectors::InjFillSkyMV(ctx, depthSRV, gWidth, gHeight);
             float jx, jy; GetTemporalJitter(jx, jy);
             // Our MV texel is (curUV - prevUV) in UV space. The upscaler wants (prevUV - curUV) in render
             // pixels (the vector from a pixel to where it was last frame), so MV_Scale is NEGATIVE display
