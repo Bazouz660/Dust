@@ -788,21 +788,24 @@ static void DrawUpscalingSection()
     ImGui::Separator();
     ImGui::Spacing();
 
-    // One selector = enable + backend: Disabled / DLSS / FSR2. Selecting a backend turns it on; there is
-    // no separate on/off checkbox. Switching rebuilds the pipeline next frame.
-    int sel = !UpscalerControl::GetEnabled() ? 0 : (UpscalerControl::GetBackend() == 1 ? 2 : 1);
-    const char* items[] = { "Disabled", "DLSS", "FSR2" };
-    if (ImGui::Combo("##upscaler", &sel, items, 3))
+    // One selector = enable + backend: Disabled / DLSS / FSR2 / FSR3-FSR4. Selecting a backend turns it on;
+    // there is no separate on/off checkbox. Switching rebuilds the pipeline next frame.
+    // sel: 0=Disabled 1=DLSS 2=FSR2 3=FSR3/4   <->   backend: DLSS=0 FSR2=1 FSR3=2
+    const int be0 = UpscalerControl::GetBackend();
+    int sel = !UpscalerControl::GetEnabled() ? 0 : (be0 == 1 ? 2 : be0 == 2 ? 3 : 1);
+    const char* items[] = { "Disabled", "DLSS", "FSR2", "FSR3 / FSR4" };
+    if (ImGui::Combo("##upscaler", &sel, items, 4))
     {
         bool en      = (sel != 0);
-        int  backend = (sel == 2) ? 1 : 0;
+        int  backend = (sel == 2) ? 1 : (sel == 3) ? 2 : 0;
         UpscalerControl::SetEnabled(en);
         UpscalerControl::SetBackend(backend);
-        WritePrivateProfileStringA("Upscaling", "DLSS",    en ? "1" : "0",            gDustIniPath.c_str());
-        WritePrivateProfileStringA("Upscaling", "Backend", backend == 1 ? "1" : "0", gDustIniPath.c_str());
+        char bs[2] = { (char)('0' + backend), '\0' };
+        WritePrivateProfileStringA("Upscaling", "DLSS",    en ? "1" : "0", gDustIniPath.c_str());
+        WritePrivateProfileStringA("Upscaling", "Backend", bs,             gDustIniPath.c_str());
     }
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Temporal anti-aliasing / upscaling. DLSS = NVIDIA RTX only (best quality). FSR2 = any GPU. Disabled = off.");
+        ImGui::SetTooltip("Temporal anti-aliasing / upscaling. DLSS = NVIDIA RTX only (best quality). FSR2 = any GPU (native D3D11). FSR3 / FSR4 = any DX12 GPU via a D3D12 side-device; FSR4 needs a Radeon RX 9000. Disabled = off.");
 
     if (sel == 1 && !UpscalerControl::Available())
         ImGui::TextDisabled("DLSS unavailable (needs NVIDIA RTX + recent driver)");

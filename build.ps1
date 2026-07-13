@@ -59,6 +59,13 @@ Copy-Item "$Root\mod\Dust.mod"                "$ModDir\"
 $NgxDll = "$Root\external\DLSS\lib\Windows_x86_64\rel\nvngx_dlss.dll"
 if (Test-Path $NgxDll) { Copy-Item $NgxDll "$ModDir\"; Write-Host "    + nvngx_dlss.dll (DLSS runtime)" -ForegroundColor DarkGray }
 
+# FSR3/FSR4 ffx-api runtime — only when the FidelityFX SDK is vendored (external/FidelityFX-SDK is
+# gitignored). The loader dispatches to the upscaler provider; both must sit next to Dust.dll.
+$FfxBin = "$Root\external\FidelityFX-SDK\Kits\FidelityFX\signedbin"
+foreach ($ffxDll in @("amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_upscaler_dx12.dll")) {
+    if (Test-Path "$FfxBin\$ffxDll") { Copy-Item "$FfxBin\$ffxDll" "$ModDir\"; Write-Host "    + $ffxDll (FSR3/4 runtime)" -ForegroundColor DarkGray }
+}
+
 foreach ($effect in $Effects) {
     $dll = Get-ChildItem "$Root\effects\$effect\build\Release\Dust*.dll" | Select-Object -First 1
     Copy-Item $dll.FullName "$ModDir\effects\"

@@ -12,6 +12,8 @@
 #include "MotionVectors.h"
 #include "Upscaler.h"
 #include "UpscalerFSR2.h"
+#include "UpscalerFSR3.h"
+#include "D3D12Interop.h"
 #include "CameraAccess.h"
 #include "DustLog.h"
 #include <cmath>
@@ -571,17 +573,18 @@ static void RunUpscaler(ID3D11DeviceContext* ctx)
         sUpsEnabled   = GetPrivateProfileIntA("Upscaling", "DLSS", 0, iniPath.c_str()) != 0;   // "enabled"
         sUpsPresetIdx = GetPrivateProfileIntA("Upscaling", "DLSSPreset", 3, iniPath.c_str());          // 3 = F (K blurs static image)
         sUpsSharpness = GetPrivateProfileIntA("Upscaling", "DLSSSharpness", 0, iniPath.c_str()) / 100.0f;
-        sUpsBackend   = GetPrivateProfileIntA("Upscaling", "Backend", 0, iniPath.c_str());     // 0=DLSS 1=FSR2
+        sUpsBackend   = GetPrivateProfileIntA("Upscaling", "Backend", 0, iniPath.c_str());     // 0=DLSS 1=FSR2 2=FSR3
     }
     if (!gDevice || gWidth == 0 || gHeight == 0) return;
 
-    const bool fsr = (sUpsBackend == 1);
+    const int backend = sUpsBackend;   // 0=DLSS 1=FSR2 2=FSR3/FSR4 (D3D12 side-device)
 
     // Backend switched in the GUI: tear the old one down, force re-init + feature recreate + jitter reset.
     if (sUpsActiveBackend != sUpsBackend)
     {
         Upscaler::Shutdown();
         UpscalerFSR2::Shutdown();
+        UpscalerFSR3::Shutdown();
         ReleaseUpscalerTargets();
         sUpsActiveBackend = sUpsBackend;
         sUpsInitTried     = false;
@@ -593,12 +596,15 @@ static void RunUpscaler(ID3D11DeviceContext* ctx)
     if (!sUpsInitTried)
     {
         sUpsInitTried = true;
-        if (fsr) UpscalerFSR2::Init(gDevice);
-        else { std::string modDir = DustLogDir(); std::wstring wdir(modDir.begin(), modDir.end());
-               Upscaler::Init(gDevice, wdir.c_str(), wdir.c_str()); }
+        std::string modDir = DustLogDir(); std::wstring wdir(modDir.begin(), modDir.end());
+        if      (backend == 1) UpscalerFSR2::Init(gDevice);
+        else if (backend == 2) UpscalerFSR3::Init(gDevice, wdir.c_str());
+        else                   Upscaler::Init(gDevice, wdir.c_str(), wdir.c_str());
     }
 
-    const bool avail = fsr ? UpscalerFSR2::IsAvailable() : Upscaler::IsAvailable();
+    const bool avail = backend == 1 ? UpscalerFSR2::IsAvailable()
+                     : backend == 2 ? UpscalerFSR3::IsAvailable()
+                     :                 Upscaler::IsAvailable();
 
     // Disabled or unavailable: ensure jitter is off (no shimmer) and skip the resolve.
     if (!sUpsEnabled || !avail)
@@ -610,9 +616,9 @@ static void RunUpscaler(ID3D11DeviceContext* ctx)
     // (Re)create the feature on first enable or when the preset changed in the GUI.
     if (sUpsFeaturePreset != sUpsPresetIdx)
     {
-        bool created = fsr
-            ? UpscalerFSR2::CreateFeature(ctx, gWidth, gHeight, gWidth, gHeight, false, false, sUpsPresetIdx)
-            : Upscaler::CreateFeature(ctx, gWidth, gHeight, gWidth, gHeight, false, false, sUpsPresetIdx);
+        bool created = backend == 1 ? UpscalerFSR2::CreateFeature(ctx, gWidth, gHeight, gWidth, gHeight, false, false, sUpsPresetIdx)
+                     : backend == 2 ? UpscalerFSR3::CreateFeature(ctx, gWidth, gHeight, gWidth, gHeight, false, false, sUpsPresetIdx)
+                     :                 Upscaler::CreateFeature(ctx, gWidth, gHeight, gWidth, gHeight, false, false, sUpsPresetIdx);
         if (created) { sUpsFeaturePreset = sUpsPresetIdx; sUpsResetNext = true; }
         else { sUpsEnabled = false; if (sUpsJitterOn) { SetTemporalJitter(0); sUpsJitterOn = false; } return; }
     }
@@ -658,15 +664,19 @@ static void RunUpscaler(ID3D11DeviceContext* ctx)
         }
         if (out && colSR)
         {
+            // Fill camera-only MV for the sky/far-depth pixels (the sky is a forward pass with no MV
+            // injection, so it's velocity 0 -> ghosts under camera motion). Must run here, after the
+            // scene + sky are drawn and before the upscaler reads the velocity buffer.
+            MotionVectors::InjFillSkyMV(ctx, depthSRV, gWidth, gHeight);
             float jx, jy; GetTemporalJitter(jx, jy);
             // Our MV texel is (curUV - prevUV) in UV space. The upscaler wants (prevUV - curUV) in render
             // pixels (the vector from a pixel to where it was last frame), so MV_Scale is NEGATIVE display
             // size. Wrong sign => history reprojected backwards => ghosting on camera motion + softness.
             // Sharpness goes to our own RCAS-lite pass, so pass 0 to the upscaler.
             const float mvsx = -(float)gWidth, mvsy = -(float)gHeight;
-            bool ok = fsr
-                ? UpscalerFSR2::Evaluate(ctx, colSR, depth, mv, out, jx, jy, mvsx, mvsy, 0.0f, sUpsResetNext, nullptr)
-                : Upscaler::Evaluate(ctx, colSR, depth, mv, out, jx, jy, mvsx, mvsy, 0.0f, sUpsResetNext, nullptr);
+            bool ok = backend == 1 ? UpscalerFSR2::Evaluate(ctx, colSR, depth, mv, out, jx, jy, mvsx, mvsy, 0.0f, sUpsResetNext, nullptr)
+                    : backend == 2 ? UpscalerFSR3::Evaluate(ctx, colSR, depth, mv, out, jx, jy, mvsx, mvsy, 0.0f, sUpsResetNext, nullptr)
+                    :                 Upscaler::Evaluate(ctx, colSR, depth, mv, out, jx, jy, mvsx, mvsy, 0.0f, sUpsResetNext, nullptr);
             if (ok)
             {
                 if (sUpsSharpness > 0.0f && sUpsOutSRV)
@@ -679,6 +689,36 @@ static void RunUpscaler(ID3D11DeviceContext* ctx)
     }
     if (color) color->Release();
     if (depth) depth->Release();
+}
+
+
+// D.0 FSR3/FSR4 interop spike (the de-risking gate). FSR 3.1 / FSR 4 are DX12-only, so they need a
+// D3D12 side-device fed by shared textures. Before building any of that, prove the bridge round-trips
+// the scene color through a D3D12 compute pass. Gated by [Upscaling] D3D12InteropSpike=1 (off by
+// default). When on, the LEFT HALF of the screen turns green; a clean split == device + shared-texture
+// + shared-fence sync + compute dispatch all work. If the D3D12 side never inits (old OS / Proton
+// without the interop), IsReady() stays false and this is a silent no-op.
+static bool sInteropSpikeRead = false;
+static bool sInteropSpike     = false;
+static bool sInteropInitTried = false;
+
+static void RunInteropSpike(ID3D11DeviceContext* ctx)
+{
+    if (!sInteropSpikeRead)
+    {
+        sInteropSpikeRead = true;
+        std::string iniPath = DustLogDir() + "Dust.ini";
+        sInteropSpike = GetPrivateProfileIntA("Upscaling", "D3D12InteropSpike", 0, iniPath.c_str()) != 0;
+    }
+    if (!sInteropSpike || !gDevice || gWidth == 0 || gHeight == 0) return;
+
+    if (!sInteropInitTried) { sInteropInitTried = true; D3D12Interop::Init(gDevice); }
+    if (!D3D12Interop::IsReady()) return;
+
+    ID3D11RenderTargetView* colorRTV = gResourceRegistry.GetRTV(ResourceName::LDR_RTV);
+    if (!colorRTV) return;
+    ID3D11Resource* color = nullptr; colorRTV->GetResource(&color);
+    if (color) { D3D12Interop::RunTintTest(ctx, color, gWidth, gHeight); color->Release(); }
 }
 
 
@@ -1878,6 +1918,7 @@ static void STDMETHODCALLTYPE HookedDraw(
         if (result.point == InjectionPoint::POST_TONEMAP)
         {
             RunUpscaler(pThis);                  // DLSS DLAA resolve (no-op unless [Upscaling] DLSS=1)
+            RunInteropSpike(pThis);              // FSR3/4 D3D12 interop spike (no-op unless D3D12InteropSpike=1)
             MotionVectors::InjDebugBlit(pThis);  // MV debug viz (only if ShowMotionVectors=1)
             MotionVectors::InjEndFrame();
         }
@@ -2671,5 +2712,5 @@ namespace UpscalerControl
     float GetSharpness()       { return D3D11Hook::sUpsSharpness; }
     void  SetSharpness(float s){ D3D11Hook::sUpsSharpness = s < 0 ? 0 : (s > 1 ? 1 : s); }
     int   GetBackend()         { return D3D11Hook::sUpsBackend; }
-    void  SetBackend(int b)    { D3D11Hook::sUpsBackend = (b == 1) ? 1 : 0; }
+    void  SetBackend(int b)    { D3D11Hook::sUpsBackend = (b >= 0 && b <= 2) ? b : 0; }
 }

@@ -68,7 +68,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>KenshiLib.lib;d3d11.lib;dxgi.lib;d3dcompiler.lib;dinput8.lib;dxguid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>KenshiLib.lib;d3d11.lib;d3d12.lib;dxgi.lib;d3dcompiler.lib;dinput8.lib;dxguid.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -84,7 +84,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>KenshiLib.lib;d3d11.lib;dxgi.lib;d3dcompiler.lib;dinput8.lib;dxguid.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>KenshiLib.lib;d3d11.lib;d3d12.lib;dxgi.lib;d3dcompiler.lib;dinput8.lib;dxguid.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <!-- DLSS/NGX: only wired in when the SDK is present (external/DLSS is gitignored). When absent,
@@ -127,6 +127,19 @@
       <AdditionalDependencies>ffx_fsr2_api_x64.lib;ffx_fsr2_api_dx11_x64.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
+  <!-- FSR 3.1 / FSR 4 via the FidelityFX ffx-api (DX12), run on the D3D12 side-device (D3D12Interop).
+       Header-only: the loader/provider DLLs are LoadLibrary'd at runtime (no .lib link). Absent =>
+       DUST_HAVE_FSR3 undefined => UpscalerFSR3.cpp compiles to stubs. Vendor: sparse-clone the SDK to
+       external/FidelityFX-SDK; ship signedbin/amd_fidelityfx_{loader,upscaler}_dx12.dll to the mod dir. -->
+  <PropertyGroup>
+    <HaveFsr3 Condition="Exists('$(ProjectDir)..\external\FidelityFX-SDK\Kits\FidelityFX\api\include\ffx_api.h')">true</HaveFsr3>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(HaveFsr3)'=='true'">
+    <ClCompile>
+      <PreprocessorDefinitions>DUST_HAVE_FSR3;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\external\FidelityFX-SDK\Kits\FidelityFX\api\include;$(ProjectDir)..\external\FidelityFX-SDK\Kits\FidelityFX\upscalers\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="BugReport.cpp" />
@@ -149,6 +162,8 @@
     <ClCompile Include="MotionVectors.cpp" />
     <ClCompile Include="Upscaler.cpp" />
     <ClCompile Include="UpscalerFSR2.cpp" />
+    <ClCompile Include="UpscalerFSR3.cpp" />
+    <ClCompile Include="D3D12Interop.cpp" />
     <ClCompile Include="CameraAccess.cpp" />
     <ClCompile Include="PssmDetour.cpp" />
     <ClCompile Include="imgui\imgui.cpp" />
@@ -178,6 +193,8 @@
     <ClInclude Include="ShaderMetadata.h" />
     <ClInclude Include="GeometryCapture.h" />
     <ClInclude Include="MotionVectors.h" />
+    <ClInclude Include="D3D12Interop.h" />
+    <ClInclude Include="UpscalerFSR3.h" />
     <ClInclude Include="CameraAccess.h" />
     <ClInclude Include="tracy\Tracy.hpp" />
     <ClInclude Include="PssmDetour.h" />

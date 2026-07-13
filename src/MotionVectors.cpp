@@ -37,6 +37,7 @@ static ID3D11VertexShader*   sVelInstVS = nullptr;   // A.4 instanced (per-insta
 static ID3D11PixelShader*    sFsPS  = nullptr;
 static ID3D11VertexShader*   sFsVS  = nullptr;
 static ID3D11PixelShader*    sSharpenPS = nullptr;   // RCAS-lite sharpen for the DLSS output
+static ID3D11PixelShader*    sSkyMvPS   = nullptr;   // camera-only MV fill for sky/far-depth pixels
 static ID3D11Buffer*         sSharpenCB = nullptr;   // { float2 invRes; float amount; float pad; }
 static ID3D11Buffer*         sVelCB = nullptr;
 static ID3D11Buffer*         sCurBoneCB = nullptr;    // 80 float3x4 bone palette (this frame)
@@ -192,6 +193,28 @@ float4 main(FOut i) : SV_Target {
     float3 mn = min(c, min(min(n, s), min(e, w)));
     float3 mx = max(c, max(max(n, s), max(e, w)));
     return float4(clamp(sharp, mn, mx), 1.0);
+})";
+
+// Sky / far-background motion vectors. The sky is a forward pass with no MV injection, so its
+// velocity stays 0 from the clear -> under camera rotation FSR/DLSS think it's static and pull
+// history from the wrong place -> ghosting + object/sky edge shimmer. Here we fill the velocity
+// buffer for far-plane pixels ONLY (depth ~= far) with the camera-only reprojection: a point at
+// infinity moves purely by camera rotation, so we reproject a far-plane clip point through the SAME
+// column-major dust_reproj (prevVP*inv(curVP)) the game shaders use, with the SAME (0.5,-0.5) UV
+// convention. Non-sky pixels are discarded so per-object MVs are preserved untouched.
+static const char* kSkyMvPS = R"(
+Texture2D<float> depthTex : register(t0);
+SamplerState smp : register(s0);
+cbuffer DustMVCB : register(b0) { column_major float4x4 dust_reproj; };
+struct FOut { float4 pos:SV_Position; float2 uv:TEXCOORD0; };
+float2 main(FOut i) : SV_Target {
+    float d = depthTex.SampleLevel(smp, i.uv, 0);
+    if (d < 0.999) discard;                        // covered geometry keeps its per-object MV
+    float2 ndc      = float2(i.uv.x*2-1, 1-i.uv.y*2);
+    float4 curClip  = float4(ndc, 1.0, 1.0);       // far plane; rotation dominates at infinity
+    float4 prevClip = mul(dust_reproj, curClip);
+    float2 prevNDC  = prevClip.xy / prevClip.w;
+    return (ndc - prevNDC) * float2(0.5, -0.5);
 })";
 
 
@@ -370,6 +393,12 @@ static bool Inv(const float* m, float* o)
 static float FrobDiff2(const float* a, const float* b)
 {
     float s = 0; for (int i = 0; i < 16; i++) { float d = a[i] - b[i]; s += d * d; } return s;
+}
+// r = m * v  (column-major: element(row,col) = m[col*4+row])
+static void MatVec(const float* m, const float* v, float* r)
+{
+    for (int row = 0; row < 4; row++)
+        r[row] = m[0*4+row]*v[0] + m[1*4+row]*v[1] + m[2*4+row]*v[2] + m[3*4+row]*v[3];
 }
 static void Transpose(const float* m, float* o)   // column-major
 {
@@ -909,6 +938,23 @@ ID3D11RenderTargetView* InjEnsureVelRTV(ID3D11RenderTargetView* refRTV)
 
 ID3D11Buffer* GetInjReprojCB() { return sReprojCB; }
 
+// ---- A.5 rigid moving-object velocity (weapons/tools/doors on animated bones) ---------------------
+// objects.hlsl carries geometry whose WORLD transform can change frame-to-frame (a weapon follows an
+// animated hand bone). Camera-only reproj then ghosts it. We spatially match each objects.hlsl draw to
+// its previous-frame self (mesh identity + nearest rebased world position, one-to-one, gated) and bind
+// that draw's PREVIOUS world-view-proj at b12, so the injected VS (InjRigidVS) reprojects by the
+// object's own motion. Current WVP is read at draw time from the SAME Map/Unmap CB shadow the skinned
+// path uses; the world position is the WVP origin unprojected by inv(curVP). Unmatched -> zero b12 ->
+// the shader falls back to camera reproj (no regression: a static object's prev WVP == the camera reproj).
+struct RigidXform { float wvp[16]; ID3D11Buffer* mesh; UINT idxCount; INT baseVtx; };
+static std::vector<RigidXform>                                  sPrevRigid, sCurRigid;
+static std::vector<uint8_t>                                     sPrevRigidClaimed;
+static std::unordered_map<ID3D11Buffer*, std::vector<uint32_t>> sPrevRigidByMesh;   // mesh(VB0) -> prev indices
+static ID3D11Buffer*  sInjRigidB12  = nullptr;   // per-draw prevWVP CB (64B, column-major)
+static ID3D11Buffer*  sRigidZeroB12 = nullptr;   // persistent all-zero b12 -> shader camera-reproj fallback
+static float          sFwdReproj[16] = {}; static bool sHaveFwd = false;   // curVP * inv(prevVP): last->this clip
+static uint32_t sRigidTotal = 0, sRigidMatched = 0, sRigidShadowMiss = 0, sRigidDiag = 0;
+
 ID3D11Resource* GetInjVelResource() { return sInjVelTex; }
 
 void InjBeginGBuffer(ID3D11DeviceContext* ctx)
@@ -926,10 +972,15 @@ void InjBeginGBuffer(ID3D11DeviceContext* ctx)
     // reprojection from A.2. Applied to a draw's current clip pos it yields its previous clip pos.
     float curVP[16]; float reproj[16]; Identity(reproj);
     bool haveVP = CameraAccess_GetViewProj(curVP);
+    sHaveFwd = false;
     if (haveVP && sInjHavePrev)
     {
         float invCur[16];
         if (Inv(curVP, invCur)) Mul(sInjPrevVP, invCur, reproj);
+        // A.5: forward reproj (last-frame clip -> this-frame clip) for predicted-screen-space matching —
+        // built from LAST frame's VP (still in sInjPrevVP here) and this frame's curVP.
+        float invPrev[16];
+        if (Inv(sInjPrevVP, invPrev)) { Mul(curVP, invPrev, sFwdReproj); sHaveFwd = true; }
     }
     if (haveVP) { memcpy(sInjPrevVP, curVP, 64); sInjHavePrev = true; }
     // Wind-MV time delta: grass_vs recomputes its sway at (time - dust_windDelta) for the previous frame.
@@ -1095,6 +1146,143 @@ void InjBindSkinPrev(ID3D11DeviceContext* ctx)
     }
 }
 
+// Draw hook (right after GeometryCapture::OnDrawIndexed): for a STATIC (rigid, objects.hlsl-class) draw,
+// read its CURRENT WVP from the CB shadow, unproject the origin to a rebased world position, spatially
+// match it to a same-mesh previous draw, and bind that draw's PREVIOUS WVP at b12. objects.hlsl's
+// InjRigidVS then reprojects the vertex by the object's OWN motion; a miss binds the zero CB and the
+// shader falls back to camera reproj. b12 is bound for EVERY static draw so a preceding skinned draw's
+// bone CB can never be misread here (and our 64B b12, if a later unmatched skin draw misreads it, reads
+// zero past 64B -> that path's own zero-VP fallback). Non-objects static VS (terrain) ignore b12.
+void InjBindRigidPrev(ID3D11DeviceContext* ctx)
+{
+    if (!ctx || !sDevice) return;
+    const auto& caps = GeometryCapture::GetCaptures();
+    if (caps.empty()) return;
+    const CapturedDraw& d = caps.back();
+    if (!d.vsMetadata || d.vsMetadata->transformType != VSTransformType::STATIC || !d.indexBuffer) return;
+
+    if (!sRigidZeroB12)
+    {
+        float zero[16] = {};
+        D3D11_BUFFER_DESC bd = {}; bd.ByteWidth = 64; bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        D3D11_SUBRESOURCE_DATA sd = { zero, 0, 0 };
+        if (FAILED(sDevice->CreateBuffer(&bd, &sd, &sRigidZeroB12))) return;
+    }
+    ID3D11Buffer* toBind = sRigidZeroB12;   // default: shader falls back to camera reproj
+
+    // OPT-IN, OFF BY DEFAULT. Cross-frame identity for rigid objects is unreliable enough that wrong
+    // matches regress static geometry, so ship it disabled: bind the zero CB (objects.hlsl then falls
+    // back to camera reproj = the original, correct-for-static behaviour) and skip the matcher entirely.
+    // Set [Upscaling] WeaponMV=1 to try the experimental per-object weapon/rigid velocity.
+    static bool sWMVRead = false, sWMV = false;
+    if (!sWMVRead)
+    {
+        sWMVRead = true;
+        sWMV = GetPrivateProfileIntA("Upscaling", "WeaponMV", 0, (DustLogDir() + "Dust.ini").c_str()) != 0;
+        Log("MotionVectors: weapon/rigid MV %s", sWMV ? "ENABLED ([Upscaling] WeaponMV=1)"
+                                                      : "disabled (default) — objects use camera reproj");
+    }
+    if (!sWMV) { ctx->VSSetConstantBuffers(12, 1, &sRigidZeroB12); return; }
+
+    uint32_t clipOff = d.vsMetadata->clipMatrixOffset;
+    uint32_t cbSlot  = d.vsMetadata->cbSlot;
+
+    // Learn this draw's clip-matrix CB so the Map/Unmap shadow captures it (reuses the skin shadow map).
+    ID3D11Buffer* clipCB = nullptr;
+    ctx->VSGetConstantBuffers(cbSlot, 1, &clipCB);
+    if (clipCB)
+    {
+        if (sKnownBoneCB.find((const void*)clipCB) == sKnownBoneCB.end())
+        {
+            if (sKnownBoneCB.size() > 96) { sKnownBoneCB.clear(); sBoneShadow.clear(); sMapPending.clear(); }
+            D3D11_BUFFER_DESC bd; clipCB->GetDesc(&bd);
+            sKnownBoneCB[(const void*)clipCB] = bd.ByteWidth;
+            sBoneShadowActive = true;
+        }
+        auto it = sBoneShadow.find((const void*)clipCB);
+        clipCB->Release();
+        if (it != sBoneShadow.end() && (size_t)clipOff + 64 <= it->second.size() && sHaveFwd)
+        {
+            sRigidTotal++;
+            const float* wvp = (const float*)(it->second.data() + clipOff);
+            float cw = (wvp[15] != 0.0f) ? 1.0f / wvp[15] : 0.0f;
+            float curNDC[2] = { wvp[12]*cw, wvp[13]*cw };            // this object's screen position now
+
+            // Match by PREDICTED screen position: forward-reproject each same-mesh previous draw's origin
+            // into this frame (camera reproj = sFwdReproj) and take the nearest. A static object's
+            // prediction is EXACT (dd~=0) so it matches ITSELF even amid dense identical furniture; a wrong
+            // pairing lands at a different screen spot and loses. The gate bounds one-frame self-motion, so
+            // it also rejects a truly-moved object whose own prev is missing (-> camera-reproj fallback).
+            ID3D11Buffer* meshKey = d.vertexBuffers[0];   // VB0 (position stream) is a stabler mesh id than the reused IB
+            const float kGate2 = 0.04f;                    // NDC^2 (~20% screen radius)
+            int best = -1; float bestD = 1e30f;
+            auto mb = meshKey ? sPrevRigidByMesh.find(meshKey) : sPrevRigidByMesh.end();
+            if (meshKey && mb != sPrevRigidByMesh.end())
+                for (uint32_t j : mb->second)
+                {
+                    if (sPrevRigidClaimed[j]) continue;
+                    const RigidXform& pr = sPrevRigid[j];
+                    if (pr.idxCount != d.indexCount || pr.baseVtx != d.baseVertexLocation) continue;
+                    float po[4] = { pr.wvp[12], pr.wvp[13], pr.wvp[14], pr.wvp[15] };
+                    float pc[4]; MatVec(sFwdReproj, po, pc);            // predicted THIS-frame clip of the prev origin
+                    float pw = (pc[3] != 0.0f) ? 1.0f / pc[3] : 0.0f;
+                    float dx = curNDC[0] - pc[0]*pw, dy = curNDC[1] - pc[1]*pw;
+                    float dd = dx*dx + dy*dy;
+                    if (dd < bestD) { bestD = dd; best = (int)j; }
+                }
+            if (best >= 0 && bestD <= kGate2)
+            {
+                sPrevRigidClaimed[best] = 1;
+                sRigidMatched++;
+                if (!sInjRigidB12)
+                {
+                    D3D11_BUFFER_DESC bd = {}; bd.ByteWidth = 64; bd.Usage = D3D11_USAGE_DYNAMIC;
+                    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+                    sDevice->CreateBuffer(&bd, nullptr, &sInjRigidB12);
+                }
+                if (sInjRigidB12)
+                {
+                    D3D11_MAPPED_SUBRESOURCE ms;
+                    if (SUCCEEDED(ctx->Map(sInjRigidB12, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms)))
+                    {
+                        memcpy(ms.pData, sPrevRigid[best].wvp, 64);
+                        ctx->Unmap(sInjRigidB12, 0);
+                        toBind = sInjRigidB12;
+                    }
+                }
+            }
+            // Record THIS draw as a match target for next frame (VB0 mesh id + this frame's WVP/screen pos).
+            if (sCurRigid.size() < 8192)
+            {
+                RigidXform cur; memcpy(cur.wvp, wvp, 64);
+                cur.mesh = meshKey; cur.idxCount = d.indexCount; cur.baseVtx = d.baseVertexLocation;
+                sCurRigid.push_back(std::move(cur));
+            }
+        }
+        else if (it == sBoneShadow.end()) sRigidShadowMiss++;   // CB not shadowed yet (warmup) -> reproj
+    }
+    ctx->VSSetConstantBuffers(12, 1, &toBind);
+}
+
+// POST_LIGHTING: promote THIS frame's rigid draws to next frame's match targets, and (re)bucket by mesh
+// so the per-draw match is O(same-mesh) not O(all). No GPU read (positions/WVPs were gathered at draw time).
+void InjFillRigidPrev(ID3D11DeviceContext*)
+{
+    if ((sRigidDiag++ % 120) == 0 && sRigidTotal > 0)
+        Log("MV[rigid]: matched=%u/%u (%.0f%%) shadowMiss=%u prev=%zu",
+            sRigidMatched, sRigidTotal, 100.0f * sRigidMatched / (float)sRigidTotal,
+            sRigidShadowMiss, sPrevRigid.size());
+    sRigidTotal = 0; sRigidMatched = 0; sRigidShadowMiss = 0;
+
+    sPrevRigid.swap(sCurRigid);
+    sCurRigid.clear();
+    sPrevRigidClaimed.assign(sPrevRigid.size(), 0);
+    sPrevRigidByMesh.clear();
+    for (uint32_t i = 0; i < sPrevRigid.size(); i++)
+        if (sPrevRigid[i].mesh) sPrevRigidByMesh[sPrevRigid[i].mesh].push_back(i);
+}
+
 void InjDebugBlit(ID3D11DeviceContext* ctx)
 {
     if (!ctx || !DebugVizEnabled() || !sInjVelSRV) return;
@@ -1169,16 +1357,56 @@ void SharpenBlit(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* srcSRV,
     sState.Restore(ctx);
 }
 
+// Fill camera-only MV into the velocity buffer for sky / far-depth pixels (see kSkyMvPS). Runs at
+// POST_TONEMAP just before the upscaler reads the velocity buffer, so per-object MVs are already in
+// place and only the uncovered sky is filled. depthSRV is the game's scene depth (R32F, 0=near..1=far).
+void InjFillSkyMV(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* depthSRV, uint32_t w, uint32_t h)
+{
+    if (!ctx || !depthSRV || !sInjVelRTV || !sReprojCB || w == 0 || h == 0) return;
+    if (!sFsVS && !CompileVS(kFsVS, &sFsVS)) return;
+    if (!sSkyMvPS && !CompilePS(kSkyMvPS, &sSkyMvPS)) return;
+    if (!sSampler)
+    {
+        D3D11_SAMPLER_DESC smp = {};
+        smp.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+        smp.AddressU = smp.AddressV = smp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sDevice->CreateSamplerState(&smp, &sSampler);
+    }
+
+    sState.Capture(ctx);
+    ID3D11RenderTargetView* rtv = sInjVelRTV;
+    ctx->OMSetRenderTargets(1, &rtv, nullptr);
+    D3D11_VIEWPORT vp = { 0, 0, (float)w, (float)h, 0, 1 };
+    ctx->RSSetViewports(1, &vp);
+    ctx->VSSetShader(sFsVS, nullptr, 0);
+    ctx->PSSetShader(sSkyMvPS, nullptr, 0);
+    ctx->PSSetShaderResources(0, 1, &depthSRV);
+    ctx->PSSetSamplers(0, 1, &sSampler);
+    ctx->PSSetConstantBuffers(0, 1, &sReprojCB);
+    ctx->OMSetDepthStencilState(nullptr, 0);
+    ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+    ctx->IASetInputLayout(nullptr);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11Buffer* nullVB = nullptr; UINT z = 0;
+    ctx->IASetVertexBuffers(0, 1, &nullVB, &z, &z);
+    ctx->Draw(3, 0);
+    sState.Restore(ctx);
+}
+
 void Shutdown()
 {
     ReleaseTargets();
     if (sSharpenPS) { sSharpenPS->Release(); sSharpenPS = nullptr; }
+    if (sSkyMvPS)   { sSkyMvPS->Release();   sSkyMvPS = nullptr; }
     if (sSharpenCB) { sSharpenCB->Release(); sSharpenCB = nullptr; }
     if (sInjVelSRV) { sInjVelSRV->Release(); sInjVelSRV = nullptr; }
     if (sInjVelRTV) { sInjVelRTV->Release(); sInjVelRTV = nullptr; }
     if (sInjVelTex) { sInjVelTex->Release(); sInjVelTex = nullptr; }
     if (sReprojCB)  { sReprojCB->Release();  sReprojCB = nullptr; }
     if (sInjSkinB12){ sInjSkinB12->Release();sInjSkinB12 = nullptr; }
+    if (sInjRigidB12) { sInjRigidB12->Release(); sInjRigidB12 = nullptr; }
+    if (sRigidZeroB12){ sRigidZeroB12->Release(); sRigidZeroB12 = nullptr; }
+    sPrevRigid.clear(); sCurRigid.clear(); sPrevRigidClaimed.clear(); sPrevRigidByMesh.clear();
     sBoneShadowActive = false;
     sKnownBoneCB.clear(); sMapPending.clear(); sBoneShadow.clear();
     sPrevSkinPoses.clear(); sPrevClaimed.clear();
