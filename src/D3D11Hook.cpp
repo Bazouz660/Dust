@@ -14,7 +14,6 @@
 #include "UpscalerFSR2.h"
 #include "UpscalerFSR3.h"
 #include "D3D12Interop.h"
-#include "FrameGen.h"
 #include "CameraAccess.h"
 #include "DustLog.h"
 #include <cmath>
@@ -2415,27 +2414,7 @@ static void TickGuiOnPresent(IDXGISwapChain* swapChain, const char* via)
 static HRESULT STDMETHODCALLTYPE HookedPresent(
     IDXGISwapChain* pThis, UINT SyncInterval, UINT Flags)
 {
-    // Skip our own gSwap->Present re-entering here — otherwise the GUI build + input run twice per frame.
-    if (FrameGen::IsWanted() && FrameGen::InTakeover())
-        return oPresent(pThis, SyncInterval, Flags);
-
     if (!gShutdownSignaled) TickGuiOnPresent(pThis, "Present");
-    // Frame-gen present-takeover: present the frame through our FSR3-FG swap chain on the real HWND, fed
-    // Dust's DLAA depth + motion vectors so it can interpolate. The game's own (hidden) swap chain presents
-    // fast + invisibly.
-    if (!gShutdownSignaled && FrameGen::IsWanted())
-    {
-        ID3D11Resource* fgDepth = nullptr;
-        if (ID3D11ShaderResourceView* dsv = gResourceRegistry.GetSRV(ResourceName::DEPTH_SRV)) dsv->GetResource(&fgDepth);
-        ID3D11Resource* fgMV = MotionVectors::GetInjVelResource();
-        bool took = FrameGen::PresentTakeover(pThis, SyncInterval, fgDepth, fgMV);
-        static void* sLastSC = nullptr; static int sLastState = -1;
-        int state = (int)took | ((fgDepth && fgMV) ? 2 : 0);
-        if ((void*)pThis != sLastSC || state != sLastState)
-        { sLastSC = pThis; sLastState = state; Log("FG-diag: Present sc=%p takeover=%d fg-inputs=%d", (void*)pThis, (int)took, (int)(fgDepth && fgMV)); }
-        if (fgDepth) fgDepth->Release();
-        if (took) return oPresent(pThis, 0, Flags);
-    }
     return oPresent(pThis, SyncInterval, Flags);
 }
 
@@ -2443,19 +2422,7 @@ static HRESULT STDMETHODCALLTYPE HookedPresent1(
     IDXGISwapChain1* pThis, UINT SyncInterval, UINT PresentFlags,
     const DXGI_PRESENT_PARAMETERS* pPresentParameters)
 {
-    if (FrameGen::IsWanted() && FrameGen::InTakeover())
-        return oPresent1(pThis, SyncInterval, PresentFlags, pPresentParameters);
-
     if (!gShutdownSignaled) TickGuiOnPresent(pThis, "Present1");
-    if (!gShutdownSignaled && FrameGen::IsWanted())
-    {
-        ID3D11Resource* fgDepth = nullptr;
-        if (ID3D11ShaderResourceView* dsv = gResourceRegistry.GetSRV(ResourceName::DEPTH_SRV)) dsv->GetResource(&fgDepth);
-        ID3D11Resource* fgMV = MotionVectors::GetInjVelResource();
-        bool took = FrameGen::PresentTakeover(pThis, SyncInterval, fgDepth, fgMV);
-        if (fgDepth) fgDepth->Release();
-        if (took) return oPresent1(pThis, 0, PresentFlags, pPresentParameters);
-    }
     return oPresent1(pThis, SyncInterval, PresentFlags, pPresentParameters);
 }
 
@@ -2464,8 +2431,6 @@ static HRESULT STDMETHODCALLTYPE HookedResizeBuffers(
     DXGI_FORMAT NewFormat, UINT SwapChainFlags)
 {
     if (gShutdownSignaled) return oResizeBuffers(pThis, BufferCount, Width, Height, NewFormat, SwapChainFlags);
-
-    if (FrameGen::IsWanted()) Log("FG-diag: ResizeBuffers on swapchain %p -> %ux%u", (void*)pThis, Width, Height);
 
     // Block Render() while we tear down and recreate the back buffer
     DustGUI::SetResizeInProgress(true);

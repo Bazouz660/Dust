@@ -62,7 +62,7 @@ if (Test-Path $NgxDll) { Copy-Item $NgxDll "$ModDir\"; Write-Host "    + nvngx_d
 # FSR3/FSR4 ffx-api runtime — only when the FidelityFX SDK is vendored (external/FidelityFX-SDK is
 # gitignored). The loader dispatches to the upscaler provider; both must sit next to Dust.dll.
 $FfxBin = "$Root\external\FidelityFX-SDK\Kits\FidelityFX\signedbin"
-foreach ($ffxDll in @("amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_upscaler_dx12.dll", "amd_fidelityfx_framegeneration_dx12.dll")) {
+foreach ($ffxDll in @("amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_upscaler_dx12.dll")) {
     if (Test-Path "$FfxBin\$ffxDll") { Copy-Item "$FfxBin\$ffxDll" "$ModDir\"; Write-Host "    + $ffxDll (FSR3/4 runtime)" -ForegroundColor DarkGray }
 }
 

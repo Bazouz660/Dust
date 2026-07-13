@@ -9,7 +9,6 @@
 #include "UpscalerControl.h"
 #include "Upscaler.h"
 #include "MotionVectors.h"
-#include "FrameGen.h"
 #include "imgui/imgui.h"
 #include "imgui/backends/imgui_impl_win32.h"
 #include "imgui/backends/imgui_impl_dx11.h"
@@ -1929,10 +1928,6 @@ bool Init(IDXGISwapChain* swapChain, ID3D11Device* device, ID3D11DeviceContext* 
     if (FAILED(hr))
     { Log("GUI: swapChain->GetDesc failed hr=0x%08X", (unsigned)hr); return false; }
     gHWnd = desc.OutputWindow;
-    // Frame gen redirected this swap chain to a hidden window; hook the REAL game window (which has focus)
-    // for the GUI + input, not the dead redirect window.
-    HWND fgHwnd = FrameGen::RealHwndFor(swapChain);
-    if (fgHwnd) { Log("GUI: FrameGen active — using real window %p (redirect window was %p)", fgHwnd, gHWnd); gHWnd = fgHwnd; }
     Log("GUI: hwnd=%p, size=%ux%u, format=%d", gHWnd, desc.BufferDesc.Width, desc.BufferDesc.Height, (int)desc.BufferDesc.Format);
     if (!gHWnd) { Log("GUI: No HWND"); return false; }
     if (!IsWindow(gHWnd)) { Log("GUI: hwnd %p is not a valid window", gHWnd); return false; }

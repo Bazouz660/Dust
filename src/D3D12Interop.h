@@ -8,7 +8,6 @@
 struct ID3D12Device;
 struct ID3D12Resource;
 struct ID3D12GraphicsCommandList;
-struct ID3D12CommandQueue;
 
 // D.0 interop spike for FSR 3.1 / FSR 4 (both are DX12-only — there is no D3D11 FSR3 backend).
 // Proves the bridge those upscalers need: a background D3D12 device on the game's own adapter that
@@ -41,11 +40,6 @@ namespace D3D12Interop
 
     // The D3D12 device on the game's adapter (null until Init succeeds). FFX etc. create contexts on it.
     ID3D12Device* GetDevice();
-
-    // The D3D12 direct queue — the present/execute queue. Frame gen creates its swap chain on this queue,
-    // and BeginD3D12Work/SubmitD3D12Work execute on it, so a present issued after Submit is GPU-ordered
-    // behind the recorded work.
-    struct ID3D12CommandQueue* GetQueue();
 
     // Create a shared texture pair (a D3D11 texture on the game device + the same memory as a D3D12
     // resource, via one NT handle). SRV + copy usable on both sides (no UAV bind — keep those D3D12-local).

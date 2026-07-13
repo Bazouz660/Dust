@@ -137,7 +137,7 @@
   <ItemDefinitionGroup Condition="'$(HaveFsr3)'=='true'">
     <ClCompile>
       <PreprocessorDefinitions>DUST_HAVE_FSR3;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalIncludeDirectories>$(ProjectDir)..\external\FidelityFX-SDK\Kits\FidelityFX\api\include;$(ProjectDir)..\external\FidelityFX-SDK\Kits\FidelityFX\upscalers\include;$(ProjectDir)..\external\FidelityFX-SDK\Kits\FidelityFX\framegeneration\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\external\FidelityFX-SDK\Kits\FidelityFX\api\include;$(ProjectDir)..\external\FidelityFX-SDK\Kits\FidelityFX\upscalers\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -164,7 +164,6 @@
     <ClCompile Include="UpscalerFSR2.cpp" />
     <ClCompile Include="UpscalerFSR3.cpp" />
     <ClCompile Include="D3D12Interop.cpp" />
-    <ClCompile Include="FrameGen.cpp" />
     <ClCompile Include="CameraAccess.cpp" />
     <ClCompile Include="PssmDetour.cpp" />
     <ClCompile Include="imgui\imgui.cpp" />
@@ -196,7 +195,6 @@
     <ClInclude Include="MotionVectors.h" />
     <ClInclude Include="D3D12Interop.h" />
     <ClInclude Include="UpscalerFSR3.h" />
-    <ClInclude Include="FrameGen.h" />
     <ClInclude Include="CameraAccess.h" />
     <ClInclude Include="tracy\Tracy.hpp" />
     <ClInclude Include="PssmDetour.h" />
