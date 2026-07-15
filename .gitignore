@@ -65,3 +65,6 @@ Desktop.ini
 external/*
 !external/KenshiLib
 !external/KenshiLib_Examples_deps
+# miniz: tiny vendored MIT zip lib compiled into Dust.dll (BugReport). Must be in
+# the repo so CI can build it — the rest of external/ is fetched or local-only.
+!external/miniz

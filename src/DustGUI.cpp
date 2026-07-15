@@ -847,15 +847,6 @@ static void DrawUpscalingSection()
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Debug overlay of the motion-vector buffer: grey = still, colour = motion dir/magnitude, red = no MV.\nWatch grass/foliage while moving — if it stays grey while swaying, it has no valid MV and will ghost under DLSS (that's what a reactive mask would fix).");
     }
-
-    // Vendor attribution. The NVIDIA RTX SDK license requires the DLSS mark to be
-    // shown in-app; AMD FSR (MIT) is credited alongside it. Kept in this section so
-    // the marks are always visible wherever the upscalers are used.
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::TextDisabled("Powered by NVIDIA DLSS.");
-    ImGui::TextDisabled("NVIDIA DLSS is a trademark of NVIDIA Corporation.");
-    ImGui::TextDisabled("AMD FSR is a trademark of Advanced Micro Devices, Inc.");
 }
 
 static void DrawFrameworkSection()
