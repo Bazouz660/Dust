@@ -418,6 +418,28 @@ static float gJitterPxX = 0.0f;   // this frame's jitter, in pixels [-0.5, 0.5]
 static float gJitterPxY = 0.0f;
 static int   sUpsBackend = 0;     // 0 = DLSS, 1 = FSR2 (declared early so the jitter advance can pick FSR2's sequence)
 
+// Forward scene passes (sky/atmosphere, water, transparents, particles) bind the SAME depth buffer as
+// the GBuffer but render AFTER it — and were never viewport-jittered. The upscaler jitter-compensates
+// the whole frame, so unjittered content wobbles by the jitter amplitude (±0.5px) in the output —
+// most visible as "jitter" on thin far silhouettes against the sky/fog. Track those passes (set in the
+// OMSet hooks: non-GBuffer bind whose DSV == this frame's GBuffer DSV) and jitter their viewports too.
+// Compositor QUADS inside such passes (fog/tonemap; image-space) are un-jittered per-draw in HookedDraw.
+static bool  gFwdScenePass = false;
+static bool  gJitterForwardPasses = true;   // [Upscaling] JitterForwardPasses (debug off-switch)
+
+// Dust-side rendering (effect dispatches, MV/upscaler fullscreen passes, ImGui) sets its own
+// viewports through the hooked context. Those must NEVER be jittered — only OGRE's own pass
+// viewports carry the sub-pixel offset. Leaking jitter into Dust's POST_* passes half-pixel-shifted
+// the sky-MV fill and the depth-convert output every frame -> DLSS/FSR got misaligned inputs ->
+// visibly blurry image (in-game 2026-07-14). Counter, not bool: effect fullscreen draws re-enter
+// HookedDraw and nest scopes.
+static thread_local int tSuppressVpJitter = 0;
+struct VpJitterSuppressScope
+{
+    VpJitterSuppressScope()  { ++tSuppressVpJitter; }
+    ~VpJitterSuppressScope() { --tSuppressVpJitter; }
+};
+
 static float HaltonSeq(uint32_t i, uint32_t b)
 {
     float f = 1.0f, r = 0.0f;
@@ -479,6 +501,7 @@ static bool             sUpsConfigRead = false;
 static bool             sUpsEnabled    = false;   // runtime DLSS on/off (seeded from [Upscaling] DLSS)
 static int              sUpsPresetIdx  = 3;        // Upscaler::PRESET_F (CNN DLAA; K blurs the static image in our D3D11 NGX integration)
 static float            sUpsSharpness  = 0.0f;     // [0,1]
+static bool             sUpsDepthConvert = true;   // [Upscaling] DepthConvert: linear game depth -> device-Z
 static int              sUpsActiveBackend = -1;    // currently-initialized backend (detect GUI switch)
 static bool             sUpsInitTried  = false;    // NGX availability probed
 static int              sUpsFeaturePreset = -1;    // preset the live feature was created with (-1 = none)
@@ -491,6 +514,15 @@ static const void*               sUpsPrevColorRTV = nullptr; // detect pipeline 
 static ID3D11Texture2D*          sUpsColorSR  = nullptr; // shader-readable copy of the scene color for NGX
 static uint32_t         sUpsColorW = 0, sUpsColorH = 0;
 static bool             sUpsDescLogged = false;
+
+// Runtime gate for the injected motion-vector feeder (velocity RT + patched-shader SV_Target3 bind +
+// reproj/clear pass + skin/geometry tracking). The feeder only earns its per-frame cost when something
+// consumes velocity: the upscaler resolve, or the MV debug overlay. RunUpscaler recomputes this once
+// per frame (POST_TONEMAP); the per-draw hooks (which run earlier, i.e. on the NEXT frame) read it as a
+// single cheap bool. So a toggle takes one frame to fully engage/disengage — harmless. When it's off,
+// the feeder does nothing and holds no VRAM, so a disabled upscaler is (near) vanilla cost.
+static bool             sMvFeederActive = false;
+static bool             gCaptureGeometryWanted = false;  // [Upscaling] CaptureGeometry — applied only while the feeder is active
 
 // Width/height of a resource (0/false if not a Texture2D). Used to skip the resolve when the color,
 // depth and MV inputs momentarily disagree (e.g. mid-pipeline-rebuild) instead of freezing the image.
@@ -574,7 +606,23 @@ static void RunUpscaler(ID3D11DeviceContext* ctx)
         sUpsPresetIdx = GetPrivateProfileIntA("Upscaling", "DLSSPreset", 3, iniPath.c_str());          // 3 = F (K blurs static image)
         sUpsSharpness = GetPrivateProfileIntA("Upscaling", "DLSSSharpness", 0, iniPath.c_str()) / 100.0f;
         sUpsBackend   = GetPrivateProfileIntA("Upscaling", "Backend", 0, iniPath.c_str());     // 0=DLSS 1=FSR2 2=FSR3
+        sUpsDepthConvert     = GetPrivateProfileIntA("Upscaling", "DepthConvert", 1, iniPath.c_str()) != 0;
+        gJitterForwardPasses = GetPrivateProfileIntA("Upscaling", "JitterForwardPasses", 1, iniPath.c_str()) != 0;
     }
+
+    // Decide whether the MV feeder should run this frame, and drive its cost from that. This runs before
+    // every early-out below, so the gate stays correct even when the resolve itself is skipped. Applying
+    // the capture flag every frame is a trivial static write and survives a device/resolution reinit.
+    const bool mvNeeded = sUpsEnabled || MotionVectors::DebugVizEnabled();
+    GeometryCapture::SetCaptureFlags(mvNeeded && gCaptureGeometryWanted ? DUST_CAPTURE_GEOMETRY : 0);
+    if (mvNeeded != sMvFeederActive)
+    {
+        sMvFeederActive = mvNeeded;
+        if (!mvNeeded) MotionVectors::ReleaseInjectionTargets();   // free the velocity RT + drop stale cross-frame state
+        Log("MotionVectors: injected-MV feeder %s (upscaler=%d, debugViz=%d)",
+            mvNeeded ? "ON" : "OFF", (int)sUpsEnabled, (int)MotionVectors::DebugVizEnabled());
+    }
+
     if (!gDevice || gWidth == 0 || gHeight == 0) return;
 
     const int backend = sUpsBackend;   // 0=DLSS 1=FSR2 2=FSR3/FSR4 (D3D12 side-device)
@@ -668,15 +716,28 @@ static void RunUpscaler(ID3D11DeviceContext* ctx)
             // injection, so it's velocity 0 -> ghosts under camera motion). Must run here, after the
             // scene + sky are drawn and before the upscaler reads the velocity buffer.
             MotionVectors::InjFillSkyMV(ctx, depthSRV, gWidth, gHeight);
+            // The game's depth is LINEAR (ray distance / farClip); the upscalers expect hyperbolic
+            // device-Z and (FSR) un-project it with cameraNear/Far for disocclusion. Feeding linear
+            // depth makes the reconstructed view-Z hypersensitive at distance -> history rejection ->
+            // shimmer/jitter on far geometry. Convert; fall back to raw depth if the pass fails.
+            ID3D11Resource* upsDepth = depth;
+            if (sUpsDepthConvert)
+            {
+                float camN = 0.1f, camF = 10000.0f, camFov = 1.0f;
+                CameraAccess_GetCameraParams(&camN, &camF, &camFov);
+                ID3D11Resource* conv = MotionVectors::ConvertDepthForUpscaler(
+                    ctx, depthSRV, gWidth, gHeight, camN, camF, camFov);
+                if (conv) upsDepth = conv;
+            }
             float jx, jy; GetTemporalJitter(jx, jy);
             // Our MV texel is (curUV - prevUV) in UV space. The upscaler wants (prevUV - curUV) in render
             // pixels (the vector from a pixel to where it was last frame), so MV_Scale is NEGATIVE display
             // size. Wrong sign => history reprojected backwards => ghosting on camera motion + softness.
             // Sharpness goes to our own RCAS-lite pass, so pass 0 to the upscaler.
             const float mvsx = -(float)gWidth, mvsy = -(float)gHeight;
-            bool ok = backend == 1 ? UpscalerFSR2::Evaluate(ctx, colSR, depth, mv, out, jx, jy, mvsx, mvsy, 0.0f, sUpsResetNext, nullptr)
-                    : backend == 2 ? UpscalerFSR3::Evaluate(ctx, colSR, depth, mv, out, jx, jy, mvsx, mvsy, 0.0f, sUpsResetNext, nullptr)
-                    :                 Upscaler::Evaluate(ctx, colSR, depth, mv, out, jx, jy, mvsx, mvsy, 0.0f, sUpsResetNext, nullptr);
+            bool ok = backend == 1 ? UpscalerFSR2::Evaluate(ctx, colSR, upsDepth, mv, out, jx, jy, mvsx, mvsy, 0.0f, sUpsResetNext, nullptr)
+                    : backend == 2 ? UpscalerFSR3::Evaluate(ctx, colSR, upsDepth, mv, out, jx, jy, mvsx, mvsy, 0.0f, sUpsResetNext, nullptr)
+                    :                 Upscaler::Evaluate(ctx, colSR, upsDepth, mv, out, jx, jy, mvsx, mvsy, 0.0f, sUpsResetNext, nullptr);
             if (ok)
             {
                 if (sUpsSharpness > 0.0f && sUpsOutSRV)
@@ -1016,6 +1077,12 @@ static bool VTableHook(void* pObject, int vtableIndex, void* detour, void** orig
 // The swap chain pointer we vtable-hooked — needed for recovery verification
 static IDXGISwapChain* gHookedSwapChain = nullptr;
 
+// Game-present identification (see the comment block above IsGamePresent, near the Present hooks):
+// the game's present = a TOP-LEVEL Present on the game's RENDER THREAD, on the GUI's home chain.
+static DWORD gGameRenderThreadId = 0;            // set at confirmed-pipeline device capture (HookedDraw)
+static thread_local int tPresentDepth = 0;       // our Present-hook recursion depth on this thread
+static IDXGISwapChain* gGuiSwapChain = nullptr;  // chain the GUI renders into (weak, compare-only)
+
 static void TryInstallSwapChainHooks(ID3D11DeviceContext* drawCtx = nullptr)
 {
     if (sSwapChainHooked)
@@ -1159,11 +1226,11 @@ static void TryCaptureDevice(ID3D11Device* device)
     MotionVectors::OnResolution(gWidth, gHeight);
     {
         std::string iniPath = DustLogDir() + "Dust.ini";
-        if (GetPrivateProfileIntA("Upscaling", "CaptureGeometry", 0, iniPath.c_str()))
-        {
-            GeometryCapture::SetCaptureFlags(DUST_CAPTURE_GEOMETRY);
-            Log("Upscaling: geometry capture ENABLED ([Upscaling] CaptureGeometry=1)");
-        }
+        // Remember the intent; the actual capture flag is driven per-frame by the MV feeder in
+        // RunUpscaler, so geometry capture only costs anything while the upscaler (or MV debug viz) is on.
+        gCaptureGeometryWanted = GetPrivateProfileIntA("Upscaling", "CaptureGeometry", 0, iniPath.c_str()) != 0;
+        if (gCaptureGeometryWanted)
+            Log("Upscaling: geometry capture requested ([Upscaling] CaptureGeometry=1) — active while the MV feeder is on");
         // Read DLSS intent early (before OGRE creates its samplers) so the mip-bias hook can apply.
         gDlssWanted = GetPrivateProfileIntA("Upscaling", "DLSS", 0, iniPath.c_str()) != 0;
         if (gDlssWanted) Log("Upscaling: DLSS on -> applying %.1f texture mip bias to new samplers", kDlssMipBias);
@@ -1742,6 +1809,45 @@ static void STDMETHODCALLTYPE HookedDraw(
         return;
     }
 
+    // A compositor/fullscreen quad inside a jittered forward scene pass (fog/tonemap and other
+    // image-space quads can bind the scene DSV) must NOT be jittered: shifting an image-space quad
+    // misaligns its screen-UV reads by the jitter offset and double-jitters the composite. 3D content
+    // in those passes comes through DrawIndexed*, so plain 3/4-vertex Draws here are only the quads.
+    // "Viewport actually jittered" is detected by its fractional origin (scene viewports are integer);
+    // this also self-corrects if OGRE set the pass viewport before the RT bind (then it's unjittered).
+    struct QuadUnjitterScope
+    {
+        ID3D11DeviceContext* ctx = nullptr;
+        D3D11_VIEWPORT saved[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+        UINT n = 0;
+        ~QuadUnjitterScope() { if (n) oRSSetViewports(ctx, n, saved); }   // restore the pass's jittered viewport
+    } quadVp;
+    if (gJitterEnabled && gJitterForwardPasses && gFwdScenePass && !gInShadowPass &&
+        (gJitterPxX != 0.0f || gJitterPxY != 0.0f))
+    {
+        UINT nVP = 0;
+        pThis->RSGetViewports(&nVP, nullptr);
+        if (nVP > 0 && nVP <= D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE)
+        {
+            D3D11_VIEWPORT vps[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+            pThis->RSGetViewports(&nVP, vps);
+            bool vpJittered = (vps[0].TopLeftX != floorf(vps[0].TopLeftX)) ||
+                              (vps[0].TopLeftY != floorf(vps[0].TopLeftY));
+            if (vpJittered)
+            {
+                quadVp.ctx = pThis;
+                quadVp.n = nVP;
+                memcpy(quadVp.saved, vps, nVP * sizeof(D3D11_VIEWPORT));
+                for (UINT i = 0; i < nVP; i++)
+                {
+                    vps[i].TopLeftX -= gJitterPxX;
+                    vps[i].TopLeftY -= gJitterPxY;
+                }
+                oRSSetViewports(pThis, nVP, vps);
+            }
+        }
+    }
+
     // Detect the render pass from GPU state. This reads ONLY the context's pipeline state (no
     // device needed), so it runs even before we've captured a device — which is exactly how we pick
     // the RIGHT device. Injected overlays (NVIDIA Smooth Motion, App/Freestyle, Steam/Discord, RTSS)
@@ -1754,6 +1860,10 @@ static void STDMETHODCALLTYPE HookedDraw(
 
     if (result.detected)
     {
+        // Everything below is Dust-side work (effect dispatches, upscaler resolve, MV passes) — its
+        // viewport sets must not pick up the scene sub-pixel jitter (see VpJitterSuppressScope).
+        VpJitterSuppressScope vpSuppress;
+
         // First confirmed game-pipeline draw: capture the device from THIS context. It just produced
         // Kenshi's own render signature, so it is guaranteed to be the game device, never an overlay's.
         if (!gDeviceCaptured)
@@ -1765,6 +1875,11 @@ static void STDMETHODCALLTYPE HookedDraw(
                 Log("Capturing device at CONFIRMED Kenshi pipeline point (%d) — overlay-proof (device=%p)",
                     (int)result.point, ctxDevice);
                 TryCaptureDevice(ctxDevice);
+                // This thread just ran Kenshi's own pipeline draws -> it IS the game render thread.
+                // Present-hook identity (IsGamePresent) keys on it to reject Smooth Motion's
+                // worker-thread interpolated presents.
+                gGameRenderThreadId = GetCurrentThreadId();
+                Log("Game render thread = %u (present-identity anchor)", (unsigned)gGameRenderThreadId);
                 ctxDevice->Release();
             }
             if (!gDeviceCaptured)
@@ -1870,7 +1985,8 @@ static void STDMETHODCALLTYPE HookedDraw(
             ExtractCameraData(pThis);
             // Repack this frame's skinned poses (GBuffer captures are resolved now) so next frame's
             // patched skin VS can read them as "previous" from b12 and emit true animation velocity.
-            MotionVectors::InjFillSkinPrev(pThis);
+            if (sMvFeederActive)
+                MotionVectors::InjFillSkinPrev(pThis);
         }
 
         DustFrameContext fctx = {};
@@ -1945,7 +2061,8 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
         GeometryCapture::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
         // If that draw was skinned, bind its matched previous-frame bone palette at b12 so the patched
         // skin VS can emit true animation velocity (must be after OGRE's per-draw constant setup).
-        MotionVectors::InjBindSkinPrev(pThis);
+        if (sMvFeederActive)
+            MotionVectors::InjBindSkinPrev(pThis);
     }
 
     // Direct-light AO for point/spot lights: for a light_fs draw, swap the AO snapshot
@@ -1954,7 +2071,8 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     bool isLV = gLvAoReady && IsLightVolumeDraw(pThis);
     LightVolumeAoScope lvAo(pThis, isLV);
     // Keep the injected-MV reproj CB pinned at b13 for the patched GBuffer VS (bind AFTER OGRE's
-    // per-draw constant setup; unconditional so the GBuffer-pass gate can't exclude a draw).
+    // per-draw constant setup). Gated on the feeder so a disabled upscaler binds nothing extra.
+    if (sMvFeederActive)
     { ID3D11Buffer* rcb = MotionVectors::GetInjReprojCB(); if (rcb) pThis->VSSetConstantBuffers(13, 1, &rcb); }
     oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 }
@@ -1980,6 +2098,7 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
     // Direct-light AO for point/spot lights (instanced light-volume path — see HookedDrawIndexed).
     bool isLV = gLvAoReady && IsLightVolumeDraw(pThis);
     LightVolumeAoScope lvAo(pThis, isLV);
+    if (sMvFeederActive)
     { ID3D11Buffer* rcb = MotionVectors::GetInjReprojCB(); if (rcb) pThis->VSSetConstantBuffers(13, 1, &rcb); }
     oDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
                           StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
@@ -1994,7 +2113,7 @@ static HRESULT STDMETHODCALLTYPE HookedMap(
     D3D11_MAP MapType, UINT MapFlags, D3D11_MAPPED_SUBRESOURCE* pMappedResource)
 {
     HRESULT hr = oMap(pThis, pResource, Subresource, MapType, MapFlags, pMappedResource);
-    if (!gShutdownSignaled && SUCCEEDED(hr) && Subresource == 0 && pMappedResource)
+    if (!gShutdownSignaled && SUCCEEDED(hr) && Subresource == 0 && pMappedResource && sMvFeederActive)
         MotionVectors::InjNoteMap(pResource, pMappedResource->pData);
     return hr;
 }
@@ -2002,7 +2121,7 @@ static HRESULT STDMETHODCALLTYPE HookedMap(
 static void STDMETHODCALLTYPE HookedUnmap(
     ID3D11DeviceContext* pThis, ID3D11Resource* pResource, UINT Subresource)
 {
-    if (!gShutdownSignaled && Subresource == 0)
+    if (!gShutdownSignaled && Subresource == 0 && sMvFeederActive)
         MotionVectors::InjNoteUnmap(pResource);   // snapshot bytes BEFORE the unmap invalidates pData
     oUnmap(pThis, pResource, Subresource);
 }
@@ -2094,9 +2213,18 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
     bool isGBuf = GeometryCapture::CheckGBufferConfig(NumViews, ppRenderTargetViews, pDepthStencilView);
     GeometryCapture::OnOMSetRenderTargetsWithResult(isGBuf);
 
+    // Temporal-jitter extension: a non-GBuffer pass that binds the scene depth buffer is a forward
+    // scene pass (sky/water/transparents/particles) — its viewport must be jittered too (see the
+    // gFwdScenePass declaration). GetGBufferDSV() is null until this frame's GBuffer pass, so passes
+    // before it can never false-positive.
+    gFwdScenePass = !isGBuf && pDepthStencilView &&
+                    pDepthStencilView == GeometryCapture::GetGBufferDSV();
+
     // Shader-injected motion vectors: append the velocity RT (SV_Target3) to the GBuffer bind, do
     // the once-per-frame reproj+clear, and bind the reproj CB at b13 for the patched vertex shaders.
-    if (isGBuf && NumViews == 3 && gDevice && ppRenderTargetViews && ppRenderTargetViews[0])
+    // Gated on the feeder: when the upscaler (and MV debug viz) are off, OGRE keeps its own 3-RTV bind
+    // and the patched shaders' SV_Target3 writes go nowhere — no extra RT, no reproj pass, no clear.
+    if (sMvFeederActive && isGBuf && NumViews == 3 && gDevice && ppRenderTargetViews && ppRenderTargetViews[0])
     {
         ID3D11RenderTargetView* velRTV = MotionVectors::InjEnsureVelRTV(ppRenderTargetViews[0]);
         if (velRTV)
@@ -2206,9 +2334,13 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargetsAndUAV(
 
     // Motion-vector pass: GBuffer-pass tracking (see the plain-OMSet hook). OGRE 2.0
     // binds the GBuffer MRT through this combined call, so detection must live here too.
+    bool isGBufU = GeometryCapture::CheckGBufferConfig(NumRTVs, ppRenderTargetViews, pDepthStencilView);
     if (GeometryCapture::GetCaptureFlags() != 0)
-        GeometryCapture::OnOMSetRenderTargetsWithResult(
-            GeometryCapture::CheckGBufferConfig(NumRTVs, ppRenderTargetViews, pDepthStencilView));
+        GeometryCapture::OnOMSetRenderTargetsWithResult(isGBufU);
+
+    // Forward-scene-pass tracking for the temporal-jitter extension (see the plain-OMSet hook).
+    gFwdScenePass = !isGBufU && pDepthStencilView &&
+                    pDepthStencilView == GeometryCapture::GetGBufferDSV();
 
     if (!gShadowSwapActive)
     {
@@ -2345,12 +2477,22 @@ static void STDMETHODCALLTYPE HookedRSSetViewports(
         return;
     }
 
-    // Temporal upscaling: offset the main GBuffer scene viewport by this frame's sub-pixel jitter.
-    // Gated to the GBuffer pass so shadow/fullscreen/UI viewports are untouched.
-    if (gJitterEnabled && !gShutdownSignaled && !gInShadowPass &&
+    // Temporal upscaling: offset the scene viewport by this frame's sub-pixel jitter. Applies to the
+    // GBuffer pass AND (JitterForwardPasses) the forward scene passes that bind the same depth buffer
+    // (sky/water/transparents) — unjittered forward content would wobble by the jitter amplitude once
+    // the upscaler jitter-compensates the frame. Shadow/fullscreen/UI viewports are untouched
+    // (compositor quads inside a jittered forward pass are un-jittered per-draw in HookedDraw).
+    if (gJitterEnabled && !gShutdownSignaled && !gInShadowPass && tSuppressVpJitter == 0 &&
         (gJitterPxX != 0.0f || gJitterPxY != 0.0f) &&
-        pViewports && NumViewports > 0 && GeometryCapture::IsInGBufferPass())
+        pViewports && NumViewports > 0 &&
+        (GeometryCapture::IsInGBufferPass() || (gJitterForwardPasses && gFwdScenePass)))
     {
+        if (!GeometryCapture::IsInGBufferPass())
+        {
+            static bool sFwdJitterLogged = false;
+            if (!sFwdJitterLogged)
+            { sFwdJitterLogged = true; Log("Upscaler: forward-scene-pass viewport jitter engaged"); }
+        }
         D3D11_VIEWPORT j[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
         UINT n = (NumViewports <= D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE)
                ? NumViewports : D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
@@ -2371,6 +2513,9 @@ static void STDMETHODCALLTYPE HookedRSSetViewports(
 
 static void TickGuiOnPresent(IDXGISwapChain* swapChain, const char* via)
 {
+    // ImGui's own viewport set must never pick up the scene jitter either.
+    VpJitterSuppressScope vpSuppress;
+
     ++gPresentHookCallCount;
 
     // Periodic diagnostic: confirm Present is firing and show init state
@@ -2408,7 +2553,8 @@ static void TickGuiOnPresent(IDXGISwapChain* swapChain, const char* via)
         if (DustGUI::Init(swapChain, gDevice, gContext))
         {
             gGuiInitDone = true;
-            Log("GUI initialized successfully (swap chain via %s)",
+            gGuiSwapChain = swapChain;   // the GUI's home chain (present/resize identity, compare-only)
+            Log("GUI initialized successfully (swap chain %p via %s)", (void*)swapChain,
                 sTryCaptureFromBoot ? "DustBoot preload" : "runtime discovery");
         }
         else
@@ -2422,19 +2568,67 @@ static void TickGuiOnPresent(IDXGISwapChain* swapChain, const char* via)
     DustGUI::Render();
 }
 
+// The vtable patch lives on the SHARED IDXGISwapChain vtable, so the Present/ResizeBuffers hooks fire
+// for EVERY swapchain in the process — including the second swapchain that driver features (NVIDIA
+// Smooth Motion) and overlays create. Ticking the GUI on those foreign presents draws ImGui at
+// foreign present timing (often from another thread) -> intermittent GUI flicker with Smooth Motion
+// on; worse, a foreign ResizeBuffers would rebind the GUI backbuffer RTV to the WRONG swapchain.
+//
+// TWO DEAD ENDS, both verified in-game 2026-07-14 — do not retry:
+// 1. Device-pointer identity (swapChain->GetDevice() == gDevice): with Smooth Motion the driver WRAPS
+//    the app device, so the swapchain and the immediate context return DIFFERENT ID3D11Device
+//    pointers for the same logical device -> rejected the GAME's own chain, killed the GUI.
+// 2. Render-thread identity: under Smooth Motion the driver takes over presentation COMPLETELY — the
+//    game renders into a proxy chain and NO present ever arrives on the game render thread; SM's
+//    pacing thread (log: tid 7944 vs renderTid 8416) presents everything, including the frames the
+//    GUI must be drawn on to be visible at all. A thread gate can never pass.
+// What remains reliable is CHAIN AFFINITY: tick the GUI only on the chain it initialized on (the
+// chain that presented during the menu — the visible/presenter chain, under SM too), and never on a
+// present nested inside our own hook. That excludes the second chain seen presenting in the wild
+// (foreign-chain ticks were the flicker suspect) without any device/thread assumptions.
+// (gGameRenderThreadId / tPresentDepth / gGuiSwapChain are declared near gHookedSwapChain — they're
+// written from the draw hook and the GUI init path, which live earlier in this file.)
+static bool IsGamePresent(IDXGISwapChain* sc, bool topLevel)
+{
+    if (!sc) return false;
+    const char* skip = nullptr;
+    if (!topLevel)
+        skip = "nested";                                            // driver shim presenting inside our hook
+    else if (gGuiSwapChain && sc != gGuiSwapChain)
+        skip = "not the GUI chain";                                 // second chain (proxy / overlay)
+    if (skip)
+    {
+        static uint64_t sSkipped = 0;   // throttled: foreign chains can present every frame
+        if ((sSkipped++ % 3600) == 0)
+            Log("Present skipped (%s): chain=%p tid=%u renderTid=%u depth-top=%d (seen %llu)",
+                skip, (void*)sc, (unsigned)GetCurrentThreadId(), (unsigned)gGameRenderThreadId,
+                (int)topLevel, (unsigned long long)sSkipped);
+        return false;
+    }
+    return true;
+}
+
 static HRESULT STDMETHODCALLTYPE HookedPresent(
     IDXGISwapChain* pThis, UINT SyncInterval, UINT Flags)
 {
-    if (!gShutdownSignaled) TickGuiOnPresent(pThis, "Present");
-    return oPresent(pThis, SyncInterval, Flags);
+    ++tPresentDepth;
+    if (!gShutdownSignaled && IsGamePresent(pThis, tPresentDepth == 1))
+        TickGuiOnPresent(pThis, "Present");
+    HRESULT hr = oPresent(pThis, SyncInterval, Flags);
+    --tPresentDepth;
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE HookedPresent1(
     IDXGISwapChain1* pThis, UINT SyncInterval, UINT PresentFlags,
     const DXGI_PRESENT_PARAMETERS* pPresentParameters)
 {
-    if (!gShutdownSignaled) TickGuiOnPresent(pThis, "Present1");
-    return oPresent1(pThis, SyncInterval, PresentFlags, pPresentParameters);
+    ++tPresentDepth;
+    if (!gShutdownSignaled && IsGamePresent(pThis, tPresentDepth == 1))
+        TickGuiOnPresent(pThis, "Present1");
+    HRESULT hr = oPresent1(pThis, SyncInterval, PresentFlags, pPresentParameters);
+    --tPresentDepth;
+    return hr;
 }
 
 static HRESULT STDMETHODCALLTYPE HookedResizeBuffers(
@@ -2442,6 +2636,15 @@ static HRESULT STDMETHODCALLTYPE HookedResizeBuffers(
     DXGI_FORMAT NewFormat, UINT SwapChainFlags)
 {
     if (gShutdownSignaled) return oResizeBuffers(pThis, BufferCount, Width, Height, NewFormat, SwapChainFlags);
+
+    // A foreign swapchain (Smooth Motion / overlay) resizing must NOT touch the GUI backbuffer:
+    // RecreateBackBuffer(pThis) would rebind the GUI RTV to the wrong swapchain. The GUI's home chain
+    // is the one it initialized on (compare-only pointer; null until GUI init -> legacy behavior).
+    if (gGuiSwapChain && pThis != gGuiSwapChain)
+    {
+        Log("Foreign swapchain %p ResizeBuffers (%ux%u) — GUI backbuffer untouched", (void*)pThis, Width, Height);
+        return oResizeBuffers(pThis, BufferCount, Width, Height, NewFormat, SwapChainFlags);
+    }
 
     // Block Render() while we tear down and recreate the back buffer
     DustGUI::SetResizeInProgress(true);

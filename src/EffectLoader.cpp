@@ -602,7 +602,27 @@ void EffectLoader::EffectConfigCheckHotReload(LoadedEffect& le)
         EffectConfigLoad(le);
         if (le.desc.OnSettingChanged)
             le.desc.OnSettingChanged();
+        // OnSettingChanged may have written the INI back (e.g. Shadows re-mirrors
+        // its Resolution). Absorb that so we don't re-fire next poll.
+        RefreshConfigMtime(le);
     }
+}
+
+void EffectLoader::RefreshConfigMtime(LoadedEffect& le)
+{
+    if (le.desc.apiVersion < 3 || !(le.desc.flags & DUST_FLAG_FRAMEWORK_CONFIG))
+        return;
+    if (le.configPath.empty())
+        return;
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (GetFileAttributesExA(le.configPath.c_str(), GetFileExInfoStandard, &fad))
+        le.configMtime = fad.ftLastWriteTime;
+}
+
+void EffectLoader::AbsorbConfigSelfWrite(size_t index)
+{
+    if (index >= effects_.size()) return;
+    RefreshConfigMtime(effects_[index]);
 }
 
 // ==================== Global Preset System ====================
@@ -1063,6 +1083,7 @@ void EffectLoader::LoadEffectConfig(size_t index)
         EffectConfigLoad(le);
         if (le.desc.OnSettingChanged)
             le.desc.OnSettingChanged();
+        RefreshConfigMtime(le);
     }
     else if (le.desc.LoadSettings)
         le.desc.LoadSettings();

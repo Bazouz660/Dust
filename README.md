@@ -13,6 +13,7 @@ Effects are loaded as separate DLL plugins from an `effects/` folder using a sta
 - **Pipeline detection**: Identifies render passes by GPU state (render target formats, SRV bindings) rather than fragile shader hashes
 - **Runtime shader patching**: Modifies the game's deferred lighting shader bytecode in memory at startup. No files replaced on disk
 - **State save/restore**: Full D3D11 state capture ensures effects don't interfere with the game's rendering
+- **Upscaling & anti-aliasing**: Optional DLSS / FSR2 / FSR3-FSR4 temporal super-resolution and DLAA, driven by real per-object motion vectors injected into the game's own G-buffer shaders. Backend is filtered by detected GPU
 
 ## Architecture
 
@@ -30,13 +31,13 @@ Game Render Pipeline:
 
 Effects register at specific injection points. When Dust detects a matching render pass, it dispatches registered effects (in priority order) with full access to the relevant GPU resources.
 
-### Plugin API (v3)
+### Plugin API (v8)
 
 Every effect DLL exports a single `DustEffectCreate` function that fills a `DustEffectDesc` struct:
 
 ```c
 typedef struct DustEffectDesc {
-    uint32_t            apiVersion;      // DUST_API_VERSION (currently 3)
+    uint32_t            apiVersion;      // DUST_API_VERSION (currently 8)
     const char*         name;            // Display name
     DustInjectionPoint  injectionPoint;  // Where in the pipeline to run
 
@@ -70,118 +71,37 @@ The host provides a `DustHostAPI` struct with functions for logging, resource ac
 
 ## Current Effects
 
-### SSAO (Screen-Space Ambient Occlusion) (`POST_LIGHTING`, priority 0)
+Effects run at one of the pipeline injection points, in ascending priority order within each stage. All are toggleable and fully configurable in the F11 GUI (most also have a debug/overlay mode).
 
-- **GTAO algorithm**: 12 directions, 6 steps per pixel
-- **Ambient-only AO**: Applied inside the deferred lighting shader to indirect/environment lighting only, not direct sunlight. Consistent between day and night, immune to auto-exposure
-- **Depth-aware bilateral blur**: Horizontal and vertical passes preserve hard edges
-- **Debug visualization**: Overlay mode to inspect the raw AO buffer
+### Deferred lighting stage (`POST_LIGHTING`)
 
-### SSIL (Screen-Space Indirect Lighting) (`POST_LIGHTING`, priority 10)
+| Effect | Prio | Summary |
+|---|---|---|
+| **Shadows (RTWSM)** | -10 | PCSS soft shadows via the RTWSM warp map; variable penumbra, Poisson disk, optional cliff-acne fix, resolution up to 16384 |
+| **SSAO** | 0 | GTAO ambient occlusion applied to indirect/ambient light only — day-night consistent, auto-exposure immune |
+| **SSIL** | 10 | One albedo-weighted bounce of colored indirect light, composited before fog |
+| **RTGI** | 20 | Per-pixel screen-space ray-traced GI + AO, multi-bounce, SVGF denoise, full compute pipeline |
+| **Kuwahara** | 40 | Anisotropic painterly filter that preserves edges |
+| **Outline** | 50 | Depth + normal edge detection, depth-limited |
 
-- **Indirect light bounce**: Samples albedo and depth in 8 directions × 4 steps per pixel to approximate one bounce of indirect lighting from nearby surfaces
-- **Color bleeding**: Albedo-weighted accumulation produces colored indirect light (red walls cast a red glow, etc.)
-- **Additive composite**: IL result is blended additively onto the HDR render target after lighting, before fog
-- **Depth-aware bilateral blur**: Horizontal and vertical passes; configurable sharpness
-- **Debug visualization**: Overlay mode to inspect the raw IL buffer
+### Post-tonemap stage (`POST_TONEMAP`)
 
-### LUT (Color Grading + Tonemapping) (`POST_TONEMAP`, priority 0)
+| Effect | Prio | Summary |
+|---|---|---|
+| **LUT (Color Grading)** | 0 | Full HDR grade before the game's tonemapper: selectable tonemapper (ACES / Reinhard / Uncharted 2 / AgX / Khronos PBR Neutral), lift-gamma-gain, split toning, 32³ float LUT, dithered 8-bit output |
+| **Clarity** | 50 | Local-contrast / midtone detail enhancement with midtone protection |
+| **Depth of Field** | 75 | Auto-focus camera blur, independent near/far fields, sky-aware |
+| **Bloom** | 100 | HDR bloom extracted post-fog before tonemapping, soft-threshold knee |
+| **Deband** | 180 | Depth/luminance-aware debanding, optional sky-only mode |
+| **Chromatic Aberration** | 190 | Per-channel edge fringing (single Strength control) |
+| **Vignette** | 200 | Circular or rectangular edge darkening |
+| **Film Grain** | 210 | Animated monochrome or per-channel chromatic grain |
+| **Letterbox** | 220 | Cinematic bars at a target aspect ratio |
+| **SMAA** | 250 | 3-pass subpixel morphological AA (luma / depth / combined) |
 
-- **Full HDR pipeline**: Captures the R11G11B10_FLOAT scene in `preExecute` before the game's tonemapper runs, then completely replaces the LDR output in `postExecute`, with only one 8-bit quantization step in the entire chain
-- **Selectable tonemapper**: ACES (Narkowicz/Hill), Reinhard, Reinhard Extended, Uncharted 2 (Hable), AgX, Khronos PBR Neutral, or linear passthrough
-- **Parametric LUT**: 32×32×32 color grading LUT generated from configurable parameters (stored as R32G32B32A32_FLOAT to avoid LUT quantization)
-- **Lift/Gamma/Gain**: Shadow, midtone, and highlight adjustment
-- **Color balance**: Contrast, saturation, temperature, and tint controls
-- **Split toning**: Independent shadow and highlight color offsets
-- **Exposure (EV stops)**: Pre-tonemap exposure adjustment
-- **Triangular dithering**: Applied at the final 8-bit write to break up gradient banding
-- **Ships with a cinematic desert preset** tuned for Kenshi's aesthetic
+### Presentation (core framework, `PRE_PRESENT`)
 
-### Clarity / Local Contrast (`POST_TONEMAP`, priority 50)
-
-- **Midtone detail enhancement**: Extracts and amplifies local contrast by subtracting a large-radius Gaussian blur from the original scene
-- **Midtone protection**: Luminance-based mask focuses the effect on midtones, preventing clipping in shadows and highlights
-- **Variable blur radius**: Configurable Gaussian kernel radius controls the spatial scale of "local" contrast (small = fine detail, large = broad structure)
-- **Debug visualization**: Overlay mode shows the extracted detail layer (gray = neutral, bright = positive detail, dark = negative)
-
-### Bloom (`POST_TONEMAP`, priority 100)
-
-- **HDR bloom pipeline**: Captures HDR scene before tonemapping, extracts bright areas, builds gaussian bloom via progressive downsample/upsample chain, composites additively onto LDR
-- **Post-fog extraction**: Blooms from the post-fog HDR scene so distant fogged objects don't bleed through
-- **Soft threshold**: Smooth knee curve controls bloom onset, so only genuinely bright features contribute
-- **Simplified controls**: Intensity, Threshold, and Radius, with no redundant settings
-
-### Outline (`POST_LIGHTING`, priority 50)
-
-- **Edge detection**: Detects edges from both depth discontinuities (Laplacian) and normal angle differences
-- **Configurable appearance**: Adjustable thickness, strength/opacity, and outline color (RGB)
-- **Depth-limited**: Max depth parameter prevents outlines on distant objects and sky
-- **Debug visualization**: Overlay mode to inspect edge detection output
-
-### RTGI (Ray-Traced Global Illumination) (`POST_LIGHTING`, priority 20)
-
-- **Screen-space indirect lighting**: Casts rays per pixel against the depth buffer and samples lit scene radiance at hit points for physically-based indirect illumination
-- **Ambient occlusion**: Occlusion term computed from ray hits, applied alongside indirect light
-- **Multi-bounce**: Previous frame's GI is fed back for approximate multi-bounce light transport
-- **Temporal accumulation + SVGF denoise**: A-trous wavelet filter with variance-guided edge stopping produces stable, noise-free output
-- **Compute shader pipeline**: Ray trace and denoise passes use compute shaders to eliminate pixel shader quad waste at depth discontinuities
-- **Configurable**: Ray count, step count, ray length, thickness, resolution mode (full/half/quarter), denoise iterations
-- **Debug visualization**: Overlay modes for indirect light, AO, and normals
-
-### Shadows (RTWSM Enhancement) (`POST_LIGHTING`, priority -10)
-
-- **Improved shadow filtering**: Replaces the game's basic shadow sampling with PCSS (Percentage-Closer Soft Shadows) via the RTWSM warp map
-- **Variable penumbra**: Light size parameter controls how much shadows soften with distance from the caster
-- **12-sample Poisson disk**: Jittered per-pixel rotation for smooth, low-noise shadow edges
-- **Configurable**: Filter radius, light size, PCSS toggle
-- **Cliff Shadow Fix (optional)**: Adds a small steep-surface bias that suppresses shadow acne on cliffs and vertical faces. Off by default since enabling it can fade close-range vertical shadows; the start distance is a smooth ramp controlled by a slider
-- **Shadow map resolution override**: Configurable in the GUI (2048–16384), requires restart
-
-### Kuwahara Filter (`POST_LIGHTING`, priority 40)
-
-- **Painterly effect**: Anisotropic Kuwahara filter that smooths flat regions while preserving edges, giving a hand-painted look
-- **Configurable radius**: Controls the size of the filter kernel
-- **Blend strength**: Smoothly blend between original and filtered result
-- **Sharpness**: Controls how aggressively the lowest-variance sector wins
-
-### Depth of Field (`POST_TONEMAP`, priority 75)
-
-- **Auto-focus**: Samples depth at screen center and smoothly tracks focus distance
-- **Near and far field blur**: Independent control over near-field and far-field blur strength and range
-- **Sky handling**: Sky pixels are clamped to max depth so they follow the natural far-field ramp: sharp when looking at the sky, soft at the horizon
-- **Configurable blur**: Adjustable blur radius and downscale factor for performance
-
-### Deband (`POST_TONEMAP`, priority 180)
-
-- **Gradient banding removal**: Adds a small, depth/luminance-aware noise pattern to break up the 8-bit color quantization that produces visible bands in skies and soft gradients
-- **Sky-only mode**: Optionally limits debanding to background pixels using a configurable depth threshold
-- **Configurable**: Threshold, sample range, intensity
-
-### Chromatic Aberration (`POST_TONEMAP`, priority 190)
-
-- **Lens-style color fringing**: Per-channel UV offset that grows toward the screen edges, mimicking real-lens dispersion
-- **Single parameter**: Strength controls the magnitude of the offset
-
-### Vignette (`POST_TONEMAP`, priority 200)
-
-- **Edge darkening**: Smooth radial falloff with configurable radius, softness, and strength
-- **Shape modes**: Circular or rectangular falloff with adjustable aspect ratio
-
-### Film Grain (`POST_TONEMAP`, priority 210)
-
-- **Animated noise**: Per-frame grain pattern with adjustable size and intensity
-- **Color modes**: Monochrome luminance grain or full per-channel chromatic grain
-
-### Letterbox (`POST_TONEMAP`, priority 220)
-
-- **Cinematic bars**: Constrains the visible image to a target aspect ratio (default 2.35:1)
-- **Configurable**: Aspect ratio, bar color, opacity
-
-### SMAA (`POST_TONEMAP`, priority 250)
-
-- **Subpixel Morphological Anti-Aliasing**: 3-pass SMAA (edge detect → blend weights → resolve) cleans up jagged edges left by the game's forward-rendered geometry
-- **Edge detection modes**: Luma, depth, or combined
-- **Debug visualization**: Show edge map or blend weights for tuning
+**Upscaling & Anti-Aliasing (DLSS / FSR)** — DLSS (NVIDIA RTX), FSR2 (any GPU), or FSR3/FSR4 (DX12 side-device; FSR4 needs a Radeon RX 9000), auto-filtered by the detected GPU. Runs at native resolution as DLAA or upscales from a lower internal resolution, driven by real motion vectors injected into the game's own G-buffer shaders (static + skinned) plus a sky pass that stops sky ghosting. Exposes a DLSS model preset + sharpness and an MV debug overlay. Release builds bundle the vendor runtime DLLs (`nvngx_dlss.dll`, `amd_fidelityfx_*_dx12.dll`); FSR2 is statically linked. Best used without driver frame generation (NVIDIA Smooth Motion), which can flicker the UI.
 
 ## In-Game GUI
 
@@ -217,6 +137,9 @@ A startup toast notification appears for 30 seconds indicating the mod version a
    └── mods/
        └── Dust/
            ├── Dust.dll
+           ├── nvngx_dlss.dll                     # DLSS runtime (NVIDIA; RTX only) — release builds only
+           ├── amd_fidelityfx_loader_dx12.dll     # FSR3/FSR4 runtime (AMD) — release builds only
+           ├── amd_fidelityfx_upscaler_dx12.dll   # FSR3/FSR4 runtime (AMD) — release builds only
            ├── Dust.ini
            ├── Dust.mod
            ├── RE_Kenshi.json
@@ -244,7 +167,8 @@ A startup toast notification appears for 30 seconds indicating the mod version a
                │   ├── dust_ultra/
                │   ├── dust_cinematic/
                │   ├── stylized_medium/
-               │   └── stylized_high/
+               │   ├── stylized_high/
+               │   └── Xscreade's Preset/
                └── shaders/
                    └── *.hlsl
    ```
@@ -653,4 +577,14 @@ GPU costs are measured via D3D11 timestamp queries and displayed in the in-game 
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+Dust is licensed under the **GNU General Public License v3.0 (or later)** with an
+additional permission (a Section 7 linking exception) that allows it to be
+combined and distributed with the proprietary NVIDIA DLSS / NGX SDK and the AMD
+FidelityFX Super Resolution (FSR) SDK. See [LICENSE](LICENSE) for the grant and
+the exception, and [COPYING](COPYING) for the full GPLv3 text.
+
+Third-party components keep their own licenses, including the vendored GPU
+upscaling SDKs: the NVIDIA DLSS / NGX SDK ([NVIDIA RTX SDKs License](external/DLSS/LICENSE.txt))
+and AMD FSR ([MIT](external/FSR2-DX11/LICENSE.txt)). Note that the NVIDIA license
+also requires attribution (NVIDIA marks in the about/credits screen) and
+pre-release notification before public distribution.

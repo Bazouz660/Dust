@@ -8,6 +8,7 @@
 #include <vector>
 #include <unordered_map>
 #include <cstring>
+#include <cmath>
 #include <string>
 #include <windows.h>
 
@@ -39,6 +40,11 @@ static ID3D11VertexShader*   sFsVS  = nullptr;
 static ID3D11PixelShader*    sSharpenPS = nullptr;   // RCAS-lite sharpen for the DLSS output
 static ID3D11PixelShader*    sSkyMvPS   = nullptr;   // camera-only MV fill for sky/far-depth pixels
 static ID3D11Buffer*         sSharpenCB = nullptr;   // { float2 invRes; float amount; float pad; }
+static ID3D11PixelShader*    sDepthConvPS = nullptr; // linear ray-distance -> hyperbolic device-Z
+static ID3D11Buffer*         sDepthConvCB = nullptr; // { near, far, tanHalfFovY, aspect }
+static ID3D11Texture2D*          sDepthConvTex = nullptr;   // R32F device-Z the upscaler reads
+static ID3D11RenderTargetView*   sDepthConvRTV = nullptr;
+static uint32_t                  sDepthConvW = 0, sDepthConvH = 0;
 static ID3D11Buffer*         sVelCB = nullptr;
 static ID3D11Buffer*         sCurBoneCB = nullptr;    // 80 float3x4 bone palette (this frame)
 static ID3D11Buffer*         sPrevBoneCB = nullptr;   // matched previous-frame bone palette
@@ -215,6 +221,30 @@ float2 main(FOut i) : SV_Target {
     float4 prevClip = mul(dust_reproj, curClip);
     float2 prevNDC  = prevClip.xy / prevClip.w;
     return (ndc - prevNDC) * float2(0.5, -0.5);
+})";
+
+// Kenshi's scene depth is LINEAR (Euclidean ray distance / farClip — engine ground truth), but the
+// upscalers expect the HYPERBOLIC device-Z a standard D3D projection writes. FSR2 un-projects its
+// depth input with cameraNear/Far to view-Z for disocclusion; fed linear depth, the reconstructed
+// view-Z is wrong everywhere and hypersensitive at distance (d(viewZ)/dL ~ near/(1-L)^2), so far
+// pixels flunk the disocclusion test almost every frame -> history rejection -> shimmer/jitter on
+// distant geometry. DLSS likewise trains on device-Z. Convert: L -> view-Z (per-pixel ray length
+// correction) -> device-Z. Monotonicity is preserved, so FSR2's internal closest-depth MV dilation
+// picks the same texels as before.
+static const char* kDepthConvPS = R"(
+Texture2D<float> depthTex : register(t0);
+SamplerState smp : register(s0);
+cbuffer CB : register(b0) { float nearZ; float farZ; float tanHalfFovY; float aspect; };
+struct FOut { float4 pos:SV_Position; float2 uv:TEXCOORD0; };
+float main(FOut i) : SV_Target {
+    float L = depthTex.SampleLevel(smp, i.uv, 0);
+    // Stored value is Euclidean distance along the view ray / farClip -> divide by the per-pixel
+    // ray length to get view-space Z.
+    float2 ndc  = float2(i.uv.x*2-1, 1-i.uv.y*2);
+    float3 ray  = float3(ndc.x * tanHalfFovY * aspect, ndc.y * tanHalfFovY, 1.0);
+    float viewZ = max(L * farZ / length(ray), nearZ);
+    // Standard D3D projection depth (0=near .. 1=far): z_dev = far*(z-near) / (z*(far-near)).
+    return saturate(farZ * (viewZ - nearZ) / (viewZ * (farZ - nearZ)));
 })";
 
 
@@ -884,6 +914,26 @@ static bool sInjBegun = false;
 // back to oDustCur (MV 0), so unmatched / first-frame / not-yet-shadowed draws are safe.
 static const uint32_t kB12Size = 60 * 48 + 64;            // 2944: float3x4[60] (row-major, 48B) + float4x4
 static ID3D11Buffer*  sInjSkinB12 = nullptr;              // re-Map_WRITE_DISCARDed per skinned draw
+static ID3D11Buffer*  sSkinZeroB12 = nullptr;             // persistent all-zero b12 -> shader camera-reproj fallback
+
+// b12 is STICKY pipeline state: once a matched draw binds sInjSkinB12, every later skinned draw that
+// MISSES its match would keep reading the previous character's pose (non-zero dust_prevVP => the
+// shader's zero-guard never fires => wrong-bone reprojection => one-frame giant MV "flash"). So every
+// miss path must explicitly bind this zero CB to make the shader's camera-reproj fallback real.
+// (The old rigid path masked this by re-binding b12 on every static draw; its revert exposed it.)
+static void BindSkinZeroB12(ID3D11DeviceContext* ctx)
+{
+    if (!sSkinZeroB12 && sDevice)
+    {
+        std::vector<uint8_t> zeros(kB12Size, 0);
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = kB12Size; bd.Usage = D3D11_USAGE_IMMUTABLE;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        D3D11_SUBRESOURCE_DATA init = { zeros.data(), 0, 0 };
+        sDevice->CreateBuffer(&bd, &init, &sSkinZeroB12);
+    }
+    if (sSkinZeroB12) ctx->VSSetConstantBuffers(12, 1, &sSkinZeroB12);
+}
 
 struct SkinPose {
     std::vector<uint8_t> b12;      // b12 layout: bones @0 (2880B) + viewProjectionMatrix @2880 (64B)
@@ -893,6 +943,7 @@ struct SkinPose {
     int32_t  baseVtx = 0;
 };
 static std::vector<SkinPose>   sPrevSkinPoses;            // last frame's skinned poses (match targets)
+static std::vector<SkinPose>   sCurSkinPoses;             // this frame's poses, recorded at draw time from the CB shadow
 static std::vector<uint8_t>    sPrevClaimed;              // one-to-one matching: prev pose already taken
 static uint32_t sSkinTotalFrame = 0, sSkinMatchedFrame = 0, sSkinShadowMissFrame = 0;   // per-frame diag
 static uint32_t sSkinDiagFrame = 0;
@@ -975,12 +1026,25 @@ void InjBeginGBuffer(ID3D11DeviceContext* ctx)
     sHaveFwd = false;
     if (haveVP && sInjHavePrev)
     {
-        float invCur[16];
-        if (Inv(curVP, invCur)) Mul(sInjPrevVP, invCur, reproj);
-        // A.5: forward reproj (last-frame clip -> this-frame clip) for predicted-screen-space matching —
-        // built from LAST frame's VP (still in sInjPrevVP here) and this frame's curVP.
-        float invPrev[16];
-        if (Inv(sInjPrevVP, invPrev)) { Mul(curVP, invPrev, sFwdReproj); sHaveFwd = true; }
+        // Bitwise-still camera => keep the EXACT identity reproj. prevVP*inv(curVP) computed in FP32
+        // is never exactly identity; the residual gives every static pixel a tiny phantom MV, so the
+        // upscaler resamples its history sub-pixel-off every frame -> shimmer/jitter on far & thin
+        // geometry even with a motionless camera (the A-spike measured this as ~0.5-2 L2 "phantom
+        // motion" on still frames). Identity => static MVs are exactly 0, sky MV fill included.
+        if (memcmp(sInjPrevVP, curVP, 64) == 0)
+        {
+            memcpy(sFwdReproj, reproj, 64);   // forward reproj = identity too
+            sHaveFwd = true;
+        }
+        else
+        {
+            float invCur[16];
+            if (Inv(curVP, invCur)) Mul(sInjPrevVP, invCur, reproj);
+            // A.5: forward reproj (last-frame clip -> this-frame clip) for predicted-screen-space matching —
+            // built from LAST frame's VP (still in sInjPrevVP here) and this frame's curVP.
+            float invPrev[16];
+            if (Inv(sInjPrevVP, invPrev)) { Mul(curVP, invPrev, sFwdReproj); sHaveFwd = true; }
+        }
     }
     if (haveVP) { memcpy(sInjPrevVP, curVP, 64); sInjHavePrev = true; }
     // Wind-MV time delta: grass_vs recomputes its sway at (time - dust_windDelta) for the previous frame.
@@ -1015,6 +1079,26 @@ void InjBeginGBuffer(ID3D11DeviceContext* ctx)
 
 void InjEndFrame() { sInjBegun = false; }
 
+// Runtime disable of the injected-MV feeder. Frees the velocity RT (full-res R16G16 — the only large
+// allocation) and drops cross-frame match state so a later re-enable can't reproject against a stale
+// previous frame (the upscaler resets its own temporal history on re-enable). Small constant buffers
+// and the learned bone-CB identity are kept: cheap, and reused as-is when the feeder turns back on.
+void ReleaseInjectionTargets()
+{
+    if (sInjVelSRV) { sInjVelSRV->Release(); sInjVelSRV = nullptr; }
+    if (sInjVelRTV) { sInjVelRTV->Release(); sInjVelRTV = nullptr; }
+    if (sInjVelTex) { sInjVelTex->Release(); sInjVelTex = nullptr; }
+    sInjW = sInjH = 0;
+    if (sDepthConvRTV) { sDepthConvRTV->Release(); sDepthConvRTV = nullptr; }
+    if (sDepthConvTex) { sDepthConvTex->Release(); sDepthConvTex = nullptr; }
+    sDepthConvW = sDepthConvH = 0;
+    sInjHavePrev = false;   // no valid previous VP -> first frame back reprojects to identity (reset covers it)
+    sInjBegun = false;
+    sHaveFwd = false;
+    sPrevSkinPoses.clear(); sCurSkinPoses.clear(); sPrevClaimed.clear();
+    sPrevRigid.clear(); sCurRigid.clear(); sPrevRigidClaimed.clear(); sPrevRigidByMesh.clear();
+}
+
 // Map/Unmap shadow: snapshot the bytes of a known bone-palette CB as OGRE writes them (WRITE_DISCARD
 // just before each skin draw), so InjBindSkinPrev can read the current root bone at draw time.
 void InjNoteMap(void* resource, void* pData)
@@ -1035,46 +1119,37 @@ void InjNoteUnmap(void* resource)
     sMapPending.erase(itp);
 }
 
-// POST_LIGHTING: snapshot THIS frame's skinned poses (bones+VP repacked to b12 layout, plus the root
-// bone and mesh identity) as the SPATIAL match targets for next frame. GeometryCapture's cbStagingCopy
-// is resolved by now, so Map(READ) doesn't stall.
+// POST_LIGHTING: promote THIS frame's skinned poses (recorded at draw time by InjBindSkinPrev from
+// the Map/Unmap CB shadow — already CPU memory) to next frame's spatial match targets. Pure swap, no
+// GPU access — the old scheme read the poses back from per-draw GPU staging copies HERE, and that
+// same-frame Map(READ) is a full CPU<->GPU sync: the CPU stalls mid-frame until the GPU catches up
+// through the GBuffer pass, so CPU and GPU frames serialize instead of overlapping (~halved fps
+// whenever the feeder was on and a skinned draw was on screen). Same fix shape as InjFillRigidPrev.
 void InjFillSkinPrev(ID3D11DeviceContext* ctx)
 {
-    if (!ctx) return;
+    (void)ctx;
     // Per-frame match diagnostic (this frame's draws matched against last frame's poses). A low
     // matched/total ratio => flashing (misses fall back to camera reproj). shadowMiss = warmup/churn.
     if ((sSkinDiagFrame++ % 120) == 0 && sSkinTotalFrame > 0)
         Log("MV[skin]: matched=%u/%u (%.0f%%) shadowMiss=%u prevPoses=%zu",
             sSkinMatchedFrame, sSkinTotalFrame,
             100.0f * sSkinMatchedFrame / sSkinTotalFrame, sSkinShadowMissFrame, sPrevSkinPoses.size());
+    // Event log: a MASS-MISS frame (most skinned draws failed the 2u gate at once) is the signature
+    // of a world rebase / draw-identity upheaval. If visible character-MV flashes line up with these
+    // lines, the flash is the (safe) camera-reproj fallback frame; if flashes occur WITHOUT them, the
+    // bad data comes from a "successful" match — next suspect is bone-CB shadow staleness.
+    if (sSkinTotalFrame >= 4 && sSkinMatchedFrame * 2 <= sSkinTotalFrame)
+    {
+        static uint32_t sMassMiss = 0;
+        ++sMassMiss;
+        if (sMassMiss <= 20 || (sMassMiss % 300) == 0)
+            Log("MV[skin] MASS-MISS frame #%u: matched=%u/%u shadowMiss=%u (camera-reproj fallback)",
+                sMassMiss, sSkinMatchedFrame, sSkinTotalFrame, sSkinShadowMissFrame);
+    }
     sSkinTotalFrame = 0; sSkinMatchedFrame = 0; sSkinShadowMissFrame = 0;
 
-    sPrevSkinPoses.clear();
-    const auto& caps = GeometryCapture::GetCaptures();
-    for (const auto& d : caps)
-    {
-        if (!d.vsMetadata || d.vsMetadata->transformType != VSTransformType::SKINNED) continue;
-        if (!d.cbStagingCopy || !d.indexBuffer) continue;
-        uint32_t clipOff = d.vsMetadata->clipMatrixOffset;
-        uint32_t boneOff = d.vsMetadata->boneArrayOffset;
-        uint32_t boneCnt = d.vsMetadata->boneCount;
-        if (boneCnt == 0) continue;
-        if (boneCnt > 60) boneCnt = 60;           // b12 declares [60]; blendIdx never exceeds it
-        uint32_t bonesLen = boneCnt * 48;
-        if (clipOff + 64 > d.cbStagingSize || boneOff + bonesLen > d.cbStagingSize) continue;
-
-        D3D11_MAPPED_SUBRESOURCE ms;
-        if (FAILED(ctx->Map(d.cbStagingCopy, 0, D3D11_MAP_READ, 0, &ms))) continue;
-        SkinPose p;
-        p.b12.assign(kB12Size, 0);
-        memcpy(p.b12.data(),        (const uint8_t*)ms.pData + boneOff, bonesLen);   // bones @ 0
-        memcpy(p.b12.data() + 2880, (const uint8_t*)ms.pData + clipOff, 64);         // VP    @ 2880
-        const float* bf = (const float*)((const uint8_t*)ms.pData + boneOff);
-        p.root[0] = bf[3]; p.root[1] = bf[7]; p.root[2] = bf[11];   // bone0 translation (rebased world)
-        ctx->Unmap(d.cbStagingCopy, 0);
-        p.ib = d.indexBuffer; p.idxCount = d.indexCount; p.baseVtx = d.baseVertexLocation;
-        sPrevSkinPoses.push_back(std::move(p));
-    }
+    sPrevSkinPoses.swap(sCurSkinPoses);
+    sCurSkinPoses.clear();
     sPrevClaimed.assign(sPrevSkinPoses.size(), 0);
 }
 
@@ -1097,7 +1172,7 @@ void InjBindSkinPrev(ID3D11DeviceContext* ctx)
     // Learn this draw's bone-palette CB so the Map/Unmap shadow starts capturing it next frame.
     ID3D11Buffer* boneCB = nullptr;
     ctx->VSGetConstantBuffers(cbSlot, 1, &boneCB);
-    if (!boneCB) return;
+    if (!boneCB) { BindSkinZeroB12(ctx); return; }
     if (sKnownBoneCB.find((const void*)boneCB) == sKnownBoneCB.end())
     {
         if (sKnownBoneCB.size() > 64) { sKnownBoneCB.clear(); sBoneShadow.clear(); sMapPending.clear(); }  // churn backstop
@@ -1107,15 +1182,42 @@ void InjBindSkinPrev(ID3D11DeviceContext* ctx)
     }
     auto its = sBoneShadow.find((const void*)boneCB);
     boneCB->Release();
-    if (its == sBoneShadow.end()) { sSkinShadowMissFrame++; return; }   // not shadowed yet (warmup) -> reproj
+    if (its == sBoneShadow.end()) { sSkinShadowMissFrame++; BindSkinZeroB12(ctx); return; }   // not shadowed yet (warmup) -> reproj
     const std::vector<uint8_t>& cur = its->second;
-    if ((size_t)boneOff + 48 > cur.size()) return;
+    if ((size_t)boneOff + 48 > cur.size()) { BindSkinZeroB12(ctx); return; }
 
     const float* bf = (const float*)(cur.data() + boneOff);
     float cr[3] = { bf[3], bf[7], bf[11] };               // current root (bone0 translation, rebased world)
 
+    // Record THIS draw's pose (bones + VP, straight from the CB shadow — already CPU memory) as a
+    // match target for next frame. This replaces the old GPU staging read-back in InjFillSkinPrev,
+    // whose same-frame Map(READ) serialized the CPU and GPU frames (~halved fps). Shadow-missed draws
+    // (first frame a bone CB is seen) returned above and sit out one frame — camera reproj covers them.
+    {
+        uint32_t clipOff  = d.vsMetadata->clipMatrixOffset;
+        uint32_t boneCnt  = d.vsMetadata->boneCount > 60 ? 60 : d.vsMetadata->boneCount;   // b12 declares [60]
+        uint32_t bonesLen = boneCnt * 48;
+        if (boneCnt && d.indexBuffer &&
+            (size_t)boneOff + bonesLen <= cur.size() && (size_t)clipOff + 64 <= cur.size() &&
+            sCurSkinPoses.size() < 4096)
+        {
+            SkinPose p;
+            p.b12.assign(kB12Size, 0);
+            memcpy(p.b12.data(),        cur.data() + boneOff, bonesLen);   // bones @ 0
+            memcpy(p.b12.data() + 2880, cur.data() + clipOff, 64);         // VP    @ 2880
+            p.root[0] = cr[0]; p.root[1] = cr[1]; p.root[2] = cr[2];
+            p.ib = d.indexBuffer; p.idxCount = d.indexCount; p.baseVtx = d.baseVertexLocation;
+            sCurSkinPoses.push_back(std::move(p));
+        }
+    }
+
     // Nearest same-mesh previous pose whose root is closest (characters barely move frame-to-frame).
-    const float kGate2 = 25.0f * 25.0f;                   // rebased world units^2; rejects wrong-char / resnap
+    // TIGHT gate: a character root moves well under 2u between frames (fast sprint ~15u/s = 0.25u @60fps).
+    // The old 25u gate let a small world-REBASE shift (all roots translate together) or two same-mesh
+    // characters standing close "successfully" claim each other's poses — matched% stayed 100% while the
+    // MVs were garbage for a frame = the character MV flash. Any global shift now turns those frames
+    // into MISSES, which are safe (zero b12 -> camera reproj) instead of wrong.
+    const float kGate2 = 2.0f * 2.0f;                     // rebased world units^2
     int best = -1; float bestD = 1e30f;
     for (size_t j = 0; j < sPrevSkinPoses.size(); j++)
     {
@@ -1126,7 +1228,7 @@ void InjBindSkinPrev(ID3D11DeviceContext* ctx)
         float dd = dx*dx + dy*dy + dz*dz;
         if (dd < bestD) { bestD = dd; best = (int)j; }
     }
-    if (best < 0 || bestD > kGate2) return;               // no confident prev -> shader guard -> camera reproj
+    if (best < 0 || bestD > kGate2) { BindSkinZeroB12(ctx); return; }   // no confident prev -> zero b12 -> camera reproj
     sPrevClaimed[best] = 1;
     sSkinMatchedFrame++;
 
@@ -1135,7 +1237,7 @@ void InjBindSkinPrev(ID3D11DeviceContext* ctx)
         D3D11_BUFFER_DESC bd = {};
         bd.ByteWidth = kB12Size; bd.Usage = D3D11_USAGE_DYNAMIC;
         bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-        if (FAILED(sDevice->CreateBuffer(&bd, nullptr, &sInjSkinB12))) return;
+        if (FAILED(sDevice->CreateBuffer(&bd, nullptr, &sInjSkinB12))) { BindSkinZeroB12(ctx); return; }
     }
     D3D11_MAPPED_SUBRESOURCE ms;
     if (SUCCEEDED(ctx->Map(sInjSkinB12, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms)))
@@ -1144,6 +1246,7 @@ void InjBindSkinPrev(ID3D11DeviceContext* ctx)
         ctx->Unmap(sInjSkinB12, 0);
         ctx->VSSetConstantBuffers(12, 1, &sInjSkinB12);
     }
+    else BindSkinZeroB12(ctx);
 }
 
 // Draw hook (right after GeometryCapture::OnDrawIndexed): for a STATIC (rigid, objects.hlsl-class) draw,
@@ -1393,17 +1496,90 @@ void InjFillSkyMV(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* depthSRV, 
     sState.Restore(ctx);
 }
 
+// Convert the game's linear depth into the hyperbolic device-Z the upscalers expect (see kDepthConvPS).
+// Runs at POST_TONEMAP right before Evaluate; returns the converted R32F texture (owned here), or null
+// on any failure so the caller can fall back to the raw depth.
+ID3D11Resource* ConvertDepthForUpscaler(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* depthSRV,
+                                        uint32_t w, uint32_t h,
+                                        float nearZ, float farZ, float fovYRadians)
+{
+    if (!ctx || !sDevice || !depthSRV || w == 0 || h == 0 || farZ <= nearZ) return nullptr;
+    if (!sFsVS && !CompileVS(kFsVS, &sFsVS)) return nullptr;
+    if (!sDepthConvPS && !CompilePS(kDepthConvPS, &sDepthConvPS)) return nullptr;
+    if (!sSampler)
+    {
+        D3D11_SAMPLER_DESC smp = {};
+        smp.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+        smp.AddressU = smp.AddressV = smp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sDevice->CreateSamplerState(&smp, &sSampler);
+    }
+    if (sDepthConvTex && (sDepthConvW != w || sDepthConvH != h))
+    {
+        if (sDepthConvRTV) { sDepthConvRTV->Release(); sDepthConvRTV = nullptr; }
+        sDepthConvTex->Release(); sDepthConvTex = nullptr;
+    }
+    if (!sDepthConvTex)
+    {
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R32_FLOAT; td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(sDevice->CreateTexture2D(&td, nullptr, &sDepthConvTex))) return nullptr;
+        if (FAILED(sDevice->CreateRenderTargetView(sDepthConvTex, nullptr, &sDepthConvRTV)))
+        { sDepthConvTex->Release(); sDepthConvTex = nullptr; return nullptr; }
+        sDepthConvW = w; sDepthConvH = h;
+        Log("MotionVectors: upscaler depth-convert RT %ux%u created (linear -> device-Z)", w, h);
+    }
+    if (!sDepthConvCB)
+    {
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = 16; bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(sDevice->CreateBuffer(&bd, nullptr, &sDepthConvCB))) return nullptr;
+    }
+    struct { float n, f, thf, ar; } cb = { nearZ, farZ, tanf(fovYRadians * 0.5f), (float)w / (float)h };
+    D3D11_MAPPED_SUBRESOURCE ms;
+    if (SUCCEEDED(ctx->Map(sDepthConvCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms)))
+    { memcpy(ms.pData, &cb, sizeof(cb)); ctx->Unmap(sDepthConvCB, 0); }
+
+    sState.Capture(ctx);
+    ID3D11RenderTargetView* rtv = sDepthConvRTV;
+    ctx->OMSetRenderTargets(1, &rtv, nullptr);
+    D3D11_VIEWPORT vp = { 0, 0, (float)w, (float)h, 0, 1 };
+    ctx->RSSetViewports(1, &vp);
+    ctx->VSSetShader(sFsVS, nullptr, 0);
+    ctx->PSSetShader(sDepthConvPS, nullptr, 0);
+    ctx->PSSetShaderResources(0, 1, &depthSRV);
+    ctx->PSSetSamplers(0, 1, &sSampler);
+    ctx->PSSetConstantBuffers(0, 1, &sDepthConvCB);
+    ctx->OMSetDepthStencilState(nullptr, 0);
+    ctx->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+    ctx->IASetInputLayout(nullptr);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11Buffer* nullVB = nullptr; UINT z = 0;
+    ctx->IASetVertexBuffers(0, 1, &nullVB, &z, &z);
+    ctx->Draw(3, 0);
+    sState.Restore(ctx);
+    return sDepthConvTex;
+}
+
 void Shutdown()
 {
     ReleaseTargets();
     if (sSharpenPS) { sSharpenPS->Release(); sSharpenPS = nullptr; }
     if (sSkyMvPS)   { sSkyMvPS->Release();   sSkyMvPS = nullptr; }
     if (sSharpenCB) { sSharpenCB->Release(); sSharpenCB = nullptr; }
+    if (sDepthConvPS) { sDepthConvPS->Release(); sDepthConvPS = nullptr; }
+    if (sDepthConvCB) { sDepthConvCB->Release(); sDepthConvCB = nullptr; }
+    if (sDepthConvRTV){ sDepthConvRTV->Release(); sDepthConvRTV = nullptr; }
+    if (sDepthConvTex){ sDepthConvTex->Release(); sDepthConvTex = nullptr; }
     if (sInjVelSRV) { sInjVelSRV->Release(); sInjVelSRV = nullptr; }
     if (sInjVelRTV) { sInjVelRTV->Release(); sInjVelRTV = nullptr; }
     if (sInjVelTex) { sInjVelTex->Release(); sInjVelTex = nullptr; }
     if (sReprojCB)  { sReprojCB->Release();  sReprojCB = nullptr; }
     if (sInjSkinB12){ sInjSkinB12->Release();sInjSkinB12 = nullptr; }
+    if (sSkinZeroB12){ sSkinZeroB12->Release(); sSkinZeroB12 = nullptr; }
     if (sInjRigidB12) { sInjRigidB12->Release(); sInjRigidB12 = nullptr; }
     if (sRigidZeroB12){ sRigidZeroB12->Release(); sRigidZeroB12 = nullptr; }
     sPrevRigid.clear(); sCurRigid.clear(); sPrevRigidClaimed.clear(); sPrevRigidByMesh.clear();

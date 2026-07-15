@@ -116,6 +116,67 @@ jobs:
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v3
 
+      # ============================================================
+      # Upscaler SDKs (all gitignored; fetched here at build time from public
+      # sources). Each backend auto-enables in src/Dust.vcxproj by file presence
+      # and compiles to a stub when its SDK is absent. These steps run ONLY on
+      # release/beta tags, so main/PR builds stay fast and upscaler-free (the
+      # previous behaviour). They are fail-soft: DLSS is prebuilt (reliable);
+      # FSR2 needs a lib build and FSR3 needs a media download, so both are
+      # continue-on-error and simply leave their backend disabled on failure,
+      # never blocking the release. DLSS ships nvngx_dlss.dll (see the bundle
+      # step below) under the NVIDIA RTX SDK redistribution terms.
+      # ============================================================
+      - name: Cache upscaler SDKs
+        if: startsWith(github.ref, 'refs/tags/')
+        id: upscaler_cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            external/DLSS
+            external/FidelityFX-SDK
+            external/FSR2-DX11
+          key: upscaler-sdks-dlss.main-ffx.v2.3.0-fsr2.f2e3f86-v1  # bump to re-fetch/rebuild
+
+      - name: Fetch DLSS SDK (NVIDIA, prebuilt)
+        if: startsWith(github.ref, 'refs/tags/') && steps.upscaler_cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -e
+          git clone --depth 1 https://github.com/NVIDIA/DLSS.git external/DLSS
+          test -f external/DLSS/include/nvsdk_ngx.h
+          test -f external/DLSS/lib/Windows_x86_64/rel/nvngx_dlss.dll
+          echo "DLSS SDK ready"
+
+      - name: Fetch FidelityFX SDK — FSR3/FSR4 (best-effort)
+        if: startsWith(github.ref, 'refs/tags/') && steps.upscaler_cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -e
+          git clone --no-checkout --branch v2.3.0 --depth 1 \
+            https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git external/FidelityFX-SDK
+          cd external/FidelityFX-SDK
+          git sparse-checkout init --cone
+          git sparse-checkout set Kits
+          git checkout
+          # The prebuilt signed provider DLLs (signedbin/) are not committed to
+          # git; the SDK downloads them. Without them FSR3/4 stays disabled.
+          cmd //c UpdateMedia.bat \
+            || echo "UpdateMedia failed — FSR3/4 provider DLLs absent, backend disabled"
+          test -f Kits/FidelityFX/api/include/ffx_api.h
+
+      - name: Fetch + build FSR2-DX11 libs (best-effort)
+        if: startsWith(github.ref, 'refs/tags/') && steps.upscaler_cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -e
+          git clone https://github.com/optiscaler/FidelityFX-FSR2-DX11.git external/FSR2-DX11
+          git -C external/FSR2-DX11 checkout f2e3f86
+          ( cd external/FSR2-DX11/build && cmd //c BuildLibs.bat )
+          test -f external/FSR2-DX11/src/ffx-fsr2-api/bin/ffx_fsr2_api/ffx_fsr2_api_dx11_x64.lib
+
       - name: Build boot (DustBoot.dll)
         run: >
           msbuild boot\DustBoot.vcxproj
@@ -266,6 +327,26 @@ jobs:
           xcopy /S /Y /I effects\presets release\Dust\presets
           copy mod\Dust.mod release\Dust\
           copy mod\RE_Kenshi.json release\Dust\
+
+      # Upscaler runtime DLLs live next to Dust.dll (the framework loads them from
+      # the mod dir). Guarded so we ship only what got fetched/built above; FSR2
+      # needs no DLL (its API is statically linked into Dust.dll).
+      - name: Bundle upscaler runtime DLLs
+        if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/beta-')
+        shell: bash
+        run: |
+          set -u
+          dst=release/Dust
+          if [ -f external/DLSS/lib/Windows_x86_64/rel/nvngx_dlss.dll ]; then
+            cp external/DLSS/lib/Windows_x86_64/rel/nvngx_dlss.dll "$dst/"; echo "  + nvngx_dlss.dll (DLSS)"
+          else
+            echo "  - nvngx_dlss.dll absent — DLSS backend not bundled"
+          fi
+          for f in amd_fidelityfx_loader_dx12.dll amd_fidelityfx_upscaler_dx12.dll; do
+            src="external/FidelityFX-SDK/Kits/FidelityFX/signedbin/$f"
+            if [ -f "$src" ]; then cp "$src" "$dst/"; echo "  + $f (FSR3/4)"; else echo "  - $f absent — FSR3/4 backend not bundled"; fi
+          done
+          echo "=== release/Dust root ===" && ls -1 "$dst"
 
       - name: Upload artifact
         if: startsWith(github.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/beta-')

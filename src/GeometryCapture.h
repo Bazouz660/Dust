@@ -15,6 +15,11 @@
 #ifndef DUST_CAPTURE_GEOMETRY
 #define DUST_CAPTURE_GEOMETRY      0x2u   // capture IA + VS state (motion-vector pass)
 #endif
+#ifndef DUST_CAPTURE_CB_SNAPSHOTS
+#define DUST_CAPTURE_CB_SNAPSHOTS  0x4u   // per-draw GPU copies of CBs / instance VB (replay path only —
+                                          // the live injected-MV path reads the Map/Unmap CB shadow
+                                          // instead; nothing sets this today)
+#endif
 
 // Kenshi GBuffer RT formats: albedo, normals, depth
 static const DXGI_FORMAT GBUFFER_COLOR_FORMATS[3] = {

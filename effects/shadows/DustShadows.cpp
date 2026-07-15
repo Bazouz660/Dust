@@ -39,10 +39,9 @@ struct ShadowConfig {
                                       // don't fit the PSSM formula at any lambda);
                                       // any other value activates the override.
     float csmFilterRadius   = 1.0f;   // global scale on the per-cascade PCF radius
-    float csmLightSize      = 2.0f;   // PCSS blocker-search/penumbra scale
-    bool  csmPcssEnabled    = true;
     bool  csmBlendEnabled   = true;   // smooth blend between adjacent cascades
     float csmBlendWidth     = 0.15f;  // fraction of cascade depth range used as blend band
+    float csmFarSoftness    = 0.85f;  // radius multiplier for the last cascade only
 };
 
 static ShadowConfig gConfig;
@@ -51,6 +50,7 @@ static const DustHostAPI* gHost = nullptr;
 static bool gWasEnabled = true;
 static int gVanillaShadowRange = -1;       // settings.cfg value at boot
 static int gLastWrittenShadowRange = INT_MIN;  // debounce slider-drag disk writes
+static int gLastWrittenResolutionIndex = INT_MIN;  // dedup Resolution INI writes
 
 // "Vanilla" (0) is appended, not prepended, so indices saved by older configs
 // keep their meaning. 0 = no override: the game's own atlas is used untouched
@@ -276,6 +276,33 @@ static void PushShadowRangeToGame()
     }
 }
 
+// Persist the atlas Resolution index to our own effect INI (effects\Shadows.ini).
+// Resolution is now a normal preset setting, but the preset load lands too late
+// to drive the atlas: OnEarlyConfigApply pushes the atlas size to the engine
+// during LoadAll, before the LastPreset is applied in the GUI loop. Mirroring the
+// value to the base INI (which EffectConfigLoad reads at startup) lets that early
+// apply use the last chosen resolution, and the framework never saves the base
+// INI after a GUI change. Section/key match what EffectConfigLoad reads:
+// [Shadows] Resolution.
+static void PushShadowResolutionToIni()
+{
+    if (gConfig.resolutionIndex == gLastWrittenResolutionIndex) return;
+    std::string installDir = GetDustInstallDir();
+    if (installDir.empty()) return;
+    std::string iniPath = installDir + "\\effects\\Shadows.ini";
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d", gConfig.resolutionIndex);
+    if (WritePrivateProfileStringA("Shadows", "Resolution", buf, iniPath.c_str()))
+    {
+        gLastWrittenResolutionIndex = gConfig.resolutionIndex;
+        Log("Shadows: persisted Resolution=%d to %s", gConfig.resolutionIndex, iniPath.c_str());
+    }
+    else
+    {
+        Log("Shadows: failed to persist Resolution to %s", iniPath.c_str());
+    }
+}
+
 // Slider drags fire OnSettingChanged on every mouse-move tick; a synchronous
 // settings.cfg rewrite per tick is a visible frame hitch. Queue the write and
 // flush from preExecute once the value has been stable for half a second.
@@ -313,11 +340,11 @@ struct alignas(16) ShadowCBData {
     float rtwCliffFixEnabled;
     float rtwCliffFixDistance;
     float csmFilterRadius;
-    float csmLightSize;
-    float csmPcssEnabled;
     float csmBlendEnabled;
     float csmBlendWidth;
     float rtwQuality;
+    float shadowTexel;
+    float csmFarSoftness;
 };
 
 static int ShadowInit(ID3D11Device* device, uint32_t w, uint32_t h, const DustHostAPI* host)
@@ -371,10 +398,10 @@ static void ShadowPreExecute(const DustFrameContext* ctx, const DustHostAPI* hos
     // CSM filter radius scales csmParams[i][1] (the per-cascade PCF radius the
     // engine baked into the lighting cbuffer). 1.0 = vanilla taper.
     data.csmFilterRadius     = gConfig.csmFilterRadius;
-    data.csmLightSize        = gConfig.csmLightSize;
-    data.csmPcssEnabled      = gConfig.csmPcssEnabled ? 1.0f : 0.0f;
     data.csmBlendEnabled     = gConfig.csmBlendEnabled ? 1.0f : 0.0f;
     data.csmBlendWidth       = gConfig.csmBlendWidth;
+    data.csmFarSoftness      = gConfig.csmFarSoftness;
+    data.shadowTexel         = 1.0f / (float)GetEffectiveShadowResolution();
 
     // Resolution-tiered RTW PCF tap count: bigger atlases need fewer taps
     // for the same visual softness.
@@ -438,6 +465,13 @@ static void RestoreVanillaShadows()
 
 static void ShadowOnSettingChanged()
 {
+    // The framework has no per-change base-INI save, so mirror Resolution to the
+    // base INI ourselves for the early-startup atlas apply (see
+    // PushShadowResolutionToIni). Dedup'd inside, and independent of the Enabled
+    // state (the chosen resolution should survive even while the effect is
+    // toggled off).
+    PushShadowResolutionToIni();
+
     if (gConfig.enabled)
     {
         ApplyDustShadows();
@@ -470,12 +504,13 @@ static DustSettingDesc gSettings[] = {
     // === Common (affect both RTWSM and CSM) ===
     { "Common",              DUST_SETTING_SECTION, nullptr,                 0.0f, 0.0f,  nullptr,            nullptr, nullptr, DUST_PERF_NONE },
     { "Enabled",             DUST_SETTING_BOOL,  &gConfig.enabled,          0.0f, 1.0f,  "Enabled",          nullptr, "Enable or disable Dust's improved shadow filtering (RTWSM and CSM). When off, vanilla Kenshi filtering is used.",                                                              DUST_PERF_LOW    },
-    // Resolution and Range bridge to player-owned engine/game state (atlas size,
-    // and a Shadow Range that persists to settings.cfg and is overwritten by the
-    // in-game slider). They are PRESET_OPTIONAL: never baked into presets, and a
-    // preset that omits them is not "outdated".
-    { "Shadow Resolution",   DUST_SETTING_ENUM,  &gConfig.resolutionIndex,  0.0f, 7.0f,  "Resolution",       kShadowResolutionLabels, "Override the shadow atlas resolution. Vanilla = no override (zero overhead). Higher = sharper shadows but the shadow pass costs proportionally more GPU time and VRAM (16384 ~= 1 GB) — 8192+ can visibly destabilize the framerate. Applies next frame.", DUST_PERF_HIGH, DUST_SETTING_FLAG_PRESET_OPTIONAL  },
-    { "Shadow Range",        DUST_SETTING_INT,   &gConfig.shadowRange,      500.0f, 50000.0f, "Range",        nullptr, "Maximum distance shadows render. Bypasses the in-game UI's 9000 cap. Applies live (cascade splits + shadow camera re-derive next frame). Also written to settings.cfg so the value survives a restart. Touching the in-game Shadow Range slider will overwrite this.", DUST_PERF_MEDIUM, DUST_SETTING_FLAG_PRESET_OPTIONAL },
+    // Resolution and Range are full preset settings (baked into presets and
+    // applied on preset switch). They ALSO mirror to player-owned engine/game
+    // state — Resolution to effects\Shadows.ini, Range to settings.cfg — because
+    // both are consumed by an early-startup path (atlas init / Kenshi's
+    // settings.cfg read) that runs before the LastPreset load reaches them.
+    { "Shadow Resolution",   DUST_SETTING_ENUM,  &gConfig.resolutionIndex,  0.0f, 7.0f,  "Resolution",       kShadowResolutionLabels, "Override the shadow atlas resolution. Vanilla = no override (zero overhead). Higher = sharper shadows but the shadow pass costs proportionally more GPU time and VRAM (16384 ~= 1 GB) — 8192+ can visibly destabilize the framerate. Applies next frame.", DUST_PERF_HIGH  },
+    { "Shadow Range",        DUST_SETTING_INT,   &gConfig.shadowRange,      500.0f, 50000.0f, "Range",        nullptr, "Maximum distance shadows render. Bypasses the in-game UI's 9000 cap. Applies live (cascade splits + shadow camera re-derive next frame). Also written to settings.cfg so the value survives a restart. Touching the in-game Shadow Range slider will overwrite this.", DUST_PERF_MEDIUM },
 
     // === RTWSM (warped shadow map) ===
     { "RTWSM",               DUST_SETTING_SECTION, nullptr,                 0.0f, 0.0f,  nullptr,            nullptr, nullptr, DUST_PERF_NONE },
@@ -489,10 +524,9 @@ static DustSettingDesc gSettings[] = {
     { "CSM",                 DUST_SETTING_SECTION, nullptr,                 0.0f, 0.0f,  nullptr,            nullptr, nullptr, DUST_PERF_NONE },
     { "Cascade Lambda",      DUST_SETTING_FLOAT, &gConfig.pssmLambda,       0.0f, 1.0f,  "CascadeLambda",    nullptr, "PSSM cascade split distribution. At 0.95 (default) Kenshi's native splits are kept. Other values override: 0.0 = pure linear (close shadows extend further but blockier); 1.0 = pure logarithmic (close shadows tiny+sharp, far cascades huge).", DUST_PERF_NONE },
     { "CSM Filter Radius",   DUST_SETTING_FLOAT, &gConfig.csmFilterRadius,  0.1f, 5.0f,  "CsmFilterRadius",  nullptr, "Global scale on the CSM PCF filter radius (on top of Kenshi's vanilla per-cascade taper).",                                                                                   DUST_PERF_NONE },
-    { "CSM Light Size",      DUST_SETTING_FLOAT, &gConfig.csmLightSize,     0.5f, 10.0f, "CsmLightSize",     nullptr, "Simulated light source size for CSM PCSS (contact-hardening). Multiplier on the per-cascade filter radius.",                                                                 DUST_PERF_NONE },
-    { "CSM PCSS",            DUST_SETTING_BOOL,  &gConfig.csmPcssEnabled,   0.0f, 1.0f,  "CsmPcss",          nullptr, "Enable Percentage-Closer Soft Shadows for CSM. Blocker search + variable penumbra. Significant cost.",                                                                       DUST_PERF_HIGH },
     { "Cascade Blending",    DUST_SETTING_BOOL,  &gConfig.csmBlendEnabled,  0.0f, 1.0f,  "CascadeBlending",  nullptr, "Smoothly blend between adjacent CSM cascades near their split boundary. Hides the hard resolution step where cascades meet.",                                              DUST_PERF_MEDIUM },
     { "Cascade Blend Width", DUST_SETTING_FLOAT, &gConfig.csmBlendWidth,    0.0f, 0.5f,  "CascadeBlendWidth", nullptr, "Width of the blend band at each cascade boundary, as a fraction of cascade depth range (0.05 = subtle, 0.25 = wide).",                                                      DUST_PERF_NONE },
+    { "CSM Far Softness",    DUST_SETTING_FLOAT, &gConfig.csmFarSoftness,   0.3f, 1.5f,  "CsmFarSoftness",   nullptr, "Softness of the FARTHEST cascade only, independent of the near cascades. Lower = crisper distant shadows; higher = softer. Near/mid cascades are unaffected.", DUST_PERF_NONE },
 };
 
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)

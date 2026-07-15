@@ -77,6 +77,14 @@ public:
     void SaveEffectConfig(size_t index);
     void LoadEffectConfig(size_t index);
 
+    // A framework-config effect may write its OWN base INI during OnSettingChanged
+    // (e.g. Shadows mirrors its atlas Resolution for the early-startup apply). That
+    // bumps the file mtime, which the hot-reload watcher would otherwise mistake for
+    // an external edit and re-apply — clobbering settings the base INI doesn't track.
+    // Call this right after such an OnSettingChanged (from the GUI) to absorb the
+    // self-write so the watcher ignores it.
+    void AbsorbConfigSelfWrite(size_t index);
+
     // Global preset system
     void ScanPresets();
     void ValidatePreset(int presetIdx);             // check for missing/unknown fields in preset INIs
@@ -125,6 +133,9 @@ private:
     static void EffectConfigSave(LoadedEffect& le);
     static void EffectConfigWriteDefaults(LoadedEffect& le);
     static void EffectConfigCheckHotReload(LoadedEffect& le);
+    // Re-stat configPath into configMtime so a write WE just made isn't seen as an
+    // external edit by the hot-reload watcher.
+    static void RefreshConfigMtime(LoadedEffect& le);
 
     // Preset I/O helpers
     static void EffectConfigLoadFrom(LoadedEffect& le, const std::string& presetDir);

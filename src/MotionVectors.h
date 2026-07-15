@@ -43,10 +43,16 @@ namespace MotionVectors
     // Reset the once-per-frame guard (call at frame end / POST_TONEMAP).
     void InjEndFrame();
 
+    // Runtime disable of the injected-MV feeder (upscaler + debug viz both off): free the velocity RT —
+    // the only large allocation — and drop cross-frame match state so a later re-enable starts clean.
+    // InjEnsureVelRTV reallocates the RT lazily when the feeder turns back on.
+    void ReleaseInjectionTargets();
+
     // True skinned-character animation MVs: the patched skin VS skins each vertex with current AND
-    // previous-frame bones (b12). InjFillSkinPrev (POST_LIGHTING) repacks this frame's skinned poses
-    // for next frame; InjBindSkinPrev (per skinned GBuffer draw, after GeometryCapture::OnDrawIndexed)
-    // binds the matched previous pose to b12 before the draw.
+    // previous-frame bones (b12). InjBindSkinPrev (per skinned GBuffer draw, after
+    // GeometryCapture::OnDrawIndexed) binds the matched previous pose to b12 before the draw AND
+    // records this draw's pose from the CB shadow; InjFillSkinPrev (POST_LIGHTING) just promotes the
+    // recorded poses to next frame's match targets (pure CPU swap — no GPU read-back, no stall).
     void InjFillSkinPrev(ID3D11DeviceContext* ctx);
     void InjBindSkinPrev(ID3D11DeviceContext* ctx);
 
@@ -77,6 +83,14 @@ namespace MotionVectors
     // reproject the sky under camera motion (kills sky ghosting + object/sky edge shimmer). Call at
     // POST_TONEMAP after the scene is rendered, just before the upscaler reads the velocity buffer.
     void InjFillSkyMV(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* depthSRV, uint32_t w, uint32_t h);
+
+    // Convert the game's LINEAR depth (Euclidean ray distance / farClip) into the HYPERBOLIC device-Z
+    // the upscalers expect. Fed linear depth, FSR2's near/far un-projection reconstructs a wrong view-Z
+    // that is hypersensitive at distance -> per-frame history rejection -> shimmer/jitter on far
+    // geometry. Returns the converted R32F texture (owned by this module), or null to fall back.
+    ID3D11Resource* ConvertDepthForUpscaler(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* depthSRV,
+                                            uint32_t w, uint32_t h,
+                                            float nearZ, float farZ, float fovYRadians);
 
     void Shutdown();
 }

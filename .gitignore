@@ -42,8 +42,12 @@ __pycache__/
 *.py[cod]
 *.pyo
 
-# Tools output
-tools/results*.txt
+# Local dev / analysis scripts (never shipped; one previously held an API key).
+# Force-add a specific script with `git add -f tools/<file>` if you want it tracked.
+tools/
+
+# Stray per-preset effect dumps left by deploy round-trips (not real preset data)
+effects/presets/*/effects/
 
 # OS files
 Thumbs.db

@@ -311,9 +311,13 @@ static void CaptureDrawState(ID3D11DeviceContext* ctx, CapturedDraw& draw)
     // Look up shader metadata
     draw.vsMetadata = ShaderMetadata::GetVSInfo(draw.vs);
 
-    // For classified draws, copy the CB containing the clip matrix to a staging buffer.
-    // By replay time (POST_LIGHTING), the GPU will have completed these copies.
-    if (draw.vsMetadata && draw.vsMetadata->transformType != VSTransformType::UNKNOWN &&
+    // For classified draws, copy the CB containing the clip matrix to a staging buffer. REPLAY-ONLY
+    // (DUST_CAPTURE_CB_SNAPSHOTS, which nothing sets today): the live injected-MV path reads these
+    // bytes from the Map/Unmap CB shadow at draw time instead. Reading a same-frame staging copy back
+    // requires a Map(READ) that stalls the CPU until the GPU catches up — a full pipeline serialization
+    // that roughly halved the frame rate when InjFillSkinPrev consumed these each frame.
+    if ((sCaptureFlags & DUST_CAPTURE_CB_SNAPSHOTS) &&
+        draw.vsMetadata && draw.vsMetadata->transformType != VSTransformType::UNKNOWN &&
         sCachedDevice)
     {
         uint32_t slot = draw.vsMetadata->cbSlot;
@@ -361,8 +365,9 @@ static void CaptureDrawState(ID3D11DeviceContext* ctx, CapturedDraw& draw)
 
     // Instanced draws: snapshot the per-instance transform VB (slot 1) to a bindable copy,
     // because OGRE recycles the HW-instance buffer per batch -> the live pointer holds the last
-    // batch's transforms by replay time. The replay rebinds this copy at slot 1.
-    if (draw.instanceCount > 1 && draw.vertexBuffers[1] && sCachedDevice)
+    // batch's transforms by replay time. The replay rebinds this copy at slot 1. REPLAY-ONLY (see above).
+    if ((sCaptureFlags & DUST_CAPTURE_CB_SNAPSHOTS) &&
+        draw.instanceCount > 1 && draw.vertexBuffers[1] && sCachedDevice)
     {
         D3D11_BUFFER_DESC bd; draw.vertexBuffers[1]->GetDesc(&bd);
         ID3D11Buffer* copy = AcquireVBCopy(sCachedDevice, bd.ByteWidth);

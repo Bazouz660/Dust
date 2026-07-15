@@ -339,6 +339,12 @@ void EffectLoader::LoadPreset(int presetIdx)
 
         if (le.desc.OnSettingChanged)
             le.desc.OnSettingChanged();
+        // OnSettingChanged may have written the effect's own base INI (e.g. Shadows
+        // mirrors its atlas Resolution). Without this, the hot-reload watcher sees
+        // the bumped mtime, re-reads the base INI — whose untracked keys are still
+        // first-run defaults — and clobbers the values we just loaded, leaving the
+        // effect dirty against this preset. Absorb our own write.
+        RefreshConfigMtime(le);
     }
 
     currentPreset_ = presetIdx;

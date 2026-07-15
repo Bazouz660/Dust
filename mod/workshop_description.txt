@@ -15,59 +15,35 @@ The mod is also built as a plugin framework. Effects are separate DLLs, so anyon
 
 [h1]What it does[/h1]
 
-[h2]Global Illumination (RTGI)[/h2]
-For high end GPUs, its an very expensive effect.
-Screen-space ray-traced indirect lighting. Rays are cast per pixel against the depth buffer and sample the lit scene at hit points, producing colored light bounces and ambient occlusion. Multi-bounce support feeds previous frame GI back into the current frame. Temporal accumulation and wavelet denoising keep the result stable and noise-free. Runs on compute shaders for best GPU utilization.
+[b]Lighting & shadows[/b]
+[list]
+[*] [b]Global Illumination (RTGI)[/b] - Screen-space ray-traced indirect light bounces and ambient occlusion, multi-bounce, temporally denoised. Very expensive - for high-end GPUs.
+[*] [b]Ambient Occlusion (SSAO)[/b] - Contact shadows in corners and crevices, integrated with the game's lighting and day/night aware.
+[*] [b]Indirect Lighting (SSIL)[/b] - A cheaper single bounce of colored indirect light from nearby surfaces.
+[*] [b]Improved Shadows[/b] - Improved shadows resolution, range, and control over their parameters.
+[/list]
 
-[h2]Ambient Occlusion (SSAO)[/h2]
-Adds realistic contact shadows in corners, crevices, and where objects meet the ground. Works directly with the game's lighting, so it looks natural even under different weather and time of day. Automatically adjusts for night scenes.
+[b]Image & post-processing[/b]
+[list]
+[*] [b]Color Grading[/b] - Full HDR pipeline, selectable tonemapper (ACES, Reinhard, AgX, Khronos PBR Neutral...), lift/gamma/gain and split toning.
+[*] [b]Depth of Field[/b] - Auto-focus camera blur with independent near/far control.
+[*] [b]Bloom[/b] - Physically-based HDR glow, extracted before tonemapping.
+[*] [b]Clarity[/b] - Local contrast that brings out fine detail without changing overall brightness.
+[*] [b]Outline[/b] - Depth and normal edge detection with configurable thickness and color.
+[*] [b]Kuwahara[/b] - Anisotropic painterly filter for a hand-painted look.
+[*] [b]SMAA[/b] - Subpixel morphological anti-aliasing (luma, depth or combined).
+[*] [b]Deband[/b] - Removes 8-bit color banding in skies and gradients, with optional sky-only mode.
+[*] [b]Chromatic Aberration / Vignette / Film Grain / Letterbox[/b] - Lens and cinematic finishing touches.
+[/list]
 
-[h2]Indirect Lighting (SSIL)[/h2]
-Adds a single bounce of indirect light from nearby surfaces. Albedo-weighted accumulation produces colored bleed (red walls cast a red glow, etc.) for richer scene lighting. Cheaper than RTGI and complements SSAO at the same injection point.
-
-[h2]Improved Shadows[/h2]
-Replaces the game's shadow sampling and filter with PCSS (Percentage-Closer Soft Shadows). Shadows get softer the further they are from the casting object, just like real life. Configurable light size, filter radius, and bias. Shadow map resolution can be increased up to 16384 in the settings (requires restart, RTWSM shadows only).
-
-[h2]Color Grading[/h2]
-Full color grading pipeline with selectable tonemapper (ACES, Reinhard, AgX, Khronos PBR Neutral, and more). Includes contrast, saturation, temperature, exposure, and shadow/highlight split toning.
-
-[h2]Depth of Field[/h2]
-Camera-style focus blur with auto-focus. Objects in front of and behind your focus point get blurred separately, with full control over near and far blur curves and intensity.
-
-[h2]Bloom[/h2]
-Soft glow on bright light sources. Extracted from the HDR scene before tonemapping for physically accurate results. Adjustable threshold, radius, and intensity.
-
-[h2]Clarity[/h2]
-Local contrast enhancement that brings out fine detail in textures without affecting the overall image brightness.
-
-[h2]Outline[/h2]
-Edge detection from depth and normal discontinuities. Configurable thickness, strength, color, and max depth.
-
-[h2]Kuwahara Filter[/h2]
-Anisotropic painterly filter that smooths flat regions while preserving edges for a hand-painted look.
-
-[h2]SMAA[/h2]
-Subpixel morphological anti-aliasing to clean up jagged edges left by the game's forward-rendered geometry. Three modes: luma, depth, or combined edge detection.
-
-[h2]Deband[/h2]
-Removes the visible color banding in skies and soft gradients caused by 8-bit quantization. Optional sky-only mode keeps the noise off detailed surfaces.
-
-[h2]Chromatic Aberration[/h2]
-Subtle lens-style color fringing that grows toward the screen edges. A single Strength slider controls the magnitude.
-
-[h2]Vignette[/h2]
-Smooth darkening around the edges of the frame, with circular or rectangular falloff and adjustable radius, softness, and strength.
-
-[h2]Film Grain[/h2]
-Animated noise on top of the final image. Adjustable intensity and grain size, with optional per-channel chromatic mode.
-
-[h2]Letterbox[/h2]
-Cinematic black bars to constrain the visible image to a target aspect ratio (default 2.35:1). Bar color and opacity are configurable.
+[b]Upscaling & Anti-Aliasing (DLSS / FSR)[/b]
+Optional temporal upscaling and native-resolution anti-aliasing (DLAA) - run native for the cleanest image, or upscale from a lower resolution for frames. Dust picks the right backend for your GPU (DLSS on NVIDIA RTX, FSR2 on any GPU, FSR3/FSR4 on modern DX12 cards) and feeds it real motion vectors from the game's own geometry, including animated characters, so it ghosts far less than a generic injector. Best used without driver-level frame generation (NVIDIA Smooth Motion), which can flicker the UI.
 
 [h1]Features[/h1]
 [list]
 [*] [b]In-game settings (F11)[/b]: Tweak every effect in real-time with sliders, save your settings, reset anytime
 [*] [b]Preset system[/b]: Quick-switch between Low, Medium, High, and Ultra presets (plus cinematic and stylized variants), share custom presets within the community
+[*] [b]DLSS / FSR upscaling & DLAA[/b]: Vendor-selectable temporal super-resolution and anti-aliasing with real motion vectors; backend auto-filtered by your GPU
 [*] [b]Performance overlay[/b]: See exactly how much GPU time each effect costs
 [*] [b]Hot-reloadable configs[/b]: Edit .ini files while the game is running
 [*] [b]Plugin system[/b]: Effects are separate DLLs, anyone can create and share new ones
@@ -101,6 +77,8 @@ Effects are loaded as plugin DLLs via a stable C API. The framework handles shad
 [*] [b]Bob[/b] - Native Stylise, also an inspiration
 [*] [b]Dear ImGui[/b] - In-game GUI library
 [*] [b]Atlas[/b] - Made the video that gave me the idea of this mod
+[*] [b]NVIDIA[/b] - DLSS (NVIDIA DLSS is a trademark of NVIDIA Corporation)
+[*] [b]AMD[/b] - FidelityFX Super Resolution (FSR)
 [/list]
 
 [h1]Source Code[/h1]
