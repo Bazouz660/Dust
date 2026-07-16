@@ -19,6 +19,12 @@ static ID3D11DepthStencilView* sGBufferDSV = nullptr;   // this frame's GBuffer 
 static uint32_t sFramesCaptured = 0;
 static uint32_t sGeneration     = 0;   // bumped every ResetFrame (see GetGeneration)
 
+// GBuffer passes seen, whether or not anything was captured. sFramesCaptured only
+// advances on a non-empty capture, so it stays 0 forever while capture is idle (the
+// normal state — nothing requests captures unless the upscaler or MV debug viz is on)
+// and cannot gate the pass-boundary logging below.
+static uint32_t sGBufferPassesSeen = 0;
+
 // Staging buffer pool — each buffer has its own size (must match the CB it copies
 // from, since D3D11 CopyResource requires identical ByteWidth for buffers).
 // Buffers are reused across frames: on frame reset we set sStagingPoolUsed=0,
@@ -269,12 +275,13 @@ void OnOMSetRenderTargetsWithResult(bool isGBuffer)
 
     if (!wasInGBuffer && sInGBufferPass)
     {
-        if (sFramesCaptured < 3)
+        sGBufferPassesSeen++;
+        if (sGBufferPassesSeen <= 3)
             Log("GeometryCapture: GBuffer pass detected (%ux%u)", sExpectedWidth, sExpectedHeight);
     }
     else if (wasInGBuffer && !sInGBufferPass)
     {
-        if (sFramesCaptured < 3)
+        if (sGBufferPassesSeen <= 3)
             Log("GeometryCapture: GBuffer pass ended, captured %u draws",
                 (uint32_t)sCaptures.size());
     }

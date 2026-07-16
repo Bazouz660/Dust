@@ -315,6 +315,13 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
     if (!gInitialized || !ctx || !depthSRV || !gHost)
         return nullptr;
 
+    // API v8: use the real camera FOV (from the OGRE projection) instead of the manual
+    // TanHalfFov setting. The INI default is only right at the stock FOV/aspect; anywhere
+    // else (e.g. 21:9) every depth->view-space reconstruction below is off by that ratio.
+    // Gate on the host version so we never read the field from an older, smaller struct.
+    if (camera && camera->valid && gHost->apiVersion >= 8 && camera->tanHalfFov > 0.0f)
+        gSSAOConfig.tanHalfFov = camera->tanHalfFov;
+
     // Defensive resolution fallback — every 300 frames (~5s) to catch
     // missed OnResolutionChanged calls without paying QI/GetDesc every frame.
     if ((gFrameIndex % 300) == 0)

@@ -39,7 +39,7 @@ namespace BugReport
 struct FileEntry {
     std::string zipName;   // path inside the archive (forward slashes)
     std::string srcPath;   // absolute path on disk
-    size_t      tailCap;   // 0 = copy whole file; else keep only the last N bytes
+    size_t      tailCap;   // 0 = copy whole file; else keep N bytes split head/tail
 };
 
 struct ReportJob {
@@ -117,9 +117,13 @@ static std::string TimestampString()
     return buf;
 }
 
-// Read a whole file (or its tail if tailCap > 0 and the file is larger).
+// Read a whole file, or — if cap > 0 and the file is larger — its HEAD and TAIL with the
+// middle elided. Keeping both ends is load-bearing: the head holds startup (versions, plugin
+// init, shader patching, hook installation), which is what a diagnosis usually turns on, while
+// the tail holds whatever immediately preceded the report. A tail-only cap loses the head
+// entirely, and any per-frame log line is enough to push it out (see GeometryCapture).
 // Returns false if the file can't be opened.
-static bool ReadFileMaybeTail(const std::string& path, size_t tailCap, std::string& out)
+static bool ReadFileMaybeTail(const std::string& path, size_t cap, std::string& out)
 {
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return false;
@@ -128,21 +132,38 @@ static bool ReadFileMaybeTail(const std::string& path, size_t tailCap, std::stri
     long size = ftell(f);
     if (size < 0) { fclose(f); return false; }
 
-    long start = 0;
-    if (tailCap > 0 && (size_t)size > tailCap)
-        start = size - (long)tailCap;
-
-    fseek(f, start, SEEK_SET);
     out.clear();
-    if (start > 0)
-        Appendf(out, "[... truncated by Dust bug report: showing last %ld of %ld bytes ...]\r\n",
-                size - start, size);
 
-    size_t want = (size_t)(size - start);
+    // Small enough to bundle whole.
+    if (cap == 0 || (size_t)size <= cap)
+    {
+        fseek(f, 0, SEEK_SET);
+        out.resize((size_t)size);
+        size_t got = fread(&out[0], 1, (size_t)size, f);
+        out.resize(got);
+        fclose(f);
+        return true;
+    }
+
+    // Split the budget: 60% head (startup detail is denser and more diagnostic), 40% tail.
+    const size_t headWant = cap * 6 / 10;
+    const size_t tailWant = cap - headWant;
+
+    fseek(f, 0, SEEK_SET);   // ftell above left us at EOF; the head read starts at 0
+    out.resize(headWant);
+    size_t headGot = fread(&out[0], 1, headWant, f);
+    out.resize(headGot);
+
+    Appendf(out, "\r\n[... Dust bug report elided %lld bytes from the middle of this %ld-byte "
+                 "log; showing the first %zu and last %zu bytes ...]\r\n",
+            (long long)size - (long long)headGot - (long long)tailWant, size, headGot, tailWant);
+
+    fseek(f, size - (long)tailWant, SEEK_SET);
     size_t off = out.size();
-    out.resize(off + want);
-    size_t got = fread(&out[off], 1, want, f);
-    out.resize(off + got);
+    out.resize(off + tailWant);
+    size_t tailGot = fread(&out[off], 1, tailWant, f);
+    out.resize(off + tailGot);
+
     fclose(f);
     return true;
 }

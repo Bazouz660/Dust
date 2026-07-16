@@ -255,6 +255,13 @@ ID3D11ShaderResourceView* RenderIL(ID3D11DeviceContext* ctx,
     if (!gInitialized || !ctx || !depthSRV || !albedoSRV || !gHost)
         return nullptr;
 
+    // API v8: use the real camera FOV (from the OGRE projection) instead of the manual
+    // TanHalfFov setting. The INI default is only right at the stock FOV/aspect; anywhere
+    // else (e.g. 21:9) every depth->view-space reconstruction below is off by that ratio.
+    // Gate on the host version so we never read the field from an older, smaller struct.
+    if (camera && camera->valid && gHost->apiVersion >= 8 && camera->tanHalfFov > 0.0f)
+        gSSILConfig.tanHalfFov = camera->tanHalfFov;
+
     // Detect resolution from depth texture (throttled backstop — the host
     // drives OnResolutionChanged; this only catches drift, same as SSAO/RTGI)
     static uint32_t sResProbeCounter = 0;
