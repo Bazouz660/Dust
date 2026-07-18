@@ -106,25 +106,29 @@ struct ShadowAtlasEntry {
     IUnknown*                 identity;     // QI(IID_IUnknown) for matching
     D3D11_TEXTURE2D_DESC      desc;         // original desc (vanilla size)
     bool                      isDepth;      // DSV-bound depth vs RTV+SRV color
+    uint64_t                  lastSeen;     // gFrameIndex of the last bind/sample
+                                            // that resolved to this entry
     ID3D11Texture2D*          newTex;       // replacement (null if no resize active)
+    UINT                      newSize;      // replacement dimension (square)
+    float                     vpScale;      // newSize / desc.Width (1.0 = no swap)
     ID3D11DepthStencilView*   newDSV;
     ID3D11RenderTargetView*   newRTV;
     ID3D11ShaderResourceView* newSRV;
-    IUnknown*                 newIdentity;  // weak; newTex's identity, registered for
-                                            // shadow-pass detection — must be removed
-                                            // from the identity list when newTex dies
+    IUnknown*                 newIdentity;  // weak; newTex's identity (backed by the
+                                            // newTex ref) — lets the bind classifier
+                                            // recognize our own replacements
     ID3D11Texture2D*          companionDepthTex;  // standalone depth for color-only entries
     ID3D11DepthStencilView*   companionDSV;       // DSV for companion depth
 };
 static ShadowAtlasEntry gShadowEntries[kMaxShadowIdentities] = {};
 static std::atomic<size_t> gShadowEntryCount{0};
-static UINT  gShadowBaseSize = 0;              // actual size of original textures
-static UINT  gShadowVanillaSize = 0;           // what Kenshi requested at creation
-static bool  gShadowSwapActive = false;        // fast-path flag read by every hook
-static float gShadowViewportScale = 1.0f;      // newSize / baseSize
+static UINT  gShadowVanillaSize = 0;           // atlas size of the live generation
+static bool  gShadowSwapActive = false;        // fast-path flag: any replacement exists
+static float gShadowPassScale = 1.0f;          // viewport scale of the current shadow pass
 static std::atomic<bool> gShadowResizePending{false};
-static UINT  gShadowResizeTarget = 0;
+static UINT  gShadowResizeTarget = 0;          // 0 = dismantle all replacements
 static uint64_t gShadowCreationFrame = ~0ull;
+static bool  gInShadowPass = false;
 
 UINT GetShadowBaseResolution()           { return gShadowVanillaSize; }
 
@@ -134,40 +138,30 @@ void SetShadowAtlasResolution(UINT size)
     size_t entries = gShadowEntryCount.load(std::memory_order_acquire);
     if (entries == 0) return;
 
-    // 0 clears the override: if a swap is active, queue a resize back to the
-    // vanilla size so it gets dismantled (the back-to-base branch in
-    // ApplyPendingShadowResize releases the replacements).
-    UINT want;
-    if (size != 0)                 want = size;
-    else if (gShadowSwapActive)    want = gShadowBaseSize;
-    else                           return;
-
-    if (want != 0 && want != gShadowResizeTarget)
+    // Queue only when some entry's replacement state doesn't match the
+    // request (this fires per GUI tick — must not spam the log or the
+    // resize path). 0 clears the override: all replacements get dismantled.
+    bool change = false;
+    for (size_t i = 0; i < entries; i++)
     {
-        Log("Shadow atlas resize queued: %u -> %u (base=%u, entries=%zu)",
-            gShadowResizeTarget, want, gShadowBaseSize, entries);
-        gShadowResizeTarget = want;
-        gShadowResizePending.store(true, std::memory_order_release);
+        const ShadowAtlasEntry& e = gShadowEntries[i];
+        UINT want = (size != 0 && size != e.desc.Width) ? size : 0;
+        UINT have = e.newTex ? e.newSize : 0;
+        if (want != have) { change = true; break; }
     }
+    if (!change) return;
+
+    Log("Shadow atlas resize queued: target=%u (entries=%zu)", size, entries);
+    gShadowResizeTarget = size;
+    gShadowResizePending.store(true, std::memory_order_release);
 }
 
-// Shadow-pass detection state. gShadowAtlasIdentities holds the IUnknown
-// identity pointers (QueryInterface(IID_IUnknown)) of the depth atlas
-// Texture2Ds — COM identity rule guarantees this matches across any interface
-// query, even if a wrapper layer (RE_Kenshi, debug layer) sits between us and
-// the real texture. gInShadowPass flips in the OMSetRenderTargets hooks when
-// the bound DSV's resource resolves to one of these identities. Weak pointers
-// — we don't AddRef and tolerate the texture outliving us. Up to 8 identities
-// tracked simultaneously: Kenshi can create multiple DSV-bound atlas textures
-// (RTW + CSM modes, workspace recreate, etc.). Atomic count so the OMSet
-// hooks can read without a lock.
-static IUnknown* gShadowAtlasIdentities[kMaxShadowIdentities] = {};
-static std::atomic<size_t> gShadowAtlasIdentityCount{0};
-static bool      gInShadowPass = false;
-
 // Find the ShadowAtlasEntry whose original texture matches this resource's
-// IUnknown identity. Returns index or -1. Caller must Release res afterwards
-// (this function does NOT consume the ref).
+// IUnknown identity (the only pointer COM guarantees stable across interface
+// queries, even if a wrapper layer sits between us and the real texture).
+// Returns index or -1. Caller must Release res afterwards (this function
+// does NOT consume the ref). Stamps lastSeen: entries the game stops
+// touching go stale and become evictable (see EvictStaleShadowEntries).
 static int FindShadowEntry(ID3D11Resource* res)
 {
     if (!res) return -1;
@@ -175,38 +169,25 @@ static int FindShadowEntry(ID3D11Resource* res)
     res->QueryInterface(IID_IUnknown, (void**)&unk);
     if (!unk) return -1;
     size_t count = gShadowEntryCount.load(std::memory_order_acquire);
+    int found = -1;
     for (size_t i = 0; i < count; i++)
     {
-        if (gShadowEntries[i].identity == unk) { unk->Release(); return (int)i; }
+        if (gShadowEntries[i].identity == unk)
+        {
+            gShadowEntries[i].lastSeen = gFrameIndex;
+            found = (int)i;
+            break;
+        }
     }
     unk->Release();
-    return -1;
-}
-
-// Remove one identity from the shadow-pass detection list (swap-remove).
-// Without this, every resize/mode-switch left the released replacement's
-// identity behind: a dangling weak pointer (false-positive shadow-pass
-// detection if the allocation is recycled) and, once the 8-slot list
-// filled up, silent registration failure — the new replacement DSV was
-// never recognized as a shadow target, so caster viewports stopped being
-// scaled and the resolution override visibly broke.
-static void RemoveShadowIdentity(IUnknown* id)
-{
-    if (!id) return;
-    size_t count = gShadowAtlasIdentityCount.load(std::memory_order_acquire);
-    for (size_t i = 0; i < count; i++)
-    {
-        if (gShadowAtlasIdentities[i] != id) continue;
-        gShadowAtlasIdentities[i] = gShadowAtlasIdentities[count - 1];
-        gShadowAtlasIdentities[count - 1] = nullptr;
-        gShadowAtlasIdentityCount.store(count - 1, std::memory_order_release);
-        return;
-    }
+    return found;
 }
 
 static void ReleaseShadowReplacement(ShadowAtlasEntry& e)
 {
-    if (e.newIdentity) { RemoveShadowIdentity(e.newIdentity); e.newIdentity = nullptr; }
+    e.newIdentity = nullptr;
+    e.newSize = 0;
+    e.vpScale = 1.0f;
     if (e.companionDSV)      { e.companionDSV->Release();      e.companionDSV = nullptr; }
     if (e.companionDepthTex) { e.companionDepthTex->Release();  e.companionDepthTex = nullptr; }
     if (e.newDSV)  { e.newDSV->Release();  e.newDSV = nullptr; }
@@ -224,11 +205,9 @@ static void ResetShadowTracking()
         if (gShadowEntries[i].tex) { gShadowEntries[i].tex->Release(); gShadowEntries[i].tex = nullptr; }
     }
     gShadowEntryCount.store(0, std::memory_order_release);
-    gShadowAtlasIdentityCount.store(0, std::memory_order_release);
-    gShadowBaseSize = 0;
     gShadowVanillaSize = 0;
     gShadowSwapActive = false;
-    gShadowViewportScale = 1.0f;
+    gShadowPassScale = 1.0f;
     gShadowResizeTarget = 0;
     gShadowResizePending.store(false, std::memory_order_relaxed);
     gInShadowPass = false;
@@ -242,7 +221,7 @@ static void ApplyPendingShadowResize()
 
     UINT newSize = gShadowResizeTarget;
     size_t count = gShadowEntryCount.load(std::memory_order_acquire);
-    if (count == 0 || newSize == 0)
+    if (count == 0)
     {
         gShadowResizePending.store(false, std::memory_order_relaxed);
         return;
@@ -253,29 +232,35 @@ static void ApplyPendingShadowResize()
         return;
     gShadowResizePending.store(false, std::memory_order_relaxed);
 
-    // If matching base size, disable swapping (original textures are correct)
-    if (newSize == gShadowBaseSize)
-    {
-        for (size_t i = 0; i < count; i++)
-            ReleaseShadowReplacement(gShadowEntries[i]);
-        gShadowSwapActive = false;
-        gShadowViewportScale = 1.0f;
-        gInShadowPass = false;
-        Log("Shadow atlas resize: back to base %u — swap disabled", newSize);
-        return;
-    }
-
-    Log("Shadow atlas runtime resize: %u -> %u (%zu entries)",
-        gShadowBaseSize, newSize, count);
-
+    // Per-entry replacement: the tracked entries can span two atlas
+    // generations of DIFFERENT vanilla sizes (RTW 1024 vs CSM 2048, both
+    // alive across a shadow-mode switch), so each entry gets its own
+    // replacement + viewport scale. An entry already matching the target
+    // (either vanilla-sized == target, or an up-to-date replacement) is
+    // left alone — re-queues after a mode switch must not churn the live
+    // replacements. Target 0 dismantles everything (override cleared).
     for (size_t i = 0; i < count; i++)
     {
         ShadowAtlasEntry& e = gShadowEntries[i];
+        UINT want = (newSize != 0 && newSize != e.desc.Width) ? newSize : 0;
+        if (want == 0)
+        {
+            if (e.newTex)
+            {
+                Log("Shadow atlas entry %zu (%s %u): replacement dismantled",
+                    i, e.isDepth ? "depth" : "color", e.desc.Width);
+                ReleaseShadowReplacement(e);
+            }
+            continue;
+        }
+        if (e.newTex && e.newSize == want)
+            continue;  // already correct
+
         ReleaseShadowReplacement(e);
 
         D3D11_TEXTURE2D_DESC d = e.desc;
-        d.Width  = newSize;
-        d.Height = newSize;
+        d.Width  = want;
+        d.Height = want;
 
         HRESULT hr = oCreateTexture2D(gDevice, &d, nullptr, &e.newTex);
         if (FAILED(hr) || !e.newTex)
@@ -307,24 +292,6 @@ static void ApplyPendingShadowResize()
                 if (FAILED(hr))
                     Log("  entry %zu: CreateSRV (depth) FAILED (0x%08X)", i, hr);
             }
-
-            // Register new depth identity for shadow-pass detection. Remember
-            // it on the entry so ReleaseShadowReplacement can take it back out
-            // of the list when this replacement dies (next resize / disable /
-            // workspace recreate).
-            IUnknown* nid = nullptr;
-            e.newTex->QueryInterface(IID_IUnknown, (void**)&nid);
-            if (nid)
-            {
-                size_t sidx = gShadowAtlasIdentityCount.load(std::memory_order_relaxed);
-                if (sidx < kMaxShadowIdentities)
-                {
-                    gShadowAtlasIdentities[sidx] = nid;
-                    gShadowAtlasIdentityCount.store(sidx + 1, std::memory_order_release);
-                    e.newIdentity = nid;  // weak ref, backed by e.newTex
-                }
-                nid->Release();
-            }
         }
         else
         {
@@ -344,8 +311,18 @@ static void ApplyPendingShadowResize()
                 Log("  entry %zu: CreateSRV FAILED (0x%08X)", i, hr);
         }
 
-        Log("  entry %zu (%s): tex=%p DSV=%p RTV=%p SRV=%p",
-            i, e.isDepth ? "depth" : "color",
+        // Remember the replacement's identity (weak, backed by the newTex
+        // ref) so the bind classifier recognizes re-binds of our own
+        // replacement views and never adopts them as "originals".
+        IUnknown* nid = nullptr;
+        e.newTex->QueryInterface(IID_IUnknown, (void**)&nid);
+        if (nid) { e.newIdentity = nid; nid->Release(); }
+
+        e.newSize = want;
+        e.vpScale = (float)want / (float)e.desc.Width;
+
+        Log("  entry %zu (%s %u -> %u, scale %.3f): tex=%p DSV=%p RTV=%p SRV=%p",
+            i, e.isDepth ? "depth" : "color", e.desc.Width, want, e.vpScale,
             e.newTex, e.newDSV, e.newRTV, e.newSRV);
     }
 
@@ -360,10 +337,10 @@ static void ApplyPendingShadowResize()
         for (size_t i = 0; i < count; i++)
         {
             ShadowAtlasEntry& e = gShadowEntries[i];
-            if (e.isDepth || !e.newTex) continue;
+            if (e.isDepth || !e.newTex || e.companionDSV) continue;
             D3D11_TEXTURE2D_DESC dd = {};
-            dd.Width = newSize;
-            dd.Height = newSize;
+            dd.Width = e.newSize;
+            dd.Height = e.newSize;
             dd.MipLevels = 1;
             dd.ArraySize = 1;
             dd.Format = DXGI_FORMAT_D32_FLOAT;
@@ -377,14 +354,22 @@ static void ApplyPendingShadowResize()
                 if (FAILED(hr))
                     Log("  companion DSV creation FAILED (0x%08X)", hr);
                 else
-                    Log("  companion DSV created for color entry %zu (%ux%u)", i, newSize, newSize);
+                    Log("  companion DSV created for color entry %zu (%ux%u)", i, e.newSize, e.newSize);
             }
         }
     }
 
-    gShadowViewportScale = (float)newSize / (float)gShadowBaseSize;
-    gShadowSwapActive = true;
-    Log("Shadow atlas swap active, viewport scale = %.3f", gShadowViewportScale);
+    bool anyReplacement = false;
+    for (size_t i = 0; i < count; i++)
+        if (gShadowEntries[i].newTex) { anyReplacement = true; break; }
+    if (gShadowSwapActive != anyReplacement)
+        Log("Shadow atlas swap %s", anyReplacement ? "active" : "disabled");
+    gShadowSwapActive = anyReplacement;
+    if (!anyReplacement)
+    {
+        gShadowPassScale = 1.0f;
+        gInShadowPass = false;
+    }
 }
 
 // The game clears its own (original) atlas views each frame; our replacements
@@ -456,8 +441,11 @@ void SetTemporalJitter(int enabled)
 // The jitter applied to the frame currently being built (pixels). Read by the upscaler resolve.
 void GetTemporalJitter(float& x, float& y) { x = gJitterPxX; y = gJitterPxY; }
 
+static void EvictStaleShadowEntries();  // defined with the bind classifier below
+
 void ResetFrameState()
 {
+    EvictStaleShadowEntries();
     ApplyPendingShadowResize();
     ClearShadowReplacements();
     gPipelineDetector.ResetFrame();
@@ -510,9 +498,11 @@ static bool             sUpsResetNext  = false;    // discard DLSS history on th
 static ID3D11Texture2D*          sUpsOut    = nullptr; // DLSS output (UAV); copied/sharpened back to scene color
 static ID3D11ShaderResourceView* sUpsOutSRV = nullptr; // SRV of sUpsOut, for the sharpen pass to sample
 static uint32_t         sUpsOutW = 0, sUpsOutH = 0;
+static DXGI_FORMAT      sUpsOutFmt = DXGI_FORMAT_UNKNOWN;   // format sUpsOut was created with
 static const void*               sUpsPrevColorRTV = nullptr; // detect pipeline rebuild (settings change)
 static ID3D11Texture2D*          sUpsColorSR  = nullptr; // shader-readable copy of the scene color for NGX
 static uint32_t         sUpsColorW = 0, sUpsColorH = 0;
+static DXGI_FORMAT      sUpsColorFmt = DXGI_FORMAT_UNKNOWN; // format sUpsColorSR was created with
 static bool             sUpsDescLogged = false;
 
 // Runtime gate for the injected motion-vector feeder (velocity RT + patched-shader SV_Target3 bind +
@@ -538,8 +528,8 @@ static bool TexDim(ID3D11Resource* res, uint32_t& w, uint32_t& h)
 static void ReleaseUpscalerTargets()   // drop derived textures so they rebuild against the new pipeline
 {
     if (sUpsOutSRV) { sUpsOutSRV->Release(); sUpsOutSRV = nullptr; }
-    if (sUpsOut)    { sUpsOut->Release();    sUpsOut = nullptr; }    sUpsOutW = sUpsOutH = 0;
-    if (sUpsColorSR){ sUpsColorSR->Release();sUpsColorSR = nullptr; } sUpsColorW = sUpsColorH = 0;
+    if (sUpsOut)    { sUpsOut->Release();    sUpsOut = nullptr; }    sUpsOutW = sUpsOutH = 0; sUpsOutFmt = DXGI_FORMAT_UNKNOWN;
+    if (sUpsColorSR){ sUpsColorSR->Release();sUpsColorSR = nullptr; } sUpsColorW = sUpsColorH = 0; sUpsColorFmt = DXGI_FORMAT_UNKNOWN;
 }
 
 // One-shot diagnostic: log a resource's format + bind flags (NGX PlatformError is usually a bind-flag gap).
@@ -562,7 +552,7 @@ static ID3D11Texture2D* EnsureColorSR(ID3D11DeviceContext* ctx, ID3D11Resource* 
     ID3D11Texture2D* colorTex = nullptr;
     if (FAILED(colorRes->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&colorTex)) || !colorTex) return nullptr;
     D3D11_TEXTURE2D_DESC cd; colorTex->GetDesc(&cd); colorTex->Release();
-    if (!sUpsColorSR || sUpsColorW != cd.Width || sUpsColorH != cd.Height)
+    if (!sUpsColorSR || sUpsColorW != cd.Width || sUpsColorH != cd.Height || sUpsColorFmt != cd.Format)
     {
         if (sUpsColorSR) { sUpsColorSR->Release(); sUpsColorSR = nullptr; }
         D3D11_TEXTURE2D_DESC sd = {};
@@ -570,7 +560,7 @@ static ID3D11Texture2D* EnsureColorSR(ID3D11DeviceContext* ctx, ID3D11Resource* 
         sd.Format = cd.Format; sd.SampleDesc.Count = 1; sd.Usage = D3D11_USAGE_DEFAULT;
         sd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         if (FAILED(gDevice->CreateTexture2D(&sd, nullptr, &sUpsColorSR))) { sUpsColorSR = nullptr; return nullptr; }
-        sUpsColorW = cd.Width; sUpsColorH = cd.Height;
+        sUpsColorW = cd.Width; sUpsColorH = cd.Height; sUpsColorFmt = cd.Format;
     }
     ctx->CopyResource(sUpsColorSR, colorRes);   // shader-readable snapshot NGX can bind as its color SRV
     return sUpsColorSR;
@@ -582,7 +572,7 @@ static ID3D11Texture2D* EnsureUpscalerOutput(ID3D11Resource* colorRes)
     ID3D11Texture2D* colorTex = nullptr;
     if (FAILED(colorRes->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&colorTex)) || !colorTex) return nullptr;
     D3D11_TEXTURE2D_DESC cd; colorTex->GetDesc(&cd); colorTex->Release();
-    if (sUpsOut && sUpsOutW == cd.Width && sUpsOutH == cd.Height) return sUpsOut;
+    if (sUpsOut && sUpsOutW == cd.Width && sUpsOutH == cd.Height && sUpsOutFmt == cd.Format) return sUpsOut;
     if (sUpsOutSRV) { sUpsOutSRV->Release(); sUpsOutSRV = nullptr; }
     if (sUpsOut) { sUpsOut->Release(); sUpsOut = nullptr; }
     D3D11_TEXTURE2D_DESC od = {};
@@ -591,7 +581,7 @@ static ID3D11Texture2D* EnsureUpscalerOutput(ID3D11Resource* colorRes)
     od.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;   // DLSS writes via compute UAV
     if (FAILED(gDevice->CreateTexture2D(&od, nullptr, &sUpsOut))) { sUpsOut = nullptr; return nullptr; }
     gDevice->CreateShaderResourceView(sUpsOut, nullptr, &sUpsOutSRV);          // for the sharpen pass
-    sUpsOutW = cd.Width; sUpsOutH = cd.Height;
+    sUpsOutW = cd.Width; sUpsOutH = cd.Height; sUpsOutFmt = cd.Format;
     Log("Upscaler: output texture %ux%u created", cd.Width, cd.Height);
     return sUpsOut;
 }
@@ -842,6 +832,16 @@ static void ExtractCameraData(ID3D11DeviceContext* ctx)
         sd.MiscFlags = 0;
         gDevice->CreateBuffer(&sd, nullptr, &gCameraStagingCBs[0]);
         gDevice->CreateBuffer(&sd, nullptr, &gCameraStagingCBs[1]);
+        if (!gCameraStagingCBs[0] || !gCameraStagingCBs[1])
+        {
+            // Partial failure: drop BOTH slots so the next frame retries creation from a
+            // clean state (a lone slot 0 would gate this branch off forever and leak).
+            if (gCameraStagingCBs[0]) { gCameraStagingCBs[0]->Release(); gCameraStagingCBs[0] = nullptr; }
+            if (gCameraStagingCBs[1]) { gCameraStagingCBs[1]->Release(); gCameraStagingCBs[1] = nullptr; }
+            gCameraStagingReady = false;
+            psCB->Release();
+            return;
+        }
     }
     if (!gCameraStagingCBs[0] || !gCameraStagingCBs[1]) { psCB->Release(); return; }
 
@@ -1086,6 +1086,13 @@ static bool TryDiscoverSwapChain(IDXGISwapChain** ppSwapChain, ID3D11DeviceConte
 static bool VTableHook(void* pObject, int vtableIndex, void* detour, void** original)
 {
     void** vtable = *reinterpret_cast<void***>(pObject);
+
+    // Already hooked (e.g. TryRecoverPresent re-running TryInstallSwapChainHooks on a chain
+    // whose vtable still points at our detours): leave the slot and the saved original alone.
+    // Overwriting *original with our own detour here would recurse until stack overflow.
+    if (vtable[vtableIndex] == detour)
+        return true;
+
     *original = vtable[vtableIndex];
 
     DWORD oldProtect;
@@ -1370,18 +1377,11 @@ static HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
         IUnknown* unk = nullptr;
         (*ppTexture2D)->QueryInterface(IID_IUnknown, (void**)&unk);
 
-        // DSV identity tracking (for shadow-pass detection)
-        if (unk && isDepth)
-        {
-            size_t idx = gShadowAtlasIdentityCount.load(std::memory_order_relaxed);
-            if (idx < kMaxShadowIdentities)
-            {
-                gShadowAtlasIdentities[idx] = unk;
-                gShadowAtlasIdentityCount.store(idx + 1, std::memory_order_release);
-            }
-        }
-
-        // Entry tracking (for runtime resize swapping)
+        // Entry tracking (shadow-pass detection + runtime resize swapping).
+        // NOTE: creation-time tracking alone is incomplete — a shadow-mode
+        // switch can rebuild the workspace from OGRE's texture pool with no
+        // creation call; those textures are adopted at bind time instead
+        // (AdoptShadowTexture).
         if (unk)
         {
             size_t eidx = gShadowEntryCount.load(std::memory_order_relaxed);
@@ -1391,11 +1391,11 @@ static HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
                 e = {};
                 e.tex = *ppTexture2D;
                 e.tex->AddRef();
-                e.identity = unk;  // weak ref (matches gShadowAtlasIdentities convention)
+                e.identity = unk;  // weak ref, backed by e.tex
                 e.desc = *pDesc;
                 e.isDepth = isDepth;
-                if (gShadowBaseSize == 0)
-                    gShadowBaseSize = pDesc->Width;
+                e.lastSeen = gFrameIndex;
+                e.vpScale = 1.0f;
                 if (gShadowVanillaSize == 0)
                     gShadowVanillaSize = pDesc->Width;
                 gShadowEntryCount.store(eidx + 1, std::memory_order_release);
@@ -1680,14 +1680,14 @@ struct LightVolumeAoScope
 
 // Fire the v5 postLightVolumes callbacks once per frame (builds a frame context from the
 // captured globals). Fired at POST_FOG/POST_TONEMAP — after the point/spot light volumes.
-static void FirePostLightVolumes(ID3D11DeviceContext* ctx, const char* where)
+static void FirePostLightVolumes(ID3D11DeviceContext* ctx, InjectionPoint point, const char* where)
 {
     gPostLightVolumesFired = true;
 
     DustFrameContext fctx = {};
     fctx.device = gDevice;
     fctx.context = ctx;
-    fctx.point = static_cast<DustInjectionPoint>(InjectionPoint::POST_FOG);
+    fctx.point = static_cast<DustInjectionPoint>(point);
     fctx.timing = DUST_TIMING_PRE;
     fctx.width = gWidth;
     fctx.height = gHeight;
@@ -1814,6 +1814,8 @@ static void STDMETHODCALLTYPE HookedDraw(
     ID3D11DeviceContext* pThis, UINT VertexCount, UINT StartVertexLocation)
 {
     if (gShutdownSignaled) { oDraw(pThis, VertexCount, StartVertexLocation); return; }
+
+    ++gDrawHookCallCount;
 
     // Try to install swap chain hooks early — DustBoot may already have captured the
     // swap chain, and we don't need device capture for that path. Pass pThis so
@@ -2035,7 +2037,8 @@ static void STDMETHODCALLTYPE HookedDraw(
             (result.point == InjectionPoint::POST_FOG ||
              result.point == InjectionPoint::POST_TONEMAP))
         {
-            FirePostLightVolumes(pThis, "post-fog");
+            FirePostLightVolumes(pThis, result.point,
+                                 result.point == InjectionPoint::POST_FOG ? "post-fog" : "post-tonemap");
         }
 
         // PRE: effects bind resources before the game's draw
@@ -2081,6 +2084,8 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
 {
     if (gShutdownSignaled) { oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation); return; }
 
+    ++gDrawHookCallCount;
+
     if (Survey::IsActive())
         SurveyRecorder::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 
@@ -2113,6 +2118,8 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
 {
     if (gShutdownSignaled) { oDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation); return; }
 
+    ++gDrawHookCallCount;
+
     if (Survey::IsActive())
         SurveyRecorder::OnDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
                                                 StartIndexLocation, BaseVertexLocation,
@@ -2143,6 +2150,8 @@ static void STDMETHODCALLTYPE HookedDrawInstanced(
     UINT StartVertexLocation, UINT StartInstanceLocation)
 {
     if (gShutdownSignaled) { oDrawInstanced(pThis, VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation); return; }
+
+    ++gDrawHookCallCount;
 
     if (sMvFeederActive)
     {
@@ -2181,72 +2190,356 @@ static void STDMETHODCALLTYPE HookedUnmap(
 // single global read otherwise, so the feature costs one predictable branch
 // per call when the resolution override is off.
 
-// Check if the bound DSV refers to one of the captured shadow atlas
-// textures. Resolves via IUnknown identity (the only pointer COM guarantees
-// stable across interface queries). Scans the identity set — typically 1-4
-// entries — so the cost is a couple virtual calls plus a tiny linear search.
-static bool ResolveIsShadowDsv(ID3D11DepthStencilView* dsv)
+// Match a resolved identity against the entry table — originals AND our own
+// replacement textures (a state save/restore can re-bind the views we
+// substituted). Stamps lastSeen so idle entries become evictable.
+static int LookupShadowEntry(IUnknown* unk, bool* outIsReplacement)
 {
-    if (!dsv) return false;
-    size_t count = gShadowAtlasIdentityCount.load(std::memory_order_acquire);
-    if (count == 0) return false;
-    ID3D11Resource* res = nullptr;
-    dsv->GetResource(&res);
-    if (!res) return false;
-    IUnknown* unk = nullptr;
-    res->QueryInterface(IID_IUnknown, (void**)&unk);
-    res->Release();
-    bool match = false;
+    *outIsReplacement = false;
+    if (!unk) return -1;
+    size_t count = gShadowEntryCount.load(std::memory_order_acquire);
     for (size_t i = 0; i < count; i++)
     {
-        if (gShadowAtlasIdentities[i] == unk) { match = true; break; }
+        if (gShadowEntries[i].identity == unk)
+        {
+            gShadowEntries[i].lastSeen = gFrameIndex;
+            return (int)i;
+        }
+        if (gShadowEntries[i].newIdentity == unk)
+        {
+            gShadowEntries[i].lastSeen = gFrameIndex;
+            *outIsReplacement = true;
+            return (int)i;
+        }
     }
-    if (unk) unk->Release();
-    return match;
+    return -1;
 }
 
-// Try to swap a DSV or RTV to its shadow atlas replacement. Returns the
-// replacement view, or the original if no swap is needed.
-static ID3D11DepthStencilView* MaybeSwapShadowDSV(ID3D11DepthStencilView* dsv)
+// What one bound RTV/DSV resolves to, for the shadow bind classifier.
+struct ShadowViewInfo {
+    bool bound = false;                // view was non-null
+    IUnknown* unk = nullptr;           // owned identity ref; caller releases
+    ID3D11Texture2D* tex = nullptr;    // owned; only set for adoption candidates
+    D3D11_TEXTURE2D_DESC desc = {};    // only valid for candidates
+    bool candidate = false;            // untracked texture with a shadow-atlas desc
+};
+
+static void ReleaseShadowViewInfo(ShadowViewInfo& v)
 {
-    if (!dsv) return dsv;
+    if (v.unk) { v.unk->Release(); v.unk = nullptr; }
+    if (v.tex) { v.tex->Release(); v.tex = nullptr; }
+}
+
+static void ResolveShadowView(ID3D11View* view, bool wantDepth, ShadowViewInfo& out)
+{
+    if (!view) return;
+    out.bound = true;
     ID3D11Resource* res = nullptr;
-    dsv->GetResource(&res);
-    int idx = FindShadowEntry(res);
-    if (res) res->Release();
-    if (idx >= 0 && gShadowEntries[idx].isDepth && gShadowEntries[idx].newDSV)
-        return gShadowEntries[idx].newDSV;
-    return dsv;
-}
+    view->GetResource(&res);
+    if (!res) return;
+    res->QueryInterface(IID_IUnknown, (void**)&out.unk);
 
-static bool AnyRtvIsShadow(UINT NumViews, ID3D11RenderTargetView* const* ppRTVs,
-                           bool& outAnyBound)
-{
-    outAnyBound = false;
-    if (!ppRTVs) return false;
-    for (UINT i = 0; i < NumViews; i++)
+    bool isRepl = false;
+    if (out.unk && LookupShadowEntry(out.unk, &isRepl) < 0)
     {
-        if (!ppRTVs[i]) continue;
-        outAnyBound = true;
-        ID3D11Resource* res = nullptr;
-        ppRTVs[i]->GetResource(&res);
-        int idx = FindShadowEntry(res);
-        if (res) res->Release();
-        if (idx >= 0) return true;
+        // Untracked — an atlas-shaped texture here is an adoption candidate
+        // (OGRE's texture pool can hand the recreated shadow workspace a
+        // texture we never saw created).
+        ID3D11Texture2D* tex = nullptr;
+        res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex);
+        if (tex)
+        {
+            D3D11_TEXTURE2D_DESC d = {};
+            tex->GetDesc(&d);
+            bool isDepthDesc = (d.BindFlags & D3D11_BIND_DEPTH_STENCIL) != 0;
+            if (IsShadowAtlasDesc(&d) && isDepthDesc == wantDepth)
+            {
+                out.candidate = true;
+                out.desc = d;
+                out.tex = tex;  // ref kept; released by ReleaseShadowViewInfo
+            }
+            else
+            {
+                tex->Release();
+            }
+        }
     }
-    return false;
+    res->Release();
 }
 
-static ID3D11RenderTargetView* MaybeSwapShadowRTV(ID3D11RenderTargetView* rtv)
+// Entries the game hasn't bound or sampled for this many frames are pool-idle
+// leftovers of a dead workspace generation.
+static constexpr uint64_t kShadowEntryIdleFrames = 300;
+
+// Drop idle entries when a new atlas generation is adopted, so replacement
+// VRAM (which can be hundreds of MB at high overrides) doesn't accumulate
+// across repeated shadow-mode switches. An actively-used entry is stamped
+// every frame by the caster bind / lighting sample, so it can never be
+// evicted; a mistaken eviction self-heals via re-adoption at the next bind.
+static void EvictStaleShadowEntries()
 {
-    if (!rtv) return rtv;
-    ID3D11Resource* res = nullptr;
-    rtv->GetResource(&res);
-    int idx = FindShadowEntry(res);
-    if (res) res->Release();
-    if (idx >= 0 && !gShadowEntries[idx].isDepth && gShadowEntries[idx].newRTV)
-        return gShadowEntries[idx].newRTV;
-    return rtv;
+    size_t count = gShadowEntryCount.load(std::memory_order_acquire);
+    bool evicted = false;
+    for (size_t i = 0; i < count; )
+    {
+        ShadowAtlasEntry& e = gShadowEntries[i];
+        if (gFrameIndex - e.lastSeen <= kShadowEntryIdleFrames) { i++; continue; }
+        Log("Shadow atlas entry evicted (idle %llu frames): %s %u",
+            (unsigned long long)(gFrameIndex - e.lastSeen),
+            e.isDepth ? "depth" : "color", e.desc.Width);
+        ReleaseShadowReplacement(e);
+        if (e.tex) { e.tex->Release(); e.tex = nullptr; }
+        e = gShadowEntries[count - 1];
+        gShadowEntries[count - 1] = {};
+        count--;
+        gShadowEntryCount.store(count, std::memory_order_release);
+        evicted = true;
+    }
+    if (evicted)
+    {
+        bool anyReplacement = false;
+        for (size_t i = 0; i < count; i++)
+            if (gShadowEntries[i].newTex) { anyReplacement = true; break; }
+        gShadowSwapActive = anyReplacement;
+        if (!anyReplacement) gShadowPassScale = 1.0f;
+    }
+}
+
+// Adopt a pool-reused atlas texture first seen at bind time. Creation-time
+// tracking alone misses these: on a shadow-mode switch OGRE's texture pool
+// can satisfy the recreated workspace with textures it already owns (no
+// CreateTexture2D call), which left the real atlas untracked — unswapped,
+// unscaled, and sampled at the wrong resolution (the 2026-07 RTWSM->CSM
+// "broken cascades" report). Returns the new entry index, or -1.
+static int AdoptShadowTexture(ID3D11Texture2D* tex, const D3D11_TEXTURE2D_DESC& desc)
+{
+    EvictStaleShadowEntries();
+    size_t eidx = gShadowEntryCount.load(std::memory_order_relaxed);
+    if (eidx >= kMaxShadowIdentities)
+    {
+        static int sFullLogs = 0;
+        if (sFullLogs < 4)
+        {
+            ++sFullLogs;
+            Log("Shadow atlas adoption skipped: entry table full (%zu)", eidx);
+        }
+        return -1;
+    }
+    IUnknown* unk = nullptr;
+    tex->QueryInterface(IID_IUnknown, (void**)&unk);
+    if (!unk) return -1;
+
+    ShadowAtlasEntry& e = gShadowEntries[eidx];
+    e = {};
+    e.tex = tex;
+    e.tex->AddRef();
+    e.identity = unk;  // weak ref (matches the creation-path convention)
+    e.desc = desc;
+    e.isDepth = (desc.BindFlags & D3D11_BIND_DEPTH_STENCIL) != 0;
+    e.lastSeen = gFrameIndex;
+    e.vpScale = 1.0f;
+    gShadowVanillaSize = desc.Width;
+    gShadowEntryCount.store(eidx + 1, std::memory_order_release);
+    unk->Release();
+
+    static int sAdoptLogs = 0;
+    if (sAdoptLogs < 8)
+    {
+        ++sAdoptLogs;
+        Log("Shadow atlas %s texture adopted at bind (pool-reused, %ux%u) entry=%zu%s",
+            e.isDepth ? "depth" : "color", desc.Width, desc.Height, eidx,
+            sAdoptLogs == 8 ? " — further adoptions not logged" : "");
+    }
+
+    // The pool-reused atlas is vanilla-sized; re-queue the resize so the
+    // override survives the mode switch (applies at next frame start).
+    UINT wanted = gShadowAtlasOverride;
+    if (wanted != 0 && wanted != desc.Width &&
+        !gShadowResizePending.load(std::memory_order_relaxed))
+    {
+        gShadowResizeTarget = wanted;
+        gShadowResizePending.store(true, std::memory_order_release);
+    }
+    return (int)eidx;
+}
+
+// Full classification of one OMSetRenderTargets bind: is it a shadow caster
+// pass, which views should be substituted, and at what viewport scale.
+struct ShadowBindDecision {
+    bool  inShadowPass = false;
+    bool  swapped = false;     // rtvs[]/dsv differ from the originals
+    float scale = 1.0f;
+    ID3D11DepthStencilView* dsv = nullptr;
+    ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+};
+
+static void ClassifyShadowBind(UINT NumViews, ID3D11RenderTargetView* const* ppRTVs,
+                               ID3D11DepthStencilView* pDSV, ShadowBindDecision& out)
+{
+    out.dsv = pDSV;
+    UINT n = NumViews;
+    if (n > D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT)
+        n = D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT;
+    for (UINT i = 0; i < n; i++)
+        out.rtvs[i] = ppRTVs ? ppRTVs[i] : nullptr;
+
+    ShadowViewInfo dv;
+    ResolveShadowView(pDSV, /*wantDepth=*/true, dv);
+    ShadowViewInfo rv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+    bool anyRtvBound = false;
+    bool anyRtvCandidate = false;
+    for (UINT i = 0; i < n; i++)
+    {
+        ResolveShadowView(out.rtvs[i], /*wantDepth=*/false, rv[i]);
+        anyRtvBound |= rv[i].bound;
+        anyRtvCandidate |= rv[i].candidate;
+    }
+
+    // Adoption: strict co-bind rule. An atlas-shaped color RTV and depth DSV
+    // of EQUAL size bound together is the shadow caster pass; either half may
+    // be a pool-reused texture we never saw created. Depth-only binds never
+    // adopt (OGRE's depth pool shares depth textures across unrelated passes
+    // — the DSV-only false-positive lesson), and neither do lone RTVs.
+    if (dv.candidate || anyRtvCandidate)
+    {
+        bool dsvRepl = false;
+        int dsvEntry = dv.candidate ? -1 : LookupShadowEntry(dv.unk, &dsvRepl);
+        UINT dsvWidth = 0;
+        if (dv.candidate)
+            dsvWidth = dv.desc.Width;
+        else if (dsvEntry >= 0 && !dsvRepl)
+            dsvWidth = gShadowEntries[dsvEntry].desc.Width;
+        if (dsvWidth != 0)
+        {
+            bool rtvPartner = false;
+            for (UINT i = 0; i < n && !rtvPartner; i++)
+            {
+                if (rv[i].candidate)
+                {
+                    rtvPartner = (rv[i].desc.Width == dsvWidth);
+                }
+                else if (rv[i].unk)
+                {
+                    bool repl = false;
+                    int idx = LookupShadowEntry(rv[i].unk, &repl);
+                    rtvPartner = (idx >= 0 && !repl &&
+                                  gShadowEntries[idx].desc.Width == dsvWidth);
+                }
+            }
+            if (rtvPartner)
+            {
+                for (UINT i = 0; i < n; i++)
+                    if (rv[i].candidate && rv[i].desc.Width == dsvWidth)
+                        AdoptShadowTexture(rv[i].tex, rv[i].desc);
+                if (dv.candidate)
+                    AdoptShadowTexture(dv.tex, dv.desc);
+            }
+        }
+    }
+
+    // Detection (post-adoption). Same semantics as always: DSV match +
+    // (RTV match or depth-only), OR RTV match alone. A lone DSV match with
+    // an unrelated RTV is NOT a shadow pass (depth pool sharing).
+    bool dsvRepl = false;
+    int  dsvEntry = LookupShadowEntry(dv.unk, &dsvRepl);
+    bool dsvIsShadow = (dsvEntry >= 0);
+    int  rtvEntry[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+    bool rtvRepl[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+    bool rtvIsShadow = false;
+    for (UINT i = 0; i < n; i++)
+    {
+        rtvRepl[i] = false;
+        rtvEntry[i] = LookupShadowEntry(rv[i].unk, &rtvRepl[i]);
+        rtvIsShadow |= (rtvEntry[i] >= 0);
+    }
+    out.inShadowPass = dsvIsShadow ? (rtvIsShadow || !anyRtvBound) : rtvIsShadow;
+
+    if (out.inShadowPass)
+    {
+        // Substitute replacements — ALL or NOTHING. A tracked view without
+        // its replacement (adopted this frame; resize lands next frame
+        // start, or no override wanted) must leave the whole bind original,
+        // or the RTV/DSV dimensions diverge and the pass renders into a
+        // different texture than the lighting samples.
+        bool allAvailable = true;
+        float scale = 0.0f;
+        ID3D11DepthStencilView* finalDSV = pDSV;
+        bool anyRTVSwapped = false;
+
+        for (UINT i = 0; i < n; i++)
+        {
+            if (rtvEntry[i] < 0) continue;
+            ShadowAtlasEntry& e = gShadowEntries[rtvEntry[i]];
+            if (rtvRepl[i])
+            {
+                if (scale == 0.0f) scale = e.vpScale;
+            }
+            else if (e.newRTV)
+            {
+                out.rtvs[i] = e.newRTV;
+                anyRTVSwapped = true;
+                if (scale == 0.0f) scale = e.vpScale;
+            }
+            else
+            {
+                allAvailable = false;
+            }
+        }
+
+        if (dsvIsShadow)
+        {
+            ShadowAtlasEntry& e = gShadowEntries[dsvEntry];
+            if (dsvRepl)
+            {
+                if (scale == 0.0f) scale = e.vpScale;
+            }
+            else if (e.newDSV)
+            {
+                finalDSV = e.newDSV;
+                if (scale == 0.0f) scale = e.vpScale;
+            }
+            else
+            {
+                allAvailable = false;
+            }
+        }
+        else if (dv.bound && rtvIsShadow)
+        {
+            // Foreign (untracked, non-atlas) depth co-bound with the shadow
+            // color: substitute a companion depth so the target dimensions
+            // match the swapped RTV.
+            ID3D11DepthStencilView* comp = nullptr;
+            size_t cnt = gShadowEntryCount.load(std::memory_order_acquire);
+            for (size_t i = 0; i < cnt; i++)
+            {
+                if (!gShadowEntries[i].isDepth && gShadowEntries[i].companionDSV)
+                    { comp = gShadowEntries[i].companionDSV; break; }
+            }
+            if (comp) finalDSV = comp;
+            else      allAvailable = false;
+        }
+
+        if (allAvailable && (anyRTVSwapped || finalDSV != pDSV || scale != 0.0f))
+        {
+            out.dsv = finalDSV;
+            out.swapped = anyRTVSwapped || (finalDSV != pDSV);
+            out.scale = (scale != 0.0f) ? scale : 1.0f;
+        }
+        else
+        {
+            // Bind everything original at scale 1 — a consistent
+            // vanilla-resolution pass until the replacements exist.
+            for (UINT i = 0; i < n; i++)
+                out.rtvs[i] = ppRTVs ? ppRTVs[i] : nullptr;
+            out.dsv = pDSV;
+            out.swapped = false;
+            out.scale = 1.0f;
+        }
+    }
+
+    ReleaseShadowViewInfo(dv);
+    for (UINT i = 0; i < n; i++)
+        ReleaseShadowViewInfo(rv[i]);
 }
 
 static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
@@ -2285,57 +2578,33 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
             ID3D11RenderTargetView* rtvs4[4] = {
                 ppRenderTargetViews[0], ppRenderTargetViews[1], ppRenderTargetViews[2], velRTV };
             oOMSetRenderTargets(pThis, 4, rtvs4, pDepthStencilView);
+            // This early-out skips the shadow-state update below — a GBuffer bind is never
+            // a shadow pass, so clear any stale caster state left over from the shadow pass.
+            gInShadowPass = false;
+            gShadowPassScale = 1.0f;
             return;
         }
     }
 
-    if (!gShadowSwapActive)
+    // Classification also runs whenever an override is set, even with no
+    // swap live and no entries tracked: bind-time adoption must see the
+    // caster pass of a pool-reused atlas (a shadow-mode switch can rebuild
+    // the whole workspace from OGRE's texture pool with zero creations).
+    if (!gShadowSwapActive && gShadowAtlasOverride == 0)
     { oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView); return; }
 
-    // Shadow pass detection: DSV match + (RTV match or depth-only), OR
-    // RTV match alone (when OGRE reuses a pooled depth buffer we didn't
-    // track). A lone DSV match with an unrelated RTV is NOT a shadow pass
-    // — OGRE's depth pool can share the shadow depth with other targets.
-    bool dsvIsShadow = ResolveIsShadowDsv(pDepthStencilView);
-    bool anyRtvBound = false;
-    bool rtvIsShadow = AnyRtvIsShadow(NumViews, ppRenderTargetViews, anyRtvBound);
-    bool nowInShadowPass = false;
-    if (dsvIsShadow)
-        nowInShadowPass = rtvIsShadow || !anyRtvBound;
-    else if (rtvIsShadow)
-        nowInShadowPass = true;
-
-    if (nowInShadowPass)
+    ShadowBindDecision sb;
+    ClassifyShadowBind(NumViews, ppRenderTargetViews, pDepthStencilView, sb);
+    if (sb.inShadowPass)
     {
-        ID3D11DepthStencilView* swapDSV = MaybeSwapShadowDSV(pDepthStencilView);
-        // If DSV wasn't tracked, use companion DSV from the color entry
-        if (swapDSV == pDepthStencilView && !dsvIsShadow)
-        {
-            size_t cnt = gShadowEntryCount.load(std::memory_order_acquire);
-            for (size_t i = 0; i < cnt; i++)
-            {
-                if (!gShadowEntries[i].isDepth && gShadowEntries[i].companionDSV)
-                    { swapDSV = gShadowEntries[i].companionDSV; break; }
-            }
-        }
-        ID3D11RenderTargetView* swapRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
-        ID3D11RenderTargetView* const* finalRTVs = ppRenderTargetViews;
-        bool anyRTVSwapped = false;
-        if (ppRenderTargetViews && NumViews > 0)
-        {
-            for (UINT i = 0; i < NumViews && i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
-            {
-                swapRTVs[i] = MaybeSwapShadowRTV(ppRenderTargetViews[i]);
-                if (swapRTVs[i] != ppRenderTargetViews[i]) anyRTVSwapped = true;
-            }
-            if (anyRTVSwapped) finalRTVs = swapRTVs;
-        }
-        oOMSetRenderTargets(pThis, NumViews, finalRTVs, swapDSV);
+        oOMSetRenderTargets(pThis, NumViews,
+            sb.swapped ? sb.rtvs : ppRenderTargetViews, sb.dsv);
+        gShadowPassScale = sb.scale;
 
         // OGRE sets RSSetViewports BEFORE OMSetRenderTargets, so the viewport
         // hook (gated on gInShadowPass) misses it. On shadow-pass entry, query
         // the already-set viewport and scale it to match the replacement atlas.
-        if (!gInShadowPass)
+        if (!gInShadowPass && sb.scale != 1.0f)
         {
             UINT nVP = 0;
             pThis->RSGetViewports(&nVP, nullptr);
@@ -2343,7 +2612,7 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
             {
                 D3D11_VIEWPORT vps[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
                 pThis->RSGetViewports(&nVP, vps);
-                float s = gShadowViewportScale;
+                float s = sb.scale;
                 for (UINT i = 0; i < nVP; i++)
                 {
                     vps[i].TopLeftX *= s;
@@ -2358,8 +2627,9 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
     else
     {
         oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView);
+        gShadowPassScale = 1.0f;
     }
-    gInShadowPass = nowInShadowPass;
+    gInShadowPass = sb.inShadowPass;
 }
 
 // OGRE 2.0 binds RTV/DSV through this combined call rather than the plain
@@ -2392,7 +2662,10 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargetsAndUAV(
     gFwdScenePass = !isGBufU && pDepthStencilView &&
                     pDepthStencilView == GeometryCapture::GetGBufferDSV();
 
-    if (!gShadowSwapActive)
+    // See the plain-OMSet hook: classification also runs whenever an
+    // override is set, so bind-time adoption can see pool-reused atlases
+    // (OGRE 2.0 binds the caster pass through this combined call).
+    if (!gShadowSwapActive && gShadowAtlasOverride == 0)
     {
         oOMSetRenderTargetsAndUAV(pThis, NumRTVs, ppRenderTargetViews,
             pDepthStencilView, UAVStartSlot, NumUAVs, ppUnorderedAccessViews,
@@ -2400,44 +2673,17 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargetsAndUAV(
         return;
     }
 
-    bool dsvIsShadow = ResolveIsShadowDsv(pDepthStencilView);
-    bool anyRtvBound = false;
-    bool rtvIsShadow = AnyRtvIsShadow(NumRTVs, ppRenderTargetViews, anyRtvBound);
-    bool nowInShadowPass = false;
-    if (dsvIsShadow)
-        nowInShadowPass = rtvIsShadow || !anyRtvBound;
-    else if (rtvIsShadow)
-        nowInShadowPass = true;
-
-    if (nowInShadowPass)
+    ShadowBindDecision sb;
+    ClassifyShadowBind(NumRTVs, ppRenderTargetViews, pDepthStencilView, sb);
+    if (sb.inShadowPass)
     {
-        ID3D11DepthStencilView* swapDSV = MaybeSwapShadowDSV(pDepthStencilView);
-        if (swapDSV == pDepthStencilView && !dsvIsShadow)
-        {
-            size_t cnt = gShadowEntryCount.load(std::memory_order_acquire);
-            for (size_t i = 0; i < cnt; i++)
-            {
-                if (!gShadowEntries[i].isDepth && gShadowEntries[i].companionDSV)
-                    { swapDSV = gShadowEntries[i].companionDSV; break; }
-            }
-        }
-        ID3D11RenderTargetView* swapRTVs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
-        ID3D11RenderTargetView* const* finalRTVs = ppRenderTargetViews;
-        bool anyRTVSwapped = false;
-        if (ppRenderTargetViews && NumRTVs > 0)
-        {
-            for (UINT i = 0; i < NumRTVs && i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; i++)
-            {
-                swapRTVs[i] = MaybeSwapShadowRTV(ppRenderTargetViews[i]);
-                if (swapRTVs[i] != ppRenderTargetViews[i]) anyRTVSwapped = true;
-            }
-            if (anyRTVSwapped) finalRTVs = swapRTVs;
-        }
-        oOMSetRenderTargetsAndUAV(pThis, NumRTVs, finalRTVs,
-            swapDSV, UAVStartSlot, NumUAVs, ppUnorderedAccessViews,
+        oOMSetRenderTargetsAndUAV(pThis, NumRTVs,
+            sb.swapped ? sb.rtvs : ppRenderTargetViews,
+            sb.dsv, UAVStartSlot, NumUAVs, ppUnorderedAccessViews,
             pUAVInitialCounts);
+        gShadowPassScale = sb.scale;
 
-        if (!gInShadowPass)
+        if (!gInShadowPass && sb.scale != 1.0f)
         {
             UINT nVP = 0;
             pThis->RSGetViewports(&nVP, nullptr);
@@ -2445,7 +2691,7 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargetsAndUAV(
             {
                 D3D11_VIEWPORT vps[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
                 pThis->RSGetViewports(&nVP, vps);
-                float s = gShadowViewportScale;
+                float s = sb.scale;
                 for (UINT i = 0; i < nVP; i++)
                 {
                     vps[i].TopLeftX *= s;
@@ -2462,8 +2708,9 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargetsAndUAV(
         oOMSetRenderTargetsAndUAV(pThis, NumRTVs, ppRenderTargetViews,
             pDepthStencilView, UAVStartSlot, NumUAVs, ppUnorderedAccessViews,
             pUAVInitialCounts);
+        gShadowPassScale = 1.0f;
     }
-    gInShadowPass = nowInShadowPass;
+    gInShadowPass = sb.inShadowPass;
 }
 
 // Routes the deferred-lighting (and any other) shadow atlas sampling to the
@@ -2508,13 +2755,16 @@ static void STDMETHODCALLTYPE HookedRSSetViewports(
     ID3D11DeviceContext* pThis, UINT NumViewports,
     const D3D11_VIEWPORT* pViewports)
 {
-    // Shadow-atlas resolution override: scale the shadow-pass viewport to the resized atlas.
-    if (gInShadowPass && gShadowSwapActive && !gShutdownSignaled && pViewports && NumViewports > 0)
+    // Shadow-atlas resolution override: scale the shadow-pass viewport to the
+    // resized atlas. gShadowPassScale is the CURRENT pass's per-entry scale
+    // (the two live atlas generations can differ in size across a mode switch).
+    if (gInShadowPass && gShadowSwapActive && gShadowPassScale != 1.0f &&
+        !gShutdownSignaled && pViewports && NumViewports > 0)
     {
         D3D11_VIEWPORT scaled[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
         UINT n = (NumViewports <= D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE)
                ? NumViewports : D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
-        float s = gShadowViewportScale;
+        float s = gShadowPassScale;
         for (UINT i = 0; i < n; i++)
         {
             scaled[i] = pViewports[i];
@@ -2580,21 +2830,44 @@ static void TickGuiOnPresent(IDXGISwapChain* swapChain, const char* via)
             (unsigned long long)gDrawHookCallCount);
     }
 
-    // Survey: finalize frame at Present boundary
-    if (Survey::IsActive())
+    // Survey: clear leftover frames on any capture-state edge. A capture stopped early
+    // (Survey::Stop from the GUI) leaves its partial frames in sSurveyFrames — without this
+    // they leak into the next capture's WriteSummary, and repeated stop/start cycles grow memory.
+    static bool sSurveyWasActive = false;
+    const bool surveyActive = Survey::IsActive();
+    if (surveyActive != sSurveyWasActive)
     {
-        SurveyFrameData frameData = SurveyRecorder::OnEndFrame();
-        SurveyWriter::WriteFrame(frameData, Survey::GetOutputDir());
-        sSurveyFrames.push_back(std::move(frameData));
+        sSurveyFrames.clear();
+        sSurveyWasActive = surveyActive;
+    }
 
-        if (Survey::OnFrameEnd())
+    // Survey: finalize frame at Present boundary
+    if (surveyActive)
+    {
+        try
         {
-            // Survey just finished — write shaders and summary
-            SurveyWriter::WriteShaders(Survey::GetOutputDir());
-            SurveyWriter::WriteSummary(sSurveyFrames.data(), (int)sSurveyFrames.size(),
-                                        Survey::GetOutputDir());
+            SurveyFrameData frameData = SurveyRecorder::OnEndFrame();
+            SurveyWriter::WriteFrame(frameData, Survey::GetOutputDir());
+            sSurveyFrames.push_back(std::move(frameData));
+
+            if (Survey::OnFrameEnd())
+            {
+                // Survey just finished — write shaders and summary
+                SurveyWriter::WriteShaders(Survey::GetOutputDir());
+                SurveyWriter::WriteSummary(sSurveyFrames.data(), (int)sSurveyFrames.size(),
+                                            Survey::GetOutputDir());
+                sSurveyFrames.clear();
+                SurveyRecorder::Shutdown();
+            }
+        }
+        catch (...)
+        {
+            // Frames are tens of MB each — a bad_alloc here must never escape into the
+            // game's Present (it would terminate the process). Stop the capture instead.
+            Log("Survey: exception during capture — stopping survey, accumulated frames dropped");
             sSurveyFrames.clear();
             SurveyRecorder::Shutdown();
+            Survey::Stop();
         }
     }
 

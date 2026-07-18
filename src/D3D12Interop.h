@@ -61,4 +61,9 @@ namespace D3D12Interop
     // so the FSR backend can transition shared/compute resources around its dispatch). fromState/toState
     // are D3D12_RESOURCE_STATES. No-op if there is no open list.
     void Transition(ID3D12Resource* r, uint32_t fromState, uint32_t toState);
+
+    // Block until the last submitted D3D12 work has finished on the GPU. Call before releasing or
+    // recreating any D3D12 resource (shared textures, FFX contexts) so nothing is destroyed while the
+    // queue may still be reading it. No-op if interop was never initialized.
+    void WaitForGpuIdle();
 }

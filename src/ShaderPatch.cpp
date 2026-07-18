@@ -6,6 +6,7 @@
 #include <string>
 #include <cstring>
 #include <set>
+#include <mutex>
 
 namespace ShaderPatch
 {
@@ -26,6 +27,9 @@ static bool DumpInjectedEnabled()
     return cached != 0;
 }
 
+// Serializes the de-dup set in DumpInjection — HookedD3DCompile (D3DCompile) is free-threaded.
+static std::mutex sDumpSeenMutex;
+
 static void DumpInjection(const char* tag, const char* srcName, const char* entry,
                           const std::string& original, const std::string& patched)
 {
@@ -41,7 +45,10 @@ static void DumpInjection(const char* tag, const char* srcName, const char* entr
     base += hash;
 
     static std::set<std::string> seen;
-    if (!seen.insert(base).second) return;
+    {
+        std::lock_guard<std::mutex> lock(sDumpSeenMutex);
+        if (!seen.insert(base).second) return;
+    }
 
     std::string dir = DustLogDir() + "injected_shaders";
     CreateDirectoryA(dir.c_str(), nullptr);

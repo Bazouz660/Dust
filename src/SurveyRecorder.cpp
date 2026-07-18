@@ -4,6 +4,7 @@
 #include "DustLog.h"
 #include <windows.h>
 #include <cstring>
+#include <mutex>
 
 #define SAFE_RELEASE(p) do { if (p) { (p)->Release(); (p) = nullptr; } } while(0)
 
@@ -33,6 +34,9 @@ static uint32_t      sStagingSizes[STAGING_POOL_SIZE] = {};
 static std::unordered_map<uint64_t, ShaderSourceInfo> sBytecodeToSource;
 // Key: shader COM pointer -> source info (populated when CreateShader maps bytecode to pointer)
 static std::unordered_map<uint64_t, ShaderSourceInfo> sShaderPtrToSource;
+// Guards both maps: the D3DCompile hook is free-threaded and the CreateShader hooks can run on
+// game loader threads, while the writer iterates the map on the Present thread.
+static std::mutex                  sShaderSourceMutex;
 
 // ==================== Helpers ====================
 
@@ -675,6 +679,7 @@ void OnShaderCompiled(const void* pSrcData, SIZE_T srcSize,
     info.target     = target ? target : "";
     info.sourceName = sourceName ? sourceName : "";
 
+    std::lock_guard<std::mutex> lock(sShaderSourceMutex);
     sBytecodeToSource[hash] = std::move(info);
 }
 
@@ -685,6 +690,7 @@ void OnPixelShaderCreated(const void* bytecode, SIZE_T bytecodeSize,
         return;
 
     uint64_t hash = HashBytecode(bytecode, bytecodeSize);
+    std::lock_guard<std::mutex> lock(sShaderSourceMutex);
     auto it = sBytecodeToSource.find(hash);
     if (it != sBytecodeToSource.end())
         sShaderPtrToSource[(uint64_t)shader] = it->second;
@@ -697,6 +703,7 @@ void OnVertexShaderCreated(const void* bytecode, SIZE_T bytecodeSize,
         return;
 
     uint64_t hash = HashBytecode(bytecode, bytecodeSize);
+    std::lock_guard<std::mutex> lock(sShaderSourceMutex);
     auto it = sBytecodeToSource.find(hash);
     if (it != sBytecodeToSource.end())
         sShaderPtrToSource[(uint64_t)shader] = it->second;
@@ -704,13 +711,22 @@ void OnVertexShaderCreated(const void* bytecode, SIZE_T bytecodeSize,
 
 const ShaderSourceInfo* GetShaderSource(uint64_t shaderPtr)
 {
+    std::lock_guard<std::mutex> lock(sShaderSourceMutex);
     auto it = sShaderPtrToSource.find(shaderPtr);
+    // Entries are never erased, and unordered_map references survive rehash — the returned
+    // pointer stays valid after the lock is released.
     return (it != sShaderPtrToSource.end()) ? &it->second : nullptr;
 }
 
 const std::unordered_map<uint64_t, ShaderSourceInfo>& GetShaderMap()
 {
-    return sShaderPtrToSource;
+    // Copy under lock and hand out a snapshot: the callers (WriteShaders / WriteSummary) iterate
+    // on the Present thread while the compile/create hooks may still be inserting into the live
+    // map. Both callers run on that one thread, so the shared snapshot needs no further guard.
+    static std::unordered_map<uint64_t, ShaderSourceInfo> sSnapshot;
+    std::lock_guard<std::mutex> lock(sShaderSourceMutex);
+    sSnapshot = sShaderPtrToSource;
+    return sSnapshot;
 }
 
 } // namespace SurveyRecorder

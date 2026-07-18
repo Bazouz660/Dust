@@ -40,7 +40,7 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     float3 n01 = normalsTex.SampleLevel(pointClamp, uv + float2(0.0, offset.y), 0).rgb * 2.0 - 1.0;
 
     float nEdge = (1.0 - dot(n00, n11)) + (1.0 - dot(n10, n01));
-    float normalFactor = smoothstep(normalThreshold, normalThreshold * 1.5, nEdge);
+    float normalFactor = smoothstep(normalThreshold, normalThreshold * 1.5 + 1e-5, nEdge);
 
     return float4(depthFactor, normalFactor, 0.0, 1.0);
 }

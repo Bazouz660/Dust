@@ -1113,6 +1113,13 @@ void InjNoteUnmap(void* resource)
     auto itp = sMapPending.find((const void*)resource);
     if (itp == sMapPending.end()) return;
     uint32_t sz = sKnownBoneCB[(const void*)resource];
+    // The map key is a raw COM pointer with no ref held, so the address can have been recycled by a
+    // SMALLER buffer since the CB was learned — clamp to the resource's current ByteWidth before
+    // copying. GetDesc sits at the same vtable slot for every ID3D11Resource child; size the local
+    // for the largest desc so a recycled texture can't smash the stack.
+    union { D3D11_BUFFER_DESC bd; D3D11_TEXTURE2D_DESC td; } desc = {};
+    ((ID3D11Buffer*)resource)->GetDesc(&desc.bd);
+    if (desc.bd.ByteWidth < sz) sz = desc.bd.ByteWidth;
     std::vector<uint8_t>& dst = sBoneShadow[(const void*)resource];
     if (dst.size() != sz) dst.resize(sz);
     if (sz && itp->second) memcpy(dst.data(), itp->second, sz);
@@ -1585,7 +1592,8 @@ void Shutdown()
     sPrevRigid.clear(); sCurRigid.clear(); sPrevRigidClaimed.clear(); sPrevRigidByMesh.clear();
     sBoneShadowActive = false;
     sKnownBoneCB.clear(); sMapPending.clear(); sBoneShadow.clear();
-    sPrevSkinPoses.clear(); sPrevClaimed.clear();
+    sPrevSkinPoses.clear(); sCurSkinPoses.clear(); sPrevClaimed.clear();
+    sInjHavePrev = false; sInjBegun = false; sHaveFwd = false;
     if (sVelVS) { sVelVS->Release(); sVelVS = nullptr; }
     if (sVelPS) { sVelPS->Release(); sVelPS = nullptr; }
     if (sVelSkinVS) { sVelSkinVS->Release(); sVelSkinVS = nullptr; }

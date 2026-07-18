@@ -44,11 +44,13 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     else
     {
         // Legacy: smoothstep ramps from focus plane
+        // Start/End are independent sliders with overlapping ranges — guard
+        // against start >= end (smoothstep(0,0) is NaN, inverted is undefined).
         float diff = depth - focusDistance;
         if (diff > 0.0)
-            coc = smoothstep(farStart, farEnd, diff) * farStrength;
+            coc = smoothstep(farStart, max(farEnd, farStart + 1e-4), diff) * farStrength;
         else
-            coc = -smoothstep(nearStart, nearEnd, -diff) * nearStrength;
+            coc = -smoothstep(nearStart, max(nearEnd, nearStart + 1e-4), -diff) * nearStrength;
     }
 
     return float4(coc, coc, coc, 1);

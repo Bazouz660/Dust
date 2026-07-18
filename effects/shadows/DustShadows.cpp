@@ -253,12 +253,26 @@ static bool WriteSettingsCfgInt(const std::string& key, int value)
         content += key + "=" + valBuf + "\n";
     }
 
+    // Write via a sibling temp file + atomic replace: opening settings.cfg
+    // with "wb" truncates it immediately, so a crash/kill mid-write would
+    // leave the game with an empty settings file.
+    std::string tmpPath = path + ".dusttmp";
     FILE* f = nullptr;
-    fopen_s(&f, path.c_str(), "wb");
+    fopen_s(&f, tmpPath.c_str(), "wb");
     if (!f) return false;
     bool ok = fwrite(content.data(), 1, content.size(), f) == content.size();
     fclose(f);
-    return ok;
+    if (!ok)
+    {
+        DeleteFileA(tmpPath.c_str());
+        return false;
+    }
+    if (!MoveFileExA(tmpPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {
+        DeleteFileA(tmpPath.c_str());
+        return false;
+    }
+    return true;
 }
 
 // Write our current shadowRange to settings.cfg, deduping repeated writes.
@@ -451,12 +465,11 @@ static void ApplyDustShadows()
 static void RestoreVanillaShadows()
 {
     if (!gHost) return;
-    if (gHost->SetShadowAtlasResolution && gHost->GetShadowBaseResolution)
-    {
-        uint32_t base = gHost->GetShadowBaseResolution();
-        if (base > 0)
-            gHost->SetShadowAtlasResolution(base);
-    }
+    // 0 = clear the override: the host dismantles all replacements. (Passing
+    // a remembered "base" size is wrong since the host can track two atlas
+    // generations of different vanilla sizes across a shadow-mode switch.)
+    if (gHost->SetShadowAtlasResolution)
+        gHost->SetShadowAtlasResolution(0);
     if (gHost->SetCascadeLambda)
         gHost->SetCascadeLambda(-1.0f);
     if (gHost->SetShadowRange)

@@ -386,17 +386,36 @@ void EffectLoader::SavePreset(int presetIdx)
     Log("Saved global preset '%s'", preset.name.c_str());
 }
 
+// Defined below in the Import / Export section; shared with ImportPresetFromFolder.
+static std::string SanitizePresetName(const std::string& name);
+
+// Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9) — Windows
+// rejects these as folder names, so CreateDirectoryA would fail and leave a
+// phantom entry in the preset list.
+static bool IsReservedDeviceName(const std::string& name)
+{
+    // Compare the base name (anything before a '.') case-insensitively.
+    std::string base = name.substr(0, name.find('.'));
+    for (char& c : base) c = (char)toupper((unsigned char)c);
+    if (base == "CON" || base == "PRN" || base == "AUX" || base == "NUL")
+        return true;
+    if (base.size() == 4 && base[3] >= '1' && base[3] <= '9' &&
+        (base.compare(0, 3, "COM") == 0 || base.compare(0, 3, "LPT") == 0))
+        return true;
+    return false;
+}
+
 int EffectLoader::SavePresetAs(const char* name)
 {
     if (!name || !name[0] || presetsDir_.empty()) return -1;
 
-    // Sanitize folder name
-    std::string safeName(name);
-    for (char& c : safeName)
+    // Sanitize folder name (also strips leading/trailing spaces and dots, so
+    // names like "..." or " . " can sanitize to nothing)
+    std::string safeName = SanitizePresetName(name);
+    if (safeName.empty() || IsReservedDeviceName(safeName))
     {
-        if (c == '\\' || c == '/' || c == ':' || c == '*' ||
-            c == '?' || c == '"' || c == '<' || c == '>' || c == '|')
-            c = '_';
+        Log("SavePresetAs: rejected invalid preset name '%s'", name);
+        return -1;
     }
 
     std::string presetDir = presetsDir_ + "\\" + safeName;
@@ -467,8 +486,15 @@ void EffectLoader::DeletePreset(int presetIdx)
         FindClose(hFind);
     }
 
-    // Remove the directory
-    RemoveDirectoryA(presetDir.c_str());
+    // Remove the directory. If this fails (e.g. a stray non-INI file inside),
+    // keep the entry — otherwise the next ScanPresets would rediscover the
+    // folder and the deleted preset would silently come back.
+    if (!RemoveDirectoryA(presetDir.c_str()))
+    {
+        Log("DeletePreset: failed to remove folder '%s' (error %lu) — keeping preset entry",
+            presetDir.c_str(), GetLastError());
+        return;
+    }
 
     Log("Deleted global preset '%s'", presets_[presetIdx].name.c_str());
 
@@ -699,11 +725,14 @@ int EffectLoader::ImportPresetFromFolder(const char* srcDir, bool overwrite, std
             if (presets_[i].name == prevCurrentName) { currentPreset_ = i; break; }
     }
 
-    // Find new index and validate
+    // Find new index and validate (case-insensitive, like the collision check
+    // above — when overwriting, the on-disk folder keeps its original case,
+    // which is what ScanPresets reads back)
     int newIdx = -1;
     for (int i = 0; i < (int)presets_.size(); i++)
-        if (presets_[i].name == targetName) { newIdx = i; break; }
+        if (_stricmp(presets_[i].name.c_str(), targetName.c_str()) == 0) { newIdx = i; break; }
     if (newIdx >= 0) ValidatePreset(newIdx);
+    else setErr("Preset was copied but could not be found in the preset list");
 
     Log("Imported preset '%s' (%d file%s) from %s",
         targetName.c_str(), copied, copied == 1 ? "" : "s", srcStr.c_str());

@@ -57,8 +57,13 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
     float4 current = currentGI.Load(int3(pix, 0));
 
-    // ---- First frame or sky ----
-    if (frameIndex < 1.0 || depth <= 0.0001)
+    // ---- First frame, history flush, or sky ----
+    // temporalBlend == 0 means the C++ side just recreated the accum/prev-depth
+    // textures (resolution or scale change): their contents are undefined, so
+    // no history may be blended this frame. Returning current still writes the
+    // accumulation output for the next frame; prev-depth is refreshed by the
+    // C++ CopyResource at end of frame regardless.
+    if (frameIndex < 1.0 || temporalBlend <= 0.0 || depth <= 0.0001)
         return current;
 
     // ---- Firefly clamp ----

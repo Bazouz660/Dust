@@ -109,7 +109,9 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     // View-space AO radius, projected to UV space
     float viewSpaceRadius = aoRadius;
     float screenRadius = viewSpaceRadius / (depth * tanHalfFov * 2.0);
-    screenRadius = clamp(screenRadius, minScreenRadius, maxScreenRadius);
+    // min/max are independent sliders — order them so min > max can't freeze
+    // the radius at max and silently disable the Min slider
+    screenRadius = clamp(screenRadius, min(minScreenRadius, maxScreenRadius), maxScreenRadius);
 
     // Precompute loop invariants
     float invRadius = 1.0 / viewSpaceRadius;

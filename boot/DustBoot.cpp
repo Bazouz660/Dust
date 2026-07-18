@@ -165,13 +165,24 @@ static HRESULT STDMETHODCALLTYPE HookedCreateSwapChain(
 
     if (SUCCEEDED(hr) && ppSwapChain && *ppSwapChain)
     {
-        if (gCapturedSwapChain)
-            gCapturedSwapChain->Release();
-        gCapturedSwapChain = *ppSwapChain;
-        gCapturedSwapChain->AddRef();
-        gCapturedHWND = pDesc ? pDesc->OutputWindow : nullptr;
-        BootLog("Captured swap chain %p (HWND=%p, AddRef'd) via CreateSwapChain",
-                gCapturedSwapChain, gCapturedHWND);
+        // Skip 1x1 tool/temp chains (e.g. Dust's own address-discovery chain from
+        // D3D11Hook::Install) — capturing one would hand Dust a dead swap chain.
+        if (pDesc && pDesc->BufferDesc.Width > 1 && pDesc->BufferDesc.Height > 1)
+        {
+            if (gCapturedSwapChain)
+                gCapturedSwapChain->Release();
+            gCapturedSwapChain = *ppSwapChain;
+            gCapturedSwapChain->AddRef();
+            gCapturedHWND = pDesc->OutputWindow;
+            BootLog("Captured swap chain %p (HWND=%p, AddRef'd) via CreateSwapChain",
+                    gCapturedSwapChain, gCapturedHWND);
+        }
+        else
+        {
+            BootLog("Skipped swap chain %p via CreateSwapChain (%ux%u — below size guard)",
+                    *ppSwapChain, pDesc ? pDesc->BufferDesc.Width : 0,
+                    pDesc ? pDesc->BufferDesc.Height : 0);
+        }
     }
     else
     {
@@ -193,13 +204,22 @@ static HRESULT STDMETHODCALLTYPE HookedCreateSwapChainForHwnd(
 
     if (SUCCEEDED(hr) && ppSwapChain && *ppSwapChain)
     {
-        if (gCapturedSwapChain)
-            gCapturedSwapChain->Release();
-        gCapturedSwapChain = (IDXGISwapChain*)*ppSwapChain;
-        gCapturedSwapChain->AddRef();
-        gCapturedHWND = hWnd;
-        BootLog("Captured swap chain %p (HWND=%p, AddRef'd) via CreateSwapChainForHwnd",
-                gCapturedSwapChain, gCapturedHWND);
+        // Skip 1x1 tool/temp chains (same guard as the other creation paths).
+        if (pDesc && pDesc->Width > 1 && pDesc->Height > 1)
+        {
+            if (gCapturedSwapChain)
+                gCapturedSwapChain->Release();
+            gCapturedSwapChain = (IDXGISwapChain*)*ppSwapChain;
+            gCapturedSwapChain->AddRef();
+            gCapturedHWND = hWnd;
+            BootLog("Captured swap chain %p (HWND=%p, AddRef'd) via CreateSwapChainForHwnd",
+                    gCapturedSwapChain, gCapturedHWND);
+        }
+        else
+        {
+            BootLog("Skipped swap chain %p via CreateSwapChainForHwnd (%ux%u — below size guard)",
+                    *ppSwapChain, pDesc ? pDesc->Width : 0, pDesc ? pDesc->Height : 0);
+        }
     }
     else
     {
@@ -240,6 +260,11 @@ static HRESULT WINAPI HookedD3D11CreateDeviceAndSwapChain(
 
 extern "C" __declspec(dllexport) IDXGISwapChain* DustBoot_GetSwapChain()
 {
+    // The caller owns the returned reference (Dust's TryInstallSwapChainHooks releases it
+    // after vtable-hooking). AddRef here so the caller's Release can't consume DustBoot's
+    // own reference — gCapturedSwapChain is reused on every recapture.
+    if (gCapturedSwapChain)
+        gCapturedSwapChain->AddRef();
     return gCapturedSwapChain;
 }
 
@@ -449,11 +474,21 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
         // Pin the DLL so FreeLibrary can never unmap it while KenshiLib trampoline
         // hooks are still pointing into our code. The hooks can't be removed, so
         // any unload would leave dangling jumps in DXGI and crash on the next
-        // CreateSwapChain* call.
+        // CreateSwapChain* call. GET_MODULE_HANDLE_EX_FLAG_PIN pins permanently,
+        // with no path lookup (the old GetModuleFileNameA + LoadLibraryA pin could
+        // silently fail on MAX_PATH truncation, leaving the DLL unloadable).
         {
-            char selfPath[MAX_PATH];
-            GetModuleFileNameA(hModule, selfPath, MAX_PATH);
-            LoadLibraryA(selfPath);
+            HMODULE hPin = nullptr;
+            if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_PIN |
+                                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                                    (LPCSTR)hModule, &hPin))
+            {
+                // Fallback: refcount bump via path, checked this time.
+                char selfPath[MAX_PATH];
+                if (!GetModuleFileNameA(hModule, selfPath, MAX_PATH) ||
+                    !LoadLibraryA(selfPath))
+                    OutputDebugStringA("[DustBoot] FATAL: could not pin module — hooks may dangle on unload\n");
+            }
         }
         break;
     }

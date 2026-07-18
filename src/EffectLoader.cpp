@@ -632,9 +632,11 @@ void EffectLoader::AbsorbConfigSelfWrite(size_t index)
 
 void EffectLoader::CollectTiming(LoadedEffect& le, ID3D11DeviceContext* ctx, int phase)
 {
-    if (le.timingWarmup[phase] < 2 || !le.tsDisjoint[phase][0]) return;
+    if (le.timingWarmup[phase] < 2) return;
 
     int readSlot = 1 - le.timingSlot[phase];
+    if (!le.tsDisjoint[phase][readSlot] || !le.tsBegin[phase][readSlot] || !le.tsEnd[phase][readSlot])
+        return;
 
     D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint;
     UINT64 tsBegin, tsEnd;
@@ -652,16 +654,20 @@ void EffectLoader::CollectTiming(LoadedEffect& le, ID3D11DeviceContext* ctx, int
 
 void EffectLoader::BeginTiming(LoadedEffect& le, ID3D11DeviceContext* ctx, int phase)
 {
-    if (!le.tsDisjoint[phase][0]) return;
+    // Check all three queries for the slot actually being recorded into —
+    // a failed CreateQuery leaves that slot null (see InitAll).
     int slot = le.timingSlot[phase];
+    if (!le.tsDisjoint[phase][slot] || !le.tsBegin[phase][slot] || !le.tsEnd[phase][slot])
+        return;
     ctx->Begin(le.tsDisjoint[phase][slot]);
     ctx->End(le.tsBegin[phase][slot]);
 }
 
 void EffectLoader::EndTiming(LoadedEffect& le, ID3D11DeviceContext* ctx, int phase)
 {
-    if (!le.tsDisjoint[phase][0]) return;
     int slot = le.timingSlot[phase];
+    if (!le.tsDisjoint[phase][slot] || !le.tsBegin[phase][slot] || !le.tsEnd[phase][slot])
+        return;
     ctx->End(le.tsEnd[phase][slot]);
     ctx->End(le.tsDisjoint[phase][slot]);
     le.timingSlot[phase] = 1 - le.timingSlot[phase];
@@ -849,6 +855,10 @@ bool EffectLoader::InitAll(ID3D11Device* device, uint32_t w, uint32_t h)
         {
             Log("WARNING: Effect '%s' failed to initialize (code %d)",
                 le.desc.name ? le.desc.name : "unnamed", result);
+            // Release anything the plugin created before failing — every shipped
+            // plugin's Shutdown is null-safe on partially-initialized state.
+            if (le.desc.Shutdown)
+                le.desc.Shutdown();
             allOk = false;
             continue;
         }
@@ -859,15 +869,22 @@ bool EffectLoader::InitAll(ID3D11Device* device, uint32_t w, uint32_t h)
         if (le.desc.apiVersion >= 3 && (le.desc.flags & DUST_FLAG_FRAMEWORK_TIMING))
         {
             D3D11_QUERY_DESC qd = {};
+            bool timingOk = true;
             for (int phase = 0; phase < 2; phase++)
             for (int slot = 0; slot < 2; slot++)
             {
                 qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
-                device->CreateQuery(&qd, &le.tsDisjoint[phase][slot]);
+                if (FAILED(device->CreateQuery(&qd, &le.tsDisjoint[phase][slot])))
+                { le.tsDisjoint[phase][slot] = nullptr; timingOk = false; }
                 qd.Query = D3D11_QUERY_TIMESTAMP;
-                device->CreateQuery(&qd, &le.tsBegin[phase][slot]);
-                device->CreateQuery(&qd, &le.tsEnd[phase][slot]);
+                if (FAILED(device->CreateQuery(&qd, &le.tsBegin[phase][slot])))
+                { le.tsBegin[phase][slot] = nullptr; timingOk = false; }
+                if (FAILED(device->CreateQuery(&qd, &le.tsEnd[phase][slot])))
+                { le.tsEnd[phase][slot] = nullptr; timingOk = false; }
             }
+            if (!timingOk)
+                Log("WARNING: GPU timing query creation failed for '%s' — timing disabled",
+                    le.desc.name ? le.desc.name : "unnamed");
         }
 
         Log("Initialized effect: %s", le.desc.name ? le.desc.name : "unnamed");

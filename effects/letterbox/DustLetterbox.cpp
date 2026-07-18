@@ -64,19 +64,19 @@ static int LetterboxInit(ID3D11Device* device, uint32_t width, uint32_t height, 
     D3D11_SAMPLER_DESC sd = {};
     sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-    device->CreateSamplerState(&sd, &gSampler);
+    if (FAILED(device->CreateSamplerState(&sd, &gSampler))) return -1;
 
     D3D11_BLEND_DESC bd = {};
     bd.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-    device->CreateBlendState(&bd, &gNoBlend);
+    if (FAILED(device->CreateBlendState(&bd, &gNoBlend))) return -1;
 
     D3D11_DEPTH_STENCIL_DESC dsd = {};
-    device->CreateDepthStencilState(&dsd, &gNoDepth);
+    if (FAILED(device->CreateDepthStencilState(&dsd, &gNoDepth))) return -1;
 
     D3D11_RASTERIZER_DESC rd = {};
     rd.FillMode = D3D11_FILL_SOLID;
     rd.CullMode = D3D11_CULL_NONE;
-    device->CreateRasterizerState(&rd, &gNoCull);
+    if (FAILED(device->CreateRasterizerState(&rd, &gNoCull))) return -1;
 
     gInitialized = true;
     Log("Letterbox: Initialized (%ux%u)", width, height);

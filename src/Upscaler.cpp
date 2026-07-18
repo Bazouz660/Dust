@@ -62,6 +62,9 @@ bool Init(ID3D11Device* device, const wchar_t* dllSearchPath, const wchar_t* app
         NVSDK_NGX_Parameter_GetI(sParams, NVSDK_NGX_Parameter_SuperSampling_FeatureInitResult, &initResult);
         NVSDK_NGX_Parameter_GetI(sParams, NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver, &needsDriver);
         Log("Upscaler[DLSS]: DLSS-SR not available (initResult=0x%08x needsUpdatedDriver=%d)", initResult, needsDriver);
+        // Same unwind as the GetCapabilityParameters failure above.
+        NVSDK_NGX_D3D11_DestroyParameters(sParams); sParams = nullptr;
+        NVSDK_NGX_D3D11_Shutdown1(device);
         return false;
     }
 

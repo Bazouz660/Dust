@@ -2,7 +2,7 @@
 // Captures HDR scene before game tonemaps, then applies:
 //   exposure -> ACES tonemap -> LUT color grading -> dither
 // in a single pass. LUT is R16G16B16A16_FLOAT (half-float).
-// Auto-exposure uses async double-buffered readback (1-frame delay, no GPU stall).
+// Auto-exposure uses an async staging ring readback (3-frame delay, no GPU stall).
 
 #include "../../src/DustAPI.h"
 #include "DustLog.h"
@@ -228,11 +228,16 @@ static ID3D11PixelShader* gLumPS = nullptr;          // Log-luminance extraction
 static ID3D11Texture2D* gLumTex = nullptr;            // Mipmap chain for luminance averaging
 static ID3D11ShaderResourceView* gLumSRV = nullptr;
 static ID3D11RenderTargetView* gLumRTV = nullptr;     // RTV for mip 0
-static ID3D11Texture2D* gLumStagingTex[2] = { nullptr, nullptr };  // Double-buffered 1x1 staging
-static int gLumStagingWrite = 0;                       // Index to copy INTO this frame
-static bool gLumStagingReady = false;                  // True once first frame has been copied
+// 1x1 staging ring. Depth 4: the driver queues 2-3 frames of work when the game
+// is GPU-bound, so a slot written 1 frame ago is usually still in flight — with
+// only 2 slots Map(DO_NOT_WAIT) fails chronically and adaptation freezes.
+static const int LUM_STAGING_COUNT = 4;
+static ID3D11Texture2D* gLumStagingTex[LUM_STAGING_COUNT] = {};
+static int gLumStagingWrite = 0;                       // Slot to copy INTO this frame
+static int gLumStagingFills = 0;                       // Slots written since (re)start
 static uint32_t gLumMipCount = 0;
 static float gAdaptedExposure = -0.7f;                // Current smoothed auto-exposure EV
+static float gTargetEV = -0.7f;                       // Last target EV from a completed readback
 static LARGE_INTEGER gLastFrameTime = {};
 static LARGE_INTEGER gPerfFreq = {};
 
@@ -241,10 +246,12 @@ static void ReleaseAutoExposure()
     if (gLumRTV)           { gLumRTV->Release();           gLumRTV = nullptr; }
     if (gLumSRV)           { gLumSRV->Release();           gLumSRV = nullptr; }
     if (gLumTex)           { gLumTex->Release();            gLumTex = nullptr; }
-    if (gLumStagingTex[0]) { gLumStagingTex[0]->Release(); gLumStagingTex[0] = nullptr; }
-    if (gLumStagingTex[1]) { gLumStagingTex[1]->Release(); gLumStagingTex[1] = nullptr; }
+    for (int i = 0; i < LUM_STAGING_COUNT; i++)
+    {
+        if (gLumStagingTex[i]) { gLumStagingTex[i]->Release(); gLumStagingTex[i] = nullptr; }
+    }
     gLumStagingWrite = 0;
-    gLumStagingReady = false;
+    gLumStagingFills = 0;
 }
 
 static uint32_t CalcMipCount(uint32_t w, uint32_t h)
@@ -292,7 +299,7 @@ static bool CreateLuminanceResources(ID3D11Device* device, uint32_t /*width*/, u
     hr = device->CreateRenderTargetView(gLumTex, &rtvDesc, &gLumRTV);
     if (FAILED(hr)) { Log("LUT: Failed to create luminance RTV: 0x%08X", hr); return false; }
 
-    // Double-buffered 1x1 staging textures for async CPU readback
+    // 1x1 staging ring for async CPU readback
     D3D11_TEXTURE2D_DESC stagingDesc = {};
     stagingDesc.Width = 1;
     stagingDesc.Height = 1;
@@ -303,7 +310,7 @@ static bool CreateLuminanceResources(ID3D11Device* device, uint32_t /*width*/, u
     stagingDesc.Usage = D3D11_USAGE_STAGING;
     stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
 
-    for (int i = 0; i < 2; i++)
+    for (int i = 0; i < LUM_STAGING_COUNT; i++)
     {
         hr = device->CreateTexture2D(&stagingDesc, nullptr, &gLumStagingTex[i]);
         if (FAILED(hr)) { Log("LUT: Failed to create luminance staging texture %d: 0x%08X", i, hr); return false; }
@@ -388,6 +395,7 @@ static int LUTInit(ID3D11Device* device, uint32_t width, uint32_t height, const 
     QueryPerformanceFrequency(&gPerfFreq);
     QueryPerformanceCounter(&gLastFrameTime);
     gAdaptedExposure = gConfig.exposure;
+    gTargetEV = gConfig.exposure;
 
     // Apply initial conditional visibility (whitepoint only for Reinhard Extended)
     UpdateConditionalSettings();
@@ -418,7 +426,8 @@ static void LUTShutdown()
 
 static void LUTOnResolutionChanged(ID3D11Device* device, uint32_t w, uint32_t h)
 {
-    CreateLuminanceResources(device, w, h);
+    if (!CreateLuminanceResources(device, w, h))
+        Log("LUT: WARNING: luminance resource recreation failed (%ux%u) — will retry next frame", w, h);
     Log("LUT: Resolution changed to %ux%u", w, h);
 }
 
@@ -434,8 +443,34 @@ static void LUTPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
 
     gHdrCopySRV = host->GetSceneCopy(ctx->context, DUST_RESOURCE_HDR_RT);
 
+    // dt is sampled every call, NOT just on frames where a readback completes:
+    // if it only advanced when data arrived, stalled frames would accumulate
+    // into one giant catch-up step — a visible single-frame exposure snap.
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    float dt = (float)(now.QuadPart - gLastFrameTime.QuadPart) / (float)gPerfFreq.QuadPart;
+    gLastFrameTime = now;
+    dt = dt < 0.0f ? 0.0f : (dt > 0.1f ? 0.1f : dt);
+
+    // Luminance resources missing (recreation failed at resize): retry so
+    // auto-exposure recovers without waiting for the next resolution change.
+    // Check the whole set — a mid-chain failure can leave gLumTex created
+    // with the RTV/SRV/staging still null.
+    bool lumResourcesOK = gLumTex && gLumSRV && gLumRTV && gLumStagingTex[0];
+    if (gConfig.autoExposure && gLumPS && !lumResourcesOK)
+    {
+        ID3D11Device* device = nullptr;
+        ctx->context->GetDevice(&device);
+        if (device)
+        {
+            if (CreateLuminanceResources(device, ctx->width, ctx->height))
+                lumResourcesOK = true;
+            device->Release();
+        }
+    }
+
     // Compute average scene luminance for auto-exposure
-    if (gConfig.autoExposure && gHdrCopySRV && gLumPS && gLumTex)
+    if (gConfig.autoExposure && gHdrCopySRV && gLumPS && lumResourcesOK)
     {
         ID3D11DeviceContext* dc = ctx->context;
         host->SaveState(dc);
@@ -463,17 +498,19 @@ static void LUTPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
         // Average via mipmap generation (bilinear on log values = geometric mean)
         dc->GenerateMips(gLumSRV);
 
-        // Async readback: copy this frame's result to staging[write],
-        // read PREVIOUS frame's result from staging[read] (no GPU stall).
-        int writeIdx = gLumStagingWrite;
-        int readIdx = 1 - writeIdx;
-
+        // Async readback ring: copy this frame's result into the write slot,
+        // then read the OLDEST slot (written LUM_STAGING_COUNT-1 frames ago) so
+        // the GPU has long since finished with it even when the driver queues
+        // several frames ahead (no GPU stall).
         D3D11_BOX srcBox = { 0, 0, 0, 1, 1, 1 };
-        dc->CopySubresourceRegion(gLumStagingTex[writeIdx], 0, 0, 0, 0,
+        dc->CopySubresourceRegion(gLumStagingTex[gLumStagingWrite], 0, 0, 0, 0,
                                    gLumTex, gLumMipCount - 1, &srcBox);
+        if (gLumStagingFills < LUM_STAGING_COUNT)
+            gLumStagingFills++;
+        int readIdx = (gLumStagingWrite + 1) % LUM_STAGING_COUNT;
+        gLumStagingWrite = readIdx;
 
-        // Read previous frame's staging (GPU finished with it by now)
-        if (gLumStagingReady)
+        if (gLumStagingFills >= LUM_STAGING_COUNT)
         {
             D3D11_MAPPED_SUBRESOURCE mapped;
             HRESULT hr = dc->Map(gLumStagingTex[readIdx], 0, D3D11_MAP_READ,
@@ -484,32 +521,30 @@ static void LUTPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
                 dc->Unmap(gLumStagingTex[readIdx], 0);
 
                 float avgLum = exp2f(avgLogLum);
-
-                if (gConfig.autoExposure)
-                {
-                    float targetEV = log2f(0.18f / (avgLum + 0.001f)) + gConfig.exposure;
-
-                    if (targetEV < gConfig.minAutoExposure) targetEV = gConfig.minAutoExposure;
-                    if (targetEV > gConfig.maxAutoExposure) targetEV = gConfig.maxAutoExposure;
-
-                    LARGE_INTEGER now;
-                    QueryPerformanceCounter(&now);
-                    float dt = (float)(now.QuadPart - gLastFrameTime.QuadPart) / (float)gPerfFreq.QuadPart;
-                    gLastFrameTime = now;
-                    dt = dt < 0.001f ? 0.001f : (dt > 0.5f ? 0.5f : dt);
-
-                    float alpha = 1.0f - expf(-dt * gConfig.adaptationSpeed);
-                    gAdaptedExposure += (targetEV - gAdaptedExposure) * alpha;
-                }
+                // A NaN/Inf HDR frame must never enter the EV state — once
+                // gAdaptedExposure goes NaN it can never recover.
+                if (std::isfinite(avgLum))
+                    gTargetEV = log2f(0.18f / (avgLum + 0.001f)) + gConfig.exposure;
             }
-            // If DO_NOT_WAIT returns DXGI_ERROR_WAS_STILL_DRAWING, skip —
-            // use last known exposure. No stall, no visible artifact.
+            // On DXGI_ERROR_WAS_STILL_DRAWING: no fresh data, but adaptation
+            // still advances below toward the last known target. Freezing here
+            // and catching up later is what caused single-frame exposure snaps.
+
+            float targetEV = gTargetEV;
+            if (targetEV < gConfig.minAutoExposure) targetEV = gConfig.minAutoExposure;
+            if (targetEV > gConfig.maxAutoExposure) targetEV = gConfig.maxAutoExposure;
+
+            float alpha = 1.0f - expf(-dt * gConfig.adaptationSpeed);
+            gAdaptedExposure += (targetEV - gAdaptedExposure) * alpha;
         }
 
-        gLumStagingWrite = readIdx;  // Flip for next frame
-        gLumStagingReady = true;
-
         host->RestoreState(dc);
+    }
+    else
+    {
+        // Not measuring (auto-exposure off or no HDR copy this frame): the ring
+        // contents go stale — require a full refill before trusting them again.
+        gLumStagingFills = 0;
     }
 }
 

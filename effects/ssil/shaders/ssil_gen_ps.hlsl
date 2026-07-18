@@ -70,7 +70,7 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
     float viewSpaceRadius = ilRadius;
     float screenRadius = viewSpaceRadius / (depth * tanHalfFov * 2.0);
-    screenRadius = clamp(screenRadius, minScreenRadius, maxScreenRadius);
+    screenRadius = clamp(screenRadius, min(minScreenRadius, maxScreenRadius), maxScreenRadius);
 
     int iNumDirs = (int)numDirections;
     int iNumSteps = (int)numSteps;

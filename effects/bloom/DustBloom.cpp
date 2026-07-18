@@ -236,7 +236,8 @@ static void BloomShutdown()
 
 static void BloomOnResolutionChanged(ID3D11Device* device, uint32_t w, uint32_t h)
 {
-    CreateMips(device, w, h, gActiveMipCount);
+    if (!CreateMips(device, w, h, gActiveMipCount))
+        Log("Bloom: WARNING: mip recreation failed (%ux%u) — will retry next frame", w, h);
     Log("Bloom: Resolution changed to %ux%u", w, h);
 }
 
@@ -269,6 +270,25 @@ static void BloomPostExecute(const DustFrameContext* ctx, const DustHostAPI* hos
     if (!ldrRTV) { gHdrCopySRV = nullptr; return; }
 
     ID3D11DeviceContext* dc = ctx->context;
+
+    // Mip chain missing (allocation failed at resize or mip-count change):
+    // retry here so a transient failure doesn't leave null views bound.
+    // Creation is sequential, so the last mip existing implies the whole chain.
+    if (!gMips[0].rtv || !gMips[gActiveMipCount - 1].rtv)
+    {
+        ID3D11Device* device = nullptr;
+        dc->GetDevice(&device);
+        if (device) {
+            CreateMips(device, ctx->width, ctx->height, gActiveMipCount);
+            device->Release();
+        }
+        if (!gMips[0].rtv || !gMips[gActiveMipCount - 1].rtv)
+        {
+            gHdrCopySRV = nullptr;
+            return;
+        }
+    }
+
     host->SaveState(dc);
 
     // Check if mip count changed at runtime
@@ -281,7 +301,14 @@ static void BloomPostExecute(const DustFrameContext* ctx, const DustHostAPI* hos
             ID3D11Device* device = nullptr;
             dc->GetDevice(&device);
             if (device) {
-                CreateMips(device, ctx->width, ctx->height, wantedMips);
+                if (!CreateMips(device, ctx->width, ctx->height, wantedMips))
+                {
+                    Log("Bloom: WARNING: mip recreation failed after mip-count change");
+                    host->RestoreState(dc);
+                    gHdrCopySRV = nullptr;
+                    device->Release();
+                    return;
+                }
                 device->Release();
             }
         }

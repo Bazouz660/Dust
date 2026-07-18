@@ -86,6 +86,7 @@ namespace
 
     void ReleaseTextures()
     {
+        D3D12Interop::WaitForGpuIdle();   // the D3D12 resources must outlive in-flight GPU work
         SafeRelease(gShColor11); SafeRelease(gShColor12);
         SafeRelease(gShDepth11); SafeRelease(gShDepth12);
         SafeRelease(gShMV11);    SafeRelease(gShMV12);
@@ -162,7 +163,12 @@ bool Init(ID3D11Device* device, const wchar_t* modDir)
     gProviderDll = LoadLibraryW((dir + L"amd_fidelityfx_upscaler_dx12.dll").c_str());
     if (!gProviderDll) { Log("FSR3: LoadLibrary amd_fidelityfx_upscaler_dx12.dll failed (err %lu)", GetLastError()); return false; }
     gLoaderDll = LoadLibraryW((dir + L"amd_fidelityfx_loader_dx12.dll").c_str());
-    if (!gLoaderDll) { Log("FSR3: LoadLibrary amd_fidelityfx_loader_dx12.dll failed (err %lu)", GetLastError()); return false; }
+    if (!gLoaderDll)
+    {
+        Log("FSR3: LoadLibrary amd_fidelityfx_loader_dx12.dll failed (err %lu)", GetLastError());
+        FreeLibrary(gProviderDll); gProviderDll = nullptr;   // unwind so an Init retry starts clean
+        return false;
+    }
 
     gCreateContext  = (PfnFfxCreateContext) GetProcAddress(gLoaderDll, "ffxCreateContext");
     gDestroyContext = (PfnFfxDestroyContext)GetProcAddress(gLoaderDll, "ffxDestroyContext");
@@ -172,6 +178,9 @@ bool Init(ID3D11Device* device, const wchar_t* modDir)
     if (!gCreateContext || !gDestroyContext || !gDispatch)
     {
         Log("FSR3: ffx-api entry points missing from loader DLL");
+        FreeLibrary(gLoaderDll);   gLoaderDll   = nullptr;   // unwind both loads (see above)
+        FreeLibrary(gProviderDll); gProviderDll = nullptr;
+        gCreateContext = nullptr; gDestroyContext = nullptr; gConfigure = nullptr; gQuery = nullptr; gDispatch = nullptr;
         return false;
     }
 
@@ -187,7 +196,7 @@ bool CreateFeature(ID3D11DeviceContext* /*ctx*/, uint32_t renderW, uint32_t rend
     ID3D12Device* dev = D3D12Interop::GetDevice();
     if (!dev) return false;
 
-    if (gContextValid) { gDestroyContext(&gContext, nullptr); gContextValid = false; gContext = nullptr; }
+    if (gContextValid) { D3D12Interop::WaitForGpuIdle(); gDestroyContext(&gContext, nullptr); gContextValid = false; gContext = nullptr; }
 
     // Chain: upscale-create desc -> DX12 backend desc (device).
     ffxCreateBackendDX12Desc backendDesc = {};
@@ -254,7 +263,10 @@ bool Evaluate(ID3D11DeviceContext* ctx,
     dd.frameTimeDelta     = FrameDeltaMs();
     dd.preExposure        = 1.0f;
     dd.reset              = reset;
-    float camN = 0.0f, camF = 0.0f, camFov = 0.0f;
+    // Real camera near/far/fov feed FFX's disocclusion math; CameraAccess_GetCameraParams leaves
+    // these untouched when the camera isn't reachable (launch/loading screens), so seed the same
+    // safe defaults FSR2 uses — zero near/far/fov produces garbage frames.
+    float camN = 0.1f, camF = 10000.0f, camFov = 1.0f;
     CameraAccess_GetCameraParams(&camN, &camF, &camFov);
     dd.cameraNear              = camN;
     dd.cameraFar               = camF;
@@ -287,6 +299,7 @@ bool Evaluate(ID3D11DeviceContext* ctx,
 
 void Shutdown()
 {
+    D3D12Interop::WaitForGpuIdle();   // same in-flight-work hazard as the context recreate above
     if (gContextValid && gDestroyContext) { gDestroyContext(&gContext, nullptr); }
     gContextValid = false; gContext = nullptr;
     ReleaseTextures();

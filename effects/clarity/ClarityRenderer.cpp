@@ -230,65 +230,49 @@ bool IsInitialized()
     return gInitialized;
 }
 
-void Render(ID3D11DeviceContext* ctx,
-            ID3D11ShaderResourceView* sceneCopySRV,
-            ID3D11RenderTargetView* ldrRTV)
+// Shared constant-buffer update (viewport + strength + normalized Gaussian
+// weights) — used by both the composite path and the debug overlay.
+static void UpdateClarityCB(ID3D11DeviceContext* ctx)
 {
-    if (!gInitialized || !ctx || !sceneCopySRV || !ldrRTV || !gHost)
-        return;
+    ClarityCBData cb = {};
+    cb.viewportSize[0] = (float)gWidth;
+    cb.viewportSize[1] = (float)gHeight;
+    cb.invViewportSize[0] = 1.0f / (float)gWidth;
+    cb.invViewportSize[1] = 1.0f / (float)gHeight;
+    cb.strength = gClarityConfig.strength;
+    cb.midtoneProtect = gClarityConfig.midtoneProtect;
+    cb.blurRadius = gClarityConfig.blurRadius;
 
-    gHost->SaveState(ctx);
-
-    // Update constant buffer
+    // Gaussian weights (sigma = radius / 3, 99.7% of energy within radius),
+    // pre-normalized so the shaders skip both exp() and the weight sum
     {
-        ClarityCBData cb = {};
-        cb.viewportSize[0] = (float)gWidth;
-        cb.viewportSize[1] = (float)gHeight;
-        cb.invViewportSize[0] = 1.0f / (float)gWidth;
-        cb.invViewportSize[1] = 1.0f / (float)gHeight;
-        cb.strength = gClarityConfig.strength;
-        cb.midtoneProtect = gClarityConfig.midtoneProtect;
-        cb.blurRadius = gClarityConfig.blurRadius;
+        float sigma = gClarityConfig.blurRadius / 3.0f;
+        if (sigma < 0.5f) sigma = 0.5f;
+        float invSigma2 = -0.5f / (sigma * sigma);
 
-        // Gaussian weights (sigma = radius / 3, 99.7% of energy within radius),
-        // pre-normalized so the shaders skip both exp() and the weight sum
+        int iRadius = (int)ceilf(gClarityConfig.blurRadius);
+        if (iRadius > 32) iRadius = 32;
+        if (iRadius < 0)  iRadius = 0;
+
+        float totalWeight = 0.0f;
+        for (int i = 0; i <= iRadius; i++)
         {
-            float sigma = gClarityConfig.blurRadius / 3.0f;
-            if (sigma < 0.5f) sigma = 0.5f;
-            float invSigma2 = -0.5f / (sigma * sigma);
-
-            int iRadius = (int)ceilf(gClarityConfig.blurRadius);
-            if (iRadius > 32) iRadius = 32;
-            if (iRadius < 0)  iRadius = 0;
-
-            float totalWeight = 0.0f;
-            for (int i = 0; i <= iRadius; i++)
-            {
-                float w = expf((float)(i * i) * invSigma2);
-                cb.blurWeights[i][0] = w;
-                totalWeight += (i == 0) ? w : 2.0f * w; // each |i|>0 tap fires twice
-            }
-            float invTotal = 1.0f / totalWeight;
-            for (int i = 0; i <= iRadius; i++)
-                cb.blurWeights[i][0] *= invTotal;
+            float w = expf((float)(i * i) * invSigma2);
+            cb.blurWeights[i][0] = w;
+            totalWeight += (i == 0) ? w : 2.0f * w; // each |i|>0 tap fires twice
         }
-
-        gHost->UpdateConstantBuffer(ctx, gClarityCB, &cb, sizeof(cb));
+        float invTotal = 1.0f / totalWeight;
+        for (int i = 0; i <= iRadius; i++)
+            cb.blurWeights[i][0] *= invTotal;
     }
 
-    // Common state
-    ctx->IASetInputLayout(nullptr);
-    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    ctx->VSSetShader(gFullscreenVS, nullptr, 0);
-    ctx->RSSetState(gNoCullRS);
-    ctx->OMSetDepthStencilState(gNoDepthDSS, 0);
+    gHost->UpdateConstantBuffer(ctx, gClarityCB, &cb, sizeof(cb));
+}
 
-    D3D11_VIEWPORT vp = {};
-    vp.Width = (float)gWidth;
-    vp.Height = (float)gHeight;
-    vp.MaxDepth = 1.0f;
-    ctx->RSSetViewports(1, &vp);
-
+// Shared blur chain (scene copy → blur temp → blur final). The debug overlay
+// visualizes the extracted detail layer, so it needs these passes too.
+static void RunBlurPasses(ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* sceneCopySRV)
+{
     float blendFactor[4] = { 0, 0, 0, 0 };
     ID3D11ShaderResourceView* nullSRV = nullptr;
 
@@ -315,6 +299,36 @@ void Render(ID3D11DeviceContext* ctx,
         ctx->Draw(3, 0);
         ctx->PSSetShaderResources(0, 1, &nullSRV);
     }
+}
+
+void Render(ID3D11DeviceContext* ctx,
+            ID3D11ShaderResourceView* sceneCopySRV,
+            ID3D11RenderTargetView* ldrRTV)
+{
+    if (!gInitialized || !ctx || !sceneCopySRV || !ldrRTV || !gHost)
+        return;
+
+    gHost->SaveState(ctx);
+
+    UpdateClarityCB(ctx);
+
+    // Common state
+    ctx->IASetInputLayout(nullptr);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx->VSSetShader(gFullscreenVS, nullptr, 0);
+    ctx->RSSetState(gNoCullRS);
+    ctx->OMSetDepthStencilState(gNoDepthDSS, 0);
+
+    D3D11_VIEWPORT vp = {};
+    vp.Width = (float)gWidth;
+    vp.Height = (float)gHeight;
+    vp.MaxDepth = 1.0f;
+    ctx->RSSetViewports(1, &vp);
+
+    float blendFactor[4] = { 0, 0, 0, 0 };
+
+    // Passes 1-2: separable blur
+    RunBlurPasses(ctx, sceneCopySRV);
 
     // Pass 3: Composite (scene copy + blurred → LDR target)
     {
@@ -342,6 +356,8 @@ void RenderDebugOverlay(ID3D11DeviceContext* ctx,
 
     gHost->SaveState(ctx);
 
+    UpdateClarityCB(ctx);
+
     ctx->IASetInputLayout(nullptr);
     ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ctx->VSSetShader(gFullscreenVS, nullptr, 0);
@@ -353,6 +369,10 @@ void RenderDebugOverlay(ID3D11DeviceContext* ctx,
     vp.Height = (float)gHeight;
     vp.MaxDepth = 1.0f;
     ctx->RSSetViewports(1, &vp);
+
+    // The debug view shows the extracted detail layer — run the blur chain
+    // that produces it (previously skipped: showed uninitialized/stale data)
+    RunBlurPasses(ctx, sceneCopySRV);
 
     float blendFactor[4] = { 0, 0, 0, 0 };
     ctx->OMSetRenderTargets(1, &ldrRTV, nullptr);

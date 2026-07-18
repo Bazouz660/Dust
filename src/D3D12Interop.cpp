@@ -66,8 +66,20 @@ namespace
         "    gOut[id.xy] = float4(rgb, c.a);\n"
         "}\n";
 
+    // Bounded CPU wait for the last submitted D3D12 work — the same fence wait BeginD3D12Work does
+    // before the allocator reset. D3D12 resources must outlive GPU execution, so this must run
+    // before releasing or recreating anything an in-flight command list can still reference.
+    void WaitForLastWork()
+    {
+        if (!gFence || !gLastDone || gFence->GetCompletedValue() >= gLastDone) return;
+        gFence->SetEventOnCompletion(gLastDone, gFenceEvent);
+        if (WaitForSingleObject(gFenceEvent, 1000) != WAIT_OBJECT_0)
+            Log("D3D12Interop: fence wait timed out before resource release");
+    }
+
     void ReleaseSharedTextures()
     {
+        WaitForLastWork();
         SafeRelease(gShared11In);
         SafeRelease(gShared11Out);
         SafeRelease(gSharedIn);
@@ -345,6 +357,13 @@ bool RunTintTest(ID3D11DeviceContext* ctx, ID3D11Resource* ldrColor, uint32_t w,
 // ---- Reusable primitives ----
 
 ID3D12Device* GetDevice() { return gDev; }
+
+// Exported copy of the internal fence wait, for the FSR3 backend: it must not release its shared
+// textures or destroy the FFX context while the previous frame's D3D12 work is still in flight.
+void WaitForGpuIdle()
+{
+    WaitForLastWork();
+}
 
 bool CreateSharedTexture(uint32_t w, uint32_t h, uint32_t fmt,
                          ID3D11Texture2D** outD3D11, ID3D12Resource** outD3D12)

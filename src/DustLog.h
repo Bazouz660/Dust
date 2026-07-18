@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdarg>
 #include <string>
+#include <mutex>
 #include <Debug.h>
 
 // Global log toggle — set by DustLogInit()
@@ -18,6 +19,16 @@ inline std::string& DustLogDir()
 {
     static std::string dir;
     return dir;
+}
+
+// Serializes DustLog across the render thread, the WndProc thread, and worker threads (the
+// first-call fopen in DustLogFile and the sBytesWritten/sCapped cap counters race otherwise).
+// Function-local static in an inline function — one instance per module, same pattern as the
+// rest of this header.
+inline std::mutex& DustLogMutex()
+{
+    static std::mutex m;
+    return m;
 }
 
 // Delete the oldest logs so at most maxKeep files remain. Filenames embed the
@@ -105,6 +116,8 @@ inline void DustLog(const char* fmt, ...)
 {
     if (!DustLogEnabled())
         return;
+
+    std::lock_guard<std::mutex> lock(DustLogMutex());
 
     char buf[512];
     va_list args;

@@ -3,11 +3,15 @@
 #include <d3dcompiler.h>
 #include <d3d11shader.h>
 #include <unordered_map>
+#include <mutex>
 #include <cstring>
 
 namespace ShaderMetadata
 {
 
+// Guards both maps: CreateVertexShader/CreateInputLayout are free-threaded and
+// can fire on game loader threads while the render thread reads.
+static std::mutex sMutex;
 static std::unordered_map<ID3D11VertexShader*, VSConstantBufferInfo> sVSMap;
 static std::unordered_map<ID3D11InputLayout*, std::vector<InputElement>> sLayoutMap;
 
@@ -29,11 +33,13 @@ void OnInputLayoutCreated(ID3D11InputLayout* layout,
         e.instanceStepRate  = descs[i].InstanceDataStepRate;
         elems.push_back(std::move(e));
     }
+    std::lock_guard<std::mutex> lock(sMutex);
     sLayoutMap[layout] = std::move(elems);
 }
 
 const std::vector<InputElement>* GetInputLayoutElements(ID3D11InputLayout* layout)
 {
+    std::lock_guard<std::mutex> lock(sMutex);
     auto it = sLayoutMap.find(layout);
     return (it != sLayoutMap.end()) ? &it->second : nullptr;
 }
@@ -162,7 +168,10 @@ void OnVertexShaderCreated(const void* bytecode, SIZE_T bytecodeSize,
 
     reflector->Release();
 
-    sVSMap[vs] = info;
+    {
+        std::lock_guard<std::mutex> lock(sMutex);
+        sVSMap[vs] = info;
+    }
 
     if (info.transformType != VSTransformType::UNKNOWN)
     {
@@ -177,25 +186,38 @@ void OnVertexShaderCreated(const void* bytecode, SIZE_T bytecodeSize,
 
 const VSConstantBufferInfo* GetVSInfo(ID3D11VertexShader* vs)
 {
+    std::lock_guard<std::mutex> lock(sMutex);
     auto it = sVSMap.find(vs);
     return (it != sVSMap.end()) ? &it->second : nullptr;
 }
 
 void Shutdown()
 {
-    uint32_t total = (uint32_t)sVSMap.size();
-    uint32_t classified = GetClassifiedCount();
+    uint32_t total = 0, classified = 0;
+    {
+        // Count inline — GetClassifiedCount() locks the same mutex (non-recursive)
+        // and would deadlock if called under this lock.
+        std::lock_guard<std::mutex> lock(sMutex);
+        total = (uint32_t)sVSMap.size();
+        for (const auto& pair : sVSMap)
+        {
+            if (pair.second.transformType != VSTransformType::UNKNOWN)
+                classified++;
+        }
+        sVSMap.clear();
+    }
     Log("ShaderMetadata: shutdown — %u VS tracked, %u classified as GBuffer", total, classified);
-    sVSMap.clear();
 }
 
 uint32_t GetTrackedCount()
 {
+    std::lock_guard<std::mutex> lock(sMutex);
     return (uint32_t)sVSMap.size();
 }
 
 uint32_t GetClassifiedCount()
 {
+    std::lock_guard<std::mutex> lock(sMutex);
     uint32_t count = 0;
     for (const auto& pair : sVSMap)
     {

@@ -55,7 +55,8 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
     float nEdge = (1.0 - dot(n00, n11)) + (1.0 - dot(n10, n01));
     // Tight smoothstep — only sharp normal breaks pass
-    float normalFactor = smoothstep(normalThreshold, normalThreshold * 1.5, nEdge);
+    // (epsilon on the far endpoint: threshold 0 would make smoothstep(0,0) NaN)
+    float normalFactor = smoothstep(normalThreshold, normalThreshold * 1.5 + 1e-5, nEdge);
 
     // Combine edges (take the stronger signal)
     float edge = max(depthFactor, normalFactor);

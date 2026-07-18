@@ -165,6 +165,9 @@ static void ValidateSplitsCache()
 
 void SetLambda(float lambda)
 {
+    // Reject non-finite input up front: NaN passes every < / > clamp below and would be
+    // written straight into the engine's shadow state (a hand-edited preset can carry `nan`).
+    if (!std::isfinite(lambda)) return;
     ValidateSplitsCache();
     if (lambda < 0.0f)
     {
@@ -191,6 +194,9 @@ float GetLambda() { return sLambda.load(); }
 
 bool SetShadowFar(float farDistance)
 {
+    // Reject non-finite input up front: NaN passes every < / > clamp below and NaN is also this
+    // module's own "no override" sentinel for sRequestedFar — never let it in as a real value.
+    if (!std::isfinite(farDistance)) return false;
     ValidateSplitsCache();
     if (farDistance < 0.0f)
     {

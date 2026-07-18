@@ -234,7 +234,8 @@ static void SMAAShutdown()
 
 static void SMAAOnResolutionChanged(ID3D11Device* device, uint32_t w, uint32_t h)
 {
-    CreateTextures(device, w, h);
+    if (!CreateTextures(device, w, h))
+        Log("SMAA: WARNING: texture recreation failed (%ux%u) — will retry next frame", w, h);
     Log("SMAA: Resolution changed to %ux%u", w, h);
 }
 
@@ -249,6 +250,21 @@ static void SMAAPostExecute(const DustFrameContext* ctx, const DustHostAPI* host
     if (!sceneCopy) return;
 
     ID3D11DeviceContext* dc = ctx->context;
+
+    // Render targets missing (recreation failed at resize): retry here so a
+    // transient failure doesn't leave null views bound until the next resize.
+    if (!gEdgeTex.rtv || !gBlendTex.rtv)
+    {
+        ID3D11Device* device = nullptr;
+        dc->GetDevice(&device);
+        if (device) {
+            CreateTextures(device, ctx->width, ctx->height);
+            device->Release();
+        }
+        if (!gEdgeTex.rtv || !gBlendTex.rtv)
+            return;
+    }
+
     host->SaveState(dc);
 
     dc->OMSetDepthStencilState(gNoDepth, 0);

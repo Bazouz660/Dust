@@ -124,6 +124,39 @@ static const char* DXGIFormatStr(DXGI_FORMAT f)
     }
 }
 
+// Minimal JSON string escaping for free-text fields. The survey label comes straight from an
+// ImGui InputText — raw quotes/backslashes/control chars would break survey_summary.json.
+static std::string JsonEscape(const char* s)
+{
+    std::string out;
+    for (const unsigned char* p = (const unsigned char*)s; p && *p; ++p)
+    {
+        unsigned char c = *p;
+        switch (c)
+        {
+        case '"':  out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\b': out += "\\b";  break;
+        case '\f': out += "\\f";  break;
+        case '\n': out += "\\n";  break;
+        case '\r': out += "\\r";  break;
+        case '\t': out += "\\t";  break;
+        default:
+            if (c < 0x20)
+            {
+                char tmp[8];
+                snprintf(tmp, sizeof(tmp), "\\u%04X", (unsigned)c);
+                out += tmp;
+            }
+            else
+            {
+                out += (char)c;
+            }
+        }
+    }
+    return out;
+}
+
 static const char* TopologyStr(D3D11_PRIMITIVE_TOPOLOGY t)
 {
     switch (t)
@@ -542,7 +575,7 @@ void WriteSummary(const SurveyFrameData* frames, int numFrames, const char* outp
     fprintf(f, "{\n");
     const char* label = Survey::GetLabel();
     if (label && label[0])
-        fprintf(f, "  \"label\": \"%s\",\n", label);
+        fprintf(f, "  \"label\": \"%s\",\n", JsonEscape(label).c_str());
     fprintf(f, "  \"framesCaptured\": %d,\n", numFrames);
     fprintf(f, "  \"totalDrawEvents\": %u,\n", totalDraws);
     fprintf(f, "  \"totalCaptureTimeMs\": %.2f,\n", totalCaptureMs);

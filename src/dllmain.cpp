@@ -299,10 +299,21 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
         // Pin the DLL so FreeLibrary can never unmap it while KenshiLib trampoline
         // hooks are still pointing into our code. The hooks can't be removed, so
         // any unload would leave dangling jumps and crash on the next call.
+        // GET_MODULE_HANDLE_EX_FLAG_PIN pins permanently, with no path lookup (the
+        // old GetModuleFileNameA + LoadLibraryA pin could silently fail on MAX_PATH
+        // truncation, leaving the DLL unloadable with hooks live).
         {
-            char selfPath[MAX_PATH];
-            GetModuleFileNameA(hModule, selfPath, MAX_PATH);
-            LoadLibraryA(selfPath);
+            HMODULE hPin = nullptr;
+            if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_PIN |
+                                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                                    (LPCSTR)hModule, &hPin))
+            {
+                // Fallback: refcount bump via path, checked this time.
+                char selfPath[MAX_PATH];
+                if (!GetModuleFileNameA(hModule, selfPath, MAX_PATH) ||
+                    !LoadLibraryA(selfPath))
+                    OutputDebugStringA("[Dust] FATAL: could not pin module — hooks may dangle on unload\n");
+            }
         }
         break;
     case DLL_PROCESS_DETACH:

@@ -141,7 +141,7 @@ static char gNewPresetName[64] = {};
 // these to indicate what the next polled result should be used for.
 enum class PickerPurpose { None, Import, Export };
 static PickerPurpose gPickerPurpose = PickerPurpose::None;
-static int  gPickerExportPresetIdx = -1; // valid only for PickerPurpose::Export
+static std::string gPickerExportPresetName; // valid only for PickerPurpose::Export (by name — indices shift while the picker is open)
 static std::string gPickerError;          // last error message (cleared when popup closes)
 static std::string gPickerInfo;           // last info message (e.g. "Imported 'X'")
 static int  gPickerInfoFrames = 0;        // countdown for transient info display
@@ -217,6 +217,8 @@ static bool IsDirty(const DustSettingDesc& s, const SavedValue& saved)
 static void SnapshotEffect(size_t idx)
 {
     const LoadedEffect& le = gEffectLoader.GetEffect(idx);
+    // Guard against malformed third-party descs (settingCount > 0, settings == NULL)
+    if (le.desc.settingCount == 0 || !le.desc.settings) return;
     if (idx >= gEffectStates.size())
         gEffectStates.resize(idx + 1);
 
@@ -232,6 +234,7 @@ static void SnapshotEffect(size_t idx)
 // Find the "Enabled" bool pointer in an effect's settings array (first DUST_SETTING_BOOL)
 static bool* FindEnabledPtr(const LoadedEffect& le)
 {
+    if (!le.desc.settings) return nullptr; // malformed desc — see SnapshotEffect
     for (uint32_t i = 0; i < le.desc.settingCount; i++)
     {
         const DustSettingDesc& s = le.desc.settings[i];
@@ -1108,19 +1111,32 @@ static void PollFilePicker()
     }
     else if (purpose == PickerPurpose::Export)
     {
-        std::string err;
-        if (gEffectLoader.ExportPreset(gPickerExportPresetIdx, path.c_str(), &err))
+        // Re-resolve the preset by name — the list may have been re-sorted or
+        // the preset deleted/imported while the folder picker was open.
+        const auto& presets = gEffectLoader.GetPresets();
+        int exportIdx = -1;
+        for (int i = 0; i < (int)presets.size(); i++)
         {
-            const auto& presets = gEffectLoader.GetPresets();
-            const char* name = (gPickerExportPresetIdx >= 0 && gPickerExportPresetIdx < (int)presets.size())
-                ? presets[gPickerExportPresetIdx].name.c_str() : "preset";
-            gPickerInfo = std::string("Exported '") + name + "' to " + path;
-            gPickerInfoFrames = 240;
-            gPickerError.clear();
+            if (presets[i].name == gPickerExportPresetName) { exportIdx = i; break; }
+        }
+
+        if (exportIdx < 0)
+        {
+            gPickerError = "Preset '" + gPickerExportPresetName + "' no longer exists";
         }
         else
         {
-            gPickerError = err.empty() ? "Export failed" : err;
+            std::string err;
+            if (gEffectLoader.ExportPreset(exportIdx, path.c_str(), &err))
+            {
+                gPickerInfo = std::string("Exported '") + presets[exportIdx].name + "' to " + path;
+                gPickerInfoFrames = 240;
+                gPickerError.clear();
+            }
+            else
+            {
+                gPickerError = err.empty() ? "Export failed" : err;
+            }
         }
     }
 }
@@ -1250,7 +1266,8 @@ static void DrawPresetSection()
         if (ImGui::Button("Export...") && !pickerBusy)
         {
             gPickerPurpose = PickerPurpose::Export;
-            gPickerExportPresetIdx = currentPreset;
+            gPickerExportPresetName = (currentPreset < (int)presets.size())
+                ? presets[currentPreset].name : "";
             gPickerError.clear();
             if (!FilePicker::StartFolderPicker("Choose a destination folder to export the preset"))
                 gPickerPurpose = PickerPurpose::None;
@@ -1908,6 +1925,12 @@ static void LoadLogoTextures()
 bool Init(IDXGISwapChain* swapChain, ID3D11Device* device, ID3D11DeviceContext* context)
 {
     if (gInitialized) return true;  // Already initialized (e.g. ResizeBuffers ran before first Present)
+
+    // The host retries Init every Present after a failure — release anything a
+    // previous failed attempt left behind before recreating it below.
+    if (gBackBufferRTV)  { gBackBufferRTV->Release();  gBackBufferRTV = nullptr; }
+    if (gDiscordLogoSRV) { gDiscordLogoSRV->Release(); gDiscordLogoSRV = nullptr; }
+    if (gGithubLogoSRV)  { gGithubLogoSRV->Release();  gGithubLogoSRV = nullptr; }
 
     Log("GUI: Init starting (swap=%p, dev=%p, ctx=%p)", swapChain, device, context);
 

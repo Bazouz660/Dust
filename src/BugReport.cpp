@@ -327,8 +327,13 @@ static void AppendGpuInfo(std::string& out, ID3D11Device* device)
 
     Appendf(out, "GPUs:\r\n");
     IDXGIAdapter1* adapter = nullptr;
-    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; i++)
+    for (UINT i = 0; ; i++)
     {
+        // Break on ANY failure, not just NOT_FOUND: on a driver fault/TDR EnumAdapters1 can
+        // return another error with adapter left null, and the body below would deref it.
+        HRESULT hrEnum = factory->EnumAdapters1(i, &adapter);
+        if (hrEnum != S_OK || !adapter) break;
+
         DXGI_ADAPTER_DESC1 d = {};
         if (SUCCEEDED(adapter->GetDesc1(&d)))
         {

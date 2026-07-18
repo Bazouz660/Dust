@@ -64,14 +64,14 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
         D3D11_BLEND_DESC desc = {};
         desc.RenderTarget[0].BlendEnable = FALSE;
         desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-        device->CreateBlendState(&desc, &gNoBlend);
+        if (FAILED(device->CreateBlendState(&desc, &gNoBlend))) return false;
     }
     // No-depth
     {
         D3D11_DEPTH_STENCIL_DESC desc = {};
         desc.DepthEnable = FALSE;
         desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
-        device->CreateDepthStencilState(&desc, &gNoDepthDSS);
+        if (FAILED(device->CreateDepthStencilState(&desc, &gNoDepthDSS))) return false;
     }
     // No-cull
     {
@@ -79,7 +79,7 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
         desc.FillMode = D3D11_FILL_SOLID;
         desc.CullMode = D3D11_CULL_NONE;
         desc.DepthClipEnable = FALSE;
-        device->CreateRasterizerState(&desc, &gNoCullRS);
+        if (FAILED(device->CreateRasterizerState(&desc, &gNoCullRS))) return false;
     }
     // Point-clamp sampler
     {
@@ -88,7 +88,7 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
         desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
         desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
         desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
-        device->CreateSamplerState(&desc, &gPointClampSampler);
+        if (FAILED(device->CreateSamplerState(&desc, &gPointClampSampler))) return false;
     }
 
     gKuwaharaCB = host->CreateConstantBuffer(device, sizeof(KuwaharaCBData));

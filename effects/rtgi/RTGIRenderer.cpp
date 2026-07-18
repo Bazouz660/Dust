@@ -567,8 +567,13 @@ void OnResolutionChanged(ID3D11Device* device, UINT newWidth, UINT newHeight)
         gInitialized = false;
     }
 
-    // Reset temporal state
+    // Reset temporal state. gFrameIndex must restart too: the accum/prev-depth
+    // textures were just recreated with undefined contents, and the per-frame
+    // UpdateCameraData call re-sets gHasPrevFrame before the next RenderGI, so
+    // only the shader's frameIndex/temporalBlend early-out can guarantee the
+    // flush frame blends zero history.
     gHasPrevFrame = false;
+    gFrameIndex = 0;
     gAccumWriteIndex = 0;
 }
 
@@ -655,6 +660,7 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
             device->Release();
         }
         gHasPrevFrame = false;
+        gFrameIndex = 0;
         gAccumWriteIndex = 0;
     }
 
