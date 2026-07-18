@@ -43,19 +43,41 @@ static std::string GetModuleDir(HMODULE hModule)
     return (pos != std::string::npos) ? s.substr(0, pos + 1) : s;
 }
 
-static std::string GetGameDir(HMODULE hModule)
+static bool FileExists(const std::string& path)
 {
-    // DLL is at <game>/mods/Dust/Dust.dll -- go up 2 dirs
-    std::string modDir = GetModuleDir(hModule);
-    auto pos = modDir.find_last_of("\\/", modDir.size() - 2);
-    if (pos != std::string::npos)
+    DWORD attr = GetFileAttributesA(path.c_str());
+    return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// Resolve the game install dir from the HOST PROCESS EXE, not the DLL location. Walking up
+// from the DLL is wrong for Steam Workshop installs (the DLL lives in
+// steamapps/workshop/content/233860/<id>/, so "up 2 dirs" lands in workshop/content/): the
+// shader-cache stamp was read+written in a phantom RE_Kenshi dir there, always matched
+// itself, and the REAL RE_Kenshi/shader_cache.sc was never invalidated. Stale bytecode
+// compiled before the MV injection then loaded from cache and paired MV-less vertex shaders
+// with MV pixel shaders — the injected TEXCOORD12/13 inputs read undefined interpolants and
+// the velocity became a function of screen position (the quadrant-coloured trees/foliage in
+// the MV debug view). Same derivation as BugReport's GetGameDir.
+static std::string GetGameDir()
+{
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, path, MAX_PATH);
+    std::string dir(path);
+    auto pos = dir.find_last_of("\\/");
+    dir = (pos != std::string::npos) ? dir.substr(0, pos + 1) : dir;
+
+    // The exe dir is not necessarily the game root: RE_Kenshi launches a patched copy of
+    // kenshi_x64.exe from <game>/RE_Kenshi/. Walk up until the game's marker files appear.
+    std::string probe = dir;
+    for (int i = 0; i < 3; i++)
     {
-        std::string modsDir = modDir.substr(0, pos);
-        pos = modsDir.find_last_of("\\/");
-        if (pos != std::string::npos)
-            return modsDir.substr(0, pos + 1);
+        if (FileExists(probe + "settings.cfg") || FileExists(probe + "currentVersion.txt"))
+            return probe;
+        size_t p = probe.find_last_of("\\/", probe.size() - 2);
+        if (p == std::string::npos) break;
+        probe = probe.substr(0, p + 1);
     }
-    return modDir;
+    return dir; // no markers found anywhere — fall back to the exe dir
 }
 
 // Build a stamp string that changes when any shader-affecting config changes.
@@ -73,7 +95,16 @@ static std::string BuildCacheStamp(const std::string& modDir)
 
     // Bump this suffix when ShaderPatch HLSL injection changes, so RE_Kenshi
     // discards cached bytecode that was compiled with an older injection.
-    stamp += "|patch=shadow-b7-csm-r9-no-pcss";
+    // mvend: the injected MV interpolants are now APPENDED to each entry function's parameter list
+    // instead of inserted after a TEXCOORDn anchor. Mid-list insertion shifted every later parameter
+    // down a register — with COLOURING it moved the vertex COLOR0 from reg7 to reg9 while Kenshi's
+    // un-injected forward icon shader (rtticons.hlsl, backwards-compat => links by REGISTER) kept
+    // reading reg7 and got the clip position as the item's colour. Every cached shader from before
+    // this change has the old register layout, so the bump is required.
+    // mvsgv: the injected PS inputs are now placed BEFORE any SV_IsFrontFace parameter — appending
+    // after it is an fxc error (X4576) that silently dropped the whole MV injection from every
+    // DOUBLESIDED variant via the original-source compile fallback.
+    stamp += "|patch=shadow-b7-csm-r9-mvsgv";
     return stamp;
 }
 
@@ -81,6 +112,25 @@ static void ManageShaderCache(const std::string& gameDir, const std::string& mod
 {
     std::string cachePath = gameDir + "RE_Kenshi\\shader_cache.sc";
     std::string stampPath = gameDir + "RE_Kenshi\\dust_cache_stamp.txt";
+
+    // One-time cleanup of the phantom RE_Kenshi dir older builds created by deriving the
+    // game dir from the DLL path (steamapps/workshop/content/ for Workshop installs).
+    {
+        std::string legacy;
+        auto p1 = modDir.find_last_of("\\/", modDir.size() - 2);
+        if (p1 != std::string::npos)
+        {
+            std::string up1 = modDir.substr(0, p1);
+            auto p2 = up1.find_last_of("\\/");
+            if (p2 != std::string::npos) legacy = up1.substr(0, p2 + 1);
+        }
+        if (!legacy.empty() && legacy != gameDir &&
+            DeleteFileA((legacy + "RE_Kenshi\\dust_cache_stamp.txt").c_str()))
+        {
+            RemoveDirectoryA((legacy + "RE_Kenshi").c_str());   // no-op unless now empty
+            Log("Removed stale cache stamp at legacy path %sRE_Kenshi\\", legacy.c_str());
+        }
+    }
 
     std::string currentStamp = BuildCacheStamp(modDir);
 
@@ -191,7 +241,7 @@ __declspec(dllexport) void startPlugin()
 #endif
 
     // Manage shader cache: only invalidate when Dust version or config changes
-    std::string gameDir = GetGameDir(gDllModule);
+    std::string gameDir = GetGameDir();
     std::string modDir = GetModuleDir(gDllModule);
     ManageShaderCache(gameDir, modDir);
 

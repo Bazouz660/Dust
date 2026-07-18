@@ -92,6 +92,10 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
     // Power curve = directional GI shadows: open surfaces (ao=1) stay lit,
     // occluded creases/contacts deepen with the contrast.
-    float ao = pow(saturate(gi.a), shadowContrast);
+    // Guard NaN/Inf BEFORE saturate: saturate(NaN)=0 -> pow(0,c)=0, and this pass is a
+    // multiply blend, so a NaN alpha would blacken the pixel. Treat non-finite as fully
+    // unoccluded (1.0 = no darkening) rather than fully occluded.
+    float aoIn = isfinite(gi.a) ? gi.a : 1.0;
+    float ao = pow(saturate(aoIn), shadowContrast);
     return float4(ao, ao, ao, 1.0);
 }

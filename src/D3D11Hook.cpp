@@ -715,7 +715,21 @@ static void RunUpscaler(ID3D11DeviceContext* ctx)
             // Fill camera-only MV for the sky/far-depth pixels (the sky is a forward pass with no MV
             // injection, so it's velocity 0 -> ghosts under camera motion). Must run here, after the
             // scene + sky are drawn and before the upscaler reads the velocity buffer.
-            MotionVectors::InjFillSkyMV(ctx, depthSRV, gWidth, gHeight);
+            //
+            // The fill keys off DEPTH ALONE (d >= 0.999), and writes a far-plane camera reprojection —
+            // a velocity that varies smoothly with screen position. Any geometry whose pixels read as
+            // far-depth (very distant meshes, or alpha-BLENDED foliage drawn in the forward pass, which
+            // never writes into the velocity RT) therefore gets the sky's position-varying field
+            // stamped over it. [Upscaling] SkyMV=0 disables the fill so that can be A/B'd directly.
+            static int sSkyMvEnabled = -1;
+            if (sSkyMvEnabled < 0)
+            {
+                sSkyMvEnabled = GetPrivateProfileIntA("Upscaling", "SkyMV", 1,
+                                                      (DustLogDir() + "Dust.ini").c_str()) ? 1 : 0;
+                Log("MotionVectors: sky MV fill %s ([Upscaling] SkyMV)", sSkyMvEnabled ? "ON" : "OFF");
+            }
+            if (sSkyMvEnabled)
+                MotionVectors::InjFillSkyMV(ctx, depthSRV, gWidth, gHeight);
             // The game's depth is LINEAR (ray distance / farClip); the upscalers expect hyperbolic
             // device-Z and (FSR) un-project it with cameraNear/Far for disocclusion. Feeding linear
             // depth makes the reconstructed view-Z hypersensitive at distance -> history rejection ->
@@ -898,6 +912,13 @@ typedef void(STDMETHODCALLTYPE* PFN_DrawIndexedInstanced)(
     ID3D11DeviceContext* pThis, UINT IndexCountPerInstance, UINT InstanceCount,
     UINT StartIndexLocation, INT BaseVertexLocation, UINT StartInstanceLocation);
 
+// Non-indexed instanced. Hooked ONLY so the injected-MV reproj CB stays pinned at b13 for geometry
+// that comes through this path — without it the patched VS reads whatever OGRE left at b13 and the
+// velocity degenerates into a function of position instead of a frame delta.
+typedef void(STDMETHODCALLTYPE* PFN_DrawInstanced)(
+    ID3D11DeviceContext* pThis, UINT VertexCountPerInstance, UINT InstanceCount,
+    UINT StartVertexLocation, UINT StartInstanceLocation);
+
 typedef void(STDMETHODCALLTYPE* PFN_OMSetRenderTargets)(
     ID3D11DeviceContext* pThis, UINT NumViews,
     ID3D11RenderTargetView* const* ppRenderTargetViews,
@@ -937,6 +958,7 @@ static PFN_CreatePixelShader        oCreatePixelShader = nullptr;
 static PFN_Draw                     oDraw = nullptr;
 static PFN_DrawIndexed              oDrawIndexed = nullptr;
 static PFN_DrawIndexedInstanced     oDrawIndexedInstanced = nullptr;
+static PFN_DrawInstanced            oDrawInstanced = nullptr;
 static PFN_OMSetRenderTargets       oOMSetRenderTargets = nullptr;
 static PFN_OMSetRenderTargetsAndUAV oOMSetRenderTargetsAndUAV = nullptr;
 static PFN_PSSetShaderResources     oPSSetShaderResources = nullptr;
@@ -1805,6 +1827,14 @@ static void STDMETHODCALLTYPE HookedDraw(
 
     if (VertexCount != 3 && VertexCount != 4)
     {
+        // Real (non-quad) geometry can also come through the NON-INDEXED path. It still needs the
+        // injected-MV reproj CB pinned at b13, exactly like DrawIndexed/DrawIndexedInstanced do:
+        // OGRE reflects the injected DustMVCB and rebinds its OWN buffer there per draw, so without
+        // this the patched VS computes oDustPrev from whatever OGRE left at b13 and the velocity
+        // becomes a function of position instead of a frame delta (shows up in the MV debug view as
+        // a position gradient rather than motion).
+        if (sMvFeederActive)
+        { ID3D11Buffer* rcb = MotionVectors::GetInjReprojCB(); if (rcb) pThis->VSSetConstantBuffers(13, 1, &rcb); }
         oDraw(pThis, VertexCount, StartVertexLocation);
         return;
     }
@@ -2102,6 +2132,26 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
     { ID3D11Buffer* rcb = MotionVectors::GetInjReprojCB(); if (rcb) pThis->VSSetConstantBuffers(13, 1, &rcb); }
     oDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
                           StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+}
+
+// NON-INDEXED instanced. Previously unhooked, so geometry drawn this way never got the reproj CB
+// pinned at b13 and its injected velocity came out as a function of position (a gradient in the MV
+// debug view) instead of a frame delta. Logs once so a capture can confirm whether the game actually
+// uses this path — if the line never appears, this was not the culprit.
+static void STDMETHODCALLTYPE HookedDrawInstanced(
+    ID3D11DeviceContext* pThis, UINT VertexCountPerInstance, UINT InstanceCount,
+    UINT StartVertexLocation, UINT StartInstanceLocation)
+{
+    if (gShutdownSignaled) { oDrawInstanced(pThis, VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation); return; }
+
+    if (sMvFeederActive)
+    {
+        static bool sLogged = false;
+        if (!sLogged) { sLogged = true; Log("DrawInstanced: non-indexed instanced draw seen (verts/inst=%u, inst=%u) — pinning reproj CB at b13", VertexCountPerInstance, InstanceCount); }
+        ID3D11Buffer* rcb = MotionVectors::GetInjReprojCB();
+        if (rcb) pThis->VSSetConstantBuffers(13, 1, &rcb);
+    }
+    oDrawInstanced(pThis, VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
 }
 
 // Map/Unmap: shadow the skinned bone-palette CB as OGRE writes it (WRITE_DISCARD before each skin
@@ -2675,6 +2725,7 @@ static const int VTIDX_CTX_Draw                     = 13;
 static const int VTIDX_CTX_Map                      = 14;
 static const int VTIDX_CTX_Unmap                    = 15;
 static const int VTIDX_CTX_DrawIndexedInstanced     = 20;
+static const int VTIDX_CTX_DrawInstanced            = 21;
 static const int VTIDX_CTX_OMSetRenderTargets       = 33;
 static const int VTIDX_CTX_OMSetRenderTargetsAndUAV = 34;
 static const int VTIDX_CTX_RSSetViewports           = 44;
@@ -2735,6 +2786,7 @@ bool Install()
     void* addrMap          = ctxVtable[VTIDX_CTX_Map];
     void* addrUnmap        = ctxVtable[VTIDX_CTX_Unmap];
     void* addrDrawIdxInst  = ctxVtable[VTIDX_CTX_DrawIndexedInstanced];
+    void* addrDrawInst     = ctxVtable[VTIDX_CTX_DrawInstanced];
     void* addrOMSetRT      = ctxVtable[VTIDX_CTX_OMSetRenderTargets];
     void* addrOMSetRTUAV   = ctxVtable[VTIDX_CTX_OMSetRenderTargetsAndUAV];
     void* addrPSSetSRVs    = ctxVtable[VTIDX_CTX_PSSetShaderResources];
@@ -2761,6 +2813,7 @@ bool Install()
     Log("  Draw                  = %p", addrDraw);
     Log("  DrawIndexed           = %p", addrDrawIndexed);
     Log("  DrawIndexedInstanced  = %p", addrDrawIdxInst);
+    Log("  DrawInstanced         = %p", addrDrawInst);
     Log("  OMSetRenderTargets    = %p", addrOMSetRT);
     Log("  OMSetRTAndUAV         = %p", addrOMSetRTUAV);
     Log("  PSSetShaderResources  = %p", addrPSSetSRVs);
@@ -2849,6 +2902,11 @@ bool Install()
                            (void**)&oDrawIndexedInstanced) != KenshiLib::SUCCESS)
     { Log("ERROR: Failed to hook DrawIndexedInstanced"); ok = false; }
 
+    // Non-fatal: only used to pin the MV reproj CB on the non-indexed instanced path.
+    if (KenshiLib::AddHook(addrDrawInst, (void*)HookedDrawInstanced,
+                           (void**)&oDrawInstanced) != KenshiLib::SUCCESS)
+    { Log("WARNING: Failed to hook DrawInstanced (non-indexed instanced MV will be wrong)"); }
+
     // Map/Unmap: needed to shadow the skinned bone-palette CB for spatial prev-pose matching.
     // Non-fatal if it fails — skinned animation MVs just fall back to zero (camera reproj only).
     if (KenshiLib::AddHook(addrMap, (void*)HookedMap,
@@ -2899,6 +2957,32 @@ void SignalShutdown()
 bool IsShutdownSignaled()
 {
     return gShutdownSignaled;
+}
+
+bool MvInjectionWanted()
+{
+    // Read the intent STRAIGHT FROM Dust.ini, cached for the session.
+    //
+    // Do NOT gate on gDlssWanted / sUpsEnabled here: both are populated during effect init, which
+    // happens AFTER the game has already compiled a chunk of its GBuffer shaders. Gating on them
+    // injects MV into the shaders compiled later but not the earlier ones, so the engine ends up
+    // pairing an MV-injected VS with an MV-less PS (verified in a capture: objects.hlsl main_ps
+    // compiled 10x at 7510->8493 = dither-only BEFORE "DLSS on", then 7510->8676 = dither+MV after).
+    // That inconsistency is exactly what this gate exists to avoid, so the decision must be stable
+    // from the very first compile. DustLogDir() is set at DLL attach, so the ini is readable here.
+    //
+    // Consequence (accepted): toggling the upscaler at runtime does not retro-inject already-compiled
+    // shaders — it takes effect on the next launch. That was already true; now it is at least
+    // all-or-nothing for the whole session instead of split by compile timing.
+    static int cached = -1;
+    if (cached < 0)
+    {
+        std::string ini = DustLogDir() + "Dust.ini";
+        const bool dlss = GetPrivateProfileIntA("Upscaling", "DLSS", 0, ini.c_str()) != 0;
+        const bool viz  = GetPrivateProfileIntA("Upscaling", "ShowMotionVectors", 0, ini.c_str()) != 0;
+        cached = (dlss || viz) ? 1 : 0;
+    }
+    return cached != 0;
 }
 
 } // namespace D3D11Hook

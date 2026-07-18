@@ -5,11 +5,58 @@
 
 #include <string>
 #include <cstring>
+#include <set>
 
 namespace ShaderPatch
 {
 
 PFN_D3DCompileHook oD3DCompile = nullptr;
+
+// Diagnostic: when [Debug] DumpInjectedShaders=1 in Dust.ini, write the ORIGINAL and INJECTED HLSL of
+// every GBuffer shader Dust rewrites to DustLogDir()\injected_shaders\, one pair per distinct variant.
+// Lets an injection bug on a specific game/mod shader variant be inspected offline (the pipeline survey
+// only captures a few startup frames, so it misses on-demand renders like item-icon generation). Off by
+// default — zero cost when the flag is absent.
+static bool DumpInjectedEnabled()
+{
+    static int cached = -1;
+    if (cached < 0)
+        cached = GetPrivateProfileIntA("Debug", "DumpInjectedShaders", 0,
+                                       (DustLogDir() + "Dust.ini").c_str()) ? 1 : 0;
+    return cached != 0;
+}
+
+static void DumpInjection(const char* tag, const char* srcName, const char* entry,
+                          const std::string& original, const std::string& patched)
+{
+    if (!DumpInjectedEnabled()) return;
+
+    // One dump per (source, entry, variant): the variant hash separates #define permutations of the
+    // same file, and de-dups the thousands of identical recompiles across draws.
+    std::string base = std::string(srcName ? srcName : "unknown") + "_" + (entry ? entry : "x");
+    for (char& ch : base)
+        if (strchr("\\/:*?\"<>| ", ch)) ch = '_';
+    char hash[16];
+    snprintf(hash, sizeof(hash), "_%08zX", std::hash<std::string>{}(original) & 0xFFFFFFFF);
+    base += hash;
+
+    static std::set<std::string> seen;
+    if (!seen.insert(base).second) return;
+
+    std::string dir = DustLogDir() + "injected_shaders";
+    CreateDirectoryA(dir.c_str(), nullptr);
+    for (int i = 0; i < 2; ++i)
+    {
+        std::string path = dir + "\\" + tag + "_" + base + (i == 0 ? ".orig.hlsl" : ".injected.hlsl");
+        FILE* f = fopen(path.c_str(), "wb");
+        if (!f) continue;
+        const std::string& s = (i == 0) ? original : patched;
+        fwrite(s.data(), 1, s.size(), f);
+        fclose(f);
+    }
+    Log("ShaderPatch: dumped injection %s / %s -> injected_shaders\\%s", srcName ? srcName : "?",
+        entry ? entry : "?", base.c_str());
+}
 
 // Patch vanilla deferred.hlsl source to add AO support and improved shadow filtering.
 // Returns the modified source, or the original if patterns weren't found.
@@ -661,10 +708,37 @@ static bool InsBefore(std::string& s, size_t& from, const char* anchor, const st
     return true;
 }
 
-// Generic velocity injection into a GBuffer VS. fnAnchor = entry-fn start; interp = a semantic at the
-// SAME spot in this shader's VS-out and PS-in lists (e.g. "TEXCOORD5,"); clipAssign = the clip-output
+// Insert `text` at the END of the entry function's parameter list (just before its closing paren).
+//
+// THIS PLACEMENT IS LOAD-BEARING. Declaring the injected interpolants LAST gives them the HIGHEST
+// signature registers, so no existing parameter's register can shift. The old behaviour inserted
+// mid-list (right after a TEXCOORDn anchor), which pushed every later parameter down a register.
+// Verified with fxc reflection on the real objects.hlsl: with COLOURING defined, the vertex COLOR0
+// output moved reg7 -> reg9, while oDustCur (clip position) took reg7. Kenshi's forward item-icon
+// shader (rtticons.hlsl main_ps, compiled with ENABLE_BACKWARDS_COMPATIBILITY, which links by
+// REGISTER) shares this VS but is never injected, so it kept reading reg7 and received the clip
+// position as the item's faction colour -> the corrupted item icons. Appending keeps COLOR0 at reg7
+// and leaves the non-COLOURING variant byte-identical, so nothing that worked before changes.
+static bool InsAtParamEnd(std::string& s, const char* fnAnchor, const std::string& text)
+{
+    size_t fn = s.find(fnAnchor);
+    if (fn == std::string::npos) return false;
+    size_t open = s.find('(', fn);
+    if (open == std::string::npos) return false;
+    int depth = 0;
+    for (size_t i = open; i < s.size(); ++i)
+    {
+        if (s[i] == '(') ++depth;
+        else if (s[i] == ')' && --depth == 0) { s.insert(i, text); return true; }
+    }
+    return false;
+}
+
+// Generic velocity injection into a GBuffer VS. fnAnchor = entry-fn start; clipAssign = the clip-output
 // assignment; clipRHS = its RHS (recomputed into oDustCur — never read the SV_Position output).
-static std::string InjVS(const std::string& src, const char* fnAnchor, const char* interp,
+// The interpolants are APPENDED to the parameter list (see InsAtParamEnd) so they never shift an
+// existing parameter's register; `interp` is no longer used for placement.
+static std::string InjVS(const std::string& src, const char* fnAnchor, const char* /*interp*/,
                          const char* clipAssign, const char* clipRHS)
 {
     if (Has(src, "oDustPrev")) return src;
@@ -675,9 +749,9 @@ static std::string InjVS(const std::string& src, const char* fnAnchor, const cha
     // matrix packing (objects.hlsl column, skin.hlsl row) — without this, row-major shaders read it
     // transposed and produce garbage MVs.
     s.insert(fn, "cbuffer DustMVCB : register(b13) { column_major float4x4 dust_reproj; };\n");
-    size_t from = s.find(fnAnchor);                    // scope all searches to the entry function
+    if (!InsAtParamEnd(s, fnAnchor, ",\n\tout float4 oDustCur : TEXCOORD12,\n\tout float4 oDustPrev : TEXCOORD13\n")) return src;
+    size_t from = s.find(fnAnchor);                    // scope the body search to the entry function
     if (from == std::string::npos) return src;
-    if (!InsAfter(s, from, interp, "\n\tout float4 oDustCur : TEXCOORD12,\n\tout float4 oDustPrev : TEXCOORD13,")) return src;
     std::string asgn = std::string("\n\toDustCur = ") + clipRHS + "; oDustPrev = mul(dust_reproj, oDustCur);";
     if (!InsAfter(s, from, clipAssign, asgn)) return src;
     return s;
@@ -691,7 +765,7 @@ static std::string InjVS(const std::string& src, const char* fnAnchor, const cha
 // MotionVectors). posExpr is the vertex position fed to the clip transform. When no match was bound
 // (all-zero matrix: new object / first frame / churn) we fall back to camera reproj, exactly like the
 // skinned path — so this NEVER regresses static objects (whose prevWVP equals the camera reproj anyway).
-static std::string InjRigidVS(const std::string& src, const char* fnAnchor, const char* interp,
+static std::string InjRigidVS(const std::string& src, const char* fnAnchor, const char* /*interp*/,
                               const char* clipAssign, const char* clipRHS, const char* posExpr)
 {
     if (Has(src, "oDustPrev")) return src;
@@ -700,9 +774,9 @@ static std::string InjRigidVS(const std::string& src, const char* fnAnchor, cons
     if (fn == std::string::npos) return src;
     s.insert(fn, "cbuffer DustMVCB : register(b13) { column_major float4x4 dust_reproj; };\n"
                  "cbuffer DustPrevWVPCB : register(b12) { column_major float4x4 dust_prevWVP; };\n");
+    if (!InsAtParamEnd(s, fnAnchor, ",\n\tout float4 oDustCur : TEXCOORD12,\n\tout float4 oDustPrev : TEXCOORD13\n")) return src;
     size_t from = s.find(fnAnchor);
     if (from == std::string::npos) return src;
-    if (!InsAfter(s, from, interp, "\n\tout float4 oDustCur : TEXCOORD12,\n\tout float4 oDustPrev : TEXCOORD13,")) return src;
     std::string asgn = std::string("\n\toDustCur = ") + clipRHS + ";"
         "\n\toDustPrev = mul(dust_prevWVP, " + posExpr + ");"
         // No per-object prev bound this draw => dust_prevWVP all-zero (its perspective row is 0) =>
@@ -712,16 +786,65 @@ static std::string InjRigidVS(const std::string& src, const char* fnAnchor, cons
     return s;
 }
 
-// Generic velocity injection into a GBuffer PS. interp MUST match the VS interp position.
-static std::string InjPS(const std::string& src, const char* fnAnchor, const char* interp,
+// Insert the Dust PS inputs at the end of the entry function's parameter list, EXCEPT when the list
+// carries a system-generated value input (SV_IsFrontFace in objects.hlsl's DOUBLESIDED variants):
+// fxc rejects non-SV signature inputs declared after an SGV (X4576), which made the injected compile
+// FAIL for every double-sided variant — the original-source fallback then silently shipped a MV-less
+// PS (and dropped the alpha-dither fix with it). In that case the inputs go right BEFORE the SGV
+// parameter — above its wrapping #ifdef when present, so variants without the define keep the exact
+// same appended layout as before. The SGV is rasterizer-fed, so shifting ITS register is harmless,
+// and everything declared before it keeps its register either way.
+static bool InsDustPSInputs(std::string& s, const char* fnAnchor)
+{
+    size_t fn = s.find(fnAnchor);
+    if (fn == std::string::npos) return false;
+    size_t open = s.find('(', fn);
+    if (open == std::string::npos) return false;
+    size_t close = std::string::npos;
+    int depth = 0;
+    for (size_t i = open; i < s.size(); ++i)
+    {
+        if (s[i] == '(') ++depth;
+        else if (s[i] == ')' && --depth == 0) { close = i; break; }
+    }
+    if (close == std::string::npos) return false;
+
+    size_t sgv = s.find("SV_IsFrontFace", open);
+    if (sgv == std::string::npos || sgv > close)
+    {
+        // No SGV input — plain append, byte-identical to the previous behaviour.
+        s.insert(close, ",\n\tfloat4 iDustCur : TEXCOORD12,\n\tfloat4 iDustPrev : TEXCOORD13,\n\tout float2 oDustVel : SV_Target3\n");
+        return true;
+    }
+    size_t ins = s.rfind('\n', sgv);
+    ins = (ins == std::string::npos) ? open + 1 : ins + 1;
+    if (ins > open + 2)
+    {
+        size_t prevStart = s.rfind('\n', ins - 2);
+        prevStart = (prevStart == std::string::npos) ? open + 1 : prevStart + 1;
+        size_t firstNonWs = s.find_first_not_of(" \t", prevStart);
+        if (firstNonWs != std::string::npos && s.compare(firstNonWs, 3, "#if") == 0)
+            ins = prevStart;                        // hop above the #ifdef guarding the SGV
+    }
+    s.insert(ins, "float4 iDustCur : TEXCOORD12,\n\tfloat4 iDustPrev : TEXCOORD13,\n\tout float2 oDustVel : SV_Target3,\n\t");
+    return true;
+}
+
+// Generic velocity injection into a GBuffer PS. Like InjVS, the inputs are APPENDED to the parameter
+// list so they take the highest registers and cannot shift an existing input (COLOR0 in the COLOURING
+// variants especially) — see InsDustPSInputs for the SV_IsFrontFace exception. gbufOut is still
+// required as proof this really is a GBuffer PS; `interp` is no longer used for placement.
+static std::string InjPS(const std::string& src, const char* fnAnchor, const char* /*interp*/,
                          const char* gbufOut, const char* body)
 {
     if (Has(src, "oDustVel")) return src;
     std::string s = src;
     size_t from = s.find(fnAnchor);
     if (from == std::string::npos) return src;
-    if (!InsAfter(s, from, interp, "\n\tfloat4 iDustCur : TEXCOORD12,\n\tfloat4 iDustPrev : TEXCOORD13,")) return src;
-    if (!InsBefore(s, from, gbufOut, "out float2 oDustVel : SV_Target3,\n\t")) return src;
+    if (!Has(s, gbufOut)) return src;               // not a GBuffer PS — leave it alone
+    if (!InsDustPSInputs(s, fnAnchor)) return src;
+    from = s.find(fnAnchor);
+    if (from == std::string::npos) return src;
     if (!InsAfter(s, from, body, "\n\toDustVel = (iDustCur.xy/iDustCur.w - iDustPrev.xy/iDustPrev.w) * float2(0.5, -0.5);")) return src;
     return s;
 }
@@ -773,7 +896,9 @@ static std::string InjSkinVS(const std::string& src)
                  "cbuffer DustMVCB : register(b13) { column_major float4x4 dust_reproj; };\n");
     size_t from = s.find("void main_vs");
     if (from == std::string::npos) return src;
-    if (!InsAfter(s, from, "TEXCOORD5,", "\n\tout float4 oDustCur : TEXCOORD12,\n\tout float4 oDustPrev : TEXCOORD13,")) return src;
+    if (!InsAtParamEnd(s, "void main_vs", ",\n\tout float4 oDustCur : TEXCOORD12,\n\tout float4 oDustPrev : TEXCOORD13\n")) return src;
+    from = s.find("void main_vs");
+    if (from == std::string::npos) return src;
     std::string prev =
         "\n\toDustCur = mul(viewProjectionMatrix, blendPos);"
         "\n\tfloat4 dmvPrev = float4(0,0,0,0);"
@@ -802,7 +927,9 @@ static std::string InjGrassVS(const std::string& src)
     s.insert(fn, "cbuffer DustMVCB : register(b13) { column_major float4x4 dust_reproj; float dust_windDelta; };\n");
     size_t from = s.find("void grass_vs");
     if (from == std::string::npos) return src;
-    if (!InsAfter(s, from, "TEXCOORD1,", "\n\tout float4 oDustCur : TEXCOORD12,\n\tout float4 oDustPrev : TEXCOORD13,")) return src;
+    if (!InsAtParamEnd(s, "void grass_vs", ",\n\tout float4 oDustCur : TEXCOORD12,\n\tout float4 oDustPrev : TEXCOORD13\n")) return src;
+    from = s.find("void grass_vs");
+    if (from == std::string::npos) return src;
     std::string prev =
         "\n\toDustCur = mul(worldViewProj, position);"
         "\n\tfloat4 dmvPrev = iPosition;"
@@ -861,6 +988,7 @@ HRESULT WINAPI HookedD3DCompile(
             {
                 Log("ShaderPatch: patched deferred main_fs (%zu -> %zu bytes)",
                     src.size(), patched.size());
+                DumpInjection("deferred", pSourceName, pEntrypoint, src, patched);
                 HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
                                           pDefines, pInclude, pEntrypoint, pTarget,
                                           Flags1, Flags2, ppCode, ppErrorMsgs);
@@ -941,16 +1069,34 @@ HRESULT WINAPI HookedD3DCompile(
         if (!isVS && patched.find("clip(normalTex.a - threshold)") != std::string::npos &&
             patched.find("DustStabilizeThreshold") == std::string::npos)
             patched = PatchObjectsShader(patched);
-        patched = isVS ? InjectGBufferVS(patched, pEntrypoint, pSourceName) : InjectGBufferPS(patched, pEntrypoint, pSourceName);
+        // Per-object MV injection rewrites the game's GBuffer VS/PS signatures, and it is ONLY consumed
+        // by the DLSS/FSR upscaler resolve + the MV debug viz. When neither is active it is pure risk for
+        // no benefit: some users' shader sets (variants / shader mods) corrupt the albedo when injected
+        // (reported as garbage item icons + world chroma; exact trigger still under investigation — the
+        // simple "asymmetric injection shifts interpolant slots" theory was DISPROVEN on real HW at SM4,
+        // where VS->PS linkage is by semantic, not slot). Only inject when something actually reads the
+        // velocity. (The alpha-dither fix above is independent — it stays.)
+        bool mvInjected = false;
+        if (D3D11Hook::MvInjectionWanted())
+        {
+            const size_t beforeMv = patched.size();
+            patched = isVS ? InjectGBufferVS(patched, pEntrypoint, pSourceName) : InjectGBufferPS(patched, pEntrypoint, pSourceName);
+            mvInjected = (patched.size() != beforeMv);
+        }
         if (patched != src)
         {
+            DumpInjection(isVS ? "vs" : "ps", pSourceName, pEntrypoint, src, patched);
             HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
                                       pDefines, pInclude, pEntrypoint, pTarget,
                                       Flags1, Flags2, ppCode, ppErrorMsgs);
             if (SUCCEEDED(hr))
             {
-                Log("ShaderPatch: injected MV into %s %s (%zu -> %zu)",
-                    pSourceName ? pSourceName : "?", pEntrypoint, src.size(), patched.size());
+                // Report what was ACTUALLY applied. This used to say "injected MV" for any rewrite,
+                // which hid a gate-timing bug where the alpha-dither applied but the MV injection did
+                // not — leaving MV-less pixel shaders paired with MV-injected vertex shaders.
+                Log("ShaderPatch: patched %s %s (%zu -> %zu) [%s]",
+                    pSourceName ? pSourceName : "?", pEntrypoint, src.size(), patched.size(),
+                    mvInjected ? "MV" : "no MV");
                 if (ppCode && *ppCode)
                     SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
                         pEntrypoint, pTarget, pSourceName,

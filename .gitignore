@@ -2,6 +2,9 @@
 build/
 */build/
 **/build/
+
+# Packaged mod output (build.ps1 -Package)
+/Dust/
 *.obj
 *.o
 *.pdb

@@ -48,4 +48,11 @@ namespace D3D11Hook
     // SSAO publishes its AO map + params here each frame (via SetLightVolumeSsaoAo). Bound at
     // t8/t9 for light_fs, preferred over the deferred-slot snapshot. Cleared per frame.
     void SetLightVolumeSsaoAo(ID3D11ShaderResourceView* ao, ID3D11ShaderResourceView* params);
+
+    // True when the injected per-object motion vectors are actually consumed this session — the
+    // DLSS/FSR upscaler is enabled, or the MV debug viz is on. ShaderPatch gates its GBuffer VS/PS
+    // injection on this: when nothing reads the velocity, injecting only risks albedo corruption on
+    // some users' shader sets (variants / shader mods) for no benefit. Reads the early "[Upscaling]
+    // DLSS" intent, so it is valid before the first object shader compiles.
+    bool MvInjectionWanted();
 }
