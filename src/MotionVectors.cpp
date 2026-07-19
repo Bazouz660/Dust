@@ -1170,7 +1170,13 @@ void InjBindSkinPrev(ID3D11DeviceContext* ctx)
     const auto& caps = GeometryCapture::GetCaptures();
     if (caps.empty()) return;
     const CapturedDraw& d = caps.back();
-    if (!d.vsMetadata || d.vsMetadata->transformType != VSTransformType::SKINNED) return;
+    // Unregistered VS (no reflection metadata): we can't prove this ISN'T an injected skin perm, and
+    // b12 is sticky — a stale non-zero pose here means wrong-bone reprojection (the MV flash). Never
+    // let such a draw read leftovers; the zero CB forces the shader's camera-reproj fallback.
+    if (!d.vsMetadata) { BindSkinZeroB12(ctx); return; }
+    // Reflected STATIC/UNKNOWN classes (objects/terrain/shadow perms) don't declare b12 at all —
+    // binding would be a wasted state change, and the stale value is never read.
+    if (d.vsMetadata->transformType != VSTransformType::SKINNED) return;
     sSkinTotalFrame++;
 
     uint32_t boneOff = d.vsMetadata->boneArrayOffset;
@@ -1254,6 +1260,19 @@ void InjBindSkinPrev(ID3D11DeviceContext* ctx)
         ctx->VSSetConstantBuffers(12, 1, &sInjSkinB12);
     }
     else BindSkinZeroB12(ctx);
+}
+
+// DrawIndexedInstanced hook (right after GeometryCapture::OnDrawIndexedInstanced): instanced draws
+// skip the pose matcher (per-instance palettes make identity ambiguous), so give any instanced
+// SKINNED draw the zero CB — camera-reproj fallback — instead of the previous draw's sticky pose.
+void InjBindZeroB12(ID3D11DeviceContext* ctx)
+{
+    if (!ctx || !sDevice) return;
+    const auto& caps = GeometryCapture::GetCaptures();
+    if (caps.empty()) return;
+    const CapturedDraw& d = caps.back();
+    if (!d.vsMetadata || d.vsMetadata->transformType != VSTransformType::SKINNED) return;
+    BindSkinZeroB12(ctx);
 }
 
 // Draw hook (right after GeometryCapture::OnDrawIndexed): for a STATIC (rigid, objects.hlsl-class) draw,

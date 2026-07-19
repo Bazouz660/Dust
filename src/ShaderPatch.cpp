@@ -837,11 +837,37 @@ static bool InsDustPSInputs(std::string& s, const char* fnAnchor)
     return true;
 }
 
-// Generic velocity injection into a GBuffer PS. Like InjVS, the inputs are APPENDED to the parameter
-// list so they take the highest registers and cannot shift an existing input (COLOR0 in the COLOURING
-// variants especially) — see InsDustPSInputs for the SV_IsFrontFace exception. gbufOut is still
-// required as proof this really is a GBuffer PS; `interp` is no longer used for placement.
-static std::string InjPS(const std::string& src, const char* fnAnchor, const char* /*interp*/,
+// Insert `text` right after the entry function's opening '{'.
+static bool InsAtFuncStart(std::string& s, const char* fnAnchor, const std::string& text)
+{
+    size_t fn = s.find(fnAnchor);
+    if (fn == std::string::npos) return false;
+    size_t open = s.find('(', fn);
+    if (open == std::string::npos) return false;
+    size_t close = std::string::npos;
+    int depth = 0;
+    for (size_t i = open; i < s.size(); ++i)
+    {
+        if (s[i] == '(') ++depth;
+        else if (s[i] == ')' && --depth == 0) { close = i; break; }
+    }
+    if (close == std::string::npos) return false;
+    size_t brace = s.find('{', close);
+    if (brace == std::string::npos) return false;
+    s.insert(brace + 1, text);
+    return true;
+}
+
+// Generic velocity injection into a GBuffer PS. Two placement modes for the injected signature:
+//  - interp == nullptr: inputs are APPENDED to the parameter list (InsDustPSInputs) so they take
+//    the highest registers and cannot shift an existing input (COLOR0 in the COLOURING variants
+//    especially). Required for VSes shared with UNINJECTED pixel shaders (the rtticons icons bug).
+//  - interp != nullptr: LEGACY anchor placement — inputs right after `interp`, output before
+//    gbufOut. Required for the character/skin family: Kenshi compiles with
+//    ENABLE_BACKWARDS_COMPATIBILITY (positional VS->PS linkage) and those PSes have a different
+//    parameter count than skin.hlsl main_vs, so end-append misaligns the registers (hair bug).
+// gbufOut is still required as proof this really is a GBuffer PS.
+static std::string InjPS(const std::string& src, const char* fnAnchor, const char* interp,
                          const char* gbufOut, const char* body)
 {
     if (Has(src, "oDustVel")) return src;
@@ -849,10 +875,23 @@ static std::string InjPS(const std::string& src, const char* fnAnchor, const cha
     size_t from = s.find(fnAnchor);
     if (from == std::string::npos) return src;
     if (!Has(s, gbufOut)) return src;               // not a GBuffer PS — leave it alone
-    if (!InsDustPSInputs(s, fnAnchor)) return src;
+    if (interp)
+    {
+        if (!InsAfter(s, from, interp, "\n\tfloat4 iDustCur : TEXCOORD12,\n\tfloat4 iDustPrev : TEXCOORD13,")) return src;
+        if (!InsBefore(s, from, gbufOut, "out float2 oDustVel : SV_Target3,\n\t")) return src;
+    }
+    else if (!InsDustPSInputs(s, fnAnchor)) return src;
     from = s.find(fnAnchor);
     if (from == std::string::npos) return src;
-    if (!InsAfter(s, from, body, "\n\toDustVel = (iDustCur.xy/iDustCur.w - iDustPrev.xy/iDustPrev.w) * float2(0.5, -0.5);")) return src;
+    const std::string vel = "\n\toDustVel = (iDustCur.xy/iDustCur.w - iDustPrev.xy/iDustPrev.w) * float2(0.5, -0.5);";
+    if (!InsAfter(s, from, body, vel))
+    {
+        // Variant without the INITIALISE_OUTPUT anchor (some material variants, e.g. hair_fs, init
+        // the GBuffer differently). oDustVel depends only on the injected inputs, so writing it at
+        // function start is valid — and the most alpha-clip-safe position. Never silently ship a
+        // MV-less PS for a shader this table promised to inject.
+        if (!InsAtFuncStart(s, fnAnchor, vel)) return src;
+    }
     return s;
 }
 
@@ -872,22 +911,22 @@ static const VSpec kVSpecs[] = {
     { "character.hlsl",   "severed_limb_vs","void severed_limb_vs","TEXCOORD5,","oPosition = mul(worldViewProjMatrix, position);","mul(worldViewProjMatrix, position)" },
 };
 static const PSpec kPSpecs[] = {
-    { "objects.hlsl",    "main_ps",       "void main_ps",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
-    { "terrain.hlsl",    "simple_fs",     "void simple_fs",     "TEXCOORD1,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // LOD terrain
-    { "terrainfp4.hlsl", "main_fs",       "void main_fs",       "TEXCOORD1,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // near terrain (pairs w/ terrain.hlsl main_vs)
-    { "terrainfp4.hlsl", "mapfeature_fs", "void mapfeature_fs", "TEXCOORD4,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // pairs w/ mapfeature feature_vs
-    { "triplanar.hlsl",  "triplanar_ps",  "void triplanar_ps",  "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
-    { "mapfeature.hlsl", "terrain_fs",    "void terrain_fs",    "TEXCOORD4,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
-    { "skin.hlsl",       "main_fs",       "void main_fs",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // skinned clothes
+    { "objects.hlsl",    "main_ps",       "void main_ps",       nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // end-append: objects VS is shared with uninjected rtticons PS (icons bug)
+    { "terrain.hlsl",    "simple_fs",     "void simple_fs",     nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // LOD terrain
+    { "terrainfp4.hlsl", "main_fs",       "void main_fs",       nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // near terrain (pairs w/ terrain.hlsl main_vs)
+    { "terrainfp4.hlsl", "mapfeature_fs", "void mapfeature_fs", nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // pairs w/ mapfeature feature_vs
+    { "triplanar.hlsl",  "triplanar_ps",  "void triplanar_ps",  nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
+    { "mapfeature.hlsl", "terrain_fs",    "void terrain_fs",    nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
+    { "skin.hlsl",       "main_fs",       "void main_fs",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // skinned clothes (skin.hlsl main_vs — legacy anchor placement, see InjPS)
     { "creature.hlsl",   "main_fs",       "void main_fs",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // creatures/animals (skin.hlsl main_vs, BLOOD variant). MUST be injected: its VS is the skinned VS, so leaving the PS un-injected mis-registers its wet(TEXCOORD6)/blood(TEXCOORD7) inputs -> garbage blood coords -> a tiled blood overlay on every creature.
-    { "distant_town.hlsl","main_fs",      "void main_fs",       "TEXCOORD2,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
-    { "foliage.hlsl",    "grass_fs",      "void grass_fs",      "TEXCOORD1,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // grass
-    { "foliage.hlsl",    "foliage_fs",    "void foliage_fs",    "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // crops (farm_vs)
-    { "character.hlsl",  "main_fs",       "void main_fs",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // character body (skin.hlsl main_vs)
-    { "character.hlsl",  "hair_fs",       "void hair_fs",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
-    { "character.hlsl",  "zero_fs",       "void zero_fs",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
-    { "character.hlsl",  "distant_fs",    "void distant_fs",    "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
-    { "character.hlsl",  "severed_limb_fs","void severed_limb_fs","TEXCOORD5,","out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
+    { "distant_town.hlsl","main_fs",      "void main_fs",       nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
+    { "foliage.hlsl",    "grass_fs",      "void grass_fs",      nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // grass
+    { "foliage.hlsl",    "foliage_fs",    "void foliage_fs",    nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // crops (farm_vs)
+    { "character.hlsl",  "main_fs",       "void main_fs",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // character body (skin.hlsl main_vs — legacy anchor placement)
+    { "character.hlsl",  "hair_fs",       "void hair_fs",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // hair (skin.hlsl main_vs) — legacy anchor placement; end-append misaligned its registers (positional linkage)
+    { "character.hlsl",  "zero_fs",       "void zero_fs",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // skin.hlsl main_vs — legacy anchor placement
+    { "character.hlsl",  "distant_fs",    "void distant_fs",    "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // character LOD (skin.hlsl main_vs) — legacy anchor placement
+    { "character.hlsl",  "severed_limb_fs","void severed_limb_fs",nullptr,    "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // pairs w/ severed_limb_vs (end-append, counts match)
 };
 
 // skin.hlsl main_vs needs TRUE animation MVs, not camera reproj: skin the vertex a second time with
@@ -903,9 +942,14 @@ static std::string InjSkinVS(const std::string& src)
                  "cbuffer DustMVCB : register(b13) { column_major float4x4 dust_reproj; };\n");
     size_t from = s.find("void main_vs");
     if (from == std::string::npos) return src;
-    if (!InsAtParamEnd(s, "void main_vs", ",\n\tout float4 oDustCur : TEXCOORD12,\n\tout float4 oDustPrev : TEXCOORD13\n")) return src;
-    from = s.find("void main_vs");
-    if (from == std::string::npos) return src;
+    // ANCHOR placement, not end-append (InsAtParamEnd): Kenshi compiles with
+    // ENABLE_BACKWARDS_COMPATIBILITY, so VS->PS linkage is POSITIONAL — and the character-family
+    // PSes (hair_fs especially) have a different parameter count than this VS. End-append then
+    // lands oDustCur/oDustPrev on different registers than the PS's iDustCur/iDustPrev and the PS
+    // samples garbage (the "hair has no MVs" regression). After-TEXCOORD5 is the verified
+    // pre-icons-fix scheme: both sides insert at the same position. This VS is shared only with
+    // INJECTED PSes (skin/creature/character GBuffer), so no rtticons-style uninjected victim.
+    if (!InsAfter(s, from, "TEXCOORD5,", "\n\tout float4 oDustCur : TEXCOORD12,\n\tout float4 oDustPrev : TEXCOORD13,")) return src;
     std::string prev =
         "\n\toDustCur = mul(viewProjectionMatrix, blendPos);"
         "\n\tfloat4 dmvPrev = float4(0,0,0,0);"
@@ -947,16 +991,29 @@ static std::string InjGrassVS(const std::string& src)
     return s;
 }
 
+// MV injection into a table-matched shader must never fail SILENTLY: an anchor miss ships the
+// shader MV-less while everything around it is injected (the "hair has no velocity" bug class) —
+// and if its counterpart stage WAS injected, interpolants mis-register (garbage MVs). The injector
+// early-outs count as success (already patched); anything else that changed nothing gets a warning.
+static std::string InjChecked(const std::string& out, const std::string& src,
+                              const char* srcName, const char* entry, const char* marker)
+{
+    if (out == src && !Has(src, marker))
+        Log("ShaderPatch: WARNING %s %s matched the MV-injection table but no anchors were found — shader ships WITHOUT motion vectors",
+            srcName, entry);
+    return out;
+}
+
 static std::string InjectGBufferVS(const std::string& src, const char* entry, const char* srcName)
 {
     if (!srcName) return src;
-    if (strcmp(entry, "main_vs") == 0 && Has(srcName, "skin.hlsl")) return InjSkinVS(src);   // true anim MVs
-    if (strcmp(entry, "grass_vs") == 0 && Has(srcName, "foliage.hlsl")) return InjGrassVS(src);   // wind MVs
+    if (strcmp(entry, "main_vs") == 0 && Has(srcName, "skin.hlsl")) return InjChecked(InjSkinVS(src), src, srcName, entry, "oDustPrev");   // true anim MVs
+    if (strcmp(entry, "grass_vs") == 0 && Has(srcName, "foliage.hlsl")) return InjChecked(InjGrassVS(src), src, srcName, entry, "oDustPrev");   // wind MVs
     // (objects.hlsl per-object previous-WVP / InjRigidVS is SHELVED — unreliable cross-frame identity
     //  regressed static geometry. objects.hlsl falls through to the generic camera-reproj InjVS below.)
     for (const VSpec& v : kVSpecs)
         if (strcmp(entry, v.entry) == 0 && Has(srcName, v.srcFile))
-            return InjVS(src, v.fnAnchor, v.interp, v.clipAssign, v.clipRHS);
+            return InjChecked(InjVS(src, v.fnAnchor, v.interp, v.clipAssign, v.clipRHS), src, srcName, entry, "oDustPrev");
     return src;
 }
 static std::string InjectGBufferPS(const std::string& src, const char* entry, const char* srcName)
@@ -964,7 +1021,7 @@ static std::string InjectGBufferPS(const std::string& src, const char* entry, co
     if (!srcName) return src;
     for (const PSpec& ps : kPSpecs)
         if (strcmp(entry, ps.entry) == 0 && Has(srcName, ps.srcFile))
-            return InjPS(src, ps.fnAnchor, ps.interp, ps.gbufOut, ps.body);
+            return InjChecked(InjPS(src, ps.fnAnchor, ps.interp, ps.gbufOut, ps.body), src, srcName, entry, "oDustVel");
     return src;
 }
 
@@ -1081,7 +1138,10 @@ HRESULT WINAPI HookedD3DCompile(
         // no benefit: some users' shader sets (variants / shader mods) corrupt the albedo when injected
         // (reported as garbage item icons + world chroma; exact trigger still under investigation — the
         // simple "asymmetric injection shifts interpolant slots" theory was DISPROVEN on real HW at SM4,
-        // where VS->PS linkage is by semantic, not slot). Only inject when something actually reads the
+        // where VS->PS linkage is by semantic, not slot. CAVEAT: with ENABLE_BACKWARDS_COMPATIBILITY the
+        // fxc signature packing is POSITIONAL, so injected interpolants must sit at the same list
+        // position in both stages when the counts differ — see InjPS/InjSkinVS, the hair_fs regression).
+        // Only inject when something actually reads the
         // velocity. (The alpha-dither fix above is independent — it stays.)
         bool mvInjected = false;
         if (D3D11Hook::MvInjectionWanted())

@@ -56,6 +56,13 @@ namespace MotionVectors
     void InjFillSkinPrev(ID3D11DeviceContext* ctx);
     void InjBindSkinPrev(ID3D11DeviceContext* ctx);
 
+    // DrawIndexedInstanced hook: instanced draws never run the pose matcher (per-instance bone
+    // palettes make cross-frame identity ambiguous), but an instanced SKINNED draw's patched VS
+    // still reads b12 — left sticky, that's the previous draw's pose (a wrong-character MV flash).
+    // Bind the zero CB so it takes the safe camera-reproj fallback instead. No-op unless the
+    // just-captured draw is skinned.
+    void InjBindZeroB12(ID3D11DeviceContext* ctx);
+
     // A.5 rigid moving-object velocity (weapons/tools/props on animated bones, objects.hlsl). Per-draw
     // previous WVP bound at b12, spatially matched cross-frame; camera-reproj fallback on any miss.
     // InjBindRigidPrev = per STATIC GBuffer draw (after GeometryCapture::OnDrawIndexed); InjFillRigidPrev

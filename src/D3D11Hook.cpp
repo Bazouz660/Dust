@@ -2128,9 +2128,15 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
     // Motion-vector pass: snapshot this instanced GBuffer draw (per-instance
     // transform VB is captured too — see GeometryCapture::CaptureDrawState).
     if (GeometryCapture::HasActiveCapture())
+    {
         GeometryCapture::OnDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
                                                 StartIndexLocation, BaseVertexLocation,
                                                 StartInstanceLocation);
+        // Instanced draws skip the pose matcher, but an instanced SKINNED draw's patched VS still
+        // reads b12 — bind the zero CB so it gets the camera-reproj fallback, not a stale pose.
+        if (sMvFeederActive)
+            MotionVectors::InjBindZeroB12(pThis);
+    }
 
     // Direct-light AO for point/spot lights (instanced light-volume path — see HookedDrawIndexed).
     bool isLV = gLvAoReady && IsLightVolumeDraw(pThis);
