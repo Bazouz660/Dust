@@ -257,6 +257,23 @@ static bool IsGBufferConfig(UINT numViews,
     slot.valid = true;
     sRtClassNext = (sRtClassNext + 1) % kRtClassCacheSize;
 
+    // DIAGNOSTIC (icon-pass investigation): log each DISTINCT RTV0 that classifies as a GBuffer
+    // bind. The main scene GBuffer is one; if the icon workspace (rtt.compositor) ever classifies
+    // too, our jitter/velocity-append/capture machinery fires on icon renders.
+    if (isGBuffer)
+    {
+        static ID3D11RenderTargetView* sSeenGBuf[16] = {};
+        static int sSeenCount = 0;
+        bool seen = false;
+        for (int i = 0; i < sSeenCount; i++) if (sSeenGBuf[i] == ppRTVs[0]) { seen = true; break; }
+        if (!seen && sSeenCount < 16)
+        {
+            sSeenGBuf[sSeenCount++] = ppRTVs[0];
+            Log("GBuffer-classified bind #%d: RTV0=%p DSV=%p (%ux%u)",
+                sSeenCount, (void*)ppRTVs[0], (void*)pDSV, sExpectedWidth, sExpectedHeight);
+        }
+    }
+
     return isGBuffer;
 }
 

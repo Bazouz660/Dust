@@ -90,7 +90,11 @@ static PFN_CreateTexture2D oCreateTexture2D = nullptr;
 // DLSS texture MIP-LOD bias: DLSS/DLAA supersamples, so NVIDIA's guide prescribes biasing texture
 // sampling by log2(render/display) - 1 = -1.0 for DLAA. gDlssWanted (read from the ini at device
 // capture) gates a CreateSamplerState hook that adds this to every sampler.
+// gMipBiasSharpen ([Upscaling] MipBiasSharpen, default 1) is a kill-switch for that hook — it
+// applies the bias to EVERY sampler in the process, including the icon pipeline's (whose materials
+// already carry a native -0.5 bias), which is a suspect for icon-texture aliasing.
 static bool  gDlssWanted   = false;
+static bool  gMipBiasSharpen = true;
 static const float kDlssMipBias = -1.0f;
 typedef HRESULT(STDMETHODCALLTYPE* PFN_CreateSamplerState)(
     ID3D11Device*, const D3D11_SAMPLER_DESC*, ID3D11SamplerState**);
@@ -410,7 +414,11 @@ static int   sUpsBackend = 0;     // 0 = DLSS, 1 = FSR2 (declared early so the j
 // OMSet hooks: non-GBuffer bind whose DSV == this frame's GBuffer DSV) and jitter their viewports too.
 // Compositor QUADS inside such passes (fog/tonemap; image-space) are un-jittered per-draw in HookedDraw.
 static bool  gFwdScenePass = false;
-static bool  gJitterForwardPasses = true;   // [Upscaling] JitterForwardPasses (debug off-switch)
+// [Upscaling] JitterForwardPasses — default OFF (2026-07-20): some UI elements render inside a
+// pass that binds the scene depth buffer, and the per-draw quad un-jitter doesn't catch them all,
+// so the jittered viewport makes the UI visibly wobble. The cost of OFF is the original artifact
+// this flag existed to fix: thin far silhouettes against sky/fog wobble by the jitter amplitude.
+static bool  gJitterForwardPasses = false;
 
 // Dust-side rendering (effect dispatches, MV/upscaler fullscreen passes, ImGui) sets its own
 // viewports through the hooked context. Those must NEVER be jittered — only OGRE's own pass
@@ -494,6 +502,12 @@ static int              sUpsActiveBackend = -1;    // currently-initialized back
 static bool             sUpsInitTried  = false;    // NGX availability probed
 static int              sUpsFeaturePreset = -1;    // preset the live feature was created with (-1 = none)
 static bool             sUpsJitterOn   = false;    // tracked so we toggle jitter cleanly on enable/disable
+// [Upscaling] TemporalJitter (default 1): kill-switch for the per-frame sub-pixel viewport jitter.
+// (Added while chasing the quadrant-coloured icons; the jitter was CLEARED — the real culprit was
+// the MV-injection gate flipping between sessions, see MvInjectionWanted/BuildCacheStamp. The icon
+// workspace GBuffer is icon-sized, so it never classifies as the scene GBuffer and is never
+// jittered. Kept as a debug lever for temporal artifacts.)
+static bool             gTemporalJitterWanted = true;
 static bool             sUpsResetNext  = false;    // discard DLSS history on the next frame (enable/recreate)
 static ID3D11Texture2D*          sUpsOut    = nullptr; // DLSS output (UAV); copied/sharpened back to scene color
 static ID3D11ShaderResourceView* sUpsOutSRV = nullptr; // SRV of sUpsOut, for the sharpen pass to sample
@@ -512,7 +526,7 @@ static bool             sUpsDescLogged = false;
 // single cheap bool. So a toggle takes one frame to fully engage/disengage — harmless. When it's off,
 // the feeder does nothing and holds no VRAM, so a disabled upscaler is (near) vanilla cost.
 static bool             sMvFeederActive = false;
-static bool             gCaptureGeometryWanted = false;  // [Upscaling] CaptureGeometry — applied only while the feeder is active
+static bool             gCaptureGeometryWanted = true;   // [Upscaling] CaptureGeometry (default ON) — applied only while the feeder is active
 
 // Width/height of a resource (0/false if not a Texture2D). Used to skip the resolve when the color,
 // depth and MV inputs momentarily disagree (e.g. mid-pipeline-rebuild) instead of freezing the image.
@@ -597,7 +611,8 @@ static void RunUpscaler(ID3D11DeviceContext* ctx)
         sUpsSharpness = GetPrivateProfileIntA("Upscaling", "DLSSSharpness", 0, iniPath.c_str()) / 100.0f;
         sUpsBackend   = GetPrivateProfileIntA("Upscaling", "Backend", 0, iniPath.c_str());     // 0=DLSS 1=FSR2 2=FSR3
         sUpsDepthConvert     = GetPrivateProfileIntA("Upscaling", "DepthConvert", 1, iniPath.c_str()) != 0;
-        gJitterForwardPasses = GetPrivateProfileIntA("Upscaling", "JitterForwardPasses", 1, iniPath.c_str()) != 0;
+        gJitterForwardPasses = GetPrivateProfileIntA("Upscaling", "JitterForwardPasses", 0, iniPath.c_str()) != 0;
+        gTemporalJitterWanted = GetPrivateProfileIntA("Upscaling", "TemporalJitter", 1, iniPath.c_str()) != 0;
     }
 
     // Decide whether the MV feeder should run this frame, and drive its cost from that. This runs before
@@ -660,7 +675,7 @@ static void RunUpscaler(ID3D11DeviceContext* ctx)
         if (created) { sUpsFeaturePreset = sUpsPresetIdx; sUpsResetNext = true; }
         else { sUpsEnabled = false; if (sUpsJitterOn) { SetTemporalJitter(0); sUpsJitterOn = false; } return; }
     }
-    if (!sUpsJitterOn) { SetTemporalJitter(1); sUpsJitterOn = true; sUpsResetNext = true; }  // fresh history
+    if (!sUpsJitterOn) { SetTemporalJitter(gTemporalJitterWanted ? 1 : 0); sUpsJitterOn = true; sUpsResetNext = true; }  // fresh history
 
     ID3D11RenderTargetView*   colorRTV = gResourceRegistry.GetRTV(ResourceName::LDR_RTV);
     ID3D11ShaderResourceView* depthSRV = gResourceRegistry.GetSRV(ResourceName::DEPTH_SRV);
@@ -1247,22 +1262,24 @@ static void TryCaptureDevice(ID3D11Device* device)
     }
 
     // Motion-vector pass (upscaling): hand the device + GBuffer resolution to the
-    // geometry-capture layer, and opt in only when the user enables it in Dust.ini
-    // ([Upscaling] CaptureGeometry=1). Default OFF — capture is a per-frame cost.
+    // geometry-capture layer. [Upscaling] CaptureGeometry — default ON (2026-07-20): without it,
+    // skinned characters get camera-only reprojection under DLSS/FSR (the ghosting the true-MV
+    // feature exists to kill) with no UI hint why. The capture flag is driven per-frame by the MV
+    // feeder, so it costs nothing unless the upscaler (or MV debug viz) is actually on.
     GeometryCapture::SetDevice(gDevice);
     GeometryCapture::SetResolution(gWidth, gHeight);
     MotionVectors::SetDevice(gDevice);
     MotionVectors::OnResolution(gWidth, gHeight);
     {
         std::string iniPath = DustLogDir() + "Dust.ini";
-        // Remember the intent; the actual capture flag is driven per-frame by the MV feeder in
-        // RunUpscaler, so geometry capture only costs anything while the upscaler (or MV debug viz) is on.
-        gCaptureGeometryWanted = GetPrivateProfileIntA("Upscaling", "CaptureGeometry", 0, iniPath.c_str()) != 0;
+        gCaptureGeometryWanted = GetPrivateProfileIntA("Upscaling", "CaptureGeometry", 1, iniPath.c_str()) != 0;
         if (gCaptureGeometryWanted)
-            Log("Upscaling: geometry capture requested ([Upscaling] CaptureGeometry=1) — active while the MV feeder is on");
+            Log("Upscaling: geometry capture on ([Upscaling] CaptureGeometry) — active while the MV feeder is on");
         // Read DLSS intent early (before OGRE creates its samplers) so the mip-bias hook can apply.
         gDlssWanted = GetPrivateProfileIntA("Upscaling", "DLSS", 0, iniPath.c_str()) != 0;
-        if (gDlssWanted) Log("Upscaling: DLSS on -> applying %.1f texture mip bias to new samplers", kDlssMipBias);
+        gMipBiasSharpen = GetPrivateProfileIntA("Upscaling", "MipBiasSharpen", 1, iniPath.c_str()) != 0;
+        if (gDlssWanted && gMipBiasSharpen) Log("Upscaling: DLSS on -> applying %.1f texture mip bias to new samplers", kDlssMipBias);
+        else if (gDlssWanted) Log("Upscaling: DLSS on, mip-bias sharpening disabled (MipBiasSharpen=0)");
     }
 
     // Initialize all loaded effect plugins
@@ -1324,7 +1341,7 @@ static HRESULT STDMETHODCALLTYPE HookedCreateSamplerState(
 {
     // When DLSS is on, sharpen by exposing ~1 extra mip of texture detail for it to resolve. Harmless
     // on point/no-mip samplers (the driver ignores the bias there), so it's applied unconditionally.
-    if (!gShutdownSignaled && gDlssWanted && pDesc)
+    if (!gShutdownSignaled && gDlssWanted && gMipBiasSharpen && pDesc)
     {
         D3D11_SAMPLER_DESC d = *pDesc;
         d.MipLODBias += kDlssMipBias;
@@ -1708,6 +1725,11 @@ static void FirePostLightVolumes(ID3D11DeviceContext* ctx, InjectionPoint point,
     }
 }
 
+// Fwd decls for the [Debug] LogIconDraws diagnostic (defined before HookedDraw below) — the
+// create hooks record bytecode for the draw-time disassembly dump.
+static bool IconDrawLogEnabled();
+static void IconDbgNoteShader(void* obj, const void* bytecode, SIZE_T len);
+
 static HRESULT STDMETHODCALLTYPE HookedCreatePixelShader(
     ID3D11Device* pThis, const void* pShaderBytecode, SIZE_T BytecodeLength,
     ID3D11ClassLinkage* pClassLinkage, ID3D11PixelShader** ppPixelShader)
@@ -1725,6 +1747,8 @@ static HRESULT STDMETHODCALLTYPE HookedCreatePixelShader(
     if (SUCCEEDED(hr) && ppPixelShader && *ppPixelShader)
     {
         SurveyRecorder::OnPixelShaderCreated(pShaderBytecode, BytecodeLength, *ppPixelShader);
+        if (IconDrawLogEnabled())
+            IconDbgNoteShader(*ppPixelShader, pShaderBytecode, BytecodeLength);
 
         // Record this shader if it's a patched light_fs. This MUST be reliable: the patched
         // light_fs multiplies each light by t8/t9/t10, so a shader we fail to recognize
@@ -1806,8 +1830,129 @@ static HRESULT STDMETHODCALLTYPE HookedCreateVertexShader(
         // Reflect the VS CB layout so GeometryCapture can classify draws
         // (STATIC vs SKINNED) and locate the clip/world matrix for the MV pass.
         ShaderMetadata::OnVertexShaderCreated(pShaderBytecode, BytecodeLength, *ppVertexShader);
+        if (IconDrawLogEnabled())
+            IconDbgNoteShader(*ppVertexShader, pShaderBytecode, BytecodeLength);
     }
     return hr;
+}
+
+// ==================== [Debug] LogIconDraws diagnostic ====================
+// Ground-truth instrument for the quadrant-coloured item icons: logs each DISTINCT VS/PS pair
+// drawn into a SMALL offscreen colour RT (<=512px — the item-icon / portrait pipeline) with the
+// shaders' compile-time identities from SurveyRecorder. Kenshi builds its icon materials in C++,
+// so the .material scripts cannot tell us which pair the icon draw actually binds — this can.
+// Also dumps the bound pair's DISASSEMBLY (exact compiled OSGN/ISGN signatures — variant-level
+// truth the sources cannot give) plus the PS SRV bindings, to DustLogDir()\icon_shaders\.
+// Off by default; zero cost beyond one cached ini read when disabled.
+static std::unordered_map<void*, std::vector<uint8_t>> sIconDbgBlob;   // shader object -> bytecode
+static std::mutex sIconDbgBlobMutex;
+static void IconDbgNoteShader(void* obj, const void* bytecode, SIZE_T len)
+{
+    if (!obj || !bytecode || !len) return;
+    std::lock_guard<std::mutex> lk(sIconDbgBlobMutex);
+    sIconDbgBlob[obj].assign((const uint8_t*)bytecode, (const uint8_t*)bytecode + len);
+}
+static void IconDbgDumpAsm(void* obj, const char* stage, const ShaderSourceInfo* info)
+{
+    std::vector<uint8_t> blob;
+    {
+        std::lock_guard<std::mutex> lk(sIconDbgBlobMutex);
+        auto it = sIconDbgBlob.find(obj);
+        if (it != sIconDbgBlob.end()) blob = it->second;
+    }
+    if (blob.empty()) { Log("ICONDRAW: no bytecode recorded for %s %p", stage, obj); return; }
+    ID3DBlob* txt = nullptr;
+    if (FAILED(D3DDisassemble(blob.data(), blob.size(), 0, nullptr, &txt)) || !txt)
+    { Log("ICONDRAW: disassembly failed for %s %p", stage, obj); return; }
+    std::string dir = DustLogDir() + "icon_shaders";
+    CreateDirectoryA(dir.c_str(), nullptr);
+    char path[MAX_PATH];
+    snprintf(path, sizeof(path), "%s\\%s_%p_%s.asm", dir.c_str(), stage, obj,
+             info ? info->entryPoint.c_str() : "unknown");
+    FILE* f = fopen(path, "wb");
+    if (f)
+    {
+        fwrite(txt->GetBufferPointer(), 1, strlen((const char*)txt->GetBufferPointer()), f);
+        fclose(f);
+        Log("ICONDRAW: dumped %s", path);
+    }
+    txt->Release();
+}
+static bool IconDrawLogEnabled()
+{
+    static int cached = -1;
+    if (cached < 0)
+        cached = GetPrivateProfileIntA("Debug", "LogIconDraws", 0,
+                                       (DustLogDir() + "Dust.ini").c_str());
+    return cached != 0;
+}
+static void LogIconDraw(ID3D11DeviceContext* ctx, const char* kind, UINT count, UINT instances)
+{
+    ID3D11RenderTargetView* rtvs[4] = {};
+    ID3D11DepthStencilView* dsv = nullptr;
+    ctx->OMGetRenderTargets(4, rtvs, &dsv);
+    D3D11_TEXTURE2D_DESC desc = {};
+    bool iconSized = false;
+    if (rtvs[0])
+    {
+        ID3D11Resource* res = nullptr;
+        rtvs[0]->GetResource(&res);
+        ID3D11Texture2D* tex = nullptr;
+        if (res) { res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex); res->Release(); }
+        if (tex) { tex->GetDesc(&desc); tex->Release(); iconSized = desc.Width <= 512 && desc.Height <= 512; }
+    }
+    if (iconSized)
+    {
+        UINT nRt = 0;
+        for (UINT i = 0; i < 4; i++) if (rtvs[i]) nRt = i + 1;
+        ID3D11VertexShader* vs = nullptr; ID3D11PixelShader* ps = nullptr;
+        ctx->VSGetShader(&vs, nullptr, nullptr);
+        ctx->PSGetShader(&ps, nullptr, nullptr);
+        static std::unordered_set<uint64_t> sSeenPairs;
+        static std::mutex sSeenMutex;
+        bool fresh;
+        {
+            std::lock_guard<std::mutex> lk(sSeenMutex);
+            fresh = sSeenPairs.insert((uint64_t)(uintptr_t)vs ^ ((uint64_t)(uintptr_t)ps << 1)).second;
+        }
+        if (fresh)
+        {
+            const ShaderSourceInfo* vi = SurveyRecorder::GetShaderSource((uint64_t)(uintptr_t)vs);
+            const ShaderSourceInfo* pi = SurveyRecorder::GetShaderSource((uint64_t)(uintptr_t)ps);
+            UINT nvp = 1; D3D11_VIEWPORT vp = {};
+            ctx->RSGetViewports(&nvp, &vp);
+            Log("ICONDRAW[%s]: rt0=%ux%u fmt=%d nRT=%u dsv=%d vp=%.0fx%.0f n=%u inst=%u VS=%p (%s : %s) PS=%p (%s : %s)",
+                kind, desc.Width, desc.Height, (int)desc.Format, nRt, dsv ? 1 : 0,
+                vp.Width, vp.Height, count, instances,
+                (void*)vs, vi ? vi->sourceName.c_str() : "?", vi ? vi->entryPoint.c_str() : "?",
+                (void*)ps, pi ? pi->sourceName.c_str() : "?", pi ? pi->entryPoint.c_str() : "?");
+            IconDbgDumpAsm((void*)vs, "vs", vi);
+            IconDbgDumpAsm((void*)ps, "ps", pi);
+            // PS SRV bindings t0-t7: catches a wrong/mis-dimensioned texture (e.g. a 2D texture
+            // where the icon shader expects its reflection CUBE at t3).
+            ID3D11ShaderResourceView* srvs[8] = {};
+            ctx->PSGetShaderResources(0, 8, srvs);
+            for (UINT i = 0; i < 8; i++)
+            {
+                if (!srvs[i]) continue;
+                D3D11_SHADER_RESOURCE_VIEW_DESC sd;
+                srvs[i]->GetDesc(&sd);
+                ID3D11Resource* sres = nullptr;
+                srvs[i]->GetResource(&sres);
+                ID3D11Texture2D* stex = nullptr;
+                D3D11_TEXTURE2D_DESC td = {};
+                if (sres) { sres->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&stex); sres->Release(); }
+                if (stex) { stex->GetDesc(&td); stex->Release(); }
+                Log("ICONDRAW:   PS t%u dim=%d fmt=%d %ux%u arr=%u", i,
+                    (int)sd.ViewDimension, (int)td.Format, td.Width, td.Height, td.ArraySize);
+                srvs[i]->Release();
+            }
+        }
+        if (vs) vs->Release();
+        if (ps) ps->Release();
+    }
+    for (UINT i = 0; i < 4; i++) if (rtvs[i]) rtvs[i]->Release();
+    if (dsv) dsv->Release();
 }
 
 static void STDMETHODCALLTYPE HookedDraw(
@@ -1826,6 +1971,9 @@ static void STDMETHODCALLTYPE HookedDraw(
     // Survey: record ALL draws (before fullscreen filter)
     if (Survey::IsActive())
         SurveyRecorder::OnDraw(pThis, VertexCount, StartVertexLocation);
+
+    if (IconDrawLogEnabled())
+        LogIconDraw(pThis, "D", VertexCount, 1);
 
     if (VertexCount != 3 && VertexCount != 4)
     {
@@ -2089,6 +2237,9 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     if (Survey::IsActive())
         SurveyRecorder::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 
+    if (IconDrawLogEnabled())
+        LogIconDraw(pThis, "DI", IndexCount, 1);
+
     // Motion-vector pass: snapshot this GBuffer draw's transform state. Fast-path
     // no-op unless capture is enabled AND we're inside the GBuffer pass.
     if (GeometryCapture::HasActiveCapture())
@@ -2124,6 +2275,9 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
         SurveyRecorder::OnDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
                                                 StartIndexLocation, BaseVertexLocation,
                                                 StartInstanceLocation);
+
+    if (IconDrawLogEnabled())
+        LogIconDraw(pThis, "DII", IndexCountPerInstance, InstanceCount);
 
     // Motion-vector pass: snapshot this instanced GBuffer draw (per-instance
     // transform VB is captured too — see GeometryCapture::CaptureDrawState).
@@ -2597,7 +2751,14 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
     // caster pass of a pool-reused atlas (a shadow-mode switch can rebuild
     // the whole workspace from OGRE's texture pool with zero creations).
     if (!gShadowSwapActive && gShadowAtlasOverride == 0)
-    { oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView); return; }
+    {
+        oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView);
+        // No managed shadow bind can be live while the swap is off: clear stale caster state
+        // so a leftover gShadowPassScale never scales a later icon-atlas/UI viewport.
+        gInShadowPass = false;
+        gShadowPassScale = 1.0f;
+        return;
+    }
 
     ShadowBindDecision sb;
     ClassifyShadowBind(NumViews, ppRenderTargetViews, pDepthStencilView, sb);

@@ -51,8 +51,10 @@ namespace D3D11Hook
 
     // True when the injected per-object motion vectors are actually consumed this session — the
     // DLSS/FSR upscaler is enabled, or the MV debug viz is on. ShaderPatch gates its GBuffer VS/PS
-    // injection on this: when nothing reads the velocity, injecting only risks albedo corruption on
-    // some users' shader sets (variants / shader mods) for no benefit. Reads the early "[Upscaling]
-    // DLSS" intent, so it is valid before the first object shader compiles.
+    // injection on this: when nothing reads the velocity, injecting is pure risk for no benefit.
+    // Reads the early "[Upscaling] DLSS" intent, so it is valid before the first object shader
+    // compiles. ALSO part of the shader-cache stamp (BuildCacheStamp in dllmain.cpp): cached
+    // bytecode bakes the injection decision in, so a gate flip must invalidate the cache or the
+    // engine pairs cached no-MV shaders with freshly compiled MV ones.
     bool MvInjectionWanted();
 }

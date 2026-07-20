@@ -104,7 +104,31 @@ static std::string BuildCacheStamp(const std::string& modDir)
     // mvsgv: the injected PS inputs are now placed BEFORE any SV_IsFrontFace parameter — appending
     // after it is an fxc error (X4576) that silently dropped the whole MV injection from every
     // DOUBLESIDED variant via the original-source compile fallback.
-    stamp += "|patch=shadow-b7-csm-r9-mvsgv";
+    // mvskinapp: skin.hlsl main_vs is back to END-APPEND placement (the 2026-07-18 'mvskin' anchor
+    // placement put oDustCur at output register 7 — the register where Kenshi's UNINJECTED icon
+    // shader rtticons.hlsl [COLOURING] reads its COLOR0 dye-colour input. D3D11 links matched
+    // semantics by NAME (so placement never mattered for the injected pairs), but a PS input with
+    // NO matching VS output is undefined, and on NV it reads the same-register VS output — clip
+    // position as the dye colour = the quadrant-coloured clothing icons. End-append keeps every
+    // vanilla output register intact, which is the actual invariant. See InjSkinVS in ShaderPatch.
+    // nosnap: DustStabilizeThreshold no longer snaps thresholds to 0.32 (it hollowed/darkened icons
+    // rendered through the deferred icon path) — the injected HLSL changed, so the cache must go.
+    // regroute: the pipeline routes VS->PS varyings BY REGISTER (live-proven 2026-07-20: a VS-only
+    // COLOR0 pad shifted the injected outputs and broke skin-family + plain-objects MVs — black
+    // characters/trees in the MV view). Scheme now: skin family = anchor placement both sides
+    // (4ed6cf0), objects/severed_limb = end-append + SYMMETRIC COLOR0 pad on VS and PS.
+    // iconcol: rtticons.hlsl COLOR input moved before SV_IsFrontFace (disasm-proven root cause of
+    // the quadrant icons: the SGV pushed COLOR0 to v8 = the injected oDustCur register; vanilla
+    // read past the VS outputs = the black dyed-icon jank). Icon PS text changed -> cache must go.
+    stamp += "|patch=shadow-b7-csm-r9-mvsgv-regroute-iconcol-nosnap";
+
+    // The MV-injection gate ([Upscaling] DLSS / ShowMotionVectors, read once per session) decides
+    // whether every GBuffer VS/PS compiles WITH or WITHOUT the injected velocity interpolants.
+    // Cached bytecode bakes that decision in, so the gate MUST be part of the stamp: toggling the
+    // upscaler in the GUI (which writes [Upscaling] DLSS) used to leave the next launch mixing
+    // cached no-MV shaders with freshly compiled MV shaders — MV-injected VSes paired with MV-less
+    // PSes and vice versa (missing velocity on some draws, undefined interpolant reads on others).
+    stamp += D3D11Hook::MvInjectionWanted() ? "|mv=1" : "|mv=0";
     return stamp;
 }
 

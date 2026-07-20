@@ -31,7 +31,8 @@ static bool DumpInjectedEnabled()
 static std::mutex sDumpSeenMutex;
 
 static void DumpInjection(const char* tag, const char* srcName, const char* entry,
-                          const std::string& original, const std::string& patched)
+                          const std::string& original, const std::string& patched,
+                          const D3D_SHADER_MACRO* pDefines = nullptr)
 {
     if (!DumpInjectedEnabled()) return;
 
@@ -50,6 +51,21 @@ static void DumpInjection(const char* tag, const char* srcName, const char* entr
         if (!seen.insert(base).second) return;
     }
 
+    // Header records the permutation's defines — the variant hash alone doesn't say WHICH #define
+    // set a dump is, and GBUFFER/backwards-compat defines drive the injection choices.
+    std::string hdr;
+    if (pDefines)
+    {
+        hdr = "// [Dust] DEFINES:";
+        for (const D3D_SHADER_MACRO* m = pDefines; m && m->Name; ++m)
+        {
+            hdr += ' ';
+            hdr += m->Name;
+            if (m->Definition && m->Definition[0]) { hdr += '='; hdr += m->Definition; }
+        }
+        hdr += "\n";
+    }
+
     std::string dir = DustLogDir() + "injected_shaders";
     CreateDirectoryA(dir.c_str(), nullptr);
     for (int i = 0; i < 2; ++i)
@@ -58,6 +74,7 @@ static void DumpInjection(const char* tag, const char* srcName, const char* entr
         FILE* f = fopen(path.c_str(), "wb");
         if (!f) continue;
         const std::string& s = (i == 0) ? original : patched;
+        if (!hdr.empty()) fwrite(hdr.data(), 1, hdr.size(), f);
         fwrite(s.data(), 1, s.size(), f);
         fclose(f);
     }
@@ -578,9 +595,6 @@ static std::string PatchObjectsShader(const std::string& src)
         "{\n"
         "\tif (!(t == t)) t = 0.30;\n"
         "\tt = clamp(t, 0.02, 0.98);\n"
-        "\tconst float CENTER = 0.32;\n"
-        "\tconst float MAX_DEV = 0.08;\n"
-        "\tif (abs(t - CENTER) > MAX_DEV) t = CENTER;\n"
         "\treturn t;\n"
         "}\n\n"
         "// [Dust] 4x4 ordered dither (Bayer)\n"
@@ -718,14 +732,13 @@ static bool InsBefore(std::string& s, size_t& from, const char* anchor, const st
 // Insert `text` at the END of the entry function's parameter list (just before its closing paren).
 //
 // THIS PLACEMENT IS LOAD-BEARING. Declaring the injected interpolants LAST gives them the HIGHEST
-// signature registers, so no existing parameter's register can shift. The old behaviour inserted
-// mid-list (right after a TEXCOORDn anchor), which pushed every later parameter down a register.
-// Verified with fxc reflection on the real objects.hlsl: with COLOURING defined, the vertex COLOR0
-// output moved reg7 -> reg9, while oDustCur (clip position) took reg7. Kenshi's forward item-icon
-// shader (rtticons.hlsl main_ps, compiled with ENABLE_BACKWARDS_COMPATIBILITY, which links by
-// REGISTER) shares this VS but is never injected, so it kept reading reg7 and received the clip
-// position as the item's faction colour -> the corrupted item icons. Appending keeps COLOR0 at reg7
-// and leaves the non-COLOURING variant byte-identical, so nothing that worked before changes.
+// signature registers, so no existing parameter's register can shift. This pipeline routes VS->PS
+// varyings BY REGISTER (live-proven 2026-07-20 — see InjPS), so the register layout IS the
+// contract: any uninjected consumer (rtticons.hlsl in the icon pipeline, construction, blood) must
+// see every vanilla output at its vanilla register. Mid-list insertion shifted them (COLOR0
+// reg7 -> reg9 with oDustCur landing on reg7 = clip position as the item's dye colour — the
+// original quadrant-icon bug). Appending keeps every vanilla register intact, and the injected
+// partner PSes append the SAME sequence so their iDustCur/iDustPrev registers line up.
 static bool InsAtParamEnd(std::string& s, const char* fnAnchor, const std::string& text)
 {
     size_t fn = s.find(fnAnchor);
@@ -741,12 +754,34 @@ static bool InsAtParamEnd(std::string& s, const char* fnAnchor, const std::strin
     return false;
 }
 
+// Sacrificial COLOR0 pad for the VSes whose meshes the item-icon pipeline renders (objects,
+// severed_limb — per the ICONDRAW ground-truth probe, icons draw with objects.hlsl main_vs +
+// uninjected rtticons.hlsl main_ps). The rtticons COLOURING variant reads `colour : COLOR0` at
+// input reg 7; the plain objects VS has no COLOR0 output, and this pipeline routes varyings BY
+// REGISTER, so without the pad that input would receive the first appended Dust output (clip
+// position) instead of vanilla's nothing/zeros. Declaring COLOR0 = 0 as the FIRST appended output
+// keeps reg 7 harmless. The guard skips variants that already output a real COLOR0 (objects
+// COLOURING/DUAL_TEXTURE); it is inert for sources without those defines. NOTE: the pad must be
+// mirrored in every INJECTED partner PS (pad flag in kPSpecs) or the register shift breaks their
+// iDustCur/iDustPrev reads — that asymmetry was the 2026-07-20 black-MV regression. (The pad did
+// NOT cure the quadrant icons on its own — that corruption enters through something the icon-pair
+// disassembly dump is still chasing — but it is kept as cheap register hygiene for reg 7.)
+static const char* kDustPadDecl =
+    "\n#if !defined(COLOURING) && !defined(DUAL_TEXTURE)"
+    "\n\tout float4 oDustPad : COLOR0,"
+    "\n#endif";
+static const char* kDustPadAssign =
+    "\n#if !defined(COLOURING) && !defined(DUAL_TEXTURE)"
+    "\n\toDustPad = float4(0,0,0,0);"
+    "\n#endif";
+
 // Generic velocity injection into a GBuffer VS. fnAnchor = entry-fn start; clipAssign = the clip-output
 // assignment; clipRHS = its RHS (recomputed into oDustCur — never read the SV_Position output).
 // The interpolants are APPENDED to the parameter list (see InsAtParamEnd) so they never shift an
-// existing parameter's register; `interp` is no longer used for placement.
+// existing parameter's register; `interp` is no longer used for placement. pad => prepend the
+// sacrificial COLOR0 (see kDustPadDecl) for icon-renderable meshes.
 static std::string InjVS(const std::string& src, const char* fnAnchor, const char* /*interp*/,
-                         const char* clipAssign, const char* clipRHS)
+                         const char* clipAssign, const char* clipRHS, bool pad = false)
 {
     if (Has(src, "oDustPrev")) return src;
     std::string s = src;
@@ -756,10 +791,13 @@ static std::string InjVS(const std::string& src, const char* fnAnchor, const cha
     // matrix packing (objects.hlsl column, skin.hlsl row) — without this, row-major shaders read it
     // transposed and produce garbage MVs.
     s.insert(fn, "cbuffer DustMVCB : register(b13) { column_major float4x4 dust_reproj; };\n");
-    if (!InsAtParamEnd(s, fnAnchor, ",\n\tout float4 oDustCur : TEXCOORD12,\n\tout float4 oDustPrev : TEXCOORD13\n")) return src;
+    std::string decl = std::string(",") + (pad ? kDustPadDecl : "") +
+                       "\n\tout float4 oDustCur : TEXCOORD12,\n\tout float4 oDustPrev : TEXCOORD13\n";
+    if (!InsAtParamEnd(s, fnAnchor, decl)) return src;
     size_t from = s.find(fnAnchor);                    // scope the body search to the entry function
     if (from == std::string::npos) return src;
-    std::string asgn = std::string("\n\toDustCur = ") + clipRHS + "; oDustPrev = mul(dust_reproj, oDustCur);";
+    std::string asgn = std::string(pad ? kDustPadAssign : "") +
+                       "\n\toDustCur = " + clipRHS + "; oDustPrev = mul(dust_reproj, oDustCur);";
     if (!InsAfter(s, from, clipAssign, asgn)) return src;
     return s;
 }
@@ -801,7 +839,12 @@ static std::string InjRigidVS(const std::string& src, const char* fnAnchor, cons
 // parameter — above its wrapping #ifdef when present, so variants without the define keep the exact
 // same appended layout as before. The SGV is rasterizer-fed, so shifting ITS register is harmless,
 // and everything declared before it keeps its register either way.
-static bool InsDustPSInputs(std::string& s, const char* fnAnchor)
+// pad => the paired VS carries the sacrificial COLOR0 pad (kDustPadDecl), and since this pipeline
+// routes varyings BY REGISTER the PS must declare the SAME sequence: a (unused) COLOR0 input under
+// the same preprocessor guard, immediately before iDustCur. Unused inputs keep their ISGN register,
+// so alignment holds. Without this symmetry the PS reads the pad as iDustCur (0/0 = NaN velocity —
+// the 2026-07-20 "characters and trees black in the MV view" regression).
+static bool InsDustPSInputs(std::string& s, const char* fnAnchor, bool pad)
 {
     size_t fn = s.find(fnAnchor);
     if (fn == std::string::npos) return false;
@@ -816,11 +859,15 @@ static bool InsDustPSInputs(std::string& s, const char* fnAnchor)
     }
     if (close == std::string::npos) return false;
 
+    const char* padBlock = pad ?
+        "#if !defined(COLOURING) && !defined(DUAL_TEXTURE)\n\tfloat4 iDustPad : COLOR0,\n#endif\n\t" : "";
+
     size_t sgv = s.find("SV_IsFrontFace", open);
     if (sgv == std::string::npos || sgv > close)
     {
-        // No SGV input — plain append, byte-identical to the previous behaviour.
-        s.insert(close, ",\n\tfloat4 iDustCur : TEXCOORD12,\n\tfloat4 iDustPrev : TEXCOORD13,\n\tout float2 oDustVel : SV_Target3\n");
+        // No SGV input — plain append, byte-identical to the previous behaviour (plus the pad).
+        s.insert(close, std::string(",\n") + padBlock +
+                        "float4 iDustCur : TEXCOORD12,\n\tfloat4 iDustPrev : TEXCOORD13,\n\tout float2 oDustVel : SV_Target3\n");
         return true;
     }
     size_t ins = s.rfind('\n', sgv);
@@ -833,7 +880,8 @@ static bool InsDustPSInputs(std::string& s, const char* fnAnchor)
         if (firstNonWs != std::string::npos && s.compare(firstNonWs, 3, "#if") == 0)
             ins = prevStart;                        // hop above the #ifdef guarding the SGV
     }
-    s.insert(ins, "float4 iDustCur : TEXCOORD12,\n\tfloat4 iDustPrev : TEXCOORD13,\n\tout float2 oDustVel : SV_Target3,\n\t");
+    s.insert(ins, std::string(padBlock) +
+                  "float4 iDustCur : TEXCOORD12,\n\tfloat4 iDustPrev : TEXCOORD13,\n\tout float2 oDustVel : SV_Target3,\n\t");
     return true;
 }
 
@@ -858,17 +906,21 @@ static bool InsAtFuncStart(std::string& s, const char* fnAnchor, const std::stri
     return true;
 }
 
-// Generic velocity injection into a GBuffer PS. Two placement modes for the injected signature:
-//  - interp == nullptr: inputs are APPENDED to the parameter list (InsDustPSInputs) so they take
-//    the highest registers and cannot shift an existing input (COLOR0 in the COLOURING variants
-//    especially). Required for VSes shared with UNINJECTED pixel shaders (the rtticons icons bug).
-//  - interp != nullptr: LEGACY anchor placement — inputs right after `interp`, output before
-//    gbufOut. Required for the character/skin family: Kenshi compiles with
-//    ENABLE_BACKWARDS_COMPATIBILITY (positional VS->PS linkage) and those PSes have a different
-//    parameter count than skin.hlsl main_vs, so end-append misaligns the registers (hair bug).
+// Generic velocity injection into a GBuffer PS. GROUND TRUTH (LIVE-proven 2026-07-20): this
+// pipeline routes VS->PS varyings BY REGISTER — semantic names are documentation only. (Proof: a
+// VS-side COLOR0 pad without a matching PS-side input shifted every later varying and turned all
+// skin-family and plain-objects MVs into NaN — black characters/trees in the MV view.) So each
+// PS's injected parameter sequence must mirror its paired VS's REGISTER layout exactly:
+//  - interp == nullptr (objects-style): the PS's vanilla inputs mirror the VS's vanilla outputs
+//    1:1, so APPEND at the end (InsDustPSInputs), with the pad flag matching the VS spec's.
+//  - interp != nullptr (skin/character/creature family): those PSes have DIFFERENT vanilla input
+//    counts than skin.hlsl main_vs (hair_fs has no wet/blood inputs), so end-append cannot align
+//    every family member. ANCHOR placement right after the shared TC0-5 prefix ("TEXCOORD5,")
+//    on BOTH the VS and every family PS puts iDustCur/iDustPrev at v7/v8 <- o7/o8 for the whole
+//    family regardless of each PS's tail (in-game verified: the 4ed6cf0 hair fix).
 // gbufOut is still required as proof this really is a GBuffer PS.
 static std::string InjPS(const std::string& src, const char* fnAnchor, const char* interp,
-                         const char* gbufOut, const char* body)
+                         const char* gbufOut, const char* body, bool pad)
 {
     if (Has(src, "oDustVel")) return src;
     std::string s = src;
@@ -880,7 +932,7 @@ static std::string InjPS(const std::string& src, const char* fnAnchor, const cha
         if (!InsAfter(s, from, interp, "\n\tfloat4 iDustCur : TEXCOORD12,\n\tfloat4 iDustPrev : TEXCOORD13,")) return src;
         if (!InsBefore(s, from, gbufOut, "out float2 oDustVel : SV_Target3,\n\t")) return src;
     }
-    else if (!InsDustPSInputs(s, fnAnchor)) return src;
+    else if (!InsDustPSInputs(s, fnAnchor, pad)) return src;
     from = s.find(fnAnchor);
     if (from == std::string::npos) return src;
     const std::string vel = "\n\toDustVel = (iDustCur.xy/iDustCur.w - iDustPrev.xy/iDustPrev.w) * float2(0.5, -0.5);";
@@ -897,36 +949,44 @@ static std::string InjPS(const std::string& src, const char* fnAnchor, const cha
 
 // Per-shader anchor tables, keyed by SOURCE FILE + entry point. Filename disambiguates the many
 // .hlsl that share the "main_vs"/"main_ps"/"main_fs" entry names (objects/terrain/skin/birds/...).
-struct VSpec { const char* srcFile; const char* entry; const char* fnAnchor; const char* interp; const char* clipAssign; const char* clipRHS; };
-struct PSpec { const char* srcFile; const char* entry; const char* fnAnchor; const char* interp; const char* gbufOut; const char* body; };
+struct VSpec { const char* srcFile; const char* entry; const char* fnAnchor; const char* interp; const char* clipAssign; const char* clipRHS; bool pad; };
+struct PSpec { const char* srcFile; const char* entry; const char* fnAnchor; const char* interp; const char* gbufOut; const char* body; bool pad; };
 
+// pad=true on the VSes whose meshes the item-icon pipeline can render (paired with the uninjected
+// rtticons COLOURING PS): rigid items = objects.hlsl, severed limbs = character.hlsl. foliage
+// farm_vs already outputs a real COLOR (no pad needed, and a second COLOR0 would not compile);
+// the rest never render item icons.
 static const VSpec kVSpecs[] = {
-    { "objects.hlsl",     "main_vs",      "void main_vs",      "TEXCOORD5,", "oPosition = mul(worldViewProjMatrix, position);", "mul(worldViewProjMatrix, position)" },
-    { "terrain.hlsl",     "main_vs",      "void main_vs",      "TEXCOORD1,", "oPosition = mul(worldViewProjMatrix, position);", "mul(worldViewProjMatrix, position)" },
-    { "triplanar.hlsl",   "triplanar_vs", "void triplanar_vs", "TEXCOORD5,", "oPosition = mul(worldViewProjMatrix, position);", "mul(worldViewProjMatrix, position)" },
-    { "mapfeature.hlsl",  "feature_vs",   "void feature_vs",   "TEXCOORD4,", "oPosition = mul(worldViewProj, iPosition);",      "mul(worldViewProj, iPosition)" },
-    { "distant_town.hlsl","main_vs",      "void main_vs",      "TEXCOORD2,", "oPosition = mul(worldViewProjMatrix, position);", "mul(worldViewProjMatrix, position)" },
-    { "birds.hlsl",       "main_vs",      "void main_vs",      "TEXCOORD5,", "oPosition = mul(viewProjMatrix, position);",       "mul(viewProjMatrix, position)" },
-    { "foliage.hlsl",     "farm_vs",      "void farm_vs",      "TEXCOORD5,", "oPosition = mul(viewProjMatrix, float4(finalPos, 1));", "mul(viewProjMatrix, float4(finalPos, 1))" },   // crops
-    { "character.hlsl",   "severed_limb_vs","void severed_limb_vs","TEXCOORD5,","oPosition = mul(worldViewProjMatrix, position);","mul(worldViewProjMatrix, position)" },
+    { "objects.hlsl",     "main_vs",      "void main_vs",      "TEXCOORD5,", "oPosition = mul(worldViewProjMatrix, position);", "mul(worldViewProjMatrix, position)", true },
+    { "terrain.hlsl",     "main_vs",      "void main_vs",      "TEXCOORD1,", "oPosition = mul(worldViewProjMatrix, position);", "mul(worldViewProjMatrix, position)", false },
+    { "triplanar.hlsl",   "triplanar_vs", "void triplanar_vs", "TEXCOORD5,", "oPosition = mul(worldViewProjMatrix, position);", "mul(worldViewProjMatrix, position)", false },  // has a real COLOR0 out
+    { "mapfeature.hlsl",  "feature_vs",   "void feature_vs",   "TEXCOORD4,", "oPosition = mul(worldViewProj, iPosition);",      "mul(worldViewProj, iPosition)", false },
+    { "distant_town.hlsl","main_vs",      "void main_vs",      "TEXCOORD2,", "oPosition = mul(worldViewProjMatrix, position);", "mul(worldViewProjMatrix, position)", false },
+    { "birds.hlsl",       "main_vs",      "void main_vs",      "TEXCOORD5,", "oPosition = mul(viewProjMatrix, position);",       "mul(viewProjMatrix, position)", false },
+    { "foliage.hlsl",     "farm_vs",      "void farm_vs",      "TEXCOORD5,", "oPosition = mul(viewProjMatrix, float4(finalPos, 1));", "mul(viewProjMatrix, float4(finalPos, 1))", false },   // crops; has a real COLOR out
+    { "character.hlsl",   "severed_limb_vs","void severed_limb_vs","TEXCOORD5,","oPosition = mul(worldViewProjMatrix, position);","mul(worldViewProjMatrix, position)", true },
 };
+// pad mirrors the paired VS spec's pad flag (register-routing symmetry — see InjPS).
+// The skin/character/creature family uses ANCHOR placement ("TEXCOORD5,"): all pair with
+// skin.hlsl main_vs but have different tail input counts, so only a shared-prefix anchor keeps
+// iDustCur/iDustPrev register-aligned for every member (the 4ed6cf0 hair fix, in-game verified).
 static const PSpec kPSpecs[] = {
-    { "objects.hlsl",    "main_ps",       "void main_ps",       nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // end-append: objects VS is shared with uninjected rtticons PS (icons bug)
-    { "terrain.hlsl",    "simple_fs",     "void simple_fs",     nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // LOD terrain
-    { "terrainfp4.hlsl", "main_fs",       "void main_fs",       nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // near terrain (pairs w/ terrain.hlsl main_vs)
-    { "terrainfp4.hlsl", "mapfeature_fs", "void mapfeature_fs", nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // pairs w/ mapfeature feature_vs
-    { "triplanar.hlsl",  "triplanar_ps",  "void triplanar_ps",  nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
-    { "mapfeature.hlsl", "terrain_fs",    "void terrain_fs",    nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
-    { "skin.hlsl",       "main_fs",       "void main_fs",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // skinned clothes (skin.hlsl main_vs — legacy anchor placement, see InjPS)
-    { "creature.hlsl",   "main_fs",       "void main_fs",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // creatures/animals (skin.hlsl main_vs, BLOOD variant). MUST be injected: its VS is the skinned VS, so leaving the PS un-injected mis-registers its wet(TEXCOORD6)/blood(TEXCOORD7) inputs -> garbage blood coords -> a tiled blood overlay on every creature.
-    { "distant_town.hlsl","main_fs",      "void main_fs",       nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },
-    { "foliage.hlsl",    "grass_fs",      "void grass_fs",      nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // grass
-    { "foliage.hlsl",    "foliage_fs",    "void foliage_fs",    nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // crops (farm_vs)
-    { "character.hlsl",  "main_fs",       "void main_fs",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // character body (skin.hlsl main_vs — legacy anchor placement)
-    { "character.hlsl",  "hair_fs",       "void hair_fs",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // hair (skin.hlsl main_vs) — legacy anchor placement; end-append misaligned its registers (positional linkage)
-    { "character.hlsl",  "zero_fs",       "void zero_fs",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // skin.hlsl main_vs — legacy anchor placement
-    { "character.hlsl",  "distant_fs",    "void distant_fs",    "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // character LOD (skin.hlsl main_vs) — legacy anchor placement
-    { "character.hlsl",  "severed_limb_fs","void severed_limb_fs",nullptr,    "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );" },  // pairs w/ severed_limb_vs (end-append, counts match)
+    { "objects.hlsl",    "main_ps",       "void main_ps",       nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );", true },   // pairs w/ objects main_vs (pad=true there)
+    { "terrain.hlsl",    "simple_fs",     "void simple_fs",     nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );", false },  // LOD terrain
+    { "terrainfp4.hlsl", "main_fs",       "void main_fs",       nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );", false },  // near terrain (pairs w/ terrain.hlsl main_vs)
+    { "terrainfp4.hlsl", "mapfeature_fs", "void mapfeature_fs", nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );", false },  // pairs w/ mapfeature feature_vs
+    { "triplanar.hlsl",  "triplanar_ps",  "void triplanar_ps",  nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );", false },
+    { "mapfeature.hlsl", "terrain_fs",    "void terrain_fs",    nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );", false },
+    { "skin.hlsl",       "main_fs",       "void main_fs",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );", false },  // skinned clothes (skin.hlsl main_vs — family anchor)
+    { "creature.hlsl",   "main_fs",       "void main_fs",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );", false },  // creatures/animals (skin.hlsl main_vs, BLOOD — family anchor)
+    { "distant_town.hlsl","main_fs",      "void main_fs",       nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );", false },
+    { "foliage.hlsl",    "grass_fs",      "void grass_fs",      nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );", false },  // grass
+    { "foliage.hlsl",    "foliage_fs",    "void foliage_fs",    nullptr,      "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );", false },  // crops (farm_vs)
+    { "character.hlsl",  "main_fs",       "void main_fs",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );", false },  // character body (family anchor)
+    { "character.hlsl",  "hair_fs",       "void hair_fs",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );", false },  // hair (family anchor; no INITIALISE_OUTPUT -> InsAtFuncStart fallback writes the velocity)
+    { "character.hlsl",  "zero_fs",       "void zero_fs",       "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );", false },  // family anchor (sparse input list — misaligned even in vanilla; zero-detail only)
+    { "character.hlsl",  "distant_fs",    "void distant_fs",    "TEXCOORD5,", "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );", false },  // character LOD (family anchor)
+    { "character.hlsl",  "severed_limb_fs","void severed_limb_fs",nullptr,    "out GBuffer buffer", "INITIALISE_OUTPUT( buffer );", true },   // pairs w/ severed_limb_vs (pad=true there; counts match)
 };
 
 // skin.hlsl main_vs needs TRUE animation MVs, not camera reproj: skin the vertex a second time with
@@ -942,15 +1002,16 @@ static std::string InjSkinVS(const std::string& src)
                  "cbuffer DustMVCB : register(b13) { column_major float4x4 dust_reproj; };\n");
     size_t from = s.find("void main_vs");
     if (from == std::string::npos) return src;
-    // ANCHOR placement, not end-append (InsAtParamEnd): Kenshi compiles with
-    // ENABLE_BACKWARDS_COMPATIBILITY, so VS->PS linkage is POSITIONAL — and the character-family
-    // PSes (hair_fs especially) have a different parameter count than this VS. End-append then
-    // lands oDustCur/oDustPrev on different registers than the PS's iDustCur/iDustPrev and the PS
-    // samples garbage (the "hair has no MVs" regression). After-TEXCOORD5 is the verified
-    // pre-icons-fix scheme: both sides insert at the same position. This VS is shared only with
-    // INJECTED PSes (skin/creature/character GBuffer), so no rtticons-style uninjected victim.
+    // FAMILY ANCHOR placement (after the shared TC0-5 prefix), matching every family PS in
+    // kPSpecs. This pipeline routes VS->PS varyings BY REGISTER (live-proven 2026-07-20 — see
+    // InjPS), and the family PSes have different tail input counts (hair_fs has no wet/blood), so
+    // only a shared-prefix anchor keeps iDustCur/iDustPrev at v7/v8 <- o7/o8 for ALL of them
+    // (the 4ed6cf0 hair fix, in-game verified). No COLOR0 pad here: per the ICONDRAW ground-truth
+    // probe, the item-icon pipeline renders items with objects.hlsl main_vs + rtticons.hlsl —
+    // skinned meshes (this VS) are used for the 128px character PORTRAITS, whose PSes are all
+    // injected family members and therefore anchor-aligned.
     if (!InsAfter(s, from, "TEXCOORD5,", "\n\tout float4 oDustCur : TEXCOORD12,\n\tout float4 oDustPrev : TEXCOORD13,")) return src;
-    std::string prev =
+    std::string prev = std::string() +
         "\n\toDustCur = mul(viewProjectionMatrix, blendPos);"
         "\n\tfloat4 dmvPrev = float4(0,0,0,0);"
         "\n\t[unroll] for (int dmvI = 0; dmvI < 3; dmvI++) dmvPrev += float4(mul(dust_prevBones[blendIdx[dmvI]], position).xyz, 1.0) * blendWgt[dmvI];"
@@ -1013,7 +1074,7 @@ static std::string InjectGBufferVS(const std::string& src, const char* entry, co
     //  regressed static geometry. objects.hlsl falls through to the generic camera-reproj InjVS below.)
     for (const VSpec& v : kVSpecs)
         if (strcmp(entry, v.entry) == 0 && Has(srcName, v.srcFile))
-            return InjChecked(InjVS(src, v.fnAnchor, v.interp, v.clipAssign, v.clipRHS), src, srcName, entry, "oDustPrev");
+            return InjChecked(InjVS(src, v.fnAnchor, v.interp, v.clipAssign, v.clipRHS, v.pad), src, srcName, entry, "oDustPrev");
     return src;
 }
 static std::string InjectGBufferPS(const std::string& src, const char* entry, const char* srcName)
@@ -1021,7 +1082,7 @@ static std::string InjectGBufferPS(const std::string& src, const char* entry, co
     if (!srcName) return src;
     for (const PSpec& ps : kPSpecs)
         if (strcmp(entry, ps.entry) == 0 && Has(srcName, ps.srcFile))
-            return InjChecked(InjPS(src, ps.fnAnchor, ps.interp, ps.gbufOut, ps.body), src, srcName, entry, "oDustVel");
+            return InjChecked(InjPS(src, ps.fnAnchor, ps.interp, ps.gbufOut, ps.body, ps.pad), src, srcName, entry, "oDustVel");
     return src;
 }
 
@@ -1052,7 +1113,7 @@ HRESULT WINAPI HookedD3DCompile(
             {
                 Log("ShaderPatch: patched deferred main_fs (%zu -> %zu bytes)",
                     src.size(), patched.size());
-                DumpInjection("deferred", pSourceName, pEntrypoint, src, patched);
+                DumpInjection("deferred", pSourceName, pEntrypoint, src, patched, pDefines);
                 HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
                                           pDefines, pInclude, pEntrypoint, pTarget,
                                           Flags1, Flags2, ppCode, ppErrorMsgs);
@@ -1130,19 +1191,58 @@ HRESULT WINAPI HookedD3DCompile(
         bool isVS = pTarget[0] == 'v';
         std::string src((const char*)pSrcData, SrcDataSize);
         std::string patched = src;
-        if (!isVS && patched.find("clip(normalTex.a - threshold)") != std::string::npos &&
+        // The alpha-dither fix targets IN-WORLD foliage. It must NOT touch the icon-rendering
+        // shader (rtticons.hlsl): DustStabilizeThreshold snaps any alpha threshold outside
+        // [0.24, 0.40] to 0.32, rewriting the icon pipeline's own threshold — icons come out
+        // hollow/over-clipped or darkened (translucency rescale), or fully clipped to nothing
+        // (the cross placeholder). The plain text match below can't tell the two pipelines
+        // apart, so exclude the icon shader by source name.
+        const bool isIconShader = pSourceName && strstr(pSourceName, "rtticons") != nullptr;
+        if (!isVS && !isIconShader && patched.find("clip(normalTex.a - threshold)") != std::string::npos &&
             patched.find("DustStabilizeThreshold") == std::string::npos)
             patched = PatchObjectsShader(patched);
+        // Item-icon quadrant fix (ROOT CAUSE, disasm-proven 2026-07-20): rtticons.hlsl main_ps
+        // declares its COLOURING `colour : COLOR` input AFTER the DOUBLESIDED SV_IsFrontFace
+        // parameter, so in DOUBLESIDED+COLOURING variants (mod cloth items) the SGV occupies v7
+        // and pushes COLOR0 to v8. This pipeline routes varyings BY REGISTER: v8 reads VS output
+        // o8 — one PAST vanilla's last output (COLOR0 sits at o7) — so vanilla renders these dyed
+        // icons BLACK (known mod jank), and with Dust's injected VS o8 = oDustCur = clip position,
+        // the white/cyan/blue/magenta quadrant tint. Moving the colour param to right after
+        // TEXCOORD5 (before the SGV) puts COLOR0 at v7 <- o7 = the REAL dye colour: corrupted
+        // icons get their true colours (better than vanilla's black). Variants without COLOURING
+        // are byte-identical; COLOURING without DOUBLESIDED keeps COLOR0 at v7 as before. The
+        // erase leaves the original #ifdef COLOURING block empty, which is legal.
+        if (isIconShader && !isVS)
+        {
+            size_t fn = patched.find("float4 main_ps");   // rtticons main_ps RETURNS float4 (not void)
+            if (fn != std::string::npos)
+            {
+                const char* colourDecl = "float4 colour : COLOR,";
+                size_t t5 = patched.find("worldPos : TEXCOORD5,", fn);
+                size_t c  = (t5 != std::string::npos) ? patched.find(colourDecl, t5) : std::string::npos;
+                if (c != std::string::npos)
+                {
+                    patched.erase(c, strlen(colourDecl));
+                    patched.insert(t5 + strlen("worldPos : TEXCOORD5,"),
+                                   "\n#ifdef COLOURING\n\tfloat4 colour : COLOR,\n#endif");
+                    Log("ShaderPatch: rtticons %s — COLOR input moved before SV_IsFrontFace (icon dye-colour fix)",
+                        pEntrypoint);
+                }
+            }
+        }
+        // Diagnostic (with [Debug] DumpInjectedShaders=1): dump the icon shaders (patched form).
+        if (isIconShader && DumpInjectedEnabled())
+            DumpInjection(isVS ? "vs" : "ps", pSourceName, pEntrypoint, src, patched, pDefines);
         // Per-object MV injection rewrites the game's GBuffer VS/PS signatures, and it is ONLY consumed
-        // by the DLSS/FSR upscaler resolve + the MV debug viz. When neither is active it is pure risk for
-        // no benefit: some users' shader sets (variants / shader mods) corrupt the albedo when injected
-        // (reported as garbage item icons + world chroma; exact trigger still under investigation — the
-        // simple "asymmetric injection shifts interpolant slots" theory was DISPROVEN on real HW at SM4,
-        // where VS->PS linkage is by semantic, not slot. CAVEAT: with ENABLE_BACKWARDS_COMPATIBILITY the
-        // fxc signature packing is POSITIONAL, so injected interpolants must sit at the same list
-        // position in both stages when the counts differ — see InjPS/InjSkinVS, the hair_fs regression).
-        // Only inject when something actually reads the
-        // velocity. (The alpha-dither fix above is independent — it stays.)
+        // by the DLSS/FSR upscaler resolve + the MV debug viz. When neither is active it is pure risk
+        // for no benefit, so only inject when something actually reads the velocity. The linkage model
+        // (RESOLVED 2026-07-20, fxc-verified): D3D11 links matched VS->PS semantics by NAME — but a PS
+        // input with NO same-name VS output reads same-register garbage on NV. The "garbage item icons"
+        // reports were the uninjected rtticons [COLOURING] PS (COLOR0 at input reg 7) paired with an
+        // anchor-injected skin.hlsl main_vs that had shifted clip position into output reg 7; the
+        // "world chroma" era was mixed-gate cached bytecode (gate now baked into the cache stamp, see
+        // BuildCacheStamp). This gate MUST stay session-stable: it participates in the stamp.
+        // (The alpha-dither fix above is independent — it stays.)
         bool mvInjected = false;
         if (D3D11Hook::MvInjectionWanted())
         {
@@ -1152,7 +1252,7 @@ HRESULT WINAPI HookedD3DCompile(
         }
         if (patched != src)
         {
-            DumpInjection(isVS ? "vs" : "ps", pSourceName, pEntrypoint, src, patched);
+            DumpInjection(isVS ? "vs" : "ps", pSourceName, pEntrypoint, src, patched, pDefines);
             HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
                                       pDefines, pInclude, pEntrypoint, pTarget,
                                       Flags1, Flags2, ppCode, ppErrorMsgs);
