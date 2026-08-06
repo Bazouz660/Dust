@@ -9,6 +9,7 @@
 #include "UpscalerControl.h"
 #include "Upscaler.h"
 #include "MotionVectors.h"
+#include "Localization.h"
 #include "imgui/imgui.h"
 #include "imgui/backends/imgui_impl_win32.h"
 #include "imgui/backends/imgui_impl_dx11.h"
@@ -65,6 +66,7 @@ struct FrameworkConfig {
     int toggleEffectsKey = 0;      // 0 = unbound; else VK code that flips all effects on/off
     std::string theme = "kenshi";  // GUI theme: "kenshi" or "dark"
     int uiScalePercent = 0;        // overlay scale; 0 = Auto (follow OS/monitor DPI)
+    std::string language = "auto"; // auto, en, zh_CN, zh_TW, etc.
 };
 
 
@@ -141,7 +143,7 @@ static char gNewPresetName[64] = {};
 // these to indicate what the next polled result should be used for.
 enum class PickerPurpose { None, Import, Export };
 static PickerPurpose gPickerPurpose = PickerPurpose::None;
-static std::string gPickerExportPresetName; // valid only for PickerPurpose::Export (by name — indices shift while the picker is open)
+static std::string gPickerExportPresetName; // valid only for PickerPurpose::Export (by name 鈥?indices shift while the picker is open)
 static std::string gPickerError;          // last error message (cleared when popup closes)
 static std::string gPickerInfo;           // last info message (e.g. "Imported 'X'")
 static int  gPickerInfoFrames = 0;        // countdown for transient info display
@@ -234,7 +236,7 @@ static void SnapshotEffect(size_t idx)
 // Find the "Enabled" bool pointer in an effect's settings array (first DUST_SETTING_BOOL)
 static bool* FindEnabledPtr(const LoadedEffect& le)
 {
-    if (!le.desc.settings) return nullptr; // malformed desc — see SnapshotEffect
+    if (!le.desc.settings) return nullptr; // malformed desc 鈥?see SnapshotEffect
     for (uint32_t i = 0; i < le.desc.settingCount; i++)
     {
         const DustSettingDesc& s = le.desc.settings[i];
@@ -304,6 +306,31 @@ static void SyncAllEffectsOnState()
 }
 
 // Case-insensitive substring match for the right-pane effect search filter.
+static const char* LocalizedIdLabel(const char* key, char* out, size_t outSize)
+{
+    if (!key) key = "";
+    snprintf(out, outSize, "%s###%s", DustLoc::T(key), key);
+    return out;
+}
+
+static const char* LocOr(const char* key, const char* fallback)
+{
+    const char* text = DustLoc::T(key);
+    return (text && strcmp(text, key) != 0) ? text : fallback;
+}
+
+static const char* LocalizedSettingDescription(const LoadedEffect& le, const DustSettingDesc& s,
+                                               char* out, size_t outSize)
+{
+    if (le.desc.name && s.name)
+    {
+        snprintf(out, outSize, "desc:%s:%s", le.desc.name, s.name);
+        const char* text = DustLoc::T(out);
+        if (text && strcmp(text, out) != 0)
+            return text;
+    }
+    return s.description ? DustLoc::T(s.description) : nullptr;
+}
 static bool EffectNameMatchesFilter(const char* name, const char* filter)
 {
     if (!filter || !*filter) return true;
@@ -463,7 +490,7 @@ static LRESULT CALLBACK DustWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
     if (gInitialized && gOverlayVisible)
     {
-        // Keep cursor visible — game tries to hide it via WM_SETCURSOR
+        // Keep cursor visible 鈥?game tries to hide it via WM_SETCURSOR
         if (msg == WM_SETCURSOR)
         {
             SetCursor(LoadCursorW(nullptr, IDC_ARROW));
@@ -494,7 +521,7 @@ static LRESULT CALLBACK DustWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
     }
     else if (gInitialized)
     {
-        // Overlay is closed — let ImGui handle only non-input messages
+        // Overlay is closed 鈥?let ImGui handle only non-input messages
         // (e.g. WM_DISPLAYCHANGE, WM_DEVICECHANGE) without consuming game input
         if (msg != WM_INPUT &&
             !(msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST) &&
@@ -530,7 +557,7 @@ static bool CreateBackBufferRTV(IDXGISwapChain* swapChain)
 
 // ==================== Theme ====================
 
-// Effective UI scale factor. uiScalePercent == 0 means "Auto" — follow the
+// Effective UI scale factor. uiScalePercent == 0 means "Auto" 鈥?follow the
 // OS/monitor DPI scale captured at init. Clamped to a sane range.
 static float ResolveUiScale()
 {
@@ -545,7 +572,7 @@ static float ResolveUiScale()
 // (Re)build the font atlas at the current UI scale. Loads Segoe UI from the
 // Windows fonts directory so text stays crisp at any scale (rasterized at the
 // target pixel size rather than bilinearly stretched); falls back to ImGui's
-// built-in font if it can't be loaded. Must NOT run mid-frame — the atlas is
+// built-in font if it can't be loaded. Must NOT run mid-frame 鈥?the atlas is
 // locked between NewFrame and Render, so runtime scale changes go through
 // gFontRebuildPending, which Render() drains before the frame starts.
 static void RebuildFontAtlas()
@@ -559,11 +586,26 @@ static void RebuildFontAtlas()
     char fontPath[MAX_PATH] = {};
     UINT n = GetWindowsDirectoryA(fontPath, MAX_PATH);
     bool loaded = false;
-    if (n > 0 && n + 19 < MAX_PATH)
+    if (n > 0)
     {
-        strcat_s(fontPath, sizeof(fontPath), "\\Fonts\\segoeui.ttf");
-        if (GetFileAttributesA(fontPath) != INVALID_FILE_ATTRIBUTES)
-            loaded = (io.Fonts->AddFontFromFileTTF(fontPath, px) != nullptr);
+        const char* fonts[] = {
+            DustLoc::IsChinese() ? "\\Fonts\\msyh.ttc" : "\\Fonts\\segoeui.ttf",
+            DustLoc::IsChinese() ? "\\Fonts\\simsun.ttc" : "\\Fonts\\segoeui.ttf",
+            "\\Fonts\\segoeui.ttf"
+        };
+        for (const char* suffix : fonts)
+        {
+            strcpy_s(fontPath, sizeof(fontPath), "");
+            GetWindowsDirectoryA(fontPath, MAX_PATH);
+            if (strlen(fontPath) + strlen(suffix) >= MAX_PATH) continue;
+            strcat_s(fontPath, sizeof(fontPath), suffix);
+            if (GetFileAttributesA(fontPath) == INVALID_FILE_ATTRIBUTES) continue;
+            const ImWchar* ranges = DustLoc::IsChinese()
+                ? io.Fonts->GetGlyphRangesChineseFull()
+                : nullptr;
+            loaded = (io.Fonts->AddFontFromFileTTF(fontPath, px, nullptr, ranges) != nullptr);
+            if (loaded) break;
+        }
     }
     if (!loaded)
     {
@@ -694,7 +736,7 @@ static void LoadFrameworkConfig()
     gDustIniPath = DustLogDir() + "Dust.ini";
     // FileLogging replaced "Logging" in v0.8: on by default so bug reports
     // always have logs (the old key auto-saved 0 as a default, which was
-    // never a deliberate user choice — hence the rename instead of a flip).
+    // never a deliberate user choice 鈥?hence the rename instead of a flip).
     gFwConfig.logging = GetPrivateProfileIntA("Dust", "FileLogging", 1, gDustIniPath.c_str()) != 0;
     gFwConfig.showStartupMessage = GetPrivateProfileIntA("Dust", "ShowStartupMessage", 1, gDustIniPath.c_str()) != 0;
     gFwConfig.showSurvey = GetPrivateProfileIntA("Dust", "ShowSurvey", 0, gDustIniPath.c_str()) != 0;
@@ -713,6 +755,11 @@ static void LoadFrameworkConfig()
         (gFwConfig.uiScalePercent < 50 || gFwConfig.uiScalePercent > 300))
         gFwConfig.uiScalePercent = 0;
 
+    char languageBuf[64] = {};
+    GetPrivateProfileStringA("Dust", "Language", "auto", languageBuf, sizeof(languageBuf), gDustIniPath.c_str());
+    gFwConfig.language = languageBuf;
+    DustLoc::Init(DustLogDir(), gFwConfig.language);
+
     char buf[256] = {};
     GetPrivateProfileStringA("Dust", "LastPreset", "", buf, sizeof(buf), gDustIniPath.c_str());
     gFwConfig.lastPreset = buf;
@@ -721,7 +768,7 @@ static void LoadFrameworkConfig()
     if (gFwConfig.lastPreset.empty())
         gFwConfig.lastPreset = "dust_high";
 
-    // Preset auto-load is deferred to Render() — effects may not be initialized yet
+    // Preset auto-load is deferred to Render() 鈥?effects may not be initialized yet
     // when the GUI starts (e.g. GUI inits from DustBoot swap chain before device capture).
 
     // Detect version change (Steam Workshop overwrites DLL but not Dust.ini)
@@ -729,7 +776,7 @@ static void LoadFrameworkConfig()
     GetPrivateProfileStringA("Dust", "LastSeenVersion", "", lastVersion, sizeof(lastVersion), gDustIniPath.c_str());
     if (strcmp(lastVersion, DUST_VERSION_STR) != 0)
     {
-        // First launch or version changed — update the stored version
+        // First launch or version changed 鈥?update the stored version
         gNewVersionInstalled = (lastVersion[0] != '\0'); // only show "new version" if there was a previous one
         WritePrivateProfileStringA("Dust", "LastSeenVersion", DUST_VERSION_STR, gDustIniPath.c_str());
         if (gNewVersionInstalled)
@@ -753,6 +800,7 @@ static void SaveFrameworkConfig()
     snprintf(keyBuf, sizeof(keyBuf), "%d", gFwConfig.toggleEffectsKey);
     WritePrivateProfileStringA("Dust", "ToggleEffectsKey", keyBuf, gDustIniPath.c_str());
     WritePrivateProfileStringA("Dust", "Theme", gFwConfig.theme.c_str(), gDustIniPath.c_str());
+    WritePrivateProfileStringA("Dust", "Language", gFwConfig.language.c_str(), gDustIniPath.c_str());
     snprintf(keyBuf, sizeof(keyBuf), "%d", gFwConfig.uiScalePercent);
     WritePrivateProfileStringA("Dust", "UiScalePercent", keyBuf, gDustIniPath.c_str());
     WritePrivateProfileStringA("Dust", "LastPreset", gFwConfig.lastPreset.c_str(), gDustIniPath.c_str());
@@ -787,7 +835,7 @@ static bool IsFrameworkDirty()
 
 static void DrawUpscalingSection()
 {
-    ImGui::TextColored(DustHeadingColor(), "Upscaling");
+    ImGui::TextColored(DustHeadingColor(), "%s", DustLoc::T("Upscaling"));
     ImGui::Separator();
     ImGui::Spacing();
 
@@ -796,7 +844,7 @@ static void DrawUpscalingSection()
     // sel: 0=Disabled 1=DLSS 2=FSR2 3=FSR3/4   <->   backend: DLSS=0 FSR2=1 FSR3=2
     const int be0 = UpscalerControl::GetBackend();
     int sel = !UpscalerControl::GetEnabled() ? 0 : (be0 == 1 ? 2 : be0 == 2 ? 3 : 1);
-    const char* items[] = { "Disabled", "DLSS", "FSR2", "FSR3 / FSR4" };
+    const char* items[] = { DustLoc::T("Disabled"), "DLSS", "FSR2", "FSR3 / FSR4" };
     if (ImGui::Combo("##upscaler", &sel, items, 4))
     {
         bool en      = (sel != 0);
@@ -808,47 +856,47 @@ static void DrawUpscalingSection()
         WritePrivateProfileStringA("Upscaling", "Backend", bs,             gDustIniPath.c_str());
     }
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Temporal anti-aliasing / upscaling. DLSS = NVIDIA RTX only (best quality). FSR2 = any GPU (native D3D11). FSR3 / FSR4 = any DX12 GPU via a D3D12 side-device; FSR4 needs a Radeon RX 9000. Disabled = off.");
+        ImGui::SetTooltip("%s", LocOr("tip:Upscaling", "Temporal anti-aliasing / upscaling. DLSS = NVIDIA RTX only (best quality). FSR2 = any GPU (native D3D11). FSR3 / FSR4 = any DX12 GPU via a D3D12 side-device; FSR4 needs a Radeon RX 9000. Disabled = off."));
 
     if (sel == 1 && !UpscalerControl::Available())
-        ImGui::TextDisabled("DLSS unavailable (needs NVIDIA RTX + recent driver)");
+        ImGui::TextDisabled("%s", DustLoc::T("DLSS unavailable (needs NVIDIA RTX + recent driver)"));
 
     if (sel != 0)
     {
         if (sel == 1)   // DLSS-only: model preset (FSR2 has no presets)
         {
             int preset = UpscalerControl::GetPreset();
-            if (ImGui::Combo("Preset", &preset, Upscaler::PresetLabels(), Upscaler::PRESET_COUNT))
+            if (ImGui::Combo(DustLoc::T("Preset"), &preset, Upscaler::PresetLabels(), Upscaler::PRESET_COUNT))
             {
                 UpscalerControl::SetPreset(preset);
                 char b[8]; snprintf(b, sizeof(b), "%d", preset);
                 WritePrivateProfileStringA("Upscaling", "DLSSPreset", b, gDustIniPath.c_str());
             }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("DLSS model. F = CNN DLAA (recommended). K/J are the DLSS-4 transformer: sharpest in theory, but blur the whole image when the scene is static in this integration. Changing it rebuilds the feature next frame.");
+                ImGui::SetTooltip("%s", LocOr("tip:DLSS model", "DLSS model. F = CNN DLAA (recommended). K/J are the DLSS-4 transformer: sharpest in theory, but blur the whole image when the scene is static in this integration. Changing it rebuilds the feature next frame."));
         }
 
         float sh = UpscalerControl::GetSharpness();
-        if (ImGui::SliderFloat("Sharpness", &sh, 0.0f, 1.0f, "%.2f"))
+        if (ImGui::SliderFloat(DustLoc::T("Sharpness"), &sh, 0.0f, 1.0f, "%.2f"))
         {
             UpscalerControl::SetSharpness(sh);
             char b[8]; snprintf(b, sizeof(b), "%d", (int)(sh * 100.0f + 0.5f));
             WritePrivateProfileStringA("Upscaling", "DLSSSharpness", b, gDustIniPath.c_str());
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Contrast-limited sharpen (RCAS) on the upscaled output — adds detail without Clarity's contrast/halo boost. Higher values can reintroduce some aliasing.");
+            ImGui::SetTooltip("%s", LocOr("tip:Sharpness", "Contrast-limited sharpen (RCAS) on the upscaled output - adds detail without Clarity's contrast/halo boost. Higher values can reintroduce some aliasing."));
     }
 
     ImGui::Spacing();
     {
         bool mv = MotionVectors::DebugVizEnabled();
-        if (ImGui::Checkbox("Show Motion Vectors", &mv))
+        if (ImGui::Checkbox(DustLoc::T("Show Motion Vectors"), &mv))
         {
             MotionVectors::SetDebugViz(mv);
             WritePrivateProfileStringA("Upscaling", "ShowMotionVectors", mv ? "1" : "0", gDustIniPath.c_str());
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Debug overlay of the motion-vector buffer: grey = still, colour = motion dir/magnitude, red = no MV.\nWatch grass/foliage while moving — if it stays grey while swaying, it has no valid MV and will ghost under DLSS (that's what a reactive mask would fix).");
+            ImGui::SetTooltip("%s", LocOr("tip:Show Motion Vectors", "Debug overlay of the motion-vector buffer: grey = still, colour = motion dir/magnitude, red = no MV. Watch grass/foliage while moving; if it stays grey while swaying, it has no valid MV and will ghost under DLSS."));
     }
 }
 
@@ -863,55 +911,55 @@ static void DrawFrameworkSection()
     // Toggle key binding (overlay GUI)
     if (gWaitingForKey)
     {
-        ImGui::Button("Press a key...", ImVec2(ImGui::GetContentRegionAvail().x, 0));
+        ImGui::Button(DustLoc::T("Press a key..."), ImVec2(ImGui::GetContentRegionAvail().x, 0));
     }
     else
     {
         char label[128];
-        snprintf(label, sizeof(label), "Toggle: %s", VKKeyName(gFwConfig.toggleKey));
+        snprintf(label, sizeof(label), DustLoc::T("Toggle: %s"), VKKeyName(gFwConfig.toggleKey));
         if (ImGui::Button(label, ImVec2(ImGui::GetContentRegionAvail().x, 0)))
         {
             gWaitingForKey = true;
             gWaitingForEffectsKey = false;
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Click to rebind the overlay toggle key");
+            ImGui::SetTooltip("%s", DustLoc::T("Click to rebind the overlay toggle key"));
     }
 
     // Toggle-all-effects key binding (works whether the overlay is open or closed)
     if (gWaitingForEffectsKey)
     {
-        ImGui::Button("Press a key...##fx", ImVec2(ImGui::GetContentRegionAvail().x, 0));
+        ImGui::Button(DustLoc::T("Press a key...##fx"), ImVec2(ImGui::GetContentRegionAvail().x, 0));
     }
     else
     {
         char label[128];
         if (gFwConfig.toggleEffectsKey == 0)
-            snprintf(label, sizeof(label), "Toggle Effects: (unbound)");
+            snprintf(label, sizeof(label), "%s", DustLoc::T("Toggle Effects: (unbound)"));
         else
-            snprintf(label, sizeof(label), "Toggle Effects: %s", VKKeyName(gFwConfig.toggleEffectsKey));
+            snprintf(label, sizeof(label), DustLoc::T("Toggle Effects: %s"), VKKeyName(gFwConfig.toggleEffectsKey));
         if (ImGui::Button(label, ImVec2(ImGui::GetContentRegionAvail().x, 0)))
         {
             gWaitingForEffectsKey = true;
             gWaitingForKey = false;
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Click to rebind the hotkey that flips all effects on/off. Works whether the overlay is open or closed. Set ToggleEffectsKey=0 in Dust.ini to unbind.");
+            ImGui::SetTooltip("%s", LocOr("tip:Toggle Effects hotkey", "Click to rebind the hotkey that flips all effects on/off. Works whether the overlay is open or closed. Set ToggleEffectsKey=0 in Dust.ini to unbind."));
     }
 
     ImGui::Spacing();
 
     {
-        const char* themeLabels[] = { "Kenshi", "Dark" };
+        const char* themeLabels[] = { DustLoc::T("Kenshi"), DustLoc::T("Dark") };
         const char* themeKeys[]   = { "kenshi", "dark"  };
         int themeIdx = (gFwConfig.theme == "dark") ? 1 : 0;
-        if (ImGui::Combo("Theme", &themeIdx, themeLabels, IM_ARRAYSIZE(themeLabels)))
+        if (ImGui::Combo(DustLoc::T("Theme"), &themeIdx, themeLabels, IM_ARRAYSIZE(themeLabels)))
         {
             gFwConfig.theme = themeKeys[themeIdx];
             ApplyDustTheme(gFwConfig.theme);
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("UI theme. Kenshi: desaturated grey-tan palette matching the game. Dark: ImGui default.");
+            ImGui::SetTooltip("%s", DustLoc::T("UI theme. Kenshi: desaturated grey-tan palette matching the game. Dark: ImGui default."));
     }
 
     ImGui::Spacing();
@@ -919,35 +967,33 @@ static void DrawFrameworkSection()
     {
         // 0 == "Auto" (follow Windows display scaling); the rest are fixed percentages.
         static const int   scalePcts[]   = { 0, 100, 125, 150, 175, 200 };
-        static const char* scaleLabels[] = { "Auto (Windows)", "100%", "125%", "150%", "175%", "200%" };
+        const char* scaleLabels[] = { DustLoc::T("Auto (Windows)"), "100%", "125%", "150%", "175%", "200%" };
         int scaleIdx = 0;
         for (int i = 0; i < IM_ARRAYSIZE(scalePcts); ++i)
             if (scalePcts[i] == gFwConfig.uiScalePercent) { scaleIdx = i; break; }
-        if (ImGui::Combo("UI Scale", &scaleIdx, scaleLabels, IM_ARRAYSIZE(scaleLabels)))
+        if (ImGui::Combo(DustLoc::T("UI Scale"), &scaleIdx, scaleLabels, IM_ARRAYSIZE(scaleLabels)))
         {
             gFwConfig.uiScalePercent = scalePcts[scaleIdx];
             ApplyDustTheme(gFwConfig.theme);  // re-applies colors + scaled style sizes
             gFontRebuildPending = true;       // rebuild font atlas at the new scale
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Scale the Dust overlay. Auto matches your Windows display scaling (%.0f%%).", gOsDpiScale * 100.0f);
+            ImGui::SetTooltip(DustLoc::T("Scale the Dust overlay. Auto matches your Windows display scaling (%.0f%%)."), gOsDpiScale * 100.0f);
     }
 
     ImGui::Spacing();
 
-    ImGui::Checkbox("Logging", &gFwConfig.logging);
+    ImGui::Checkbox(DustLoc::T("Logging"), &gFwConfig.logging);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Write timestamped logs to the logs/ folder next to the DLL.\n"
-                          "Only the 10 newest sessions are kept (20 MB max each), so disk\n"
-                          "usage stays bounded. Needed for useful bug reports.");
+        ImGui::SetTooltip("%s", DustLoc::T("Write timestamped logs to the logs/ folder next to the DLL. Only the 10 newest sessions are kept (20 MB max each), so disk usage stays bounded. Needed for useful bug reports."));
 
-    ImGui::Checkbox("Startup Message", &gFwConfig.showStartupMessage);
+    ImGui::Checkbox(DustLoc::T("Startup Message"), &gFwConfig.showStartupMessage);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Show notification on game start");
+        ImGui::SetTooltip("%s", DustLoc::T("Show notification on game start"));
 
-    ImGui::Checkbox("Show Survey", &gFwConfig.showSurvey);
+    ImGui::Checkbox(DustLoc::T("Show Survey"), &gFwConfig.showSurvey);
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Show pipeline survey controls (developer tool)");
+        ImGui::SetTooltip("%s", DustLoc::T("Show pipeline survey controls (developer tool)"));
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -957,15 +1003,15 @@ static void DrawFrameworkSection()
 
     if (dirty)
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.2f, 1.0f));
-    if (ImGui::Button("Save##fw", ImVec2(80, 0)) && dirty)
+    if (ImGui::Button(DustLoc::T("Save##fw"), ImVec2(80, 0)) && dirty)
         SaveFrameworkConfig();
     if (dirty)
         ImGui::PopStyleColor();
     if (ImGui::IsItemHovered() && !dirty)
-        ImGui::SetTooltip("No changes to save");
+        ImGui::SetTooltip("%s", DustLoc::T("No changes to save"));
 
     ImGui::SameLine();
-    if (ImGui::Button("Reset##fw", ImVec2(80, 0)) && dirty)
+    if (ImGui::Button(DustLoc::T("Reset##fw"), ImVec2(80, 0)) && dirty)
         ResetFrameworkConfig();
 
     // ---- Pipeline Survey (hidden by default, dev tool) ----
@@ -975,13 +1021,13 @@ static void DrawFrameworkSection()
         ImGui::Separator();
         ImGui::Spacing();
 
-        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Pipeline Survey");
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "%s", DustLoc::T("Pipeline Survey"));
 
         if (Survey::IsActive())
         {
-            ImGui::TextWrapped("Capturing frame %d / %d...",
+            ImGui::TextWrapped(DustLoc::T("Capturing frame %d / %d..."),
                                Survey::CurrentFrame() + 1, Survey::TotalFrames());
-            if (ImGui::Button("Stop Survey", ImVec2(ImGui::GetContentRegionAvail().x, 0)))
+            if (ImGui::Button(DustLoc::T("Stop Survey"), ImVec2(ImGui::GetContentRegionAvail().x, 0)))
                 Survey::Stop();
         }
         else
@@ -989,16 +1035,16 @@ static void DrawFrameworkSection()
             static int  surveyFrames = 3;
             static int  surveyDetail = 1;
             static char surveyLabel[64] = "";
-            ImGui::InputText("Label##survey", surveyLabel, sizeof(surveyLabel));
+            ImGui::InputText(DustLoc::T("Label##survey"), surveyLabel, sizeof(surveyLabel));
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Optional label for this capture (e.g. desert_night, hub_city)");
+                ImGui::SetTooltip("%s", DustLoc::T("Optional label for this capture (e.g. desert_night, hub_city)"));
             ImGui::SliderInt("Frames##survey", &surveyFrames, 1, 30);
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Number of frames to capture");
+                ImGui::SetTooltip("%s", DustLoc::T("Number of frames to capture"));
             ImGui::SliderInt("Detail##survey", &surveyDetail, 0, 3);
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("0=Minimal, 1=Standard, 2=Deep (CB data), 3=Full (VB/IB)");
-            if (ImGui::Button("Capture Survey", ImVec2(ImGui::GetContentRegionAvail().x, 0)))
+                ImGui::SetTooltip("%s", DustLoc::T("Survey detail levels"));
+            if (ImGui::Button(DustLoc::T("Capture Survey"), ImVec2(ImGui::GetContentRegionAvail().x, 0)))
             {
                 SurveyRecorder::Reset();
                 Survey::Start(surveyFrames, surveyDetail,
@@ -1029,7 +1075,7 @@ static void DrawPresetMetaTooltip(const PresetInfo& p)
     if (p.hasMetadata)
     {
         if (!p.metaAuthor.empty())
-            ImGui::Text("Author: %s", p.metaAuthor.c_str());
+            ImGui::Text(DustLoc::T("Author: %s"), p.metaAuthor.c_str());
         if (!p.metaDescription.empty())
         {
             ImGui::Separator();
@@ -1038,11 +1084,11 @@ static void DrawPresetMetaTooltip(const PresetInfo& p)
             ImGui::PopTextWrapPos();
         }
         if (p.metaApiVersion > 0)
-            ImGui::TextDisabled("API v%d, preset v%d", p.metaApiVersion, p.metaVersion);
+            ImGui::TextDisabled(DustLoc::T("API v%d, preset v%d"), p.metaApiVersion, p.metaVersion);
     }
     else
     {
-        ImGui::TextDisabled("(no metadata)");
+        ImGui::TextDisabled("%s", DustLoc::T("(no metadata)"));
     }
     ImGui::EndTooltip();
 }
@@ -1111,7 +1157,7 @@ static void PollFilePicker()
     }
     else if (purpose == PickerPurpose::Export)
     {
-        // Re-resolve the preset by name — the list may have been re-sorted or
+        // Re-resolve the preset by name 鈥?the list may have been re-sorted or
         // the preset deleted/imported while the folder picker was open.
         const auto& presets = gEffectLoader.GetPresets();
         int exportIdx = -1;
@@ -1148,17 +1194,17 @@ static void DrawPresetSection()
     const auto& presets = gEffectLoader.GetPresets();
     int currentPreset = gEffectLoader.GetCurrentPreset();
 
-    ImGui::TextColored(DustHeadingColor(), "Preset");
+    ImGui::TextColored(DustHeadingColor(), "%s", DustLoc::T("Preset"));
     ImGui::Separator();
     ImGui::Spacing();
 
     const char* previewName = (currentPreset >= 0 && currentPreset < (int)presets.size())
-        ? presets[currentPreset].name.c_str() : "(Custom)";
+        ? presets[currentPreset].name.c_str() : DustLoc::T("(Custom)");
 
     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
     if (ImGui::BeginCombo("##Preset", previewName))
     {
-        if (ImGui::Selectable("(Custom)", currentPreset < 0))
+        if (ImGui::Selectable(DustLoc::T("(Custom)"), currentPreset < 0))
         {
             gEffectLoader.SetCurrentPreset(-1);
             gFwConfig.lastPreset.clear();
@@ -1187,14 +1233,14 @@ static void DrawPresetSection()
     // Show warnings for outdated presets
     if (currentPreset >= 0 && !presets[currentPreset].warnings.empty())
     {
-        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "[!] Preset is outdated");
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "%s", DustLoc::T("[!] Preset is outdated"));
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("%s", presets[currentPreset].warnings.c_str());
     }
 
     // Picker-busy banner (so the user knows the dialog is open somewhere)
     if (FilePicker::IsBusy())
-        ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "Waiting for folder picker...");
+        ImGui::TextColored(ImVec4(0.7f, 0.9f, 1.0f, 1.0f), "%s", DustLoc::T("Waiting for folder picker..."));
 
     // Transient info / error
     if (gPickerInfoFrames > 0 && !gPickerInfo.empty())
@@ -1206,38 +1252,38 @@ static void DrawPresetSection()
     {
         ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.4f, 1.0f), "%s", gPickerError.c_str());
         ImGui::SameLine();
-        if (ImGui::SmallButton("Dismiss##PickerErr")) gPickerError.clear();
+        if (ImGui::SmallButton(DustLoc::T("Dismiss##PickerErr"))) gPickerError.clear();
     }
 
     // ---- Row 1: Save As / Import ----
     bool pickerBusy = FilePicker::IsBusy();
 
-    if (ImGui::Button("Save As...", ImVec2(0, 0)))
+    if (ImGui::Button(DustLoc::T("Save As..."), ImVec2(0, 0)))
         ImGui::OpenPopup("##GlobalSavePresetAs");
 
     ImGui::SameLine();
     PushVisualDisabled(pickerBusy);
-    if (ImGui::Button("Import...") && !pickerBusy)
+    if (ImGui::Button(DustLoc::T("Import...")) && !pickerBusy)
     {
         gPickerPurpose = PickerPurpose::Import;
         gPickerError.clear();
-        if (!FilePicker::StartFolderPicker("Choose a Dust preset folder to import"))
+        if (!FilePicker::StartFolderPicker(DustLoc::T("Choose a Dust preset folder to import")))
             gPickerPurpose = PickerPurpose::None;
     }
     PopVisualDisabled(pickerBusy);
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("%s",
-            pickerBusy ? "A folder picker is already open"
-                       : "Import a preset from a folder on disk");
+            pickerBusy ? DustLoc::T("A folder picker is already open")
+                       : DustLoc::T("Import a preset from a folder on disk"));
 
     if (ImGui::BeginPopup("##GlobalSavePresetAs"))
     {
-        ImGui::Text("Save all settings as preset:");
+        ImGui::Text("%s", DustLoc::T("Save all settings as preset:"));
         ImGui::SetNextItemWidth(200);
         ImGui::InputText("##presetname", gNewPresetName, sizeof(gNewPresetName));
 
         bool nameValid = gNewPresetName[0] != '\0';
-        if (ImGui::Button("Save", ImVec2(80, 0)) && nameValid)
+        if (ImGui::Button(DustLoc::T("Save"), ImVec2(80, 0)) && nameValid)
         {
             gEffectLoader.SavePresetAs(gNewPresetName);
             gNewPresetName[0] = '\0';
@@ -1245,7 +1291,7 @@ static void DrawPresetSection()
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(80, 0)))
+        if (ImGui::Button(DustLoc::T("Cancel"), ImVec2(80, 0)))
             ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
@@ -1253,37 +1299,37 @@ static void DrawPresetSection()
     // ---- Row 2: Save / Export / Edit Info / Delete (only when a preset is selected) ----
     if (currentPreset >= 0)
     {
-        if (ImGui::Button("Save", ImVec2(0, 0)))
+        if (ImGui::Button(DustLoc::T("Save"), ImVec2(0, 0)))
         {
             gEffectLoader.SavePreset(currentPreset);
             SnapshotAllEffects();
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Save current settings into '%s'", presets[currentPreset].name.c_str());
+            ImGui::SetTooltip(DustLoc::T("Save current settings into '%s'"), presets[currentPreset].name.c_str());
 
         ImGui::SameLine();
         PushVisualDisabled(pickerBusy);
-        if (ImGui::Button("Export...") && !pickerBusy)
+        if (ImGui::Button(DustLoc::T("Export...")) && !pickerBusy)
         {
             gPickerPurpose = PickerPurpose::Export;
             gPickerExportPresetName = (currentPreset < (int)presets.size())
                 ? presets[currentPreset].name : "";
             gPickerError.clear();
-            if (!FilePicker::StartFolderPicker("Choose a destination folder to export the preset"))
+            if (!FilePicker::StartFolderPicker(DustLoc::T("Choose a destination folder to export the preset")))
                 gPickerPurpose = PickerPurpose::None;
         }
         PopVisualDisabled(pickerBusy);
         if (ImGui::IsItemHovered())
         {
             if (pickerBusy)
-                ImGui::SetTooltip("A folder picker is already open");
+                ImGui::SetTooltip("%s", DustLoc::T("A folder picker is already open"));
             else
-                ImGui::SetTooltip("Copy '%s' into another folder for sharing",
+                ImGui::SetTooltip(DustLoc::T("Copy '%s' into another folder for sharing"),
                                   presets[currentPreset].name.c_str());
         }
 
         ImGui::SameLine();
-        if (ImGui::Button("Edit Info..."))
+        if (ImGui::Button(DustLoc::T("Edit Info...")))
         {
             gEditInfoPresetIdx = currentPreset;
             const PresetInfo& p = presets[currentPreset];
@@ -1295,24 +1341,24 @@ static void DrawPresetSection()
             ImGui::OpenPopup("##EditPresetInfo");
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Edit author / description metadata");
+            ImGui::SetTooltip("%s", DustLoc::T("Edit author / description metadata"));
 
         ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.15f, 0.15f, 1.0f));
-        if (ImGui::Button("Delete"))
+        if (ImGui::Button(DustLoc::T("Delete")))
             ImGui::OpenPopup("##ConfirmDeletePreset");
         ImGui::PopStyleColor();
 
         if (ImGui::BeginPopup("##ConfirmDeletePreset"))
         {
-            ImGui::Text("Delete preset '%s'?", presets[currentPreset].name.c_str());
-            if (ImGui::Button("Yes", ImVec2(60, 0)))
+            ImGui::Text(DustLoc::T("Delete preset '%s'?"), presets[currentPreset].name.c_str());
+            if (ImGui::Button(DustLoc::T("Yes"), ImVec2(60, 0)))
             {
                 gEffectLoader.DeletePreset(currentPreset);
                 ImGui::CloseCurrentPopup();
             }
             ImGui::SameLine();
-            if (ImGui::Button("No", ImVec2(60, 0)))
+            if (ImGui::Button(DustLoc::T("No"), ImVec2(60, 0)))
                 ImGui::CloseCurrentPopup();
             ImGui::EndPopup();
         }
@@ -1321,16 +1367,16 @@ static void DrawPresetSection()
     // ---- Edit Info popup ----
     if (ImGui::BeginPopup("##EditPresetInfo"))
     {
-        ImGui::Text("Preset metadata");
+        ImGui::Text("%s", DustLoc::T("Preset metadata"));
         ImGui::Separator();
         ImGui::SetNextItemWidth(280);
-        ImGui::InputText("Author##editinfoauthor", gEditInfoAuthor, sizeof(gEditInfoAuthor));
+        ImGui::InputText(DustLoc::T("Author##editinfoauthor"), gEditInfoAuthor, sizeof(gEditInfoAuthor));
         ImGui::SetNextItemWidth(280);
-        ImGui::InputTextMultiline("Description##editinfodesc",
+        ImGui::InputTextMultiline(DustLoc::T("Description##editinfodesc"),
                                   gEditInfoDesc, sizeof(gEditInfoDesc),
                                   ImVec2(280, 80));
         ImGui::Spacing();
-        if (ImGui::Button("Save##editinfo", ImVec2(80, 0)))
+        if (ImGui::Button(DustLoc::T("Save##editinfo"), ImVec2(80, 0)))
         {
             if (gEditInfoPresetIdx >= 0 && gEditInfoPresetIdx < (int)presets.size())
                 gEffectLoader.UpdatePresetMetadata(gEditInfoPresetIdx,
@@ -1338,7 +1384,7 @@ static void DrawPresetSection()
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
-        if (ImGui::Button("Cancel##editinfo", ImVec2(80, 0)))
+        if (ImGui::Button(DustLoc::T("Cancel##editinfo"), ImVec2(80, 0)))
             ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
@@ -1349,10 +1395,10 @@ static void DrawPresetSection()
     if (ImGui::BeginPopupModal("##ConfirmImportOverwrite", nullptr,
                                ImGuiWindowFlags_AlwaysAutoResize))
     {
-        ImGui::Text("A preset named '%s' already exists.", gPendingImportName.c_str());
-        ImGui::Text("Overwrite it?");
+        ImGui::Text(DustLoc::T("A preset named '%s' already exists."), gPendingImportName.c_str());
+        ImGui::Text("%s", DustLoc::T("Overwrite it?"));
         ImGui::Spacing();
-        if (ImGui::Button("Overwrite", ImVec2(100, 0)))
+        if (ImGui::Button(DustLoc::T("Overwrite"), ImVec2(100, 0)))
         {
             std::string err;
             int idx = gEffectLoader.ImportPresetFromFolder(gPendingImportSrc.c_str(), true, &err);
@@ -1379,7 +1425,7 @@ static void DrawPresetSection()
             ImGui::CloseCurrentPopup();
         }
         ImGui::SameLine();
-        if (ImGui::Button("Cancel", ImVec2(100, 0)))
+        if (ImGui::Button(DustLoc::T("Cancel"), ImVec2(100, 0)))
         {
             gPendingImportSrc.clear();
             gPendingImportName.clear();
@@ -1419,7 +1465,7 @@ static void DrawResetButton(size_t effectIdx, uint32_t settingIdx)
         }
         ImGui::PopStyleColor();
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Reset to saved value");
+            ImGui::SetTooltip("%s", DustLoc::T("Reset to saved value"));
     }
     else
     {
@@ -1438,13 +1484,13 @@ static void DrawEffectSection(size_t idx)
     if (!gEffectStates[idx].snapshotted)
         SnapshotEffect(idx);
 
-    const char* name = le.desc.name ? le.desc.name : "Unnamed";
+    const char* name = DustLoc::T(le.desc.name ? le.desc.name : "Unnamed");
 
     // Build header label with enabled status
     bool enabled = IsEffectEnabled(le);
     char headerLabel[256];
-    snprintf(headerLabel, sizeof(headerLabel), "%s  %s",
-             name, enabled ? "[ON]" : "[OFF]");
+    snprintf(headerLabel, sizeof(headerLabel), "%s  %s###effect_%zu",
+             name, enabled ? DustLoc::T("[ON]") : DustLoc::T("[OFF]"), idx);
 
     // Color the header text
     if (gForceCollapseState != 0)
@@ -1460,7 +1506,7 @@ static void DrawEffectSection(size_t idx)
 
     if (le.desc.apiVersion < 2 || !le.desc.settings || le.desc.settingCount == 0)
     {
-        ImGui::TextDisabled("No configurable settings");
+        ImGui::TextDisabled("%s", DustLoc::T("No configurable settings"));
         return;
     }
 
@@ -1482,7 +1528,7 @@ static void DrawEffectSection(size_t idx)
             ImGui::Spacing();
             ImGui::Separator();
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.75f, 0.45f, 1.0f));
-            ImGui::TextUnformatted(s.name);
+            ImGui::TextUnformatted(DustLoc::T(s.name));
             ImGui::PopStyleColor();
             ImGui::Separator();
             continue;
@@ -1493,16 +1539,17 @@ static void DrawEffectSection(size_t idx)
         ImGui::PushID((int)i);
 
         bool changed = false;
+        char stableLabel[256];
         switch (s.type)
         {
         case DUST_SETTING_BOOL:
-            changed = ImGui::Checkbox(s.name, (bool*)s.valuePtr);
+            changed = ImGui::Checkbox(LocalizedIdLabel(s.name, stableLabel, sizeof(stableLabel)), (bool*)s.valuePtr);
             break;
         case DUST_SETTING_FLOAT:
-            changed = DustSliderFloat(s.name, (float*)s.valuePtr, s.minVal, s.maxVal);
+            changed = DustSliderFloat(LocalizedIdLabel(s.name, stableLabel, sizeof(stableLabel)), (float*)s.valuePtr, s.minVal, s.maxVal);
             break;
         case DUST_SETTING_INT:
-            changed = ImGui::SliderInt(s.name, (int*)s.valuePtr, (int)s.minVal, (int)s.maxVal);
+            changed = ImGui::SliderInt(LocalizedIdLabel(s.name, stableLabel, sizeof(stableLabel)), (int*)s.valuePtr, (int)s.minVal, (int)s.maxVal);
             break;
         case DUST_SETTING_ENUM:
         {
@@ -1514,13 +1561,13 @@ static void DrawEffectSection(size_t idx)
             {
                 if (*v < 0) *v = 0;
                 if (*v >= count) *v = count - 1;
-                const char* preview = s.enumLabels[*v];
-                if (ImGui::BeginCombo(s.name, preview))
+                const char* preview = DustLoc::T(s.enumLabels[*v]);
+                if (ImGui::BeginCombo(LocalizedIdLabel(s.name, stableLabel, sizeof(stableLabel)), preview))
                 {
                     for (int n = 0; n < count; n++)
                     {
                         bool selected = (*v == n);
-                        if (ImGui::Selectable(s.enumLabels[n], selected))
+                        if (ImGui::Selectable(DustLoc::T(s.enumLabels[n]), selected))
                         {
                             if (*v != n) { *v = n; changed = true; }
                         }
@@ -1536,7 +1583,7 @@ static void DrawEffectSection(size_t idx)
             float* col = (float*)s.valuePtr;
             // HDR allows out-of-[0,1] values so we can reuse this widget for ASC-CDL-style
             // triplets (lift/gamma/gain/offset/slope) that go negative or above 1.
-            changed = ImGui::ColorEdit3(s.name, col,
+            changed = ImGui::ColorEdit3(LocalizedIdLabel(s.name, stableLabel, sizeof(stableLabel)), col,
                 ImGuiColorEditFlags_Float | ImGuiColorEditFlags_HDR);
             if (changed && s.minVal < s.maxVal)
             {
@@ -1553,26 +1600,29 @@ static void DrawEffectSection(size_t idx)
         {
             ImGui::BeginTooltip();
             if (s.description)
-                ImGui::TextUnformatted(s.description);
+            {
+                char descKey[256];
+                ImGui::TextUnformatted(LocalizedSettingDescription(le, s, descKey, sizeof(descKey)));
+            }
 
             const char* perfLabel = nullptr;
             ImVec4 perfColor;
             switch (s.perfImpact)
             {
             case DUST_PERF_NONE:
-                perfLabel = "None";
+                perfLabel = DustLoc::T("None");
                 perfColor = ImVec4(0.80f, 0.80f, 0.80f, 1.00f);
                 break;
             case DUST_PERF_LOW:
-                perfLabel = "Low";
+                perfLabel = DustLoc::T("Low");
                 perfColor = ImVec4(0.85f, 0.80f, 0.55f, 1.00f);
                 break;
             case DUST_PERF_MEDIUM:
-                perfLabel = "Medium";
+                perfLabel = DustLoc::T("Medium");
                 perfColor = ImVec4(1.00f, 0.60f, 0.20f, 1.00f);
                 break;
             case DUST_PERF_HIGH:
-                perfLabel = "High";
+                perfLabel = DustLoc::T("High");
                 perfColor = ImVec4(1.00f, 0.30f, 0.25f, 1.00f);
                 break;
             default:
@@ -1580,7 +1630,7 @@ static void DrawEffectSection(size_t idx)
             }
             if (perfLabel)
             {
-                ImGui::TextUnformatted("Performance impact: ");
+                ImGui::TextUnformatted(DustLoc::T("Performance impact:"));
                 ImGui::SameLine(0.0f, 0.0f);
                 ImGui::TextColored(perfColor, "%s", perfLabel);
             }
@@ -1625,18 +1675,18 @@ static void DrawPerformanceSection()
         gFpsCount = 0;
     }
 
-    ImGui::TextColored(DustHeadingColor(), "Performance");
+    ImGui::TextColored(DustHeadingColor(), "%s", DustLoc::T("Performance"));
     ImGui::Separator();
     ImGui::Spacing();
 
     // FPS and frame time
-    ImGui::Text("FPS: %.1f", gDisplayFps);
-    ImGui::Text("Frame Time: %.2f ms", frameTime);
+    ImGui::Text("%s: %.1f", DustLoc::T("FPS"), gDisplayFps);
+    ImGui::Text("%s: %.2f ms", DustLoc::T("Frame Time"), frameTime);
 
     ImGui::Spacing();
 
     // Frame time graph
-    ImGui::Text("Frame Time History:");
+    ImGui::Text("%s", DustLoc::T("Frame Time History:"));
     float maxMs = 0.0f;
     for (int i = 0; i < 120; i++)
         if (gFrameTimes[i] > maxMs) maxMs = gFrameTimes[i];
@@ -1650,7 +1700,7 @@ static void DrawPerformanceSection()
     ImGui::Spacing();
 
     // Per-effect GPU timing (only active effects)
-    ImGui::Text("Effect GPU Times:");
+    ImGui::Text("%s", DustLoc::T("Effect GPU Times:"));
     ImGui::Spacing();
 
     float totalEffectMs = 0.0f;
@@ -1661,7 +1711,7 @@ static void DrawPerformanceSection()
     {
         const LoadedEffect& le = gEffectLoader.GetEffect(i);
         if (!le.initialized || !IsEffectEnabled(le)) continue;
-        const char* name = le.desc.name ? le.desc.name : "Unnamed";
+        const char* name = DustLoc::T(le.desc.name ? le.desc.name : "Unnamed");
         int len = (int)strlen(name);
         if (len > maxNameLen) maxNameLen = len;
     }
@@ -1671,7 +1721,7 @@ static void DrawPerformanceSection()
         const LoadedEffect& le = gEffectLoader.GetEffect(i);
         if (!le.initialized || !IsEffectEnabled(le)) continue;
 
-        const char* name = le.desc.name ? le.desc.name : "Unnamed";
+        const char* name = DustLoc::T(le.desc.name ? le.desc.name : "Unnamed");
         float gpuMs = gEffectLoader.GetEffectGpuTime(i);
         bool hasTiming = (le.desc.apiVersion >= 3 && (le.desc.flags & DUST_FLAG_FRAMEWORK_TIMING))
                       || le.desc.gpuTimeMsPtr;
@@ -1688,15 +1738,15 @@ static void DrawPerformanceSection()
         }
         else
         {
-            ImGui::TextDisabled("  %-*s (no timing)", maxNameLen, name);
+            ImGui::TextDisabled(DustLoc::T("  %-*s (no timing)"), maxNameLen, name);
         }
     }
 
     if (count > 0 && totalEffectMs > 0.0f)
     {
         ImGui::Spacing();
-        ImGui::Text("  Total Effects: %.2f ms", totalEffectMs);
-        ImGui::Text("  Effect Budget: %.1f%% of frame", totalEffectMs / frameTime * 100.0f);
+        ImGui::Text(DustLoc::T("  Total Effects: %.2f ms"), totalEffectMs);
+        ImGui::Text(DustLoc::T("  Effect Budget: %.1f%% of frame"), totalEffectMs / frameTime * 100.0f);
     }
 
     ImGui::Spacing();
@@ -1704,9 +1754,9 @@ static void DrawPerformanceSection()
     ImGui::Spacing();
 
     // Resolution info
-    ImGui::TextDisabled("Resolution info from last frame context");
+    ImGui::TextDisabled("%s", DustLoc::T("Resolution info from last frame context"));
     // We don't have direct access to resolution here, but we can show display size
-    ImGui::Text("Display: %.0fx%.0f", io.DisplaySize.x, io.DisplaySize.y);
+    ImGui::Text(DustLoc::T("Display: %.0fx%.0f"), io.DisplaySize.x, io.DisplaySize.y);
 }
 
 // ==================== Bug report ====================
@@ -1720,7 +1770,7 @@ static void DrawBugReportModal()
     if (gBugReportOpenRequested)
     {
         gBugReportOpenRequested = false;
-        ImGui::OpenPopup("Report a Bug##DustBugReport");
+        ImGui::OpenPopup(DustLoc::T("Report a Bug##DustBugReport"));
     }
 
     // Center on first appearance
@@ -1729,26 +1779,25 @@ static void DrawBugReportModal()
                             ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(460, 0), ImGuiCond_Appearing);
 
-    if (!ImGui::BeginPopupModal("Report a Bug##DustBugReport", nullptr,
+    if (!ImGui::BeginPopupModal(DustLoc::T("Report a Bug##DustBugReport"), nullptr,
                                 ImGuiWindowFlags_AlwaysAutoResize))
         return;
 
-    ImGui::TextWrapped("Spotted a bug? Join the Discord server or create an issue on GitHub.");
+    ImGui::TextWrapped("%s", DustLoc::T("Spotted a bug? Join the Discord server or create an issue on GitHub."));
     ImGui::Spacing();
-    ImGui::TextWrapped("To help me fix it fast, Dust can bundle a diagnostic report (.zip) containing:");
-    ImGui::BulletText("Dust logs, framework config and live effect settings");
-    ImGui::BulletText("Active preset files");
-    ImGui::BulletText("Kenshi graphics settings and mod load order");
-    ImGui::BulletText("Hardware info (GPU, driver, monitors, CPU, RAM, OS)");
-    ImGui::BulletText("Detected overlays (ReShade, RTSS, ...) and RE_Kenshi info");
-    ImGui::TextDisabled("No personal data is collected; file paths are visible in logs.");
+    ImGui::TextWrapped("%s", DustLoc::T("To help me fix it fast, Dust can bundle a diagnostic report (.zip) containing:"));
+    ImGui::BulletText(DustLoc::T("Dust logs, framework config and live effect settings"));
+    ImGui::BulletText(DustLoc::T("Active preset files"));
+    ImGui::BulletText(DustLoc::T("Kenshi graphics settings and mod load order"));
+    ImGui::BulletText(DustLoc::T("Hardware info (GPU, driver, monitors, CPU, RAM, OS)"));
+    ImGui::BulletText(DustLoc::T("Detected overlays (ReShade, RTSS, ...) and RE_Kenshi info"));
+    ImGui::TextDisabled("%s", DustLoc::T("No personal data is collected; file paths are visible in logs."));
 
     if (!DustLogEnabled())
     {
         ImGui::Spacing();
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.8f, 0.2f, 1.0f));
-        ImGui::TextWrapped("[!] Logging is disabled. For the most useful report, enable "
-                           "Logging in the left panel, reproduce the bug, then generate the report.");
+        ImGui::TextWrapped("%s", DustLoc::T("[!] Logging is disabled. For the most useful report, enable Logging in the left panel, reproduce the bug, then generate the report."));
         ImGui::PopStyleColor();
     }
 
@@ -1760,7 +1809,7 @@ static void DrawBugReportModal()
     bool busy = (status == BugReport::Status::Running);
 
     PushVisualDisabled(busy);
-    if (ImGui::Button(busy ? "Generating..." : "Generate Report", ImVec2(160, 0)) && !busy)
+    if (ImGui::Button(busy ? DustLoc::T("Generating...") : DustLoc::T("Generate Report"), ImVec2(160, 0)) && !busy)
     {
         BugReport::LiveStats stats;
         stats.device      = gDevice;
@@ -1772,7 +1821,7 @@ static void DrawBugReportModal()
     }
     PopVisualDisabled(busy);
     if (ImGui::IsItemHovered() && !busy)
-        ImGui::SetTooltip("Write a DustReport_<date>.zip into the bug_reports folder next to the DLL");
+        ImGui::SetTooltip("%s", DustLoc::T("Write a DustReport_<date>.zip into the bug_reports folder next to the DLL"));
 
     if (status == BugReport::Status::Done)
     {
@@ -1781,28 +1830,28 @@ static void DrawBugReportModal()
         auto pos = name.find_last_of("\\/");
         if (pos != std::string::npos) name = name.substr(pos + 1);
 
-        ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "Report created: %s", name.c_str());
+        ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), DustLoc::T("Report created: %s"), name.c_str());
 
-        if (ImGui::Button("Show in Folder", ImVec2(160, 0)))
+        if (ImGui::Button(DustLoc::T("Show in Folder"), ImVec2(160, 0)))
         {
             std::string args = "/select,\"" + path + "\"";
             ShellExecuteA(nullptr, "open", "explorer.exe", args.c_str(), nullptr, SW_SHOWNORMAL);
         }
         ImGui::SameLine();
-        if (ImGui::Button("Copy Summary", ImVec2(160, 0)))
+        if (ImGui::Button(DustLoc::T("Copy Summary"), ImVec2(160, 0)))
             ImGui::SetClipboardText(BugReport::GetSummary().c_str());
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Copy a short system summary to the clipboard (paste into Discord)");
+            ImGui::SetTooltip("%s", DustLoc::T("Copy a short system summary to the clipboard (paste into Discord)"));
 
         ImGui::Spacing();
-        ImGui::TextWrapped("Attach the .zip to your Discord post or GitHub issue:");
-        if (ImGui::Button("Create GitHub Issue", ImVec2(160, 0)))
+        ImGui::TextWrapped("%s", DustLoc::T("Attach the .zip to your Discord post or GitHub issue:"));
+        if (ImGui::Button(DustLoc::T("Create GitHub Issue"), ImVec2(160, 0)))
             ShellExecuteA(nullptr, "open", BugReport::BuildGitHubIssueURL().c_str(),
                           nullptr, nullptr, SW_SHOWNORMAL);
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("Opens a pre-filled bug report form on GitHub — drag the .zip into it");
+            ImGui::SetTooltip("%s", DustLoc::T("Opens a pre-filled bug report form on GitHub - drag the .zip into it"));
         ImGui::SameLine();
-        if (ImGui::Button("Join Discord", ImVec2(160, 0)))
+        if (ImGui::Button(DustLoc::T("Join Discord"), ImVec2(160, 0)))
             ShellExecuteA(nullptr, "open", "https://discord.gg/3fd3c7EFvT",
                           nullptr, nullptr, SW_SHOWNORMAL);
     }
@@ -1813,7 +1862,7 @@ static void DrawBugReportModal()
 
     ImGui::Spacing();
     ImGui::Separator();
-    if (ImGui::Button("Close", ImVec2(80, 0)))
+    if (ImGui::Button(DustLoc::T("Close"), ImVec2(80, 0)))
         ImGui::CloseCurrentPopup();
 
     ImGui::EndPopup();
@@ -1847,10 +1896,10 @@ static void RenderToast()
     ImGui::SameLine();
     ImGui::TextDisabled("(%s)", DUST_VERSION_STR);
     if (gNewVersionInstalled)
-        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "New version installed!");
-    ImGui::Text("Press %s to open settings", VKKeyName(gFwConfig.toggleKey));
+        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", DustLoc::T("New version installed!"));
+    ImGui::Text(DustLoc::T("Press %s to open settings"), VKKeyName(gFwConfig.toggleKey));
     if (!gNewVersionInstalled)
-        ImGui::TextDisabled("(disable this message in settings)");
+        ImGui::TextDisabled("%s", DustLoc::T("(disable this message in settings)"));
 
     ImGui::End();
     ImGui::PopStyleVar(3);
@@ -1896,7 +1945,7 @@ static ID3D11ShaderResourceView* LoadTextureFromMemory(const unsigned char* data
 // Load a PNG embedded in Dust.dll's resources (see Dust.rc / resource.h).
 static ID3D11ShaderResourceView* LoadTextureFromResource(int resourceId)
 {
-    // Module handle of Dust.dll itself (not the game exe) — resolved from an
+    // Module handle of Dust.dll itself (not the game exe) 鈥?resolved from an
     // address inside this module so no dllmain global is needed.
     HMODULE mod = nullptr;
     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -1926,7 +1975,7 @@ bool Init(IDXGISwapChain* swapChain, ID3D11Device* device, ID3D11DeviceContext* 
 {
     if (gInitialized) return true;  // Already initialized (e.g. ResizeBuffers ran before first Present)
 
-    // The host retries Init every Present after a failure — release anything a
+    // The host retries Init every Present after a failure 鈥?release anything a
     // previous failed attempt left behind before recreating it below.
     if (gBackBufferRTV)  { gBackBufferRTV->Release();  gBackBufferRTV = nullptr; }
     if (gDiscordLogoSRV) { gDiscordLogoSRV->Release(); gDiscordLogoSRV = nullptr; }
@@ -1935,9 +1984,9 @@ bool Init(IDXGISwapChain* swapChain, ID3D11Device* device, ID3D11DeviceContext* 
     Log("GUI: Init starting (swap=%p, dev=%p, ctx=%p)", swapChain, device, context);
 
     if (!swapChain)
-    { Log("GUI: Init aborted — null swap chain"); return false; }
+    { Log("GUI: Init aborted 鈥?null swap chain"); return false; }
 
-    // Always use the swap chain's own device — it's the only one that can create
+    // Always use the swap chain's own device 鈥?it's the only one that can create
     // views on the swap chain's back buffer. On multi-device systems (e.g. iGPU +
     // discrete GPU) this may differ from the effects pipeline's captured device.
     {
@@ -1975,7 +2024,7 @@ bool Init(IDXGISwapChain* swapChain, ID3D11Device* device, ID3D11DeviceContext* 
     if (!ImGui::CreateContext())
     { Log("GUI: ImGui::CreateContext failed"); return false; }
     ImGuiIO& io = ImGui::GetIO();
-    // NOTE: NavEnableKeyboard intentionally NOT set — it maps Space to
+    // NOTE: NavEnableKeyboard intentionally NOT set 鈥?it maps Space to
     // "Activate" which can leave io.KeysDown[VK_SPACE] stuck when the
     // overlay closes, breaking the game's pause key.
 
@@ -2008,6 +2057,18 @@ bool Init(IDXGISwapChain* swapChain, ID3D11Device* device, ID3D11DeviceContext* 
     ApplyDustTheme(gFwConfig.theme);
     RebuildFontAtlas();  // build TTF atlas at the configured scale (texture made on first NewFrame)
 
+    // DustBoot can initialize the GUI from the swap chain before the pipeline detector
+    // captures a draw-context device. In that case effects are loaded but not initialized,
+    // so the F11 settings list is empty. The swap chain device is valid for GPU resources;
+    // use it as a fallback and let the normal capture path skip if initialization already ran.
+    if (gEffectLoader.Count() > 0 && !gEffectLoader.IsInitialized())
+    {
+        uint32_t initW = desc.BufferDesc.Width  ? desc.BufferDesc.Width  : 1;
+        uint32_t initH = desc.BufferDesc.Height ? desc.BufferDesc.Height : 1;
+        Log("GUI: effect loader not initialized; initializing from swap-chain device at %ux%u", initW, initH);
+        if (!gEffectLoader.InitAll(gDevice, initW, initH))
+            Log("WARNING: One or more effect plugins failed to initialize from GUI fallback");
+    }
     gInitialized = true;
     Log("GUI: Initialized (%s to toggle)", VKKeyName(gFwConfig.toggleKey));
     return true;
@@ -2150,7 +2211,7 @@ void Render()
     {
         ImGui::SetNextWindowSize(ImVec2(560, 420), ImGuiCond_FirstUseEver);
         bool wasVisible = gOverlayVisible;
-        ImGui::Begin("Dust Settings", &gOverlayVisible);
+        ImGui::Begin(DustLoc::T("Dust Settings"), &gOverlayVisible);
         if (wasVisible && !gOverlayVisible)
             OnOverlayClose(); // user clicked the X button
 
@@ -2186,7 +2247,7 @@ void Render()
 
         ImGui::EndChild(); // ##leftContent
 
-        // Fixed footer — always visible at bottom of left pane
+        // Fixed footer 鈥?always visible at bottom of left pane
         ImGui::Separator();
         {
             ImGui::PushStyleColor(ImGuiCol_Button,        ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
@@ -2200,7 +2261,7 @@ void Render()
                     ShellExecuteA(nullptr, "open", "https://discord.gg/3fd3c7EFvT", nullptr, nullptr, SW_SHOWNORMAL);
                 ImGui::PopID();
                 if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Join the Discord server");
+                    ImGui::SetTooltip("%s", DustLoc::T("Join the Discord server"));
             }
 
             if (gGithubLogoSRV)
@@ -2211,14 +2272,14 @@ void Render()
                     ShellExecuteA(nullptr, "open", "https://github.com/Bazouz660/Dust", nullptr, nullptr, SW_SHOWNORMAL);
                 ImGui::PopID();
                 if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("View on GitHub");
+                    ImGui::SetTooltip("%s", DustLoc::T("View on GitHub"));
             }
 
             ImGui::PopStyleColor(3);
 
             ImGui::SameLine();
             // Report-a-Bug button: bug emoji (U+1F41B, merged from Segoe UI
-            // Emoji) + label that adapts to the space left by the logos — one
+            // Emoji) + label that adapts to the space left by the logos 鈥?one
             // line if it fits, two lines if narrow, emoji only when squeezed.
             // "###reportbug" keeps the ImGui ID stable across label switches.
             {
@@ -2229,18 +2290,24 @@ void Render()
                 float contentW = btnSize.x - style.FramePadding.x * 2.0f;
 
                 #define DUST_BUG_EMOJI "\xF0\x9F\x90\x9B"  // UTF-8 U+1F41B
+                char reportBugFull[128];
+                char reportBugWrapped[128];
+                char reportBugPlain[96];
+                snprintf(reportBugFull, sizeof(reportBugFull), DUST_BUG_EMOJI "  %s###reportbug", DustLoc::T("Report a Bug"));
+                snprintf(reportBugWrapped, sizeof(reportBugWrapped), DUST_BUG_EMOJI " %s###reportbug", DustLoc::T("Report a Bug"));
+                snprintf(reportBugPlain, sizeof(reportBugPlain), "%s###reportbug", DustLoc::T("Report a Bug"));
+
                 const char* candidates[3];
                 int n = 0;
                 if (gEmojiFontLoaded)
                 {
-                    candidates[n++] = DUST_BUG_EMOJI "  Report a Bug###reportbug";
-                    candidates[n++] = DUST_BUG_EMOJI " Report\na Bug###reportbug";
+                    candidates[n++] = reportBugFull;
+                    candidates[n++] = reportBugWrapped;
                     candidates[n++] = DUST_BUG_EMOJI "###reportbug";
                 }
                 else
                 {
-                    candidates[n++] = "Report a Bug###reportbug";
-                    candidates[n++] = "Report\na Bug###reportbug";
+                    candidates[n++] = reportBugPlain;
                 }
                 const char* label = candidates[n - 1];
                 for (int c = 0; c < n; c++)
@@ -2252,7 +2319,7 @@ void Render()
                 if (ImGui::Button(label, btnSize))
                     gBugReportOpenRequested = true;
                 if (ImGui::IsItemHovered())
-                    ImGui::SetTooltip("Spotted a bug? Generate a diagnostic report to share on Discord or GitHub");
+                    ImGui::SetTooltip("%s", DustLoc::T("Spotted a bug? Generate a diagnostic report to share on Discord or GitHub"));
             }
         }
 
@@ -2280,7 +2347,7 @@ void Render()
 
         if (count == 0)
         {
-            ImGui::TextDisabled("No effect plugins loaded");
+            ImGui::TextDisabled("%s", DustLoc::T("No effect plugins loaded"));
         }
         else
         {
@@ -2289,22 +2356,22 @@ void Render()
 
             {
                 bool desired = gAllEffectsOn;
-                if (ImGui::Checkbox("Toggle Effects", &desired))
+                if (ImGui::Checkbox(DustLoc::T("Toggle Effects"), &desired))
                     SetAllEffectsEnabled(desired);
             }
 
             ImGui::SameLine();
-            if (ImGui::SmallButton("Expand All"))
+            if (ImGui::SmallButton(DustLoc::T("Expand All")))
                 gForceCollapseState = 1;
             ImGui::SameLine();
-            if (ImGui::SmallButton("Collapse All"))
+            if (ImGui::SmallButton(DustLoc::T("Collapse All")))
                 gForceCollapseState = -1;
 
             // Search/filter box: case-insensitive substring match on effect name.
             // Empty filter shows everything; this state is intentionally not persisted.
             static char sFilterBuf[64] = {};
             ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
-            ImGui::InputTextWithHint("##effectfilter", "Search effects...", sFilterBuf, sizeof(sFilterBuf));
+            ImGui::InputTextWithHint("##effectfilter", DustLoc::T("Search effects..."), sFilterBuf, sizeof(sFilterBuf));
 
             ImGui::Spacing();
             ImGui::Separator();
@@ -2314,12 +2381,19 @@ void Render()
             ImGui::BeginChild("##effects", ImVec2(0, 0), false);
 
             int shown = 0;
+            int initializedCount = 0;
+            const char* firstInitializedName = nullptr;
+            ImVec2 effectsAvail = ImGui::GetContentRegionAvail();
             for (size_t i = 0; i < count; i++)
             {
                 const LoadedEffect& le = gEffectLoader.GetEffect(i);
                 if (!le.initialized) continue;
+                initializedCount++;
+                if (!firstInitializedName) firstInitializedName = le.desc.name ? le.desc.name : "Unnamed";
 
-                if (sFilterBuf[0] && !EffectNameMatchesFilter(le.desc.name, sFilterBuf))
+                if (sFilterBuf[0] &&
+                    !EffectNameMatchesFilter(le.desc.name, sFilterBuf) &&
+                    !EffectNameMatchesFilter(DustLoc::T(le.desc.name), sFilterBuf))
                     continue;
 
                 if (shown > 0)
@@ -2333,8 +2407,19 @@ void Render()
                 ImGui::PopID();
                 ++shown;
             }
+
+            static int sEffectListDiagFrame = 0;
+            if ((sEffectListDiagFrame++ % 120) == 0)
+            {
+                Log("GUI effect list: count=%zu initialized=%d shown=%d filter='%s' avail=(%.1f, %.1f) first='%s'",
+                    count, initializedCount, shown, sFilterBuf, effectsAvail.x, effectsAvail.y,
+                    firstInitializedName ? firstInitializedName : "<none>");
+            }
+
             if (shown == 0 && sFilterBuf[0])
-                ImGui::TextDisabled("No effect matches \"%s\"", sFilterBuf);
+                ImGui::TextDisabled(DustLoc::T("No effect matches \"%s\""), sFilterBuf);
+            else if (shown == 0)
+                ImGui::TextDisabled("%s", DustLoc::T("No initialized effect plugins to display"));
             gForceCollapseState = 0;
 
             ImGui::EndChild(); // ##effects
