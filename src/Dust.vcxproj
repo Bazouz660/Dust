@@ -152,6 +152,7 @@
     <ClCompile Include="EffectLoaderPresets.cpp" />
     <ClCompile Include="DustGUI.cpp" />
     <ClCompile Include="DustGUI_DInputHook.cpp" />
+    <ClCompile Include="Localization.cpp" />
     <ClCompile Include="FilePicker.cpp" />
     <ClCompile Include="Survey.cpp" />
     <ClCompile Include="SurveyRecorder.cpp" />
@@ -179,6 +180,7 @@
     <ClInclude Include="DustLog.h" />
     <ClInclude Include="DustGUI.h" />
     <ClInclude Include="DustGUI_DInputHook.h" />
+    <ClInclude Include="Localization.h" />
     <ClInclude Include="InjectionPoint.h" />
     <ClInclude Include="PipelineDetector.h" />
     <ClInclude Include="ResourceRegistry.h" />

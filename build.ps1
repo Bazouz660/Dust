@@ -61,6 +61,8 @@ function Publish-Build($Dest, [switch]$Clean) {
     Copy-Item "$Root\src\build\Release\Dust.dll"  "$Dest\"
     Copy-Item "$Root\mod\RE_Kenshi.json"          "$Dest\"
     Copy-Item "$Root\mod\Dust.mod"                "$Dest\"
+    Copy-Item "$Root\mod\Dust.ini"                "$Dest\"
+    if (Test-Path "$Root\mod\lang") { Copy-Item "$Root\mod\lang" "$Dest\" -Recurse -Force }
 
     # DLSS runtime model — only when the NGX SDK is vendored (external/DLSS is gitignored). NGX loads it
     # from the mod dir via the path Upscaler::Init passes.
