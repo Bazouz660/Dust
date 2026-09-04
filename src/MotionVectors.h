@@ -49,18 +49,17 @@ namespace MotionVectors
     void ReleaseInjectionTargets();
 
     // True skinned-character animation MVs: the patched skin VS skins each vertex with current AND
-    // previous-frame bones (b12). InjBindSkinPrev (per skinned GBuffer draw, after
-    // GeometryCapture::OnDrawIndexed) binds the matched previous pose to b12 before the draw AND
-    // records this draw's pose from the CB shadow; InjFillSkinPrev (POST_LIGHTING) just promotes the
-    // recorded poses to next frame's match targets (pure CPU swap — no GPU read-back, no stall).
+    // previous-frame bones (b12). InjBindSkinPrev identifies a skinned draw directly, binds the matched
+    // previous pose to b12 before the draw, and records this draw's pose from the CB shadow;
+    // InjFillSkinPrev promotes the recorded poses to next frame's match targets.
     void InjFillSkinPrev(ID3D11DeviceContext* ctx);
-    void InjBindSkinPrev(ID3D11DeviceContext* ctx);
+    void InjBindSkinPrev(ID3D11DeviceContext* ctx, UINT indexCount, INT baseVertexLocation);
 
     // DrawIndexedInstanced hook: instanced draws never run the pose matcher (per-instance bone
     // palettes make cross-frame identity ambiguous), but an instanced SKINNED draw's patched VS
     // still reads b12 — left sticky, that's the previous draw's pose (a wrong-character MV flash).
     // Bind the zero CB so it takes the safe camera-reproj fallback instead. No-op unless the
-    // just-captured draw is skinned.
+    // currently-bound vertex shader is skinned.
     void InjBindZeroB12(ID3D11DeviceContext* ctx);
 
     // A.5 rigid moving-object velocity (weapons/tools/props on animated bones, objects.hlsl). Per-draw
@@ -70,10 +69,10 @@ namespace MotionVectors
     void InjBindRigidPrev(ID3D11DeviceContext* ctx);
     void InjFillRigidPrev(ID3D11DeviceContext* ctx);
 
-    // Bone-palette CB shadow, fed from the Map/Unmap hooks. InjBindSkinPrev needs the CURRENT frame's
-    // root bone at draw time (to spatially match prev poses); these snapshot it stall-free. Cheap
-    // no-ops until a skinned draw teaches the shadow which CB is the bone palette.
-    void InjNoteMap(void* resource, void* pData);
+    // Bone-palette CB shadow, fed from the Map/Unmap hooks. For known WRITE_DISCARD buffers the hook
+    // gives the game cached RAM, then copies that RAM to the real mapped GPU pointer at Unmap. This
+    // preserves the current root pose without ever reading slow write-combined upload memory.
+    void InjNoteMap(void* resource, D3D11_MAP mapType, D3D11_MAPPED_SUBRESOURCE* mapped);
     void InjNoteUnmap(void* resource);
     // Blit the injected velocity RT as colour over the bound target (debug viz).
     void InjDebugBlit(ID3D11DeviceContext* ctx);
