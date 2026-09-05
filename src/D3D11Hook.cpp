@@ -2163,8 +2163,8 @@ static void STDMETHODCALLTYPE HookedDraw(
         if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
         {
             ExtractCameraData(pThis);
-            // Repack this frame's skinned poses (GBuffer captures are resolved now) so next frame's
-            // patched skin VS can read them as "previous" from b12 and emit true animation velocity.
+            // Repack this frame's skinned poses so next frame's patched skin VS can read them as
+            // "previous" from b12 and emit true animation velocity.
             if (sMvFeederActive)
                 MotionVectors::InjFillSkinPrev(pThis);
         }
@@ -2240,16 +2240,10 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     if (IconDrawLogEnabled())
         LogIconDraw(pThis, "DI", IndexCount, 1);
 
-    // Motion-vector pass: snapshot this GBuffer draw's transform state. Fast-path
-    // no-op unless capture is enabled AND we're inside the GBuffer pass.
-    if (GeometryCapture::HasActiveCapture())
-    {
-        GeometryCapture::OnDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
-        // If that draw was skinned, bind its matched previous-frame bone palette at b12 so the patched
-        // skin VS can emit true animation velocity (must be after OGRE's per-draw constant setup).
-        if (sMvFeederActive)
-            MotionVectors::InjBindSkinPrev(pThis);
-    }
+    // The injected path only needs the current VS, skin CB and index buffer. Avoid the legacy full
+    // CapturedDraw snapshot, whose replay-only IA/SRV/sampler queries dominated character-heavy scenes.
+    if (sMvFeederActive && GeometryCapture::HasActiveCapture())
+        MotionVectors::InjBindSkinPrev(pThis, IndexCount, BaseVertexLocation);
 
     // Direct-light AO for point/spot lights: for a light_fs draw, swap the AO snapshot
     // into s8/s9 for the draw and restore afterward (scope dtor). gLvAoReady gates the
@@ -2279,18 +2273,9 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
     if (IconDrawLogEnabled())
         LogIconDraw(pThis, "DII", IndexCountPerInstance, InstanceCount);
 
-    // Motion-vector pass: snapshot this instanced GBuffer draw (per-instance
-    // transform VB is captured too — see GeometryCapture::CaptureDrawState).
-    if (GeometryCapture::HasActiveCapture())
-    {
-        GeometryCapture::OnDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
-                                                StartIndexLocation, BaseVertexLocation,
-                                                StartInstanceLocation);
-        // Instanced draws skip the pose matcher, but an instanced SKINNED draw's patched VS still
-        // reads b12 — bind the zero CB so it gets the camera-reproj fallback, not a stale pose.
-        if (sMvFeederActive)
-            MotionVectors::InjBindZeroB12(pThis);
-    }
+    // Instanced skin draws skip pose matching but must not inherit another character's sticky b12.
+    if (sMvFeederActive && GeometryCapture::HasActiveCapture())
+        MotionVectors::InjBindZeroB12(pThis);
 
     // Direct-light AO for point/spot lights (instanced light-volume path — see HookedDrawIndexed).
     bool isLV = gLvAoReady && IsLightVolumeDraw(pThis);
@@ -2323,17 +2308,16 @@ static void STDMETHODCALLTYPE HookedDrawInstanced(
     oDrawInstanced(pThis, VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
 }
 
-// Map/Unmap: shadow the skinned bone-palette CB as OGRE writes it (WRITE_DISCARD before each skin
-// draw), so InjBindSkinPrev can read the CURRENT frame's root bone at draw time — the key to spatial
-// (nearest-root) prev-pose matching without a GPU read-back stall. MotionVectors gates the fast path
-// on having learned a bone CB, so the overhead is one hash lookup per Map/Unmap until then.
+// Map/Unmap: proxy known skinned bone-palette WRITE_DISCARD buffers through cached CPU RAM. At Unmap
+// the cached bytes are written to the real mapped GPU pointer (never read back from write-combined
+// upload memory), while remaining available for current-root matching.
 static HRESULT STDMETHODCALLTYPE HookedMap(
     ID3D11DeviceContext* pThis, ID3D11Resource* pResource, UINT Subresource,
     D3D11_MAP MapType, UINT MapFlags, D3D11_MAPPED_SUBRESOURCE* pMappedResource)
 {
     HRESULT hr = oMap(pThis, pResource, Subresource, MapType, MapFlags, pMappedResource);
     if (!gShutdownSignaled && SUCCEEDED(hr) && Subresource == 0 && pMappedResource && sMvFeederActive)
-        MotionVectors::InjNoteMap(pResource, pMappedResource->pData);
+        MotionVectors::InjNoteMap(pResource, MapType, pMappedResource);
     return hr;
 }
 
@@ -3347,8 +3331,8 @@ bool Install()
                            (void**)&oDrawInstanced) != KenshiLib::SUCCESS)
     { Log("WARNING: Failed to hook DrawInstanced (non-indexed instanced MV will be wrong)"); }
 
-    // Map/Unmap: needed to shadow the skinned bone-palette CB for spatial prev-pose matching.
-    // Non-fatal if it fails — skinned animation MVs just fall back to zero (camera reproj only).
+    // Map/Unmap: needed to proxy and shadow the skinned bone-palette CB for spatial pose matching.
+    // Non-fatal if it fails — skinned animation MVs fall back to camera reprojection.
     if (KenshiLib::AddHook(addrMap, (void*)HookedMap,
                            (void**)&oMap) != KenshiLib::SUCCESS)
     { Log("WARNING: Failed to hook Map (skinned animation motion vectors disabled)"); }
