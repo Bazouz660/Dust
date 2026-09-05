@@ -13,7 +13,7 @@ Effects are loaded as separate DLL plugins from an `effects/` folder using a sta
 - **Pipeline detection**: Identifies render passes by GPU state (render target formats, SRV bindings) rather than fragile shader hashes
 - **Runtime shader patching**: Modifies the game's deferred lighting shader bytecode in memory at startup. No files replaced on disk
 - **State save/restore**: Full D3D11 state capture ensures effects don't interfere with the game's rendering
-- **Upscaling & anti-aliasing**: Optional DLSS / FSR2 / FSR3-FSR4 temporal super-resolution and DLAA, driven by real per-object motion vectors injected into the game's own G-buffer shaders. Backend is filtered by detected GPU
+- **Temporal anti-aliasing**: Optional DLAA (DLSS at native resolution) / FSR2 / FSR3-FSR4, driven by real per-object motion vectors injected into the game's own G-buffer shaders. Backend is filtered by detected GPU
 
 ## Architecture
 
@@ -101,7 +101,7 @@ Effects run at one of the pipeline injection points, in ascending priority order
 
 ### Presentation (core framework, `PRE_PRESENT`)
 
-**Upscaling & Anti-Aliasing (DLSS / FSR)** — DLSS (NVIDIA RTX), FSR2 (any GPU), or FSR3/FSR4 (DX12 side-device; FSR4 needs a Radeon RX 9000), auto-filtered by the detected GPU. Runs at native resolution as DLAA or upscales from a lower internal resolution, driven by real motion vectors injected into the game's own G-buffer shaders (static + skinned) plus a sky pass that stops sky ghosting. Exposes a DLSS model preset + sharpness and an MV debug overlay. Release builds bundle the vendor runtime DLLs (`nvngx_dlss.dll`, `amd_fidelityfx_*_dx12.dll`); FSR2 is statically linked. Best used without driver frame generation (NVIDIA Smooth Motion), which can flicker the UI.
+**Temporal Anti-Aliasing (DLAA / FSR)** — DLAA (DLSS on NVIDIA RTX), FSR2 (any GPU), or FSR3/FSR4 (DX12 side-device; FSR4 needs a Radeon RX 9000), auto-filtered by the detected GPU. All backends run at native resolution (render size == display size), so this is an image-quality feature, not a performance one; there is no lower-internal-resolution mode. Driven by real motion vectors injected into the game's own G-buffer shaders (static + skinned) plus a sky pass that stops sky ghosting. Exposes a DLAA model preset + sharpness and an MV debug overlay. Release builds bundle the vendor runtime DLLs (`nvngx_dlss.dll`, `amd_fidelityfx_*_dx12.dll`); FSR2 is statically linked. Best used without driver frame generation (NVIDIA Smooth Motion), which can flicker the UI.
 
 ## In-Game GUI
 

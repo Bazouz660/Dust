@@ -17,6 +17,7 @@ namespace
     std::unordered_map<std::string, std::string> gTranslations;
     std::unordered_map<std::string, std::string> gLabelCache;
     std::string gLanguage = "en_GB";
+    std::string gGlyphText;
     bool gIsChinese = false;
 
     static std::string Trim(const std::string& s)
@@ -117,6 +118,17 @@ namespace
     static std::string DetectGameLanguage(const std::string& modDir)
     {
         std::vector<std::string> candidates;
+
+        // The game root from the host exe FIRST. Deriving it from the mod dir (below) only works for
+        // <game>/mods/Dust; a Steam Workshop install lives in steamapps/workshop/content/233860/<id>,
+        // whose grandparent has no settings.cfg, and Kenshi keeps settings.cfg in the game root, not
+        // under %LOCALAPPDATA% - so Workshop users silently got English (2026-09-05).
+        {
+            std::string gameRoot = DustGameDir();
+            AddCandidate(candidates, JoinPath(gameRoot, "settings.cfg"));
+            AddCandidate(candidates, JoinPath(gameRoot, "options.cfg"));
+        }
+
         std::string cleanModDir = modDir;
         while (!cleanModDir.empty() && (cleanModDir.back() == '\\' || cleanModDir.back() == '/'))
             cleanModDir.pop_back();
@@ -153,6 +165,10 @@ namespace
                 return lang;
             }
         }
+        // Say so, and where we looked: a silent fallback is indistinguishable from "working, English".
+        std::string looked;
+        for (const std::string& c : candidates) { if (!looked.empty()) looked += ", "; looked += c; }
+        Log("Localization: no language setting found (looked in: %s) - defaulting to English", looked.c_str());
         return "en_GB";
     }
 
@@ -166,7 +182,10 @@ namespace
         {
             if (!line.empty() && line.back() == '\r') line.pop_back();
             std::string trimmed = Trim(line);
-            if (trimmed.empty() || trimmed[0] == '#' || trimmed[0] == ';' || trimmed[0] == '[') continue;
+            if (trimmed.empty() || trimmed[0] == '#' || trimmed[0] == ';') continue;
+            // A "[section]" header carries no '='. Keys such as "[ON]", "[OFF]" and
+            // "[!] Preset is outdated" also start with '[' but are real key=value lines.
+            if (trimmed[0] == '[' && trimmed.find('=') == std::string::npos) continue;
 
             size_t eq = line.find('=');
             if (eq == std::string::npos) continue;
@@ -198,11 +217,24 @@ namespace DustLoc
         }
         else if (lang != "en_GB")
         {
-            Log("Localization: loaded %zu strings for '%s'", gTranslations.size(), lang.c_str());
+            Log("Localization: loaded %zu strings for '%s' from %s", gTranslations.size(), lang.c_str(), path.c_str());
+        }
+        else
+        {
+            Log("Localization: language 'en_GB' (requested '%s'), no translation file needed", requestedLanguage.c_str());
         }
 
         gLanguage = lang;
         gIsChinese = (lang == "zh_CN" || lang == "zh_TW");
+
+        // Concatenate every translated value once, for the GUI's glyph-range builder (see GlyphText).
+        gGlyphText.clear();
+        for (const auto& kv : gTranslations) { gGlyphText += kv.second; gGlyphText += ' '; }
+    }
+
+    const std::string& GlyphText()
+    {
+        return gGlyphText;
     }
 
     const char* T(const char* key)

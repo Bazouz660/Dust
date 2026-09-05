@@ -403,6 +403,26 @@ static void ClearShadowReplacements()
 // clip-space), so our injected motion vectors — computed from clip-space cur/prev in the VS — stay
 // jitter-free, which is exactly the upscaler input contract. Recovered from the TSSAA stash@{0}.
 static bool  gJitterEnabled = false;
+
+// ---- Water occlusion query: share the G-buffer viewport jitter for exactly the query's span ----
+// Root cause of "temporal AA costs ~7 ms in towns" (static RE of Kenshi_x64 1.0.65 + captures,
+// 2026-09-05): WaterOcclusionListener (RenderObjectListener) begins a D3D11 OCCLUSION query right
+// before the zoneWater plane's draw (rq 81, Lighting_HDR forward pass on the scene depth buffer) and
+// ends it at renderQueueEnded; its FrameListener::frameStarted then sets the Water_Reflection
+// compositor node's enabled flag to (samples > 100). That node re-renders the whole scene from
+// ReflectionCamera into a 512x512 target (rq 1-60: 1-3k draws in a town) every frame it is enabled.
+// The forward pass is not viewport-jittered (JitterForwardPasses), so the water plane was depth-tested
+// against the sub-pixel-shifted G-buffer depth: wherever the plane sits just under the terrain the
+// shift let thousands of water samples through -> "water visible" -> reflection every frame (a
+// constant offset did not trigger it, a changing one did). Giving the query span the same viewport
+// offset as the G-buffer restores the vanilla depth relationship: the reflection renders only when
+// water is genuinely on screen, exactly as without Dust. See docs/upscaling_dlss_fsr.md.
+static bool     gOcclQueryHooksLive = false;
+static bool     sOcclVpJittered = false;
+static UINT     sOcclVpN = 0;
+static uint32_t gVpSetSerial = 0;          // bumped by every RSSetViewports; End restores only if unchanged
+static uint32_t sOcclVpSerialAtBegin = 0;
+static D3D11_VIEWPORT sOcclVpSaved[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
 static float gJitterPxX = 0.0f;   // this frame's jitter, in pixels [-0.5, 0.5]
 static float gJitterPxY = 0.0f;
 static int   sUpsBackend = 0;     // 0 = DLSS, 1 = FSR2 (declared early so the jitter advance can pick FSR2's sequence)
@@ -626,6 +646,11 @@ static void RunUpscaler(ID3D11DeviceContext* ctx)
         if (!mvNeeded) MotionVectors::ReleaseInjectionTargets();   // free the velocity RT + drop stale cross-frame state
         Log("MotionVectors: injected-MV feeder %s (upscaler=%d, debugViz=%d)",
             mvNeeded ? "ON" : "OFF", (int)sUpsEnabled, (int)MotionVectors::DebugVizEnabled());
+        // The injection gate is frozen at launch: shaders compiled this session have no velocity
+        // output, so the feeder runs against an empty buffer. The GUI shows a restart hint for this;
+        // log it too so a user report with "upscaler on, MVs broken" is diagnosable from the log.
+        if (mvNeeded && !MvInjectionWanted())
+            Log("MotionVectors: feeder enabled at runtime but this session's GBuffer shaders were compiled WITHOUT the velocity output (launch gate off) - per-object MVs need a game restart");
     }
 
     if (!gDevice || gWidth == 0 || gHeight == 0) return;
@@ -871,7 +896,12 @@ static void ExtractCameraData(ID3D11DeviceContext* ctx)
     if (gCameraStagingReady)
     {
         D3D11_MAPPED_SUBRESOURCE mapped;
-        if (SUCCEEDED(ctx->Map(gCameraStagingCBs[readSlot], 0, D3D11_MAP_READ, 0, &mapped)))
+        // DO_NOT_WAIT: never block the render thread on the GPU. If the GPU has not finished last
+        // frame's copy yet (it is more than a frame behind), keep the camera data we already have
+        // (it is one frame old by design; a miss makes it two). A blocking map here forced CPU<->GPU
+        // lockstep whenever the GPU lagged: the sawtooth frame graph.
+        const HRESULT mapHr = ctx->Map(gCameraStagingCBs[readSlot], 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+        if (SUCCEEDED(mapHr))
         {
             float m[16];
             memcpy(m, (float*)mapped.pData + 32, 64); // c8 offset
@@ -962,6 +992,19 @@ typedef HRESULT(STDMETHODCALLTYPE* PFN_Map)(
 typedef void(STDMETHODCALLTYPE* PFN_Unmap)(
     ID3D11DeviceContext* pThis, ID3D11Resource* pResource, UINT Subresource);
 
+typedef void(STDMETHODCALLTYPE* PFN_VSSetShader)(
+    ID3D11DeviceContext* pThis, ID3D11VertexShader* pVertexShader,
+    ID3D11ClassInstance* const* ppClassInstances, UINT NumClassInstances);
+
+typedef void(STDMETHODCALLTYPE* PFN_IASetIndexBuffer)(
+    ID3D11DeviceContext* pThis, ID3D11Buffer* pIndexBuffer, DXGI_FORMAT Format, UINT Offset);
+
+typedef void(STDMETHODCALLTYPE* PFN_VSSetConstantBuffers)(
+    ID3D11DeviceContext* pThis, UINT StartSlot, UINT NumBuffers, ID3D11Buffer* const* ppConstantBuffers);
+
+typedef void(STDMETHODCALLTYPE* PFN_Begin)(ID3D11DeviceContext* pThis, ID3D11Asynchronous* pAsync);
+typedef void(STDMETHODCALLTYPE* PFN_End)(ID3D11DeviceContext* pThis, ID3D11Asynchronous* pAsync);
+
 typedef HRESULT(STDMETHODCALLTYPE* PFN_Present)(
     IDXGISwapChain* pThis, UINT SyncInterval, UINT Flags);
 
@@ -980,6 +1023,11 @@ static PFN_PSSetShaderResources     oPSSetShaderResources = nullptr;
 static PFN_RSSetViewports           oRSSetViewports = nullptr;
 static PFN_Map                      oMap = nullptr;
 static PFN_Unmap                    oUnmap = nullptr;
+static PFN_VSSetShader              oVSSetShader = nullptr;
+static PFN_IASetIndexBuffer         oIASetIndexBuffer = nullptr;
+static PFN_VSSetConstantBuffers     oVSSetConstantBuffers = nullptr;
+static PFN_Begin                    oBegin = nullptr;
+static PFN_End                      oEnd = nullptr;
 static PFN_Present                  oPresent = nullptr;
 static PFN_ResizeBuffers            oResizeBuffers = nullptr;
 
@@ -1984,7 +2032,7 @@ static void STDMETHODCALLTYPE HookedDraw(
         // becomes a function of position instead of a frame delta (shows up in the MV debug view as
         // a position gradient rather than motion).
         if (sMvFeederActive)
-        { ID3D11Buffer* rcb = MotionVectors::GetInjReprojCB(); if (rcb) pThis->VSSetConstantBuffers(13, 1, &rcb); }
+        { if (GeometryCapture::IsInGBufferPass()) MotionVectors::InjEnsureB13(pThis); }   // re-pins b13 only if something overwrote it (tracked through the VSSetConstantBuffers hook)
         oDraw(pThis, VertexCount, StartVertexLocation);
         return;
     }
@@ -2253,7 +2301,7 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     // Keep the injected-MV reproj CB pinned at b13 for the patched GBuffer VS (bind AFTER OGRE's
     // per-draw constant setup). Gated on the feeder so a disabled upscaler binds nothing extra.
     if (sMvFeederActive)
-    { ID3D11Buffer* rcb = MotionVectors::GetInjReprojCB(); if (rcb) pThis->VSSetConstantBuffers(13, 1, &rcb); }
+    { if (GeometryCapture::IsInGBufferPass()) MotionVectors::InjEnsureB13(pThis); }   // re-pins b13 only if something overwrote it (tracked through the VSSetConstantBuffers hook)
     oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 }
 
@@ -2281,7 +2329,7 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
     bool isLV = gLvAoReady && IsLightVolumeDraw(pThis);
     LightVolumeAoScope lvAo(pThis, isLV);
     if (sMvFeederActive)
-    { ID3D11Buffer* rcb = MotionVectors::GetInjReprojCB(); if (rcb) pThis->VSSetConstantBuffers(13, 1, &rcb); }
+    { if (GeometryCapture::IsInGBufferPass()) MotionVectors::InjEnsureB13(pThis); }   // re-pins b13 only if something overwrote it (tracked through the VSSetConstantBuffers hook)
     oDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
                           StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
 }
@@ -2302,10 +2350,86 @@ static void STDMETHODCALLTYPE HookedDrawInstanced(
     {
         static bool sLogged = false;
         if (!sLogged) { sLogged = true; Log("DrawInstanced: non-indexed instanced draw seen (verts/inst=%u, inst=%u) — pinning reproj CB at b13", VertexCountPerInstance, InstanceCount); }
-        ID3D11Buffer* rcb = MotionVectors::GetInjReprojCB();
-        if (rcb) pThis->VSSetConstantBuffers(13, 1, &rcb);
+        MotionVectors::InjEnsureB13(pThis);
     }
     oDrawInstanced(pThis, VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
+}
+
+// VSSetShader / IASetIndexBuffer: pure state trackers for the injected-MV feeder. MotionVectors keeps
+// the bound VS's registry info and the bound index buffer, so the per-draw skinned-MV path no longer
+// calls VSGetShader / IAGetIndexBuffer (+Release, +registry mutex) on EVERY draw. Always on, a few ns
+// each; OGRE sets shaders per material, not per draw. Single immediate context assumed, like every
+// other context hook here (OGRE's D3D11 render system does not use deferred contexts).
+static void STDMETHODCALLTYPE HookedVSSetShader(
+    ID3D11DeviceContext* pThis, ID3D11VertexShader* pVertexShader,
+    ID3D11ClassInstance* const* ppClassInstances, UINT NumClassInstances)
+{
+    if (!gShutdownSignaled) MotionVectors::InjNoteVSSetShader(pVertexShader);
+    oVSSetShader(pThis, pVertexShader, ppClassInstances, NumClassInstances);
+}
+
+static void STDMETHODCALLTYPE HookedIASetIndexBuffer(
+    ID3D11DeviceContext* pThis, ID3D11Buffer* pIndexBuffer, DXGI_FORMAT Format, UINT Offset)
+{
+    if (!gShutdownSignaled) MotionVectors::InjNoteIASetIndexBuffer(pIndexBuffer);
+    oIASetIndexBuffer(pThis, pIndexBuffer, Format, Offset);
+}
+
+// VSSetConstantBuffers: observer only. Lets MotionVectors know when slots 12/13 are overwritten, so
+// the b13 reproj pin is re-issued only when needed instead of on every G-buffer draw. OGRE calls
+// this once per draw for slot 0 (its single per-program constant buffer); the observer is two compares.
+static void STDMETHODCALLTYPE HookedVSSetConstantBuffers(
+    ID3D11DeviceContext* pThis, UINT StartSlot, UINT NumBuffers, ID3D11Buffer* const* ppConstantBuffers)
+{
+    if (!gShutdownSignaled) MotionVectors::InjNoteVSSetConstantBuffers(StartSlot, NumBuffers, ppConstantBuffers);
+    oVSSetConstantBuffers(pThis, StartSlot, NumBuffers, ppConstantBuffers);
+}
+
+// Query Begin/End: see the gOcclQueryHooksLive block for the why.
+static bool IsOcclusionQuery(ID3D11Asynchronous* pAsync)
+{
+    if (!pAsync) return false;
+    ID3D11Query* q = nullptr;
+    if (FAILED(pAsync->QueryInterface(__uuidof(ID3D11Query), (void**)&q)) || !q) return false;
+    D3D11_QUERY_DESC qd = {}; q->GetDesc(&qd); q->Release();
+    return qd.Query == D3D11_QUERY_OCCLUSION;
+}
+
+// Query Begin: an OCCLUSION query opened inside an unjittered forward scene pass gets the scene jitter
+// for its span (the game's water-visibility test; see the gOcclQueryHooksLive block for the why).
+static void STDMETHODCALLTYPE HookedBegin(ID3D11DeviceContext* pThis, ID3D11Asynchronous* pAsync)
+{
+    if (gOcclQueryHooksLive && gJitterEnabled && !gShutdownSignaled && !sOcclVpJittered &&
+        !gInShadowPass && tSuppressVpJitter == 0 && (gJitterPxX != 0.0f || gJitterPxY != 0.0f) &&
+        gFwdScenePass && !gJitterForwardPasses && !GeometryCapture::IsInGBufferPass() &&
+        IsOcclusionQuery(pAsync))
+    {
+        UINT n = 0;
+        pThis->RSGetViewports(&n, nullptr);
+        if (n > 0 && n <= D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE)
+        {
+            pThis->RSGetViewports(&n, sOcclVpSaved);
+            D3D11_VIEWPORT j[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+            for (UINT i = 0; i < n; i++)
+            { j[i] = sOcclVpSaved[i]; j[i].TopLeftX += gJitterPxX; j[i].TopLeftY += gJitterPxY; }
+            oRSSetViewports(pThis, n, j);   // raw: the hook must not offset it a second time
+            sOcclVpJittered = true; sOcclVpN = n; sOcclVpSerialAtBegin = gVpSetSerial;
+            static bool sLogged = false;
+            if (!sLogged) { sLogged = true; Log("Upscaler: water occlusion-query span now shares the G-buffer viewport jitter"); }
+        }
+    }
+    oBegin(pThis, pAsync);
+}
+
+static void STDMETHODCALLTYPE HookedEnd(ID3D11DeviceContext* pThis, ID3D11Asynchronous* pAsync)
+{
+    oEnd(pThis, pAsync);
+    if (sOcclVpJittered && IsOcclusionQuery(pAsync))
+    {
+        // Restore only if nothing else set a viewport meanwhile (then the pass has already moved on).
+        if (gVpSetSerial == sOcclVpSerialAtBegin) oRSSetViewports(pThis, sOcclVpN, sOcclVpSaved);
+        sOcclVpJittered = false;
+    }
 }
 
 // Map/Unmap: proxy known skinned bone-palette WRITE_DISCARD buffers through cached CPU RAM. At Unmap
@@ -2694,6 +2818,11 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
     if (gShutdownSignaled)
     { oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView); return; }
 
+    // OGRE's D3D11 _setRenderTarget calls ClearState() before every bind (plugin RE + capture: 55
+    // ClearState/OMSetRenderTargets pairs per frame), which silently unbinds Dust's b12/b13. The
+    // VSSetConstantBuffers observer cannot see that, so drop the tracked state here (one re-pin per pass).
+    MotionVectors::InjNoteRenderTargetsRebound();
+
     // Motion-vector pass: track GBuffer-pass entry/exit — independent of the shadow-swap feature,
     // so it must run before the !gShadowSwapActive early-out. Runs unconditionally now (the injected
     // MV path needs it even without geometry capture); CheckGBufferConfig is pointer-cached, cheap.
@@ -2795,6 +2924,7 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargetsAndUAV(
     ID3D11UnorderedAccessView* const* ppUnorderedAccessViews,
     const UINT* pUAVInitialCounts)
 {
+    MotionVectors::InjNoteRenderTargetsRebound();   // see the plain-OMSet hook: ClearState precedes every bind
     if (gShutdownSignaled)
     {
         oOMSetRenderTargetsAndUAV(pThis, NumRTVs, ppRenderTargetViews,
@@ -2906,6 +3036,7 @@ static void STDMETHODCALLTYPE HookedRSSetViewports(
     ID3D11DeviceContext* pThis, UINT NumViewports,
     const D3D11_VIEWPORT* pViewports)
 {
+    ++gVpSetSerial;   // lets HookedEnd know whether the pass moved on during an occlusion-query span
     // Shadow-atlas resolution override: scale the shadow-pass viewport to the
     // resized atlas. gShadowPassScale is the CURRENT pass's per-entry scale
     // (the two live atlas generations can differ in size across a mode switch).
@@ -2968,6 +3099,7 @@ static void TickGuiOnPresent(IDXGISwapChain* swapChain, const char* via)
     VpJitterSuppressScope vpSuppress;
 
     ++gPresentHookCallCount;
+    sOcclVpJittered = false;   // an occlusion-query span never crosses a frame; drop one whose End never came
 
     // Periodic diagnostic: confirm Present is firing and show init state
     if (gPresentHookCallCount <= 5 ||
@@ -3148,6 +3280,11 @@ static const int VTIDX_CTX_DrawIndexed              = 12;
 static const int VTIDX_CTX_Draw                     = 13;
 static const int VTIDX_CTX_Map                      = 14;
 static const int VTIDX_CTX_Unmap                    = 15;
+static const int VTIDX_CTX_VSSetShader              = 11;
+static const int VTIDX_CTX_IASetIndexBuffer         = 19;
+static const int VTIDX_CTX_VSSetConstantBuffers     = 7;
+static const int VTIDX_CTX_Begin                    = 27;
+static const int VTIDX_CTX_End                      = 28;
 static const int VTIDX_CTX_DrawIndexedInstanced     = 20;
 static const int VTIDX_CTX_DrawInstanced            = 21;
 static const int VTIDX_CTX_OMSetRenderTargets       = 33;
@@ -3209,6 +3346,11 @@ bool Install()
     void* addrDrawIndexed  = ctxVtable[VTIDX_CTX_DrawIndexed];
     void* addrMap          = ctxVtable[VTIDX_CTX_Map];
     void* addrUnmap        = ctxVtable[VTIDX_CTX_Unmap];
+    void* addrVSSetShader  = ctxVtable[VTIDX_CTX_VSSetShader];
+    void* addrIASetIB      = ctxVtable[VTIDX_CTX_IASetIndexBuffer];
+    void* addrVSSetCBs     = ctxVtable[VTIDX_CTX_VSSetConstantBuffers];
+    void* addrBegin        = ctxVtable[VTIDX_CTX_Begin];
+    void* addrEnd          = ctxVtable[VTIDX_CTX_End];
     void* addrDrawIdxInst  = ctxVtable[VTIDX_CTX_DrawIndexedInstanced];
     void* addrDrawInst     = ctxVtable[VTIDX_CTX_DrawInstanced];
     void* addrOMSetRT      = ctxVtable[VTIDX_CTX_OMSetRenderTargets];
@@ -3331,6 +3473,37 @@ bool Install()
                            (void**)&oDrawInstanced) != KenshiLib::SUCCESS)
     { Log("WARNING: Failed to hook DrawInstanced (non-indexed instanced MV will be wrong)"); }
 
+    // VSSetShader / IASetIndexBuffer: bound-state trackers for the skinned-MV per-draw path. Non-fatal:
+    // if either fails, MotionVectors falls back to querying the context per draw (slower, same result).
+    {
+        const bool vsOk = KenshiLib::AddHook(addrVSSetShader, (void*)HookedVSSetShader,
+                                             (void**)&oVSSetShader) == KenshiLib::SUCCESS;
+        const bool ibOk = KenshiLib::AddHook(addrIASetIB, (void*)HookedIASetIndexBuffer,
+                                             (void**)&oIASetIndexBuffer) == KenshiLib::SUCCESS;
+        if (!vsOk) Log("WARNING: Failed to hook VSSetShader (skinned-MV path falls back to per-draw VSGetShader)");
+        if (!ibOk) Log("WARNING: Failed to hook IASetIndexBuffer (skinned-MV path falls back to per-draw IAGetIndexBuffer)");
+        MotionVectors::InjSetStateHooksLive(vsOk && ibOk);
+    }
+
+    // VSSetConstantBuffers: observer for slots 12/13 so the b13 pin is re-issued only when overwritten.
+    // Non-fatal: without it MotionVectors re-pins b13 on every G-buffer draw (the old behaviour).
+    {
+        const bool cbOk = KenshiLib::AddHook(addrVSSetCBs, (void*)HookedVSSetConstantBuffers,
+                                             (void**)&oVSSetConstantBuffers) == KenshiLib::SUCCESS;
+        if (!cbOk) Log("WARNING: Failed to hook VSSetConstantBuffers (b13 reproj CB re-pinned per G-buffer draw)");
+        MotionVectors::InjSetCbHookLive(cbOk);
+    }
+
+    // Begin/End: give the game's water occlusion query the G-buffer viewport jitter (see HookedBegin).
+    // Non-fatal, but without both hooks the Water_Reflection re-render returns whenever the jitter is on.
+    {
+        const bool bOk = KenshiLib::AddHook(addrBegin, (void*)HookedBegin, (void**)&oBegin) == KenshiLib::SUCCESS;
+        const bool eOk = KenshiLib::AddHook(addrEnd,   (void*)HookedEnd,   (void**)&oEnd)   == KenshiLib::SUCCESS;
+        gOcclQueryHooksLive = bOk && eOk;
+        if (!gOcclQueryHooksLive)
+            Log("WARNING: Failed to hook query Begin/End - the water occlusion query is not jitter-aligned (expect the Water_Reflection re-render under temporal AA)");
+    }
+
     // Map/Unmap: needed to proxy and shadow the skinned bone-palette CB for spatial pose matching.
     // Non-fatal if it fails — skinned animation MVs fall back to camera reprojection.
     if (KenshiLib::AddHook(addrMap, (void*)HookedMap,
@@ -3424,4 +3597,5 @@ namespace UpscalerControl
     void  SetSharpness(float s){ D3D11Hook::sUpsSharpness = s < 0 ? 0 : (s > 1 ? 1 : s); }
     int   GetBackend()         { return D3D11Hook::sUpsBackend; }
     void  SetBackend(int b)    { D3D11Hook::sUpsBackend = (b >= 0 && b <= 2) ? b : 0; }
+    bool  MvShadersInjected()  { return D3D11Hook::MvInjectionWanted(); }
 }

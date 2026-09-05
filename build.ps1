@@ -61,7 +61,12 @@ function Publish-Build($Dest, [switch]$Clean) {
     Copy-Item "$Root\src\build\Release\Dust.dll"  "$Dest\"
     Copy-Item "$Root\mod\RE_Kenshi.json"          "$Dest\"
     Copy-Item "$Root\mod\Dust.mod"                "$Dest\"
-    Copy-Item "$Root\mod\Dust.ini"                "$Dest\"
+    # Dust.ini is deliberately NOT shipped. It holds USER settings (upscaler on/off, last preset,
+    # keybind, language), Dust creates it on first run, and every key in mod/Dust.ini already matches
+    # the code default (FileLogging=1, Language=auto). Shipping it would make a Workshop update (and a
+    # -Deploy) overwrite the user's copy: that wiped [Upscaling] DLSS=1 on 2026-09-05, and since the
+    # MV-injection gate is read from that key at launch, the next session compiled every GBuffer
+    # shader without motion vectors. mod/Dust.ini stays in the repo as the documented defaults.
     if (Test-Path "$Root\mod\lang") { Copy-Item "$Root\mod\lang" "$Dest\" -Recurse -Force }
 
     # DLSS runtime model — only when the NGX SDK is vendored (external/DLSS is gitignored). NGX loads it

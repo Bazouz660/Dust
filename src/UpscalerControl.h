@@ -14,4 +14,9 @@ namespace UpscalerControl
     void  SetSharpness(float s);
     int   GetBackend();           // 0 = DLSS, 1 = FSR2
     void  SetBackend(int b);
+    // True when this session's game shaders were compiled WITH the injected velocity output. That
+    // decision is frozen at launch (D3D11Hook::MvInjectionWanted reads [Upscaling] DLSS /
+    // ShowMotionVectors once), so turning the upscaler or the MV viz on in a session that launched
+    // with both off gives a resolve with no per-object motion vectors until the game is restarted.
+    bool  MvShadersInjected();
 }

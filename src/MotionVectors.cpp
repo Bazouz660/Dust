@@ -1,4 +1,5 @@
 #include "MotionVectors.h"
+#include <d3d11_1.h>   // ID3D11DeviceContext1::VSSetConstantBuffers1 (per-draw pose bind by offset)
 #include "GeometryCapture.h"
 #include "ShaderMetadata.h"
 #include "D3D11StateBlock.h"
@@ -921,8 +922,125 @@ static ID3D11Buffer*  sSkinZeroB12 = nullptr;             // persistent all-zero
 // shader's zero-guard never fires => wrong-bone reprojection => one-frame giant MV "flash"). So every
 // miss path must explicitly bind this zero CB to make the shader's camera-reproj fallback real.
 // (The old rigid path masked this by re-binding b12 on every static draw; its revert exposed it.)
+// ---- b12 / b13 binding with (almost) no per-draw API traffic ---------------------------------------
+// OGRE's D3D11 render system binds exactly ONE constant buffer per draw, VSSetConstantBuffers(0,1,..)
+// (ground truth: OgreD3D11RenderSystem::bindGpuProgramParameters); it never touches b12/b13. The old
+// scheme still re-pinned b13 on EVERY G-buffer draw and did Map(DISCARD)+Unmap+bind of a fresh b12
+// per skinned draw: ~7000 extra API calls per frame in a town, each processed later by the driver's
+// worker thread - invisible to main-thread timers, but that thread is what throttles the game.
+// Now: the VSSetConstantBuffers hook OBSERVES slots 12/13 (InjNoteVSSetConstantBuffers), so the b13
+// pin is re-issued only if something overwrote it, and all previous poses live in ONE large constant
+// buffer uploaded once per frame (UploadPrevPoses); a skinned draw binds its pose with a single
+// VSSetConstantBuffers1 offset call (D3D11.1 constant-buffer offsetting, feature-checked, legacy
+// per-draw Map path kept as the fallback).
+static const uint32_t kPoseStride = 3072;               // 192 constants: kB12Size rounded up to the 16-constant offset granularity
+static const uint32_t kPoseConsts = kPoseStride / 16;   // 192
+static ID3D11DeviceContext1* sCtx1 = nullptr;           // QI'd once; ref held
+static int                   sCbOffsetsOk = -1;         // -1 unprobed, 0 legacy per-draw Map path, 1 offset path
+// Ring of FOUR pose buffers, one discarded per frame in rotation. A single 4-12 MB buffer discarded
+// EVERY frame makes the driver rename a large allocation each frame; when its rename pool for that
+// resource runs dry the Map blocks until the GPU releases one - a mid-frame CPU<->GPU sync, i.e. the
+// sawtooth frame-time graph and CPU+GPU lockstep. Discarding a buffer last touched 4 frames ago never
+// waits (the swapchain lets the GPU lag at most 3 frames).
+static ID3D11Buffer*         sPoseRing[4] = {};
+static uint32_t              sPoseRingIdx = 0;
+static ID3D11Buffer*         sPoseBuf = nullptr;        // = sPoseRing[sPoseRingIdx]: this frame's; slot 0 = zero pose, slot i+1 = sPrevSkinPoses[i]
+static uint32_t              sPoseBufCap = 0;           // capacity in pose slots
+static uint32_t              sPoseBufCount = 0;         // valid slots this frame (incl. the zero slot); 0 = not uploaded
+static bool                  sB13Ours = false;          // slot 13 holds sReprojCB (tracked through the hook)
+static int                   sB12State = 0;             // 0 unknown/foreign, 1 our zero pose, 2 one of our poses
+static bool                  sCbHookLive = false;       // VSSetConstantBuffers hook installed => tracking is exact
+
+void InjSetCbHookLive(bool live) { sCbHookLive = live; }
+
+// Hook observer. Any bind covering slot 12/13 that is not ours invalidates the tracked state; our own
+// plain VSSetConstantBuffers binds pass through here too and re-validate it. (Our VSSetConstantBuffers1
+// binds do NOT pass through this hook - BindPoseSlot updates the state itself.)
+void InjNoteVSSetConstantBuffers(UINT startSlot, UINT num, ID3D11Buffer* const* buffers)
+{
+    if (startSlot > 13 || num == 0) return;
+    const UINT end = startSlot + num;   // exclusive
+    if (startSlot <= 13 && 13 < end)
+    {
+        ID3D11Buffer* b = buffers ? buffers[13 - startSlot] : nullptr;
+        sB13Ours = (b != nullptr && b == sReprojCB);
+    }
+    if (startSlot <= 12 && 12 < end)
+    {
+        ID3D11Buffer* b = buffers ? buffers[12 - startSlot] : nullptr;
+        sB12State = (b != nullptr && b == sSkinZeroB12) ? 1 : 0;
+    }
+}
+
+void InjNoteRenderTargetsRebound() { sB13Ours = false; sB12State = 0; }
+
+// Per-draw replacement for the unconditional b13 re-pin: bind only when the tracked state says the
+// slot no longer holds the reproj CB (or when the hook is missing and we cannot know).
+void InjEnsureB13(ID3D11DeviceContext* ctx)
+{
+    if (!ctx || !sReprojCB) return;
+    if (sCbHookLive && sB13Ours) return;
+    ctx->VSSetConstantBuffers(13, 1, &sReprojCB);   // through the hook -> sB13Ours = true
+}
+
+static bool EnsureCtx1(ID3D11DeviceContext* ctx)
+{
+    if (sCbOffsetsOk >= 0) return sCbOffsetsOk == 1;
+    sCbOffsetsOk = 0;
+    if (!ctx || !sDevice) return false;
+    D3D11_FEATURE_DATA_D3D11_OPTIONS opts = {};
+    if (FAILED(sDevice->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &opts, sizeof(opts))) || !opts.ConstantBufferOffsetting)
+    { Log("MotionVectors: D3D11.1 constant-buffer offsetting unavailable - per-draw b12 Map path"); return false; }
+    if (FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), (void**)&sCtx1)) || !sCtx1)
+    { sCtx1 = nullptr; Log("MotionVectors: ID3D11DeviceContext1 unavailable - per-draw b12 Map path"); return false; }
+    sCbOffsetsOk = 1;
+    Log("MotionVectors: skinned prev-pose binding = one per-frame pose buffer + VSSetConstantBuffers1 offsets (no per-draw Map)");
+    return true;
+}
+
+// Grow (never shrink) the pose buffer to hold `slots` poses. On refusal, fall back to the legacy path.
+static bool EnsurePoseBuffer(uint32_t slots)
+{
+    if (sPoseRing[0] && sPoseBufCap >= slots) return true;
+    uint32_t cap = sPoseBufCap ? sPoseBufCap : 1024;
+    while (cap < slots) cap *= 2;
+    if (cap > 4097) cap = 4097;   // sCurSkinCount is capped at 4096 poses (+ the zero slot)
+    if (cap < slots) return false;
+    for (int i = 0; i < 4; i++) { if (sPoseRing[i]) { sPoseRing[i]->Release(); sPoseRing[i] = nullptr; } }
+    sPoseBuf = nullptr;
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth = cap * kPoseStride; bd.Usage = D3D11_USAGE_DYNAMIC;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    for (int i = 0; i < 4; i++)
+    {
+        if (FAILED(sDevice->CreateBuffer(&bd, nullptr, &sPoseRing[i])))
+        {
+            for (int k = 0; k < 4; k++) { if (sPoseRing[k]) { sPoseRing[k]->Release(); sPoseRing[k] = nullptr; } }
+            sPoseBufCap = 0; sCbOffsetsOk = 0;
+            Log("MotionVectors: large pose constant buffer (%u B) refused - per-draw b12 Map path", bd.ByteWidth);
+            return false;
+        }
+    }
+    sPoseBufCap = cap;
+    Log("MotionVectors: pose buffer ring 4 x %u slots (4 x %u KB)", cap, bd.ByteWidth / 1024);
+    return true;
+}
+
+static inline void BindPoseSlot(uint32_t slot)
+{
+    const UINT first = slot * kPoseConsts, num = kPoseConsts;
+    sCtx1->VSSetConstantBuffers1(12, 1, &sPoseBuf, &first, &num);
+    sB12State = slot == 0 ? 1 : 2;
+}
+
+// b12 is STICKY pipeline state: once a matched draw binds a pose, every later skinned draw that MISSES
+// its match would keep reading the previous character's pose (non-zero dust_prevVP => the shader's
+// zero-guard never fires => wrong-bone reprojection => one-frame giant MV "flash"). So every miss path
+// binds the zero pose - but only when the tracked state says b12 is not already the zero pose.
 static void BindSkinZeroB12(ID3D11DeviceContext* ctx)
 {
+    if (sCbHookLive && sB12State == 1) return;
+    if (sCbOffsetsOk == 1 && sPoseBuf && sPoseBufCount > 0 && sCtx1) { BindPoseSlot(0); return; }
     if (!sSkinZeroB12 && sDevice)
     {
         std::vector<uint8_t> zeros(kB12Size, 0);
@@ -932,20 +1050,74 @@ static void BindSkinZeroB12(ID3D11DeviceContext* ctx)
         D3D11_SUBRESOURCE_DATA init = { zeros.data(), 0, 0 };
         sDevice->CreateBuffer(&bd, &init, &sSkinZeroB12);
     }
-    if (sSkinZeroB12) ctx->VSSetConstantBuffers(12, 1, &sSkinZeroB12);
+    if (sSkinZeroB12) ctx->VSSetConstantBuffers(12, 1, &sSkinZeroB12);   // through the hook -> state 1
 }
 
-// The live injected-MV path only needs shader classification for every GBuffer draw. Query the
-// currently-bound VS, resolve its persistent registry metadata, and immediately release the COM ref.
-// This replaces the legacy full CapturedDraw snapshot used by the abandoned geometry-replay path.
+// Bind previous pose `j` (index into sPrevSkinPoses) for the skinned draw about to be issued.
+static void BindPrevPose(ID3D11DeviceContext* ctx, uint32_t j, const std::vector<uint8_t>& b12)
+{
+    if (sCbOffsetsOk == 1 && sPoseBuf && sCtx1 && (j + 1) < sPoseBufCount) { BindPoseSlot(j + 1); return; }
+    // Legacy: rewrite a per-draw dynamic CB (3 API calls + a rename per draw).
+    if (!sInjSkinB12 && sDevice)
+    {
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = kB12Size; bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        sDevice->CreateBuffer(&bd, nullptr, &sInjSkinB12);
+    }
+    D3D11_MAPPED_SUBRESOURCE ms;
+    if (sInjSkinB12 && SUCCEEDED(ctx->Map(sInjSkinB12, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms)))
+    {
+        memcpy(ms.pData, b12.data(), kB12Size);
+        ctx->Unmap(sInjSkinB12, 0);
+        ctx->VSSetConstantBuffers(12, 1, &sInjSkinB12);
+        sB12State = 2;
+    }
+    else BindSkinZeroB12(ctx);
+}
+
+// The live injected-MV path only needs shader classification for every GBuffer draw. The bound VS
+// and index buffer are tracked from D3D11Hook's VSSetShader / IASetIndexBuffer hooks, so a NON-skinned
+// draw costs two static reads. The previous scheme called VSGetShader (+Release) and took the registry
+// mutex on EVERY draw (~10k per frame in a town), which is main-thread time in a game that is already
+// bound on render submission. If the hooks failed to install, fall back to querying the context.
+static bool                         sStateHooksLive = false;
+static ID3D11VertexShader*          sCurVS     = nullptr;   // raw pointer, no ref held
+static const VSConstantBufferInfo*  sCurVSInfo = nullptr;
+static ID3D11Buffer*                sCurIB     = nullptr;   // raw pointer, no ref held
+
+void InjSetStateHooksLive(bool live) { sStateHooksLive = live; }
+int  InjCurrentVSClass()
+{
+    if (!sStateHooksLive || !sCurVSInfo) return 0;
+    return sCurVSInfo->transformType == VSTransformType::SKINNED ? 2 : (sCurVSInfo->transformType == VSTransformType::STATIC ? 1 : 0);
+}
+void InjNoteVSSetShader(ID3D11VertexShader* vs)
+{
+    // Always re-resolve (no pointer-equality shortcut): a released VS's address can be reused by a
+    // new one with different metadata.
+    sCurVS     = vs;
+    sCurVSInfo = vs ? ShaderMetadata::GetVSInfo(vs) : nullptr;
+}
+void InjNoteIASetIndexBuffer(ID3D11Buffer* ib) { sCurIB = ib; }
+
 static const VSConstantBufferInfo* CurrentVSInfo(ID3D11DeviceContext* ctx)
 {
+    if (sStateHooksLive) return sCurVSInfo;
     if (!ctx) return nullptr;
     ID3D11VertexShader* vs = nullptr;
     ctx->VSGetShader(&vs, nullptr, nullptr);
     const VSConstantBufferInfo* info = vs ? ShaderMetadata::GetVSInfo(vs) : nullptr;
     if (vs) vs->Release();
     return info;
+}
+static ID3D11Buffer* CurrentIndexBuffer(ID3D11DeviceContext* ctx)
+{
+    if (sStateHooksLive) return sCurIB;
+    ID3D11Buffer* ib = nullptr; DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN; UINT off = 0;
+    ctx->IAGetIndexBuffer(&ib, &fmt, &off);
+    if (ib) ib->Release();   // keep only the stable pointer value as the identity
+    return ib;
 }
 
 struct SkinPose {
@@ -955,11 +1127,43 @@ struct SkinPose {
     uint32_t idxCount = 0;
     int32_t  baseVtx = 0;
 };
+// Pose storage is POOLED: the vectors are never cleared, only the live counts move, so a crowd frame
+// does not pay ~1500 heap alloc/free pairs of 2.9 KB (the old push_back/clear churn).
 static std::vector<SkinPose>   sPrevSkinPoses;            // last frame's skinned poses (match targets)
 static std::vector<SkinPose>   sCurSkinPoses;             // this frame's poses, recorded at draw time from the CB shadow
+static uint32_t                sPrevSkinCount = 0, sCurSkinCount = 0;
 static std::vector<uint8_t>    sPrevClaimed;              // one-to-one matching: prev pose already taken
+// Previous poses bucketed by mesh identity (ib, idxCount, baseVtx): a draw scans only its own mesh's
+// candidates. The old linear scan was O(skinned draws^2) per frame — ~2.5M compares at 1600 draws.
+static std::unordered_map<uint64_t, std::vector<uint32_t>> sPrevByMesh;
+static inline uint64_t SkinMeshKey(const void* ib, uint32_t idxCount, int32_t baseVtx)
+{
+    uint64_t h = (uint64_t)(uintptr_t)ib * 0x9E3779B97F4A7C15ull;
+    return h ^ ((uint64_t)idxCount << 32) ^ (uint64_t)(uint32_t)baseVtx;
+}
 static uint32_t sSkinTotalFrame = 0, sSkinMatchedFrame = 0, sSkinShadowMissFrame = 0;   // per-frame diag
 static uint32_t sSkinDiagFrame = 0;
+// Once per frame, after the pose swap (InjFillSkinPrev): every previous pose into the pose buffer with
+// ONE Map(DISCARD). Next frame's skinned draws bind by offset. DISCARD renames the buffer, so whatever
+// b12 held becomes unknown - the next skinned draw always re-binds explicitly.
+static void UploadPrevPoses(ID3D11DeviceContext* ctx)
+{
+    sPoseBufCount = 0;
+    if (!EnsureCtx1(ctx)) return;
+    const uint32_t slots = sPrevSkinCount + 1;
+    if (!EnsurePoseBuffer(slots)) return;
+    sPoseRingIdx = (sPoseRingIdx + 1) & 3;   // rotate: this buffer was last discarded 4 frames ago
+    sPoseBuf = sPoseRing[sPoseRingIdx];
+    D3D11_MAPPED_SUBRESOURCE ms;
+    if (FAILED(ctx->Map(sPoseBuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) return;
+    uint8_t* dst = (uint8_t*)ms.pData;
+    memset(dst, 0, kPoseStride);   // slot 0 = the zero pose (shader camera-reproj fallback)
+    for (uint32_t i = 0; i < sPrevSkinCount; ++i)
+        memcpy(dst + (size_t)(i + 1) * kPoseStride, sPrevSkinPoses[i].b12.data(), kB12Size);
+    ctx->Unmap(sPoseBuf, 0);
+    sPoseBufCount = slots;
+    sB12State = 0;
+}
 
 // Bone-palette CB shadow: OGRE Map_WRITE_DISCARDs the skin CB (bones + VP) just before each skin draw.
 // We snapshot those bytes at Unmap so InjBindSkinPrev can read THIS frame's root bone at draw time
@@ -1117,6 +1321,8 @@ void ReleaseInjectionTargets()
     sInjBegun = false;
     sHaveFwd = false;
     sPrevSkinPoses.clear(); sCurSkinPoses.clear(); sPrevClaimed.clear();
+    sPrevSkinCount = sCurSkinCount = 0; sPrevByMesh.clear();
+    sPoseBufCount = 0; sB12State = 0; sB13Ours = false;   // nothing uploaded / bound is trustworthy any more
     sPrevRigid.clear(); sCurRigid.clear(); sPrevRigidClaimed.clear(); sPrevRigidByMesh.clear();
 }
 
@@ -1159,9 +1365,9 @@ void InjFillSkinPrev(ID3D11DeviceContext* ctx)
     // Per-frame match diagnostic (this frame's draws matched against last frame's poses). A low
     // matched/total ratio => flashing (misses fall back to camera reproj). shadowMiss = warmup/churn.
     if ((sSkinDiagFrame++ % 120) == 0 && sSkinTotalFrame > 0)
-        Log("MV[skin]: matched=%u/%u (%.0f%%) shadowMiss=%u prevPoses=%zu",
+        Log("MV[skin]: matched=%u/%u (%.0f%%) shadowMiss=%u prevPoses=%u",
             sSkinMatchedFrame, sSkinTotalFrame,
-            100.0f * sSkinMatchedFrame / sSkinTotalFrame, sSkinShadowMissFrame, sPrevSkinPoses.size());
+            100.0f * sSkinMatchedFrame / sSkinTotalFrame, sSkinShadowMissFrame, sPrevSkinCount);
     // Event log: a MASS-MISS frame (most skinned draws failed the 2u gate at once) is the signature
     // of a world rebase / draw-identity upheaval. If visible character-MV flashes line up with these
     // lines, the flash is the (safe) camera-reproj fallback frame; if flashes occur WITHOUT them, the
@@ -1176,9 +1382,21 @@ void InjFillSkinPrev(ID3D11DeviceContext* ctx)
     }
     sSkinTotalFrame = 0; sSkinMatchedFrame = 0; sSkinShadowMissFrame = 0;
 
+    // Pooled swap: the vectors keep their elements (and each element's 2.9 KB), only the counts move.
     sPrevSkinPoses.swap(sCurSkinPoses);
-    sCurSkinPoses.clear();
-    sPrevClaimed.assign(sPrevSkinPoses.size(), 0);
+    sPrevSkinCount = sCurSkinCount;
+    sCurSkinCount  = 0;
+    sPrevClaimed.assign(sPrevSkinCount, 0);
+    // Rebuild the mesh buckets. Bucket vectors keep their capacity across frames; the map is only
+    // rebuilt from scratch if it grew past what any crowd needs (stale empty keys are harmless).
+    if (sPrevByMesh.size() > 8192) sPrevByMesh.clear();
+    for (auto& kv : sPrevByMesh) kv.second.clear();
+    for (uint32_t j = 0; j < sPrevSkinCount; ++j)
+    {
+        const SkinPose& p = sPrevSkinPoses[j];
+        sPrevByMesh[SkinMeshKey(p.ib, p.idxCount, p.baseVtx)].push_back(j);
+    }
+    UploadPrevPoses(ctx);   // one Map for every previous pose; next frame's draws bind by offset
 }
 
 // Draw hook: identify the current VS directly, then read the CURRENT root bone from the CB shadow,
@@ -1204,13 +1422,8 @@ void InjBindSkinPrev(ID3D11DeviceContext* ctx, UINT indexCount, INT baseVertexLo
     ctx->VSGetConstantBuffers(cbSlot, 1, &boneCB);
     if (!boneCB) { BindSkinZeroB12(ctx); return; }
 
-    // Query only the index buffer needed for cross-frame mesh identity.
-    ID3D11Buffer* indexBuffer = nullptr;
-    DXGI_FORMAT indexFormat = DXGI_FORMAT_UNKNOWN;
-    UINT indexOffset = 0;
-    ctx->IAGetIndexBuffer(&indexBuffer, &indexFormat, &indexOffset);
-    ID3D11Buffer* meshId = indexBuffer;
-    if (indexBuffer) indexBuffer->Release();   // keep only the stable pointer value as the identity
+    // Mesh identity for cross-frame matching: the bound index buffer (tracked, no query).
+    ID3D11Buffer* meshId = CurrentIndexBuffer(ctx);
 
     if (sKnownBoneCB.find((const void*)boneCB) == sKnownBoneCB.end())
     {
@@ -1237,15 +1450,17 @@ void InjBindSkinPrev(ID3D11DeviceContext* ctx, UINT indexCount, INT baseVertexLo
         const uint32_t bonesLen = boneCnt * 48;
         if (boneCnt && meshId &&
             (size_t)boneOff + bonesLen <= cur.size() && (size_t)clipOff + 64 <= cur.size() &&
-            sCurSkinPoses.size() < 4096)
+            sCurSkinCount < 4096)
         {
-            SkinPose p;
-            p.b12.assign(kB12Size, 0);
-            memcpy(p.b12.data(),        cur.data() + boneOff, bonesLen);
+            // Pooled slot: reuse the element (and its 2.9 KB) from an earlier frame; grow only once.
+            if (sCurSkinPoses.size() <= sCurSkinCount) sCurSkinPoses.emplace_back();
+            SkinPose& p = sCurSkinPoses[sCurSkinCount++];
+            if (p.b12.size() != kB12Size) p.b12.resize(kB12Size);
+            memcpy(p.b12.data(), cur.data() + boneOff, bonesLen);
+            if (bonesLen < 2880) memset(p.b12.data() + bonesLen, 0, 2880 - bonesLen);   // same bytes as the old zero-fill
             memcpy(p.b12.data() + 2880, cur.data() + clipOff, 64);
             p.root[0] = cr[0]; p.root[1] = cr[1]; p.root[2] = cr[2];
             p.ib = meshId; p.idxCount = indexCount; p.baseVtx = baseVertexLocation;
-            sCurSkinPoses.push_back(std::move(p));
         }
     }
 
@@ -1257,34 +1472,24 @@ void InjBindSkinPrev(ID3D11DeviceContext* ctx, UINT indexCount, INT baseVertexLo
     // into MISSES, which are safe (zero b12 -> camera reproj) instead of wrong.
     const float kGate2 = 2.0f * 2.0f;                     // rebased world units^2
     int best = -1; float bestD = 1e30f;
-    for (size_t j = 0; j < sPrevSkinPoses.size(); ++j)
+    auto bucket = sPrevByMesh.find(SkinMeshKey(meshId, indexCount, baseVertexLocation));
+    if (bucket != sPrevByMesh.end())
     {
-        if (sPrevClaimed[j]) continue;
-        const SkinPose& p = sPrevSkinPoses[j];
-        if (p.ib != meshId || p.idxCount != indexCount || p.baseVtx != baseVertexLocation) continue;
-        float dx = cr[0]-p.root[0], dy = cr[1]-p.root[1], dz = cr[2]-p.root[2];
-        float dd = dx*dx + dy*dy + dz*dz;
-        if (dd < bestD) { bestD = dd; best = (int)j; }
+        for (uint32_t j : bucket->second)   // only this mesh's previous poses (see sPrevByMesh)
+        {
+            if (sPrevClaimed[j]) continue;
+            const SkinPose& p = sPrevSkinPoses[j];
+            if (p.ib != meshId || p.idxCount != indexCount || p.baseVtx != baseVertexLocation) continue;   // hash-collision guard
+            float dx = cr[0]-p.root[0], dy = cr[1]-p.root[1], dz = cr[2]-p.root[2];
+            float dd = dx*dx + dy*dy + dz*dz;
+            if (dd < bestD) { bestD = dd; best = (int)j; }
+        }
     }
     if (best < 0 || bestD > kGate2) { BindSkinZeroB12(ctx); return; }   // no confident prev -> camera reproj
     sPrevClaimed[best] = 1;
     sSkinMatchedFrame++;
 
-    if (!sInjSkinB12)
-    {
-        D3D11_BUFFER_DESC bd = {};
-        bd.ByteWidth = kB12Size; bd.Usage = D3D11_USAGE_DYNAMIC;
-        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-        if (FAILED(sDevice->CreateBuffer(&bd, nullptr, &sInjSkinB12))) { BindSkinZeroB12(ctx); return; }
-    }
-    D3D11_MAPPED_SUBRESOURCE ms;
-    if (SUCCEEDED(ctx->Map(sInjSkinB12, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms)))
-    {
-        memcpy(ms.pData, sPrevSkinPoses[best].b12.data(), kB12Size);
-        ctx->Unmap(sInjSkinB12, 0);
-        ctx->VSSetConstantBuffers(12, 1, &sInjSkinB12);
-    }
-    else BindSkinZeroB12(ctx);
+    BindPrevPose(ctx, (uint32_t)best, sPrevSkinPoses[best].b12);   // one offset bind (or the legacy Map path)
 }
 
 // DrawIndexedInstanced hook: instanced draws skip the pose matcher (per-instance palettes make
@@ -1630,12 +1835,18 @@ void Shutdown()
     if (sInjVelTex) { sInjVelTex->Release(); sInjVelTex = nullptr; }
     if (sReprojCB)  { sReprojCB->Release();  sReprojCB = nullptr; }
     if (sInjSkinB12){ sInjSkinB12->Release();sInjSkinB12 = nullptr; }
+    for (int i = 0; i < 4; i++) { if (sPoseRing[i]) { sPoseRing[i]->Release(); sPoseRing[i] = nullptr; } }
+    sPoseBuf = nullptr; sPoseBufCap = 0; sPoseBufCount = 0; sPoseRingIdx = 0;
+    if (sCtx1)      { sCtx1->Release();      sCtx1 = nullptr; }
+    sCbOffsetsOk = -1; sB12State = 0; sB13Ours = false;
     if (sSkinZeroB12){ sSkinZeroB12->Release(); sSkinZeroB12 = nullptr; }
     if (sInjRigidB12) { sInjRigidB12->Release(); sInjRigidB12 = nullptr; }
     if (sRigidZeroB12){ sRigidZeroB12->Release(); sRigidZeroB12 = nullptr; }
     sPrevRigid.clear(); sCurRigid.clear(); sPrevRigidClaimed.clear(); sPrevRigidByMesh.clear();
     ClearBoneShadows();
     sPrevSkinPoses.clear(); sCurSkinPoses.clear(); sPrevClaimed.clear();
+    sPrevSkinCount = sCurSkinCount = 0; sPrevByMesh.clear();
+    sPoseBufCount = 0; sB12State = 0; sB13Ours = false;   // nothing uploaded / bound is trustworthy any more
     sInjHavePrev = false; sInjBegun = false; sHaveFwd = false;
     if (sVelVS) { sVelVS->Release(); sVelVS = nullptr; }
     if (sVelPS) { sVelPS->Release(); sVelPS = nullptr; }

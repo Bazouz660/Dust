@@ -74,6 +74,25 @@ namespace MotionVectors
     // preserves the current root pose without ever reading slow write-combined upload memory.
     void InjNoteMap(void* resource, D3D11_MAP mapType, D3D11_MAPPED_SUBRESOURCE* mapped);
     void InjNoteUnmap(void* resource);
+    // Bound-state trackers fed by D3D11Hook's VSSetShader / IASetIndexBuffer hooks (raw pointers, no
+    // refs held). With the hooks live, a NON-skinned draw costs the feeder two static reads instead of
+    // VSGetShader+Release plus a mutex-guarded registry lookup on every draw (~10k/frame in towns).
+    void InjSetStateHooksLive(bool live);
+    void InjNoteVSSetShader(ID3D11VertexShader* vs);
+    void InjNoteIASetIndexBuffer(ID3D11Buffer* ib);
+    // VSSetConstantBuffers hook observer: tracks whether slots 12/13 still hold Dust's buffers, so the
+    // b13 reproj pin is re-issued only when something actually overwrote it (OGRE's D3D11 render
+    // system binds slot 0 only - ground truth from its source - so in practice never). InjEnsureB13 is
+    // the per-draw call that replaced the unconditional re-pin.
+    // Class of the currently bound VS from the tracker: 0 unknown/unregistered, 1 static, 2 skinned.
+    int  InjCurrentVSClass();
+    void InjSetCbHookLive(bool live);
+    void InjNoteVSSetConstantBuffers(UINT startSlot, UINT num, ID3D11Buffer* const* buffers);
+    void InjEnsureB13(ID3D11DeviceContext* ctx);
+    // OGRE's D3D11 render system calls ClearState() before every render-target bind, which unbinds every
+    // constant buffer without the observer seeing it. Drop the tracked b12/b13 state so the next draw
+    // re-pins (one extra bind per pass switch).
+    void InjNoteRenderTargetsRebound();
     // Blit the injected velocity RT as colour over the bound target (debug viz).
     void InjDebugBlit(ID3D11DeviceContext* ctx);
 

@@ -583,14 +583,37 @@ static void RebuildFontAtlas()
 
     io.Fonts->Clear();
 
+    // Font and glyph coverage follow the active menu language. Segoe UI covers Latin + Cyrillic;
+    // CJK needs a system CJK face (first one present wins). The glyph ranges are the script's base
+    // table PLUS every character the loaded translation actually uses (≈, en/em dashes, curly
+    // quotes...), so nothing the menu draws falls outside the atlas and renders as '?'.
+    const std::string lang = DustLoc::Language();
+    const bool zh = DustLoc::IsChinese();
+    const bool ja = (lang == "ja_JP");
+    const bool ko = (lang == "ko_KR");
+    const bool ru = (lang == "ru_RU");
+    static ImVector<ImWchar> sGlyphRanges;   // must outlive the atlas build (first NewFrame)
+    sGlyphRanges.clear();
+    {
+        ImFontGlyphRangesBuilder b;
+        b.AddRanges(io.Fonts->GetGlyphRangesDefault());
+        if (zh)      b.AddRanges(io.Fonts->GetGlyphRangesChineseFull());
+        else if (ja) b.AddRanges(io.Fonts->GetGlyphRangesJapanese());
+        else if (ko) b.AddRanges(io.Fonts->GetGlyphRangesKorean());
+        else if (ru) b.AddRanges(io.Fonts->GetGlyphRangesCyrillic());
+        if (!DustLoc::GlyphText().empty()) b.AddText(DustLoc::GlyphText().c_str());
+        b.BuildRanges(&sGlyphRanges);
+    }
+
     char fontPath[MAX_PATH] = {};
     UINT n = GetWindowsDirectoryA(fontPath, MAX_PATH);
     bool loaded = false;
     if (n > 0)
     {
         const char* fonts[] = {
-            DustLoc::IsChinese() ? "\\Fonts\\msyh.ttc" : "\\Fonts\\segoeui.ttf",
-            DustLoc::IsChinese() ? "\\Fonts\\simsun.ttc" : "\\Fonts\\segoeui.ttf",
+            zh ? "\\Fonts\\msyh.ttc"   : ja ? "\\Fonts\\YuGothM.ttc"  : ko ? "\\Fonts\\malgun.ttf" : "\\Fonts\\segoeui.ttf",
+            zh ? "\\Fonts\\simsun.ttc" : ja ? "\\Fonts\\meiryo.ttc"   : ko ? "\\Fonts\\gulim.ttc"  : "\\Fonts\\segoeui.ttf",
+            ja ? "\\Fonts\\msgothic.ttc" : "\\Fonts\\segoeui.ttf",
             "\\Fonts\\segoeui.ttf"
         };
         for (const char* suffix : fonts)
@@ -600,11 +623,8 @@ static void RebuildFontAtlas()
             if (strlen(fontPath) + strlen(suffix) >= MAX_PATH) continue;
             strcat_s(fontPath, sizeof(fontPath), suffix);
             if (GetFileAttributesA(fontPath) == INVALID_FILE_ATTRIBUTES) continue;
-            const ImWchar* ranges = DustLoc::IsChinese()
-                ? io.Fonts->GetGlyphRangesChineseFull()
-                : nullptr;
-            loaded = (io.Fonts->AddFontFromFileTTF(fontPath, px, nullptr, ranges) != nullptr);
-            if (loaded) break;
+            loaded = (io.Fonts->AddFontFromFileTTF(fontPath, px, nullptr, sGlyphRanges.Data) != nullptr);
+            if (loaded) { Log("GUI: font %s for language %s", suffix + 7, lang.c_str()); break; }
         }
     }
     if (!loaded)
@@ -835,7 +855,7 @@ static bool IsFrameworkDirty()
 
 static void DrawUpscalingSection()
 {
-    ImGui::TextColored(DustHeadingColor(), "%s", DustLoc::T("Upscaling"));
+    ImGui::TextColored(DustHeadingColor(), "%s", DustLoc::T("Temporal Anti-Aliasing"));
     ImGui::Separator();
     ImGui::Spacing();
 
@@ -844,7 +864,10 @@ static void DrawUpscalingSection()
     // sel: 0=Disabled 1=DLSS 2=FSR2 3=FSR3/4   <->   backend: DLSS=0 FSR2=1 FSR3=2
     const int be0 = UpscalerControl::GetBackend();
     int sel = !UpscalerControl::GetEnabled() ? 0 : (be0 == 1 ? 2 : be0 == 2 ? 3 : 1);
-    const char* items[] = { DustLoc::T("Disabled"), "DLSS", "FSR2", "FSR3 / FSR4" };
+    // The NVIDIA backend is labelled DLAA: Dust runs DLSS at native resolution (render == display,
+    // NVSDK_NGX_PerfQuality_Value_DLAA), i.e. as anti-aliasing, never as a performance upscale.
+    // The [Upscaling] DLSS/DLSSPreset/DLSSSharpness ini keys keep their names for existing configs.
+    const char* items[] = { DustLoc::T("Disabled"), "DLAA", "FSR2", "FSR3 / FSR4" };
     if (ImGui::Combo("##upscaler", &sel, items, 4))
     {
         bool en      = (sel != 0);
@@ -856,10 +879,23 @@ static void DrawUpscalingSection()
         WritePrivateProfileStringA("Upscaling", "Backend", bs,             gDustIniPath.c_str());
     }
     if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("%s", LocOr("tip:Upscaling", "Temporal anti-aliasing / upscaling. DLSS = NVIDIA RTX only (best quality). FSR2 = any GPU (native D3D11). FSR3 / FSR4 = any DX12 GPU via a D3D12 side-device; FSR4 needs a Radeon RX 9000. Disabled = off."));
+        ImGui::SetTooltip("%s", LocOr("tip:Upscaling", "Temporal anti-aliasing / upscaling. DLAA = NVIDIA RTX only (DLSS at native resolution, best quality). FSR2 = any GPU (native D3D11). FSR3 / FSR4 = any DX12 GPU via a D3D12 side-device; FSR4 needs a Radeon RX 9000. Disabled = off."));
 
     if (sel == 1 && !UpscalerControl::Available())
-        ImGui::TextDisabled("%s", DustLoc::T("DLSS unavailable (needs NVIDIA RTX + recent driver)"));
+        ImGui::TextDisabled("%s", DustLoc::T("DLAA unavailable (needs NVIDIA RTX + recent driver)"));
+
+    // The velocity output is compiled into the game's GBuffer shaders at launch (session-stable gate,
+    // see D3D11Hook::MvInjectionWanted). Turning the upscaler / MV viz on in a session that launched
+    // with both off runs the resolve against an empty velocity buffer (ghosting on moving objects)
+    // until the game is restarted — say so, instead of looking broken.
+    if ((sel != 0 || MotionVectors::DebugVizEnabled()) && !UpscalerControl::MvShadersInjected())
+    {
+        ImGui::TextColored(ImVec4(1.00f, 0.72f, 0.25f, 1.00f), "%s",
+                           DustLoc::T("Restart the game to enable motion vectors"));
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", LocOr("tip:Restart for motion vectors",
+                "Motion-vector output is compiled into the game's shaders when Kenshi starts. This session started with the upscaler off, so the shaders have no velocity output: moving objects will ghost until you restart the game. The setting is saved; the next launch compiles the shaders with motion vectors."));
+    }
 
     if (sel != 0)
     {
@@ -873,7 +909,7 @@ static void DrawUpscalingSection()
                 WritePrivateProfileStringA("Upscaling", "DLSSPreset", b, gDustIniPath.c_str());
             }
             if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", LocOr("tip:DLSS model", "DLSS model. F = CNN DLAA (recommended). K/J are the DLSS-4 transformer: sharpest in theory, but blur the whole image when the scene is static in this integration. Changing it rebuilds the feature next frame."));
+                ImGui::SetTooltip("%s", LocOr("tip:DLAA model", "DLAA model. F = CNN (recommended). K/J are the DLSS-4 transformer: sharpest in theory, but blur the whole image when the scene is static in this integration. Changing it rebuilds the feature next frame."));
         }
 
         float sh = UpscalerControl::GetSharpness();
@@ -896,7 +932,7 @@ static void DrawUpscalingSection()
             WritePrivateProfileStringA("Upscaling", "ShowMotionVectors", mv ? "1" : "0", gDustIniPath.c_str());
         }
         if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", LocOr("tip:Show Motion Vectors", "Debug overlay of the motion-vector buffer: grey = still, colour = motion dir/magnitude, red = no MV. Watch grass/foliage while moving; if it stays grey while swaying, it has no valid MV and will ghost under DLSS."));
+            ImGui::SetTooltip("%s", LocOr("tip:Show Motion Vectors", "Debug overlay of the motion-vector buffer: grey = still, colour = motion dir/magnitude, red = no MV. Watch grass/foliage while moving; if it stays grey while swaying, it has no valid MV and will ghost under DLAA."));
     }
 }
 

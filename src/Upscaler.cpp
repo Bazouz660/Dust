@@ -75,7 +75,7 @@ bool Init(ID3D11Device* device, const wchar_t* dllSearchPath, const wchar_t* app
 
 bool IsAvailable() { return sAvailable; }
 
-static const char* kPresetLabels[] = { "Default", "K (transformer, blurs when static)", "J", "F (DLAA, recommended)", "E (CNN)" };
+static const char* kPresetLabels[] = { "Default", "K (transformer, blurs when static)", "J", "F (CNN, recommended)", "E (CNN)" };
 const char* const* PresetLabels() { return kPresetLabels; }
 
 static unsigned int PresetToNgx(int p)
@@ -181,7 +181,7 @@ bool Init(ID3D11Device*, const wchar_t*, const wchar_t*)
     return false;
 }
 bool IsAvailable() { return false; }
-static const char* kPresetLabels[] = { "Default", "K (transformer, blurs when static)", "J", "F (DLAA, recommended)", "E (CNN)" };
+static const char* kPresetLabels[] = { "Default", "K (transformer, blurs when static)", "J", "F (CNN, recommended)", "E (CNN)" };
 const char* const* PresetLabels() { return kPresetLabels; }
 bool CreateFeature(ID3D11DeviceContext*, uint32_t, uint32_t, uint32_t, uint32_t, bool, bool, int) { return false; }
 bool Evaluate(ID3D11DeviceContext*, ID3D11Resource*, ID3D11Resource*, ID3D11Resource*,

@@ -21,6 +21,34 @@ inline std::string& DustLogDir()
     return dir;
 }
 
+// The Kenshi game root (trailing slash), derived from the HOST EXE, not from the DLL: the DLL may
+// live in <game>/mods/Dust or in steamapps/workshop/content/233860/<id>, and only the former sits
+// under the game folder. RE_Kenshi launches a patched copy of kenshi_x64.exe from <game>/RE_Kenshi/,
+// so walk up from the exe until the game's marker files appear. Falls back to the exe dir.
+// (Same derivation as dllmain's and BugReport's static GetGameDir.)
+inline std::string DustGameDir()
+{
+    char path[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, path, MAX_PATH);
+    std::string dir(path);
+    auto pos = dir.find_last_of("\\/");
+    dir = (pos != std::string::npos) ? dir.substr(0, pos + 1) : dir;
+    auto isFile = [](const std::string& p) {
+        DWORD a = GetFileAttributesA(p.c_str());
+        return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+    };
+    std::string probe = dir;
+    for (int i = 0; i < 3; i++)
+    {
+        if (isFile(probe + "settings.cfg") || isFile(probe + "currentVersion.txt"))
+            return probe;
+        size_t p = probe.find_last_of("\\/", probe.size() - 2);
+        if (p == std::string::npos) break;
+        probe = probe.substr(0, p + 1);
+    }
+    return dir;
+}
+
 // Serializes DustLog across the render thread, the WndProc thread, and worker threads (the
 // first-call fopen in DustLogFile and the sBytesWritten/sCapped cap counters race otherwise).
 // Function-local static in an inline function — one instance per module, same pattern as the
