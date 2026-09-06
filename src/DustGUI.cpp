@@ -98,7 +98,8 @@ bool gOverlayVisible = false;
 static volatile bool gResizeInProgress = false;
 static HWND gHWnd = nullptr;
 static float gOsDpiScale = 1.0f;   // window's OS/monitor DPI scale, captured at init
-static bool gFontRebuildPending = false;  // rebuild atlas at top of next Render (scale changed)
+static bool gFontRebuildPending = false;  // rebuild atlas at top of next Render (scale/language changed)
+static bool gLanguageReloadPending = false;
 static bool gEmojiFontLoaded = false;     // Segoe UI Emoji merged into the atlas (bug button glyph)
 static WNDPROC oWndProc = nullptr;
 static ID3D11Device* gDevice = nullptr;
@@ -114,6 +115,7 @@ static std::vector<EffectGUIState> gEffectStates;
 static FrameworkConfig gFwConfig;
 static FrameworkConfig gFwDiskConfig;
 static std::string gDustIniPath;
+static std::vector<std::string> gAvailableLanguages;
 
 // Startup toast
 static float gToastTimer = 30.0f;
@@ -776,9 +778,15 @@ static void LoadFrameworkConfig()
         gFwConfig.uiScalePercent = 0;
 
     char languageBuf[64] = {};
-    GetPrivateProfileStringA("Dust", "Language", "auto", languageBuf, sizeof(languageBuf), gDustIniPath.c_str());
+    // Materialize the default for both new INIs and existing INIs without a language.
+    if (GetPrivateProfileStringA("Dust", "Language", "", languageBuf, sizeof(languageBuf), gDustIniPath.c_str()) == 0)
+    {
+        strcpy_s(languageBuf, "auto");
+        WritePrivateProfileStringA("Dust", "Language", "auto", gDustIniPath.c_str());
+    }
     gFwConfig.language = languageBuf;
     DustLoc::Init(DustLogDir(), gFwConfig.language);
+    gAvailableLanguages = DustLoc::AvailableLanguages(DustLogDir());
 
     char buf[256] = {};
     GetPrivateProfileStringA("Dust", "LastPreset", "", buf, sizeof(buf), gDustIniPath.c_str());
@@ -833,6 +841,8 @@ static void SaveFrameworkConfig()
 
 static void ResetFrameworkConfig()
 {
+    if (gFwConfig.language != gFwDiskConfig.language)
+        gLanguageReloadPending = true;
     gFwConfig = gFwDiskConfig;
     DustLogEnabled() = gFwConfig.logging;
     ApplyDustTheme(gFwConfig.theme);
@@ -848,6 +858,7 @@ static bool IsFrameworkDirty()
            gFwConfig.toggleKey != gFwDiskConfig.toggleKey ||
            gFwConfig.toggleEffectsKey != gFwDiskConfig.toggleEffectsKey ||
            gFwConfig.theme != gFwDiskConfig.theme ||
+           gFwConfig.language != gFwDiskConfig.language ||
            gFwConfig.uiScalePercent != gFwDiskConfig.uiScalePercent;
 }
 
@@ -1015,6 +1026,23 @@ static void DrawFrameworkSection()
         }
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip(DustLoc::T("Scale the Dust overlay. Auto matches your Windows display scaling (%.0f%%)."), gOsDpiScale * 100.0f);
+    }
+
+    ImGui::Spacing();
+
+    if (ImGui::BeginCombo(DustLoc::T("Language##language"), gFwConfig.language.c_str()))
+    {
+        for (const std::string& language : gAvailableLanguages)
+        {
+            const bool selected = (gFwConfig.language == language);
+            if (ImGui::Selectable(language.c_str(), selected) && !selected)
+            {
+                gFwConfig.language = language;
+                gLanguageReloadPending = true;
+            }
+            if (selected) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
     }
 
     ImGui::Spacing();
@@ -2226,7 +2254,16 @@ void Render()
     HRESULT removeReason = gDevice->GetDeviceRemovedReason();
     if (removeReason != S_OK) return;
 
-    // Font atlas can only change between frames. A UI-scale change sets the flag;
+    // Reload between frames: translation pointers and font glyphs must remain valid
+    // for the whole frame in which the dropdown or Reset was clicked.
+    if (gLanguageReloadPending)
+    {
+        gLanguageReloadPending = false;
+        DustLoc::Init(DustLogDir(), gFwConfig.language);
+        gFontRebuildPending = true;
+    }
+
+    // Font atlas can only change between frames. A UI-scale/language change sets the flag;
     // rebuild here and drop the stale GPU font texture so the DX11 backend
     // recreates it from the new atlas during this NewFrame.
     if (gFontRebuildPending)
@@ -2247,7 +2284,8 @@ void Render()
     {
         ImGui::SetNextWindowSize(ImVec2(560, 420), ImGuiCond_FirstUseEver);
         bool wasVisible = gOverlayVisible;
-        ImGui::Begin(DustLoc::T("Dust Settings"), &gOverlayVisible);
+        std::string windowTitle = std::string(DustLoc::T("Dust Settings")) + "###DustSettings";
+        ImGui::Begin(windowTitle.c_str(), &gOverlayVisible);
         if (wasVisible && !gOverlayVisible)
             OnOverlayClose(); // user clicked the X button
 

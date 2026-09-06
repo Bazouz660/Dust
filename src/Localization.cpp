@@ -199,6 +199,30 @@ namespace
 
 namespace DustLoc
 {
+    std::vector<std::string> AvailableLanguages(const std::string& modDir)
+    {
+        std::vector<std::string> languages = { "auto", "en_GB" };
+        WIN32_FIND_DATAA data = {};
+        const std::string pattern = JoinPath(JoinPath(modDir, "lang"), "*.ini");
+        HANDLE search = FindFirstFileA(pattern.c_str(), &data);
+        if (search != INVALID_HANDLE_VALUE)
+        {
+            do
+            {
+                if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                std::string filename = data.cFileName;
+                const size_t dot = filename.find_last_of('.');
+                if (dot == std::string::npos || dot == 0) continue;
+                std::string locale = filename.substr(0, dot);
+                if (std::find(languages.begin(), languages.end(), locale) == languages.end())
+                    languages.push_back(locale);
+            } while (FindNextFileA(search, &data));
+            FindClose(search);
+        }
+        std::sort(languages.begin() + 2, languages.end());
+        return languages;
+    }
+
     void Init(const std::string& modDir, const std::string& requestedLanguage)
     {
         gTranslations.clear();

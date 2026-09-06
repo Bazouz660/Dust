@@ -190,6 +190,7 @@ FileLogging=1         # timestamped logs in logs/ next to the DLL (on by default
 MaxLogFiles=10        # log sessions kept before the oldest are deleted (1-100)
 StartupMessage=1
 Theme=kenshi          # "kenshi" (warm parchment palette) or "dark" (ImGui default)
+Language=auto         # follow Kenshi, or a locale such as en_GB, fr_FR, or zh_CN
 ToggleKey=122         # VK code for the overlay toggle (122 = VK_F11)
 ToggleEffectsKey=0    # VK code for the all-effects on/off hotkey (0 = unbound)
 

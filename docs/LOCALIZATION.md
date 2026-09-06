@@ -22,9 +22,15 @@ At runtime, the localization system detects the language selected in Kenshi
 the host executable so that both `<game>/mods/Dust` and Steam Workshop
 installs work), loads the matching file from `mod/lang/`, and looks up the
 original English text as the translation key. `Language=auto` in `Dust.ini`
-is the default; set it to a code such as `fr_FR` to force a language. The
-Dust log reports which language was detected, from which file, and how many
+is the default and is added automatically if missing; set it to a code such
+as `fr_FR` to force a language. The Dust log reports which language was
+detected, from which file, and how many
 strings were loaded.
+
+The F11 menu's Language dropdown offers `auto`, built-in English (`en_GB`),
+and the locales installed in the mod's `lang/` folder. Selecting a language
+previews it immediately, including the required fonts. Use Save to keep the
+selection in `Dust.ini`, or Reset to restore the saved language.
 
 The GUI picks a system font per script (Segoe UI for Latin and Cyrillic,
 Microsoft YaHei / SimSun for Chinese, Yu Gothic / Meiryo / MS Gothic for

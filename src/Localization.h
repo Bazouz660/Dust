@@ -1,10 +1,13 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 namespace DustLoc
 {
     void Init(const std::string& modDir, const std::string& requestedLanguage);
+    // Auto, built-in English, then the locales installed in modDir/lang.
+    std::vector<std::string> AvailableLanguages(const std::string& modDir);
     const char* T(const char* key);
     const char* Language();
     bool IsChinese();
