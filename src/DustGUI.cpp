@@ -2121,18 +2121,9 @@ bool Init(IDXGISwapChain* swapChain, ID3D11Device* device, ID3D11DeviceContext* 
     ApplyDustTheme(gFwConfig.theme);
     RebuildFontAtlas();  // build TTF atlas at the configured scale (texture made on first NewFrame)
 
-    // DustBoot can initialize the GUI from the swap chain before the pipeline detector
-    // captures a draw-context device. In that case effects are loaded but not initialized,
-    // so the F11 settings list is empty. The swap chain device is valid for GPU resources;
-    // use it as a fallback and let the normal capture path skip if initialization already ran.
-    if (gEffectLoader.Count() > 0 && !gEffectLoader.IsInitialized())
-    {
-        uint32_t initW = desc.BufferDesc.Width  ? desc.BufferDesc.Width  : 1;
-        uint32_t initH = desc.BufferDesc.Height ? desc.BufferDesc.Height : 1;
-        Log("GUI: effect loader not initialized; initializing from swap-chain device at %ux%u", initW, initH);
-        if (!gEffectLoader.InitAll(gDevice, initW, initH))
-            Log("WARNING: One or more effect plugins failed to initialize from GUI fallback");
-    }
+    // The GUI may start before the game pipeline is detected. Only TryCaptureDevice
+    // initializes effects, using the confirmed game device and render-target dimensions.
+    // Do not allocate effect resources from this potentially different swap-chain device.
     gInitialized = true;
     Log("GUI: Initialized (%s to toggle)", VKKeyName(gFwConfig.toggleKey));
     return true;
