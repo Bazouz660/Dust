@@ -327,6 +327,7 @@ jobs:
           xcopy /S /Y /I effects\presets release\Dust\presets
           copy mod\Dust.mod release\Dust\
           copy mod\RE_Kenshi.json release\Dust\
+          xcopy /S /Y /I mod\lang release\Dust\lang
 
       # Upscaler runtime DLLs live next to Dust.dll (the framework loads them from
       # the mod dir). Guarded so we ship only what got fetched/built above; FSR2
