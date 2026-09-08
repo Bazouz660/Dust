@@ -15,7 +15,7 @@
 #pragma once
 
 //---- [Dust] 32-bit ImWchar so glyphs outside the Basic Multilingual Plane can
-// be loaded — the Report-a-Bug button renders U+1F41B from Segoe UI Emoji.
+// be loaded. Keep this consistent across the host and effect plugins.
 #define IMGUI_USE_WCHAR32
 
 //---- Define assertion handler. Defaults to calling assert().

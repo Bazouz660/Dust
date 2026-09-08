@@ -100,7 +100,6 @@ static HWND gHWnd = nullptr;
 static float gOsDpiScale = 1.0f;   // window's OS/monitor DPI scale, captured at init
 static bool gFontRebuildPending = false;  // rebuild atlas at top of next Render (scale/language changed)
 static bool gLanguageReloadPending = false;
-static bool gEmojiFontLoaded = false;     // Segoe UI Emoji merged into the atlas (bug button glyph)
 static WNDPROC oWndProc = nullptr;
 static ID3D11Device* gDevice = nullptr;
 static ID3D11DeviceContext* gContext = nullptr;
@@ -635,30 +634,6 @@ static void RebuildFontAtlas()
         cfg.SizePixels = 13.0f * ResolveUiScale();
         io.Fonts->AddFontDefault(&cfg);
         Log("GUI: Segoe UI unavailable, using built-in font");
-    }
-
-    // Merge the emoji glyphs we use (bug-report button) from Segoe UI Emoji.
-    // stb_truetype rasterizes the font's monochrome outline layer, so the
-    // glyph tints with the text color like any other character. Needs
-    // IMGUI_USE_WCHAR32 (imconfig.h) because emoji live outside the BMP.
-    gEmojiFontLoaded = false;
-    {
-        static const ImWchar kEmojiRanges[] = { 0x1F41B, 0x1F41E, 0 }; // bug..lady beetle
-        char emojiPath[MAX_PATH] = {};
-        UINT m = GetWindowsDirectoryA(emojiPath, MAX_PATH);
-        if (m > 0 && m + 20 < MAX_PATH)
-        {
-            strcat_s(emojiPath, sizeof(emojiPath), "\\Fonts\\seguiemj.ttf");
-            if (GetFileAttributesA(emojiPath) != INVALID_FILE_ATTRIBUTES)
-            {
-                ImFontConfig cfg;
-                cfg.MergeMode = true;
-                gEmojiFontLoaded =
-                    (io.Fonts->AddFontFromFileTTF(emojiPath, px, &cfg, kEmojiRanges) != nullptr);
-            }
-        }
-        if (!gEmojiFontLoaded)
-            Log("GUI: Segoe UI Emoji unavailable, bug button falls back to text");
     }
 
     io.Fonts->Build();
@@ -2281,16 +2256,28 @@ void Render()
             OnOverlayClose(); // user clicked the X button
 
         static float leftW = 220.0f;
-        const float minLeftW = 150.0f;
+        const ImGuiStyle& footerStyle = ImGui::GetStyle();
+        const std::string reportBugLabel = std::string(DustLoc::T("Report a Bug")) + "###reportbug";
+        const float reportBugWidth = ImGui::CalcTextSize(reportBugLabel.c_str(), nullptr, true).x
+                                     + footerStyle.FramePadding.x * 2.0f;
+        const float reportBugPaneWidth = reportBugWidth + footerStyle.WindowPadding.x * 2.0f;
+        const float minLeftW = reportBugPaneWidth > 150.0f ? reportBugPaneWidth : 150.0f;
+        if (leftW < minLeftW) leftW = minLeftW;
         const float minRightW = 200.0f;
         float availW = ImGui::GetContentRegionAvail().x;
 
         // ---- Left pane: Framework settings + Performance (scrollable) + fixed footer ----
         const float logoSize = 36.0f;
-        const float footerH = logoSize + ImGui::GetStyle().FramePadding.y * 2.0f
-                             + ImGui::GetStyle().ItemSpacing.y + 4.0f;
+        const float logoHeight = logoSize + footerStyle.FramePadding.y * 2.0f;
+        const int logoCount = (gDiscordLogoSRV ? 1 : 0) + (gGithubLogoSRV ? 1 : 0);
+        const float logosWidth = logoCount * (logoSize + footerStyle.FramePadding.x * 2.0f
+                                             + footerStyle.ItemSpacing.x);
 
         ImGui::BeginChild("##left", ImVec2(leftW, 0), true, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        const bool reportBugOwnRow = logoCount > 0
+                                    && ImGui::GetContentRegionAvail().x < logosWidth + reportBugWidth;
+        const float footerH = logoHeight + footerStyle.ItemSpacing.y + 4.0f
+                              + (reportBugOwnRow ? ImGui::GetFrameHeightWithSpacing() : 0.0f);
 
         // Scrollable content area (everything except footer)
         ImGui::BeginChild("##leftContent", ImVec2(0, -footerH), false);
@@ -2331,7 +2318,7 @@ void Render()
 
             if (gGithubLogoSRV)
             {
-                ImGui::SameLine();
+                if (gDiscordLogoSRV) ImGui::SameLine();
                 ImGui::PushID("github");
                 if (ImGui::ImageButton((ImTextureID)gGithubLogoSRV, ImVec2(logoSize, logoSize)))
                     ShellExecuteA(nullptr, "open", "https://github.com/Bazouz660/Dust", nullptr, nullptr, SW_SHOWNORMAL);
@@ -2342,46 +2329,12 @@ void Render()
 
             ImGui::PopStyleColor(3);
 
-            ImGui::SameLine();
-            // Report-a-Bug button: bug emoji (U+1F41B, merged from Segoe UI
-            // Emoji) + label that adapts to the space left by the logos 鈥?one
-            // line if it fits, two lines if narrow, emoji only when squeezed.
-            // "###reportbug" keeps the ImGui ID stable across label switches.
+            // Keep the full translated label visible, using a separate row when needed.
+            if (logoCount > 0 && !reportBugOwnRow) ImGui::SameLine();
             {
-                const ImGuiStyle& style = ImGui::GetStyle();
-                // Match the logos' height (+FramePadding*2, as ImageButton pads around the image)
-                ImVec2 btnSize(ImGui::GetContentRegionAvail().x,
-                               logoSize + style.FramePadding.y * 2.0f);
-                float contentW = btnSize.x - style.FramePadding.x * 2.0f;
-
-                #define DUST_BUG_EMOJI "\xF0\x9F\x90\x9B"  // UTF-8 U+1F41B
-                char reportBugFull[128];
-                char reportBugWrapped[128];
-                char reportBugPlain[96];
-                snprintf(reportBugFull, sizeof(reportBugFull), DUST_BUG_EMOJI "  %s###reportbug", DustLoc::T("Report a Bug"));
-                snprintf(reportBugWrapped, sizeof(reportBugWrapped), DUST_BUG_EMOJI " %s###reportbug", DustLoc::T("Report a Bug"));
-                snprintf(reportBugPlain, sizeof(reportBugPlain), "%s###reportbug", DustLoc::T("Report a Bug"));
-
-                const char* candidates[3];
-                int n = 0;
-                if (gEmojiFontLoaded)
-                {
-                    candidates[n++] = reportBugFull;
-                    candidates[n++] = reportBugWrapped;
-                    candidates[n++] = DUST_BUG_EMOJI "###reportbug";
-                }
-                else
-                {
-                    candidates[n++] = reportBugPlain;
-                }
-                const char* label = candidates[n - 1];
-                for (int c = 0; c < n; c++)
-                {
-                    if (ImGui::CalcTextSize(candidates[c], nullptr, true).x <= contentW)
-                    { label = candidates[c]; break; }
-                }
-
-                if (ImGui::Button(label, btnSize))
+                const ImVec2 btnSize(ImGui::GetContentRegionAvail().x,
+                                     reportBugOwnRow ? ImGui::GetFrameHeight() : logoHeight);
+                if (ImGui::Button(reportBugLabel.c_str(), btnSize))
                     gBugReportOpenRequested = true;
                 if (ImGui::IsItemHovered())
                     ImGui::SetTooltip("%s", DustLoc::T("Spotted a bug? Generate a diagnostic report to share on Discord or GitHub"));
