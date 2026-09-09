@@ -17,6 +17,7 @@ struct TemporalCB {
 static_assert(sizeof(TemporalCB) == 112);
 static std::vector<TemporalCB> temporalUploads;
 static std::vector<float> bounceUploads;
+static std::vector<float> gpuUploads;
 
 int main()
 {
@@ -73,20 +74,27 @@ int main()
     ComPtr<ID3D11Buffer> buffer; buffer.Attach(p.host.CreateConstantBuffer(p.device.Get(),sizeof(TemporalCB)));
     D3D11_SAMPLER_DESC sd = {}; sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
     sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP; sd.MaxLOD = D3D11_FLOAT32_MAX;
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     ComPtr<ID3D11SamplerState> sampler; assert(SUCCEEDED(p.device->CreateSamplerState(&sd,&sampler)));
     std::vector<Pixel> current(p.W*p.H,Pixel{.8f,.8f,.8f,.8f});
     p.ctx->UpdateSubresource(p.scene.Get(),0,nullptr,current.data(),p.W*sizeof(Pixel),0);
     p.SetNormals(std::vector<Pixel>(p.W*p.H,Pixel{.2f,.2f,.2f,.2f})); // history
     std::vector<float> depths(p.W*p.H,.1f);
     p.ctx->UpdateSubresource(p.depth.Get(),0,nullptr,depths.data(),p.W*sizeof(float),0);
+    struct CameraCB { float matrix[16]; float farClip, previousFar, gpu, valid; };
+    ComPtr<ID3D11Buffer> cameraBuffer; cameraBuffer.Attach(p.host.CreateConstantBuffer(p.device.Get(),sizeof(CameraCB)));
     auto draw = [&](const TemporalCB& cb) {
         p.ctx->ClearState();
+        CameraCB camera = {}; std::memcpy(camera.matrix,cb.matrix,sizeof(camera.matrix));
+        camera.farClip = camera.previousFar = 2000; camera.valid = 1;
+        p.host.UpdateConstantBuffer(p.ctx.Get(),cameraBuffer.Get(),&camera,sizeof(camera));
+        auto cameraB = cameraBuffer.Get(); p.ctx->PSSetConstantBuffers(3,1,&cameraB);
         p.host.UpdateConstantBuffer(p.ctx.Get(),buffer.Get(),&cb,sizeof(cb));
         p.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         p.ctx->VSSetShader(vs.Get(),nullptr,0); p.ctx->PSSetShader(ps.Get(),nullptr,0);
         auto b = buffer.Get(); p.ctx->PSSetConstantBuffers(0,1,&b);
         ID3D11ShaderResourceView* views[] = {p.sceneSRV.Get(),p.normalsSRV.Get(),p.depthSRV.Get(),p.depthSRV.Get()};
-        p.ctx->PSSetShaderResources(0,4,views); auto sam = sampler.Get(); p.ctx->PSSetSamplers(0,1,&sam);
+        p.ctx->PSSetShaderResources(0,4,views); auto sam = sampler.Get(); p.ctx->PSSetSamplers(0,1,&sam); p.ctx->PSSetSamplers(1,1,&sam);
         auto rt = p.outputRTV.Get(); p.ctx->OMSetRenderTargets(1,&rt,nullptr);
         D3D11_VIEWPORT vp = {0,0,float(p.W),float(p.H),0,1}; p.ctx->RSSetViewports(1,&vp);
         p.ctx->Draw(3,0); p.ctx->CopyResource(p.staging.Get(),p.output.Get());
@@ -99,25 +107,41 @@ int main()
         TemporalCB cb; Camera(prev,20000); Camera(cur,20000+dx);
         assert(RTGITemporal::Reprojection(cur,prev,2000,cb.matrix));
         auto result = draw(cb);
-        // Independent projection of a world point: normalized ray * depth * farClip.
-        for (UINT y = 0; y < p.H; ++y) for (UINT x = 0; x < p.W; ++x) {
-            double rx = (2*(x+.5)/p.W-1)*cb.aspect*cb.fov;
-            double ry = (1-2*(y+.5)/p.H)*cb.fov;
-            double z = .1*2000/std::sqrt(rx*rx+ry*ry+1);
-            double pixels = (double(cur[12])-prev[12])/z/cb.aspect/cb.fov*.5*cb.size[0];
-            double dynamic = std::clamp((pixels-1.5)*.2,0.,1.);
-            float alpha = float(.1+.7*dynamic), aoAlpha = float(.1+.8*dynamic);
-            for (int c = 0; c < 4; ++c)
-                assert(std::abs(result[y*p.W+x][c] - (.2f+.6f*(c==3 ? aoAlpha : alpha))) < 3e-5);
-        }
+        // Changed uniform lighting must immediately replace stale radiance/AO,
+        // even for a stationary camera. History clipping prevents a brightness trail.
+        AssertImagesNear(result,current);
     }
     TemporalCB flush; flush.blend = 0;
     AssertImagesNear(draw(flush),current);
+
+    // A planar surface moves exactly one history pixel. Its gradient stays
+    // attached to the surface; same-UV blending would darken every column.
+    TemporalCB pan; pan.aspect = 1.5f;
+    pan.matrix[0] = pan.matrix[5] = pan.matrix[10] = pan.matrix[15] = 1;
+    pan.matrix[12] = 2*pan.aspect*pan.fov*.1f/p.W;
+    std::vector<Pixel> gradient(p.W*p.H), shifted(p.W*p.H);
+    for (UINT y = 0; y < p.H; ++y) for (UINT x = 0; x < p.W; ++x) {
+        float value = .1f+.025f*x, old = .1f+.025f*(int(x)-1);
+        gradient[y*p.W+x] = {value,value,value,value}; shifted[y*p.W+x] = {old,old,old,old};
+        float rx = (2*(x+.5f)/p.W-1)*pan.aspect*pan.fov, ry = (1-2*(y+.5f)/p.H)*pan.fov;
+        depths[y*p.W+x] = .1f*std::sqrt(rx*rx+ry*ry+1);
+    }
+    p.ctx->UpdateSubresource(p.scene.Get(),0,nullptr,gradient.data(),p.W*sizeof(Pixel),0);
+    p.ctx->UpdateSubresource(p.depth.Get(),0,nullptr,depths.data(),p.W*sizeof(float),0);
+    p.SetNormals(shifted);
+    AssertImagesNear(draw(pan),gradient);
+    // History is outside the viewport: reject it completely, not a clamped edge texel.
+    pan.matrix[12] = 20;
+    AssertImagesNear(draw(pan),gradient);
+    // Reprojection remains on screen but lands on a different depth surface.
+    pan.matrix[12] = 0; pan.matrix[14] = .05f;
+    AssertImagesNear(draw(pan),gradient);
 
     // Observe uploads from the real renderer/DLL. No history (including bounce)
     // until a successful consecutive frame, and none after skipped work/reset.
     p.host.UpdateConstantBuffer = [](ID3D11DeviceContext* ctx,ID3D11Buffer* cb,const void* data,uint32_t bytes) {
         if (bytes == sizeof(TemporalCB)) temporalUploads.push_back(*static_cast<const TemporalCB*>(data));
+        if (bytes == 80) gpuUploads.push_back(static_cast<const float*>(data)[18]);
         if (bytes == 128) bounceUploads.push_back(static_cast<const float*>(data)[10]);
         D3D11_MAPPED_SUBRESOURCE map = {}; assert(SUCCEEDED(ctx->Map(cb,0,D3D11_MAP_WRITE_DISCARD,0,&map)));
         std::memcpy(map.pData,data,bytes); ctx->Unmap(cb,0);
@@ -131,13 +155,29 @@ int main()
     frame.width = p.W; frame.height = p.H; frame.point = DUST_INJECT_POST_LIGHTING;
     frame.camera.valid = 1; frame.camera.farZ = 2000; frame.camera.tanHalfFov = .5f;
     Camera(frame.camera.inverseView,20000);
+    ComPtr<ID3D11Buffer> gameCamera;
+    gameCamera.Attach(p.host.CreateConstantBuffer(p.device.Get(),192));
+    bool useGpu = false;
     auto render = [&](uint64_t index,bool history) {
-        p.ctx->ClearState(); temporalUploads.clear(); bounceUploads.clear(); frame.frameIndex = index;
+        p.ctx->ClearState(); temporalUploads.clear(); bounceUploads.clear(); gpuUploads.clear(); frame.frameIndex = index;
+        if (useGpu) {
+            float raw[48] = {}; raw[8] = 3000; Camera(raw+32,20000+float(index));
+            p.host.UpdateConstantBuffer(p.ctx.Get(),gameCamera.Get(),raw,sizeof(raw));
+            auto source = gameCamera.Get(); p.ctx->PSSetConstantBuffers(0,1,&source);
+        }
+        ID3D11Buffer* sentinels[] = {gameCamera.Get(),gameCamera.Get(),gameCamera.Get()};
+        p.ctx->PSSetConstantBuffers(1,3,sentinels); p.ctx->CSSetConstantBuffers(1,3,sentinels);
         frame.timing = DUST_TIMING_PRE; p.effect.preExecute(&frame,&p.host);
         frame.timing = DUST_TIMING_POST; p.effect.postExecute(&frame,&p.host);
         assert(temporalUploads.size() == 1 && bounceUploads.size() == 1);
         assert((temporalUploads[0].blend > 0) == history);
         assert((bounceUploads[0] > 0) == history);
+        assert(gpuUploads.size() == 1 && (gpuUploads[0] > 0) == useGpu);
+        ID3D11Buffer* restored[3] = {};
+        p.ctx->PSGetConstantBuffers(1,3,restored);
+        for (auto* cb : restored) { assert(cb == gameCamera.Get()); cb->Release(); }
+        p.ctx->CSGetConstantBuffers(1,3,restored);
+        for (auto* cb : restored) { assert(cb == gameCamera.Get()); cb->Release(); }
     };
     render(100,false); render(101,true);
     p.Setting<bool>("Enabled") = false;
@@ -155,5 +195,11 @@ int main()
     frame.frameIndex = 117; p.effect.preExecute(&frame,&p.host); p.effect.postExecute(&frame,&p.host);
     p.Setting<float>("GIIntensity") = 3; p.Setting<float>("AOIntensity") = 1;
     render(118,false); render(119,true);
-    std::puts("RTGI world/depth units, handedness, large-coordinate stability, GPU blending and history/bounce resets passed");
+    // Current GPU poses remain usable even when CPU camera readback never arrives.
+    useGpu = true; frame.camera.valid = 0;
+    render(120,false); render(121,true); render(122,true);
+    frame.camera.valid = 1; Camera(frame.camera.inverseView,-10000); // deliberately stale/wrong
+    render(123,true); render(124,true);
+    useGpu = false; render(125,false); render(126,true);
+    std::puts("RTGI world/depth units, handedness, large-coordinate stability, radiance clipping and history/bounce resets passed");
 }
