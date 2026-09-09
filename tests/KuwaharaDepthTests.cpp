@@ -1,5 +1,6 @@
 #include "EffectShaderProbe.h"
 #include "../src/EffectSettingDefaults.h"
+#include "../src/PostProcessOrder.h"
 #include <algorithm>
 
 // Independent CPU reference for the original integer-radius sector filter.
@@ -62,5 +63,11 @@ int main() {
     p.Setting<float>("NearRadius") = 2.00001f; AssertImagesNear(p.Render(input, .05f), below, .001f);
     for (uint32_t i = 0; i < p.effect.settingCount; ++i) defaults.RestoreMissing(p.effect.settings[i], i);
     assert(!p.Setting<bool>("DepthEnabled")); AssertImagesNear(p.Render(input, .05f), legacy);
+    for (int i = 0; i < 12; ++i) {
+        p.Setting<int>("RenderStage") = i % 2;
+        const auto point = PostProcessOrder::Point(p.effect);
+        AssertImagesNear(p.Render(input, .05f, point), legacy);
+        assert(p.lastTarget == (i % 2 ? DUST_RESOURCE_LDR_RT : DUST_RESOURCE_HDR_RT));
+    }
     std::puts("Depth endpoints, legacy kernels, blend, sky, missing depth, fractional radii and preset defaults passed");
 }

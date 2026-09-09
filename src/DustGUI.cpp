@@ -169,8 +169,11 @@ static SavedValue GetValue(const DustSettingDesc& s)
     SavedValue v = {};
     if (!s.valuePtr) return v;
     switch (s.type) {
+    case DUST_SETTING_HIDDEN_BOOL:
     case DUST_SETTING_BOOL:   v.bVal = *(bool*)s.valuePtr; break;
+    case DUST_SETTING_HIDDEN_FLOAT:
     case DUST_SETTING_FLOAT:  v.fVal = *(float*)s.valuePtr; break;
+    case DUST_SETTING_HIDDEN_INT:
     case DUST_SETTING_INT:
     case DUST_SETTING_ENUM:   v.iVal = *(int*)s.valuePtr; break;
     case DUST_SETTING_COLOR3: {
@@ -187,8 +190,11 @@ static void SetValue(const DustSettingDesc& s, const SavedValue& v)
 {
     if (!s.valuePtr) return;
     switch (s.type) {
+    case DUST_SETTING_HIDDEN_BOOL:
     case DUST_SETTING_BOOL:   *(bool*)s.valuePtr = v.bVal; break;
+    case DUST_SETTING_HIDDEN_FLOAT:
     case DUST_SETTING_FLOAT:  *(float*)s.valuePtr = v.fVal; break;
+    case DUST_SETTING_HIDDEN_INT:
     case DUST_SETTING_INT:
     case DUST_SETTING_ENUM:   *(int*)s.valuePtr = v.iVal; break;
     case DUST_SETTING_COLOR3: {
@@ -204,8 +210,11 @@ static bool IsDirty(const DustSettingDesc& s, const SavedValue& saved)
 {
     if (!s.valuePtr) return false;
     switch (s.type) {
+    case DUST_SETTING_HIDDEN_BOOL:
     case DUST_SETTING_BOOL:   return *(bool*)s.valuePtr != saved.bVal;
+    case DUST_SETTING_HIDDEN_FLOAT:
     case DUST_SETTING_FLOAT:  return *(float*)s.valuePtr != saved.fVal;
+    case DUST_SETTING_HIDDEN_INT:
     case DUST_SETTING_INT:
     case DUST_SETTING_ENUM:   return *(int*)s.valuePtr != saved.iVal;
     case DUST_SETTING_COLOR3: {
@@ -1513,6 +1522,50 @@ static void DrawResetButton(size_t effectIdx, uint32_t settingIdx)
     ImGui::PopID();
 }
 
+static void DrawEffectOrder()
+{
+    if (!ImGui::CollapsingHeader(DustLoc::T("Effect Order"))) return;
+    ImGui::TextWrapped("%s", DustLoc::T("Effects run from top to bottom within each stage. Save the preset to keep changes. Fixed effects cannot be crossed."));
+    const DustInjectionPoint points[] = { DUST_INJECT_POST_LIGHTING, DUST_INJECT_POST_TONEMAP };
+    const char* labels[] = { "Before tonemapping (HDR)", "After tonemapping (LDR)" };
+    int moveDirection = 0;
+    size_t moveIndex = 0;
+    for (int group = 0; group < 2; ++group)
+    {
+        ImGui::Spacing();
+        ImGui::TextColored(DustHeadingColor(), "%s", DustLoc::T(labels[group]));
+        const auto order = gEffectLoader.GetPostOrder(points[group]);
+        for (size_t index : order)
+        {
+            const auto& le = gEffectLoader.GetEffect(index);
+            if (index >= gEffectStates.size() || !gEffectStates[index].snapshotted) SnapshotEffect(index);
+            const bool movable = PostProcessOrder::OrderSetting(le.desc) != nullptr;
+            bool dirty = false;
+            if (index < gEffectStates.size())
+                for (uint32_t s = 0; s < le.desc.settingCount && s < gEffectStates[index].diskValues.size(); ++s)
+                    if (le.desc.settings[s].settingFlags & (DUST_SETTING_FLAG_POST_ORDER_HDR | DUST_SETTING_FLAG_POST_ORDER_LDR))
+                        dirty |= IsDirty(le.desc.settings[s], gEffectStates[index].diskValues[s]);
+            ImGui::PushID((int)index);
+            const bool noEarlier = !gEffectLoader.CanMovePostEffect(index, -1);
+            PushVisualDisabled(noEarlier);
+            if (ImGui::ArrowButton("##earlier", ImGuiDir_Up) && !noEarlier) { moveIndex = index; moveDirection = -1; }
+            PopVisualDisabled(noEarlier);
+            ImGui::SameLine();
+            const bool noLater = !gEffectLoader.CanMovePostEffect(index, 1);
+            PushVisualDisabled(noLater);
+            if (ImGui::ArrowButton("##later", ImGuiDir_Down) && !noLater) { moveIndex = index; moveDirection = 1; }
+            PopVisualDisabled(noLater);
+            ImGui::SameLine();
+            ImGui::Text("%s%s  %s", DustLoc::T(le.desc.name ? le.desc.name : "Unnamed"), dirty ? " *" : "",
+                !movable ? DustLoc::T("(fixed)") : !IsEffectEnabled(le) ? DustLoc::T("[OFF]") : "");
+            ImGui::PopID();
+        }
+    }
+    if (moveDirection) gEffectLoader.MovePostEffect(moveIndex, moveDirection);
+    ImGui::Spacing();
+    ImGui::Separator();
+}
+
 static void DrawEffectSection(size_t idx)
 {
     const LoadedEffect& le = gEffectLoader.GetEffect(idx);
@@ -2397,6 +2450,8 @@ void Render()
 
             // Scrollable effects area
             ImGui::BeginChild("##effects", ImVec2(0, 0), false);
+
+            DrawEffectOrder();
 
             int shown = 0;
             int initializedCount = 0;

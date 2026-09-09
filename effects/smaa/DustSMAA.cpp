@@ -372,7 +372,9 @@ static int SMAAIsEnabled()
 
 static const char* const gEdgeModeLabels[] = { "Luma", "Depth", "Luma + Depth", nullptr };
 
+static int gPostOrder = 250;
 static DustSettingDesc gSettings[] = {
+    { "Effect Order", DUST_SETTING_HIDDEN_INT, &gPostOrder, -10000, 10000, "PostOrder", nullptr, nullptr, DUST_PERF_NONE, DUST_SETTING_FLAG_POST_ORDER_LDR | DUST_SETTING_FLAG_PRESET_DEFAULT },
     { "Enabled",         DUST_SETTING_BOOL,    &gConfig.enabled,        0.0f,  1.0f, "Enabled",        nullptr,          "Enable or disable anti-aliasing",                                 DUST_PERF_LOW  },
     { "Mode",            DUST_SETTING_ENUM,    &gConfig.edgeMode,       0.0f,  2.0f, "EdgeMode",       gEdgeModeLabels,  "Edge detection method: Luma, Depth, or both",                     DUST_PERF_LOW  },
     { "Luma Threshold",  DUST_SETTING_FLOAT,   &gConfig.lumaThreshold,  0.05f, 0.5f, "LumaThreshold",  nullptr,          "Sensitivity for luma-based edge detection (lower = more edges)",  DUST_PERF_NONE },

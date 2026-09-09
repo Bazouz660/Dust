@@ -40,6 +40,20 @@ for name in names:
         output = root / "build/ShadowAtlasHooks.generated.h"
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text("\n".join(slices))
+    if name == "EffectOrderTests":
+        source = (root.parent / "src/EffectLoader.cpp").read_text()
+        begin = source.index("const std::vector<size_t>& EffectLoader::GetPostOrder(")
+        end = source.index("void EffectLoader::DispatchPostLightVolumes(", begin)
+        output = root / "build/EffectDispatch.generated.h"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(source[begin:end])
+    if name == "EffectPresetTests":
+        source = (root.parent / "src/EffectLoaderPresets.cpp").read_text()
+        begin = source.index("void EffectLoader::EffectConfigLoadFrom(")
+        end = source.index("void EffectLoader::ScanPresets(", begin)
+        output = root / "build/EffectPresetIO.generated.h"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(source[begin:end])
     result = subprocess.run([
         msbuild, str(root / "NativeTests.vcxproj"), "/nologo", "/verbosity:minimal",
         "/p:Configuration=Release", "/p:Platform=x64", "/p:TestName=" + name,

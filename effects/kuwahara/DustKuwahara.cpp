@@ -36,11 +36,12 @@ static void KuwaharaPostExecute(const DustFrameContext* ctx, const DustHostAPI* 
         (!gKuwaharaConfig.depthEnabled || gKuwaharaConfig.nearStrength <= 0.0f))
         return;
 
-    ID3D11RenderTargetView* hdrRTV = host->GetRTV(DUST_RESOURCE_HDR_RT);
+    const char* target = ctx->point == DUST_INJECT_POST_TONEMAP ? DUST_RESOURCE_LDR_RT : DUST_RESOURCE_HDR_RT;
+    ID3D11RenderTargetView* hdrRTV = host->GetRTV(target);
     if (!hdrRTV)
         return;
 
-    ID3D11ShaderResourceView* sceneCopy = host->GetSceneCopy(ctx->context, DUST_RESOURCE_HDR_RT);
+    ID3D11ShaderResourceView* sceneCopy = host->GetSceneCopy(ctx->context, target);
     if (!sceneCopy)
         return;
 
@@ -77,6 +78,7 @@ static int KuwaharaIsEnabled()
     return gKuwaharaConfig.enabled ? 1 : 0;
 }
 
+static const char* const gRenderStages[] = { "Before tonemapping (HDR)", "After tonemapping (LDR)", nullptr };
 static DustSettingDesc gSettingsArray[] = {
     { "Enabled",    DUST_SETTING_BOOL,  &gKuwaharaConfig.enabled,    0.0f,  1.0f,  "Enabled",   nullptr, "Enable or disable the Kuwahara filter",                     DUST_PERF_MEDIUM },
     { "Radius",     DUST_SETTING_INT,   &gKuwaharaConfig.radius,     0.0f,  8.0f,  "Radius",    nullptr, "Filter radius in pixels; the far radius when Depth Dependent is enabled", DUST_PERF_HIGH },
@@ -88,6 +90,9 @@ static DustSettingDesc gSettingsArray[] = {
     { "Near Radius", DUST_SETTING_FLOAT, &gKuwaharaConfig.nearRadius, 0, 8, "NearRadius", nullptr, "Radius at and before Depth Start; zero preserves close-up detail", DUST_PERF_NONE, DUST_SETTING_FLAG_PRESET_DEFAULT },
     { "Near Strength", DUST_SETTING_FLOAT, &gKuwaharaConfig.nearStrength, 0, 1, "NearStrength", nullptr, "Blend strength at and before Depth Start; zero leaves nearby pixels unchanged", DUST_PERF_NONE, DUST_SETTING_FLAG_PRESET_DEFAULT },
     { "Debug View", DUST_SETTING_BOOL,  &gKuwaharaConfig.debugView,  0.0f,  1.0f,  "DebugView", nullptr, "Show the filtered result without blending",                 DUST_PERF_NONE },
+    { "Render Stage", DUST_SETTING_ENUM, &gKuwaharaConfig.renderStage, 0, 1, "RenderStage", gRenderStages, "Choose LDR to filter the DoF result; adjust its position in Effect Order", DUST_PERF_NONE, DUST_SETTING_FLAG_POST_STAGE | DUST_SETTING_FLAG_PRESET_DEFAULT },
+    { "HDR Order", DUST_SETTING_HIDDEN_INT, &gKuwaharaConfig.hdrOrder, -10000, 10000, "HDROrder", nullptr, nullptr, DUST_PERF_NONE, DUST_SETTING_FLAG_POST_ORDER_HDR | DUST_SETTING_FLAG_PRESET_DEFAULT },
+    { "LDR Order", DUST_SETTING_HIDDEN_INT, &gKuwaharaConfig.ldrOrder, -10000, 10000, "LDROrder", nullptr, nullptr, DUST_PERF_NONE, DUST_SETTING_FLAG_POST_ORDER_LDR | DUST_SETTING_FLAG_PRESET_DEFAULT },
 };
 
 extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)

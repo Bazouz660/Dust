@@ -167,7 +167,9 @@ static int DebandIsEnabled()
     return gDebandConfig.enabled ? 1 : 0;
 }
 
+static int gPostOrder = 180;
 static DustSettingDesc gSettingsArray[] = {
+    { "Effect Order", DUST_SETTING_HIDDEN_INT, &gPostOrder, -10000, 10000, "PostOrder", nullptr, nullptr, DUST_PERF_NONE, DUST_SETTING_FLAG_POST_ORDER_LDR | DUST_SETTING_FLAG_PRESET_DEFAULT },
     { "Enabled",        DUST_SETTING_BOOL,  &gDebandConfig.enabled,          0.0f,  1.0f,  "Enabled",          nullptr, "Enable or disable debanding",                       DUST_PERF_LOW  },
     { "Threshold",      DUST_SETTING_FLOAT, &gDebandConfig.threshold,        0.001f,0.1f,  "Threshold",        nullptr, "Maximum color difference to treat as banding",      DUST_PERF_NONE },
     { "Range",          DUST_SETTING_FLOAT, &gDebandConfig.range,            4.0f,  64.0f, "Range",            nullptr, "Search radius in pixels for averaging",             DUST_PERF_NONE },

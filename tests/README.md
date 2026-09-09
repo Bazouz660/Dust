@@ -41,6 +41,11 @@ You can pass individual executable names to the native runner, for example
 - `KuwaharaDepthTests`: real effect DLL/shader on WARP against an independent
   legacy-filter reference, depth/blend endpoints, sky and missing-depth fallback,
   equal/reversed depth endpoints, fractional-radius continuity and preset defaults.
+- `EffectOrderTests`: production dispatch bodies with callback fixtures; repeated
+  HDR/LDR switches, DoF/Kuwahara order, fixed barriers, tied ranks, unchanged pre
+  callbacks, disabled-effect hot reload, old API behavior and preset defaults.
+- `EffectPresetTests`: production preset INI reader/writer, testing order and
+  new controls through save/load, old/missing presets and player-owned settings.
 - `EffectResourcesTests`: loads the seven affected Release effect DLLs on WARP,
   compiles their real shaders, observes texture creation, injects an allocation
   failure after a partial allocation, and exercises disabled startup/resize,

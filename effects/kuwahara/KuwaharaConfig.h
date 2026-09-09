@@ -11,6 +11,9 @@ struct KuwaharaConfig
     float depthEnd = 0.10f;
     float nearRadius = 0.0f;    // Radius/strength above are the far endpoints
     float nearStrength = 0.0f;
+    int   renderStage = 0;     // 0 = legacy HDR, 1 = LDR (after DoF by default)
+    int   hdrOrder = 40;
+    int   ldrOrder = 80;
     bool  debugView  = false;
 };
 

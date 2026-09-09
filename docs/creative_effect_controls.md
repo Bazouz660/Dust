@@ -16,3 +16,27 @@ instead of rounding the radius to an integer. Radius zero bypasses the filter.
 The feature defaults off. Loading an older preset without these controls resets
 them to their defaults, even after a preset that enabled them. Debug View shows
 full filter strength, retaining the depth-dependent radius.
+
+## Effect order and DoF into Kuwahara
+
+Set Kuwahara's **Render Stage** to **After tonemapping (LDR)**. Its default
+position in that stage is immediately after DoF, so it filters the DoF output.
+The original HDR stage remains the default for existing presets. HDR and LDR
+orders are saved independently, so switching stages preserves both arrangements.
+
+Expand **Effect Order** above the effect settings to move compatible effects up
+or down within their stage. Disabled effects retain their positions. An asterisk
+marks an order changed since loading/saving the preset. Use **Save** or **Save
+As** in the preset controls to keep the arrangement. Loading an older preset
+restores the default order and Kuwahara's original HDR stage.
+
+Fixed passes are barriers. In particular, LUT rebuilds the LDR image from HDR,
+so it must precede effects that consume that image. Shadow and lighting passes
+also stay fixed. The ordering controls affect post callbacks; autofocus, HDR
+capture and other pre callbacks retain their original timing.
+
+Plugin API v9 uses flags on existing settings (no struct size change):
+`POST_STAGE` is an enum selecting HDR/LDR; `POST_ORDER_HDR` and `POST_ORDER_LDR`
+mark integer order settings. Effects must explicitly opt in. Plugins built
+against earlier APIs retain their fixed scheduling. Dispatch caches ordered
+indices and rebuilds only when scheduling changes; effect objects stay in place.

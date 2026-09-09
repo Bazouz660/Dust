@@ -162,7 +162,9 @@ static int VignetteIsEnabled()
 
 static const char* const gShapeLabels[] = { "Circle", "Rectangle", "Diamond", nullptr };
 
+static int gPostOrder = 200;
 static DustSettingDesc gSettingsArray[] = {
+    { "Effect Order", DUST_SETTING_HIDDEN_INT, &gPostOrder, -10000, 10000, "PostOrder", nullptr, nullptr, DUST_PERF_NONE, DUST_SETTING_FLAG_POST_ORDER_LDR | DUST_SETTING_FLAG_PRESET_DEFAULT },
     { "Enabled",   DUST_SETTING_BOOL,  &gVignetteConfig.enabled,   0.0f, 1.0f, "Enabled",   nullptr,       "Enable or disable the vignette effect",                    DUST_PERF_NONE },
     { "Strength",  DUST_SETTING_FLOAT, &gVignetteConfig.strength,  0.0f, 1.0f, "Strength",  nullptr,       "How much the edges darken",                                DUST_PERF_NONE },
     { "Radius",    DUST_SETTING_FLOAT, &gVignetteConfig.radius,    0.1f, 2.0f, "Radius",    nullptr,       "Distance from center where darkening begins",              DUST_PERF_NONE },

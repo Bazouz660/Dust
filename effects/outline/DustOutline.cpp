@@ -96,7 +96,9 @@ static int OutlineIsEnabled()
 
 // ==================== GUI Settings ====================
 
+static int gPostOrder = 50;
 static DustSettingDesc gSettingsArray[] = {
+    { "Effect Order", DUST_SETTING_HIDDEN_INT, &gPostOrder, -10000, 10000, "PostOrder", nullptr, nullptr, DUST_PERF_NONE, DUST_SETTING_FLAG_POST_ORDER_HDR | DUST_SETTING_FLAG_PRESET_DEFAULT },
     { "Enabled",           DUST_SETTING_BOOL,  &gOutlineConfig.enabled,          0.0f,    1.0f,  "Enabled",         nullptr, "Enable or disable edge outlines",                       DUST_PERF_LOW  },
     { "Depth Threshold",   DUST_SETTING_FLOAT, &gOutlineConfig.depthThreshold,   0.0001f, 0.01f, "DepthThreshold",  nullptr, "Minimum depth difference to draw an outline",           DUST_PERF_NONE },
     { "Normal Threshold",  DUST_SETTING_FLOAT, &gOutlineConfig.normalThreshold,  0.0f,    1.0f,  "NormalThreshold", nullptr, "Minimum normal difference to draw an outline",          DUST_PERF_NONE },

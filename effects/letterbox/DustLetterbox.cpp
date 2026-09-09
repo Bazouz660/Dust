@@ -160,7 +160,9 @@ static int LetterboxIsEnabled()
 static const char* const gAspectLabels[] = { "2.35:1 (Cinemascope)", "2.39:1 (Anamorphic)", "2.76:1 (Ultra Panavision)", "21:9 (Ultrawide)", nullptr };
 static float gAspectValues[] = { 2.35f, 2.39f, 2.76f, 2.333f };
 
+static int gPostOrder = 220;
 static DustSettingDesc gSettingsArray[] = {
+    { "Effect Order", DUST_SETTING_HIDDEN_INT, &gPostOrder, -10000, 10000, "PostOrder", nullptr, nullptr, DUST_PERF_NONE, DUST_SETTING_FLAG_POST_ORDER_LDR | DUST_SETTING_FLAG_PRESET_DEFAULT },
     { "Enabled",      DUST_SETTING_BOOL,  &gLetterboxConfig.enabled,    0.0f, 1.0f, "Enabled",    nullptr, "Enable or disable letterbox bars",                              DUST_PERF_NONE },
     { "Aspect Ratio", DUST_SETTING_FLOAT, &gLetterboxConfig.aspectRatio,1.5f, 3.0f, "AspectRatio",nullptr, "Target aspect ratio (bars appear when wider than your screen)", DUST_PERF_NONE },
     { "Opacity",      DUST_SETTING_FLOAT, &gLetterboxConfig.opacity,    0.0f, 1.0f, "Opacity",    nullptr, "Bar opacity (0 = transparent, 1 = solid)",                      DUST_PERF_NONE },

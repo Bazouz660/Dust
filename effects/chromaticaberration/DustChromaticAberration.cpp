@@ -152,7 +152,9 @@ static int CAIsEnabled()
     return gCAConfig.enabled ? 1 : 0;
 }
 
+static int gPostOrder = 190;
 static DustSettingDesc gSettingsArray[] = {
+    { "Effect Order", DUST_SETTING_HIDDEN_INT, &gPostOrder, -10000, 10000, "PostOrder", nullptr, nullptr, DUST_PERF_NONE, DUST_SETTING_FLAG_POST_ORDER_LDR | DUST_SETTING_FLAG_PRESET_DEFAULT },
     { "Enabled",    DUST_SETTING_BOOL,  &gCAConfig.enabled,   0.0f,  1.0f,  "Enabled",   nullptr, "Enable or disable chromatic aberration",      DUST_PERF_NONE },
     { "Strength",   DUST_SETTING_FLOAT, &gCAConfig.strength,  0.0f,  0.02f, "Strength",  nullptr, "Intensity of the RGB fringe at screen edges", DUST_PERF_NONE },
     { "Debug View", DUST_SETTING_BOOL,  &gCAConfig.debugView, 0.0f,  1.0f,  "DebugView", nullptr, "Visualize the offset magnitude as a heatmap", DUST_PERF_NONE },

@@ -3,6 +3,7 @@
 #include "DustAPI.h"
 #include "GpuTiming.h"
 #include "EffectSettingDefaults.h"
+#include "PostProcessOrder.h"
 #include <vector>
 #include <string>
 #include <windows.h>
@@ -75,6 +76,9 @@ public:
     // v3: Framework config helpers (called by DustGUI)
     void SaveEffectConfig(size_t index);
     void LoadEffectConfig(size_t index);
+    const std::vector<size_t>& GetPostOrder(DustInjectionPoint point);
+    bool CanMovePostEffect(size_t index, int direction) const;
+    bool MovePostEffect(size_t index, int direction);
 
     // A framework-config effect may write its OWN base INI during OnSettingChanged
     // (e.g. Shadows mirrors its atlas Resolution for the early-startup apply). That
@@ -119,6 +123,9 @@ private:
     DustHostAPI hostAPI_ = {};
 
     bool initialized_ = false;
+    PostProcessOrder::Schedule postSchedule_;
+    uint64_t configPollFrame_ = UINT64_MAX;
+    void PrepareDispatch(uint64_t frameIndex);
 
     // Preset state
     std::string presetsDir_;            // <effectsDir>/presets/

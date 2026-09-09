@@ -905,8 +905,37 @@ bool EffectLoader::ReinitAll(ID3D11Device* device, uint32_t w, uint32_t h)
 
 // ==================== Dispatch ====================
 
+const std::vector<size_t>& EffectLoader::GetPostOrder(DustInjectionPoint point)
+{
+    postSchedule_.Refresh(effects_.size(), [&](size_t i) -> const DustEffectDesc& { return effects_[i].desc; });
+    return postSchedule_.Group(point);
+}
+
+bool EffectLoader::CanMovePostEffect(size_t index, int direction) const
+{
+    return postSchedule_.CanMove(index, direction);
+}
+
+bool EffectLoader::MovePostEffect(size_t index, int direction)
+{
+    return postSchedule_.Move(index, direction, [&](size_t i) -> const DustEffectDesc& { return effects_[i].desc; });
+}
+
+void EffectLoader::PrepareDispatch(uint64_t frameIndex)
+{
+    if (configPollFrame_ == frameIndex) return;
+    configPollFrame_ = frameIndex;
+    // Poll before building this frame's schedule, including disabled plugins.
+    // A hot-reloaded stage change cannot execute an effect twice in one frame.
+    for (auto& le : effects_)
+        if (le.initialized && le.desc.apiVersion >= 3 && (le.desc.flags & DUST_FLAG_FRAMEWORK_CONFIG))
+            EffectConfigCheckHotReload(le);
+    postSchedule_.Refresh(effects_.size(), [&](size_t i) -> const DustEffectDesc& { return effects_[i].desc; });
+}
+
 void EffectLoader::DispatchPre(DustInjectionPoint point, const DustFrameContext* ctx)
 {
+    PrepareDispatch(ctx->frameIndex);
     for (auto& le : effects_)
     {
         if (!le.initialized || !le.desc.preExecute)
@@ -915,10 +944,6 @@ void EffectLoader::DispatchPre(DustInjectionPoint point, const DustFrameContext*
             continue;
         if (le.desc.IsEnabled && !le.desc.IsEnabled())
             continue;
-
-        // v3: Hot-reload config
-        if (le.desc.apiVersion >= 3 && (le.desc.flags & DUST_FLAG_FRAMEWORK_CONFIG))
-            EffectConfigCheckHotReload(le);
 
         // v3: Collect previous frame timing, then start new timing (phase 0 = pre)
         bool frameworkTiming = (le.desc.apiVersion >= 3 && (le.desc.flags & DUST_FLAG_FRAMEWORK_TIMING));
@@ -937,19 +962,14 @@ void EffectLoader::DispatchPre(DustInjectionPoint point, const DustFrameContext*
 
 void EffectLoader::DispatchPost(DustInjectionPoint point, const DustFrameContext* ctx)
 {
-    for (auto& le : effects_)
+    PrepareDispatch(ctx->frameIndex);
+    for (size_t index : postSchedule_.Group(point))
     {
+        auto& le = effects_[index];
         if (!le.initialized || !le.desc.postExecute)
-            continue;
-        if (le.desc.injectionPoint != point)
             continue;
         if (le.desc.IsEnabled && !le.desc.IsEnabled())
             continue;
-
-        // v3: Hot-reload config (if preExecute didn't already)
-        if (le.desc.apiVersion >= 3 && (le.desc.flags & DUST_FLAG_FRAMEWORK_CONFIG)
-            && !le.desc.preExecute)
-            EffectConfigCheckHotReload(le);
 
         // v3: Time postExecute (phase 1 = post)
         bool frameworkTiming = (le.desc.apiVersion >= 3 && (le.desc.flags & DUST_FLAG_FRAMEWORK_TIMING));
@@ -1008,6 +1028,8 @@ void EffectLoader::OnResolutionChanged(ID3D11Device* device, uint32_t w, uint32_
 void EffectLoader::ShutdownAll()
 {
     initialized_ = false;
+    configPollFrame_ = UINT64_MAX;
+    postSchedule_ = {};
     for (auto& le : effects_)
     {
         if (le.initialized && le.desc.Shutdown)

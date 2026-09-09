@@ -230,7 +230,9 @@ static int DOFIsEnabled()
 
 static const char* const gBlurShapeLabels[] = { "Gaussian", "Disc (Bokeh)", "Hexagonal", nullptr };
 
+static int gPostOrder = 75;
 static DustSettingDesc gSettingsArray[] = {
+    { "Effect Order", DUST_SETTING_HIDDEN_INT, &gPostOrder, -10000, 10000, "PostOrder", nullptr, nullptr, DUST_PERF_NONE, DUST_SETTING_FLAG_POST_ORDER_LDR | DUST_SETTING_FLAG_PRESET_DEFAULT },
     { "Enabled",             DUST_SETTING_BOOL,  &gDOFConfig.enabled,            0.0f,   1.0f,   "Enabled",            nullptr, "Enable or disable depth of field",                              DUST_PERF_LOW    },
     { "Auto Focus",          DUST_SETTING_BOOL,  &gDOFConfig.autoFocus,          0.0f,   1.0f,   "AutoFocus",          nullptr, "Automatically focus on the object at screen center",            DUST_PERF_NONE   },
     { "Focus Speed",         DUST_SETTING_FLOAT, &gDOFConfig.autoFocusSpeed,     0.5f,   20.0f,  "AutoFocusSpeed",     nullptr, "How quickly auto-focus adapts to new targets",                  DUST_PERF_NONE   },

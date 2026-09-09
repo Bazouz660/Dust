@@ -158,7 +158,9 @@ static int FilmGrainIsEnabled()
     return gFilmGrainConfig.enabled ? 1 : 0;
 }
 
+static int gPostOrder = 210;
 static DustSettingDesc gSettingsArray[] = {
+    { "Effect Order", DUST_SETTING_HIDDEN_INT, &gPostOrder, -10000, 10000, "PostOrder", nullptr, nullptr, DUST_PERF_NONE, DUST_SETTING_FLAG_POST_ORDER_LDR | DUST_SETTING_FLAG_PRESET_DEFAULT },
     { "Enabled",    DUST_SETTING_BOOL,  &gFilmGrainConfig.enabled,   0.0f,  1.0f, "Enabled",   nullptr, "Enable or disable the film grain effect", DUST_PERF_NONE },
     { "Intensity",  DUST_SETTING_FLOAT, &gFilmGrainConfig.intensity, 0.0f,  0.3f, "Intensity", nullptr, "Strength of the grain noise",             DUST_PERF_NONE },
     { "Size",       DUST_SETTING_FLOAT, &gFilmGrainConfig.size,      1.0f,  4.0f, "Size",      nullptr, "Grain particle size in pixels",           DUST_PERF_NONE },

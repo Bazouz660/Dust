@@ -402,7 +402,9 @@ static int BloomIsEnabled()
 
 // ==================== GUI Settings ====================
 
+static int gPostOrder = 100;
 static DustSettingDesc gBloomSettingsArray[] = {
+    { "Effect Order", DUST_SETTING_HIDDEN_INT, &gPostOrder, -10000, 10000, "PostOrder", nullptr, nullptr, DUST_PERF_NONE, DUST_SETTING_FLAG_POST_ORDER_LDR | DUST_SETTING_FLAG_PRESET_DEFAULT },
     { "Enabled",     DUST_SETTING_BOOL,  &gConfig.enabled,    0.0f, 1.0f, "Enabled",   nullptr, "Enable or disable the bloom effect",                                  DUST_PERF_LOW    },
     { "Intensity",   DUST_SETTING_FLOAT, &gConfig.intensity,  0.0f, 2.0f, "Intensity",  nullptr, "Overall bloom brightness multiplier",                                 DUST_PERF_NONE   },
     { "Threshold",   DUST_SETTING_FLOAT, &gConfig.threshold,  0.0f, 5.0f, "Threshold",  nullptr, "Minimum brightness for a pixel to contribute to bloom",               DUST_PERF_NONE   },
