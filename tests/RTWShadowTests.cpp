@@ -48,7 +48,7 @@ struct ShadowParams {
 
 struct SceneParams {
     float slope = .4f, warpScale = 1, depthOffset = .1f, depthScale = .1f;
-    float projectionScale = .1f, receiverDepth = 3, blockerGap = 0, padding = 0;
+    float projectionScale = .1f, receiverDepth = 3, blockerGap = 0, shadowRange = 10;
 };
 
 int main(int argc, char** argv)
@@ -65,7 +65,19 @@ int main(int argc, char** argv)
             for (bool workshop : {false, true}) {
                 auto patched = PatchDeferredShader(source + (workshop ? "\n// steepBias\n" : ""));
                 assert(patched.find("DustRtwReceiverGradient") != std::string::npos);
-                Compile(patched, "main_fs", "ps_4_0", &includes, defines);
+                auto code = Compile(patched, "main_fs", "ps_4_0", &includes, defines);
+                ComPtr<ID3D11ShaderReflection> reflection;
+                assert(SUCCEEDED(D3DReflect(code->GetBufferPointer(), code->GetBufferSize(), IID_PPV_ARGS(&reflection))));
+                D3D11_SHADER_DESC desc; reflection->GetDesc(&desc);
+                bool hasShadowAtlas = false;
+                for (UINT i = 0; i < desc.BoundResources; ++i) {
+                    D3D11_SHADER_INPUT_BIND_DESC binding; reflection->GetResourceBindingDesc(i, &binding);
+                    if (binding.Type == D3D_SIT_TEXTURE && !std::strcmp(binding.Name, "$shadowDepthMap")) {
+                        hasShadowAtlas = true;
+                        assert(binding.BindPoint == 5); // host atlas lookup and resize binding
+                    }
+                }
+                assert(hasShadowAtlas || !std::strcmp(mode, "NOSHADOW"));
             }
         }
         std::puts("Installed deferred shader: RTW/CSM/no-shadow and workshop variants compile");
@@ -80,19 +92,19 @@ int main(int argc, char** argv)
     std::string source = patched.substr(begin, end - begin) + R"hlsl(
 cbuffer Scene : register(b0) {
     float slope, warpScale, depthOffset, depthScale;
-    float projectionScale, receiverDepth, blockerGap, padding;
+    float projectionScale, receiverDepth, blockerGap, shadowRange;
 };
 sampler2D depthMap : register(s0);
 sampler2D warpMap : register(s1);
 float4 main(float4 pixel : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
-    float2 xy = (uv - .5) * .2 / projectionScale;
+    float2 xy = (uv - .5) * 2;
     float3 world = float3(xy, receiverDepth + xy.x * slope);
     float4x4 shadowProjection = float4x4(projectionScale, 0, 0, .5,
                                0, projectionScale, 0, .5,
                                0, 0, depthScale, depthOffset,
                                0, 0, 0, 1);
     float visibility = DustRTWShadow(depthMap, warpMap, shadowProjection, world, .00003, 0,
-                                    pixel.xy, normalize(float3(-slope, 0, 1)), 0, 100);
+                                    pixel.xy, normalize(float3(-slope, 0, 1)), 0, shadowRange);
     return visibility.xxxx;
 })hlsl";
     EffectShaderProbe probe("ssao", "DustSSAO.dll");
@@ -139,17 +151,24 @@ float4 main(float4 pixel : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
         return view;
     };
 
-    auto render = [&](const SceneParams& scene, ShadowParams shadows, UINT resolution, bool edge = false) {
+    auto render = [&](const SceneParams& scene, ShadowParams shadows, UINT resolution,
+                      bool edge = false, float curvature = 0.f) {
         shadows.texel = 1.f / resolution;
         std::vector<float> depths(resolution * resolution);
         for (UINT y = 0; y < resolution; ++y) for (UINT x = 0; x < resolution; ++x) {
-            float worldX = ((x + .5f) / resolution - .5f) / (scene.warpScale * scene.projectionScale);
+            float warpedX = (x + .5f) / resolution - .5f;
+            float discriminant = scene.warpScale * scene.warpScale + 4 * curvature * warpedX;
+            if (discriminant < 0) { depths[y * resolution + x] = 1; continue; }
+            float unwarpedX = 2 * warpedX / (scene.warpScale + std::sqrt(discriminant));
+            float worldX = unwarpedX / scene.projectionScale;
             float gap = (!edge || worldX < 0) ? scene.blockerGap : 0;
             depths[y * resolution + x] = scene.depthOffset + scene.depthScale * (scene.receiverDepth + scene.slope * worldX - gap);
         }
         std::vector<float> warp(513 * 2);
-        for (UINT i = 0; i < warp.size(); ++i)
-            warp[i] = (scene.warpScale - 1) * ((i % 513 + .5f) / 513 - .5f);
+        for (UINT i = 0; i < warp.size(); ++i) {
+            float u = (i % 513 + .5f) / 513 - .5f;
+            warp[i] = (scene.warpScale - 1) * u + curvature * u * u;
+        }
         auto depthView = texture(resolution, resolution, depths);
         auto warpView = texture(513, 2, warp);
         probe.ctx->ClearState();
@@ -192,4 +211,31 @@ float4 main(float4 pixel : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
         for (const auto& pixel : occluded) assert(pixel[0] == 0.f);
     }
     std::puts("RTW: sloped receivers remain lit and nearby blockers remain shadowed across warp, resolution and PCSS modes");
+
+    // Moving the shadow camera's depth origin does not move either physical
+    // surface. Its shadow edge, including the penumbra, must remain identical.
+    SceneParams scene; scene.slope = 0; scene.blockerGap = 1; scene.depthOffset = .05f;
+    ShadowParams shadows; shadows.pcss = 1; shadows.filterRadius = .001f; shadows.lightSize = .3f;
+    auto reference = render(scene, shadows, 2048, true);
+    scene.depthOffset = .6f;
+    AssertImagesNear(reference, render(scene, shadows, 2048, true));
+    for (float scale : {.05f, .1f}) for (float warp : {.5f, 1.f, 2.f}) {
+        scene.depthScale = scale;
+        scene.projectionScale = scale;
+        scene.warpScale = warp;
+        // Quantization may change one Poisson vote at an edge; it must not
+        // remove or expand the penumbra as the projection/warp scale changes.
+        AssertImagesNear(reference, render(scene, shadows, 2048, true), .084f);
+    }
+    auto partialPixels = [](const std::vector<Pixel>& image) {
+        return std::count_if(image.begin(), image.end(), [](const Pixel& p) { return p[0] > 0 && p[0] < 1; });
+    };
+    assert(partialPixels(reference) > 16);
+    scene = SceneParams{}; scene.slope = 0; scene.blockerGap = .05f;
+    assert(partialPixels(render(scene, shadows, 2048, true)) < partialPixels(reference));
+    scene.blockerGap = 1;
+    AssertImagesNear(reference, render(scene, shadows, 2048, true, .6f), .084f);
+    scene.blockerGap = 0; scene.slope = .8f;
+    for (const auto& pixel : render(scene, shadows, 2048, false, .6f)) assert(pixel[0] == 1.f);
+    std::puts("RTW PCSS: penumbra survives depth-origin, depth-scale and warp changes; contact shadows remain sharper");
 }
