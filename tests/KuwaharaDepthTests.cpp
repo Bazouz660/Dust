@@ -43,6 +43,26 @@ int main() {
     AssertImagesNear(p.Render(input, .05f), input);
     AssertImagesNear(p.Render(input, .6f), legacy);
     AssertImagesNear(p.Render(input, 0), legacy); // sky
+    // Spatial depth fixture: far objects at the top, nearby detail at the
+    // bottom. Catch flipped/misaligned depth sampling, not just scalar math.
+    std::vector<float> distances(p.W * p.H);
+    auto spatialExpected = input;
+    for (UINT y = 0; y < p.H; ++y) for (UINT x = 0; x < p.W; ++x) {
+        const size_t i = y * p.W + x;
+        distances[i] = y < p.H / 2 ? .6f : .05f;
+        if (y < p.H / 2) spatialExpected[i] = legacy[i];
+    }
+    AssertImagesNear(p.RenderDepths(input, distances), spatialExpected);
+    p.Setting<bool>("DepthPreview") = true;
+    p.Setting<float>("Strength") = 0; // preview must bypass the zero-effect early return
+    for (UINT y = 0; y < p.H; ++y) for (UINT x = 0; x < p.W; ++x) {
+        float fade = y < p.H / 2 ? 1.f : 0.f;
+        spatialExpected[y*p.W+x] = {fade,fade,fade,1};
+    }
+    AssertImagesNear(p.RenderDepths(input, distances), spatialExpected);
+    p.hasDepth = false;
+    AssertImagesNear(p.Render(input,.1f), std::vector<Pixel>(p.W*p.H, Pixel{1,0,1,1}));
+    p.hasDepth = true; p.Setting<bool>("DepthPreview") = false; p.Setting<float>("Strength") = 1;
     p.Setting<float>("NearRadius") = 3;
     auto halfway = p.Render(input, .3f);
     auto expected = legacy;

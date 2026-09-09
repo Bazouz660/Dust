@@ -93,8 +93,12 @@ struct EffectShaderProbe {
     }
     std::vector<Pixel> Render(const std::vector<Pixel>& input, float distance,
                              DustInjectionPoint point = DUST_INJECT_POST_LIGHTING) {
+        return RenderDepths(input, std::vector<float>(W * H, distance), point);
+    }
+    std::vector<Pixel> RenderDepths(const std::vector<Pixel>& input, const std::vector<float>& depths,
+                                  DustInjectionPoint point = DUST_INJECT_POST_LIGHTING) {
+        assert(depths.size() == W * H);
         ctx->ClearState();
-        std::vector<float> depths(W * H, distance);
         ctx->UpdateSubresource(scene.Get(), 0, nullptr, input.data(), W * sizeof(Pixel), 0);
         ctx->UpdateSubresource(depth.Get(), 0, nullptr, depths.data(), W * sizeof(float), 0);
         // The game target already contains the input when an effect skips work.

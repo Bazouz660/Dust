@@ -41,6 +41,8 @@ You can pass individual executable names to the native runner, for example
 - `KuwaharaDepthTests`: real effect DLL/shader on WARP against an independent
   legacy-filter reference, depth/blend endpoints, sky and missing-depth fallback,
   equal/reversed depth endpoints, fractional-radius continuity and preset defaults.
+  A spatial near/far fixture also checks texture orientation, the distance-fade
+  preview, missing-depth indication and preview with zero filter strength.
 - `EffectOrderTests`: production dispatch bodies with callback fixtures; repeated
   HDR/LDR switches, DoF/Kuwahara order, fixed barriers, tied ranks, unchanged pre
   callbacks, disabled-effect hot reload, old API behavior and preset defaults.

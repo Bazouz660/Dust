@@ -35,7 +35,8 @@ struct KuwaharaCBData
     float depthEnd;
     float nearRadius;
     float nearStrength;
-    float _pad[2];
+    int   depthPreview;
+    float _pad;
 };
 static ID3D11Buffer* gKuwaharaCB = nullptr;
 
@@ -152,6 +153,7 @@ void Render(ID3D11DeviceContext* ctx,
         cb.depthEnd = gKuwaharaConfig.depthEnd;
         cb.nearRadius = gKuwaharaConfig.nearRadius;
         cb.nearStrength = gKuwaharaConfig.debugView ? 1.0f : gKuwaharaConfig.nearStrength;
+        cb.depthPreview = gKuwaharaConfig.depthPreview;
         gHost->UpdateConstantBuffer(ctx, gKuwaharaCB, &cb, sizeof(cb));
     }
 

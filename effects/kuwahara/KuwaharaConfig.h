@@ -7,6 +7,7 @@ struct KuwaharaConfig
     float strength   = 1.0f;    // Blend with original (0 = original, 1 = full filter)
     float sharpness  = 8.0f;    // How aggressively the lowest-variance sector wins
     bool  depthEnabled = false;
+    bool  depthPreview = false;
     float depthStart = 0.01f;   // Linear distance / far clip, as in DoF
     float depthEnd = 0.10f;
     float nearRadius = 0.0f;    // Radius/strength above are the far endpoints

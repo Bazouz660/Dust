@@ -18,7 +18,8 @@ cbuffer KuwaharaParams : register(b0)
     float  depthEnd;
     float  nearRadius;
     float  nearStrength;
-    float2 _pad;
+    int    depthPreview;
+    float  _pad;
 };
 
 static const int NUM_SECTORS = 8;
@@ -41,6 +42,7 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
     float effectiveRadius = clamp((float)radius, 0.0, 8.0);
     float effectiveStrength = saturate(strength);
+    float distanceFade = 1.0;
     if (depthEnabled)
     {
         float depth = depthTex.SampleLevel(pointClamp, uv, 0);
@@ -49,9 +51,14 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         float start = min(depthStart, depthEnd);
         float end = max(depthStart, depthEnd);
         float t = smoothstep(start, max(end, start + 1e-5), depth);
+        distanceFade = t;
         effectiveRadius = lerp(clamp(nearRadius, 0.0, 8.0), effectiveRadius, t);
         effectiveStrength = lerp(saturate(nearStrength), effectiveStrength, t);
     }
+    // Diagnose the distance ramp independently of filtering/endpoint strengths.
+    // Magenta means depth modulation is disabled or its texture is unavailable.
+    if (depthPreview)
+        return depthEnabled ? float4(distanceFade.xxx, 1.0) : float4(1, 0, 1, 1);
     if (effectiveRadius <= 0.0 || effectiveStrength <= 0.0)
         return float4(original, 1.0);
 
