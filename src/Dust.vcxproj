@@ -185,6 +185,7 @@
     <ClInclude Include="PipelineDetector.h" />
     <ClInclude Include="ResourceRegistry.h" />
     <ClInclude Include="EffectLoader.h" />
+    <ClInclude Include="GpuTiming.h" />
     <ClInclude Include="FilePicker.h" />
     <ClInclude Include="D3D11Hook.h" />
     <ClInclude Include="D3D11StateBlock.h" />
