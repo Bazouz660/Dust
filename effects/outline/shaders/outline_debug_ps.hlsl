@@ -1,6 +1,8 @@
 // Outline debug shader — visualizes edge detection.
 // Red = depth edges (Laplacian), Green = normal edges (Roberts Cross).
 
+#include "outline_normals.hlsl"
+
 Texture2D depthTex   : register(t0);
 Texture2D normalsTex : register(t1);
 
@@ -24,6 +26,8 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     float2 oy = float2(0.0, texelSize.y * thickness);
 
     float dC = depthTex.SampleLevel(pointClamp, uv, 0).r;
+    if (dC <= 0.0001 || dC > maxDepth)
+        return float4(0.0, 0.0, 0.0, 1.0);
     float dL = depthTex.SampleLevel(pointClamp, uv - ox, 0).r;
     float dR = depthTex.SampleLevel(pointClamp, uv + ox, 0).r;
     float dU = depthTex.SampleLevel(pointClamp, uv - oy, 0).r;
@@ -39,7 +43,7 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     float3 n10 = normalsTex.SampleLevel(pointClamp, uv + float2(offset.x, 0.0), 0).rgb * 2.0 - 1.0;
     float3 n01 = normalsTex.SampleLevel(pointClamp, uv + float2(0.0, offset.y), 0).rgb * 2.0 - 1.0;
 
-    float nEdge = (1.0 - dot(n00, n11)) + (1.0 - dot(n10, n01));
+    float nEdge = OutlineNormalDifference(n00, n11) + OutlineNormalDifference(n10, n01);
     float normalFactor = smoothstep(normalThreshold, normalThreshold * 1.5 + 1e-5, nEdge);
 
     return float4(depthFactor, normalFactor, 0.0, 1.0);
