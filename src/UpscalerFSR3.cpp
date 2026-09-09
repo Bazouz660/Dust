@@ -84,15 +84,16 @@ namespace
         return d.Format;
     }
 
-    void ReleaseTextures()
+    bool ReleaseTextures()
     {
-        D3D12Interop::WaitForGpuIdle();   // the D3D12 resources must outlive in-flight GPU work
+        if (D3D12Interop::WaitForGpuIdle() == D3D12Interop::GpuWaitResult::Pending) return false;
         SafeRelease(gShColor11); SafeRelease(gShColor12);
         SafeRelease(gShDepth11); SafeRelease(gShDepth12);
         SafeRelease(gShMV11);    SafeRelease(gShMV12);
         SafeRelease(gShOut11);   SafeRelease(gShOut12);
         SafeRelease(gFsrOut12);
         gTexRW = gTexRH = gTexDW = gTexDH = 0;
+        return true;
     }
 
     // D3D12-local UAV texture that FFX writes its result into (kept off the shared textures, which carry no
@@ -124,7 +125,7 @@ namespace
         if (gShColor11 && rw == gTexRW && rh == gTexRH && dw == gTexDW && dh == gTexDH &&
             colorFmt == gColorFmt && depthFmt == gDepthFmt && mvFmt == gMVFmt && outFmt == gOutFmt)
             return true;
-        ReleaseTextures();
+        if (!ReleaseTextures() || !D3D12Interop::IsReady()) return false;
 
         bool ok =
             D3D12Interop::CreateSharedTexture(rw, rh, colorFmt, &gShColor11, &gShColor12) &&
@@ -141,11 +142,11 @@ namespace
     }
 }
 
-bool IsAvailable() { return gLoaded; }
+bool IsAvailable() { return gLoaded && D3D12Interop::IsReady(); }
 
 bool Init(ID3D11Device* device, const wchar_t* modDir)
 {
-    if (gLoaded) return true;
+    if (gLoaded) return D3D12Interop::IsReady();
     if (!device || !modDir) return false;
 
     // FSR3/FSR4 run on the D3D12 side-device — bring it up if it isn't already.
@@ -192,11 +193,16 @@ bool Init(ID3D11Device* device, const wchar_t* modDir)
 bool CreateFeature(ID3D11DeviceContext* /*ctx*/, uint32_t renderW, uint32_t renderH,
                    uint32_t displayW, uint32_t displayH, bool isHDR, bool depthInverted, int /*preset*/)
 {
-    if (!gLoaded) return false;
+    if (!IsAvailable()) return false;
     ID3D12Device* dev = D3D12Interop::GetDevice();
     if (!dev) return false;
 
-    if (gContextValid) { D3D12Interop::WaitForGpuIdle(); gDestroyContext(&gContext, nullptr); gContextValid = false; gContext = nullptr; }
+    if (gContextValid)
+    {
+        if (D3D12Interop::WaitForGpuIdle() != D3D12Interop::GpuWaitResult::Completed) return false;
+        gDestroyContext(&gContext, nullptr);
+        gContextValid = false; gContext = nullptr;
+    }
 
     // Chain: upscale-create desc -> DX12 backend desc (device).
     ffxCreateBackendDX12Desc backendDesc = {};
@@ -228,7 +234,7 @@ bool Evaluate(ID3D11DeviceContext* ctx,
               float mvScaleX, float mvScaleY, float sharpness, bool reset,
               ID3D11Resource* /*reactiveMask*/)
 {
-    if (!gLoaded || !gContextValid || !ctx || !color || !depth || !motionVectors || !output) return false;
+    if (!IsAvailable() || !gContextValid || !ctx || !color || !depth || !motionVectors || !output) return false;
 
     DXGI_FORMAT colorFmt = FormatOf(color), depthFmt = FormatOf(depth),
                 mvFmt = FormatOf(motionVectors), outFmt = FormatOf(output);
@@ -299,7 +305,11 @@ bool Evaluate(ID3D11DeviceContext* ctx,
 
 void Shutdown()
 {
-    D3D12Interop::WaitForGpuIdle();   // same in-flight-work hazard as the context recreate above
+    if (D3D12Interop::WaitForGpuIdle() == D3D12Interop::GpuWaitResult::Pending)
+    {
+        Log("FSR3: shutdown deferred; retaining context, textures and runtime DLLs");
+        return;
+    }
     if (gContextValid && gDestroyContext) { gDestroyContext(&gContext, nullptr); }
     gContextValid = false; gContext = nullptr;
     ReleaseTextures();
