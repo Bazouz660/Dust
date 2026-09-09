@@ -1830,7 +1830,11 @@ static void DrawBugReportModal()
     ImGui::BulletText(DustLoc::T("Kenshi graphics settings and mod load order"));
     ImGui::BulletText(DustLoc::T("Hardware info (GPU, driver, monitors, CPU, RAM, OS)"));
     ImGui::BulletText(DustLoc::T("Detected overlays (ReShade, RTSS, ...) and RE_Kenshi info"));
-    ImGui::TextDisabled("%s", DustLoc::T("No personal data is collected; file paths are visible in logs."));
+    ImGui::TextDisabled("%s", DustLoc::T("Reports contain configuration, system information and file paths. Review before sharing."));
+    ImGui::Spacing();
+    ImGui::TextWrapped("%s", DustLoc::T("Crashes during save loading are recorded automatically, before effects load."));
+    if (ImGui::Button(DustLoc::T("Open Crash Reports"))) BugReport::OpenCrashReports();
+    ImGui::TextDisabled("%s", DustLoc::T("Crash dumps are saved locally and may contain memory fragments. Nothing is uploaded automatically."));
 
     if (!DustLogEnabled())
     {

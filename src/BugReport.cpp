@@ -1,6 +1,7 @@
 #include "BugReport.h"
 #include "DustLog.h"
 #include "EffectLoader.h"
+#include "../crash/CrashProtocol.h"
 
 #include <dxgi.h>
 #include <psapi.h>
@@ -31,6 +32,14 @@ static const char* DUST_VERSION_STR = "dev";
 
 namespace BugReport
 {
+void OpenCrashReports()
+{
+    wchar_t path[1024];
+    if (DustCrash::ReportDirectory(path,1024)) {
+        SHCreateDirectoryExW(nullptr,path,nullptr);
+        ShellExecuteW(nullptr,L"open",path,nullptr,nullptr,SW_SHOWNORMAL);
+    }
+}
 
 // ==================== State ====================
 

@@ -9,6 +9,7 @@
 #include <dxgi1_2.h>
 #include <cstdio>
 #include <cstdarg>
+#include "../crash/CrashClient.h"
 
 #include <core/Functions.h>
 #include <Debug.h>
@@ -446,9 +447,41 @@ static bool InstallFactoryHooks()
 
 // ==================== Plugin entry point ====================
 
+extern "C" __declspec(dllexport) void DustCrashSetPhase(const char* phase)
+{
+    if (DustCrash::request && phase) strncpy_s(DustCrash::request->phase,phase,_TRUNCATE);
+}
+extern "C" __declspec(dllexport) void DustCrashShutdown()
+{
+    InterlockedExchange(&DustCrash::shuttingDown,1);
+}
+
+static void StartCrashReporting()
+{
+    static bool attempted = false;
+    if (attempted) return;
+    attempted = true;
+    wchar_t mod[1024] = {}, game[1024] = {};
+    if (!GetModuleFileNameW(gDllModule,mod,1024) || !GetModuleFileNameW(nullptr,game,1024)) return;
+    wchar_t* a = wcsrchr(mod,L'\\'); wchar_t* b = wcsrchr(game,L'\\');
+    if (!a || !b) return; *a = 0; *b = 0;
+    if (!DustCrash::Start(mod,game)) {
+        BootLog("Automatic crash reporting disabled or helper unavailable"); return;
+    }
+    // Kenshi and other plugins install their own top-level filters later.
+    // Keep the recorder first, returning the previous downstream filter to
+    // each registrant so their ordinary chaining remains intact.
+    static void* originalSetFilter = nullptr;
+    if (KenshiLib::AddHook((void*)SetUnhandledExceptionFilter,(void*)DustCrash::SetNext,
+        &originalSetFilter) != KenshiLib::SUCCESS)
+        BootLog("WARNING: crash recorder installed, but later exception filters may replace it");
+    BootLog("Automatic crash reporting ready: %%LOCALAPPDATA%%\\Dust\\crash_reports");
+}
+
 __declspec(dllexport) void startPlugin()
 {
     BootLogInit();
+    StartCrashReporting();
     BootLog("DustBoot preload plugin starting...");
 
     if (InstallFactoryHooks())
@@ -490,6 +523,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
                     OutputDebugStringA("[DustBoot] FATAL: could not pin module — hooks may dangle on unload\n");
             }
         }
+        break;
+    case DLL_PROCESS_DETACH:
+        DustCrashShutdown();
         break;
     }
     return TRUE;
