@@ -1,3 +1,4 @@
+#include "rtgi_camera.hlsl"
 // RTGI Ray Trace — Compute Shader (Visibility-Bitmask Horizon GI)
 //
 // Horizon-based screen-space GI with a 32-sector visibility bitmask
@@ -29,6 +30,8 @@
 // leans on cross-pixel rotation averaging (grain) to cover the other side.
 // Two-sided marching is the correct estimator and measurably reduces grain
 // relative to occlusion depth (validated offline at equal tap budget).
+
+Texture2D<float> historyDepth : register(t5);
 
 static const float PI       = 3.14159265358979;
 static const float HALF_PI  = 1.57079632679490;
@@ -186,9 +189,7 @@ void main(uint3 tid : SV_DispatchThreadID)
 
     float3 worldN = normalsTex.SampleLevel(pointClamp, snapUV, 0).rgb * 2.0 - 1.0;
     float3 gbufNormal;
-    gbufNormal.x =  dot(worldN, camRight.xyz);
-    gbufNormal.y =  dot(worldN, camUp.xyz);
-    gbufNormal.z = -dot(worldN, camForward.xyz);
+    gbufNormal = RTGIWorldNormalToView(worldN, camRight.xyz, camUp.xyz, camForward.xyz);
     gbufNormal = normalize(gbufNormal);
 
     if (dot(geoNormal, gbufNormal) < 0)
@@ -306,8 +307,13 @@ void main(uint3 tid : SV_DispatchThreadID)
                     float2 radUV = (floor(sUV * depthSize) + 1.0) * depthTexel;
                     float3 rad = Compress(sceneTex.SampleLevel(linearClamp, radUV, 0).rgb);
 
-                    if (bounceIntensity > 0.0)
-                        rad += Compress(prevGI.SampleLevel(linearClamp, sUV, 0).rgb) * bounceIntensity;
+                    if (bounceIntensity > 0.0) {
+                        float2 historyUV; float expectedDepth;
+                        float hitDepth = depthTex.SampleLevel(pointClamp, sUV, 0);
+                        if (RTGIPreviousPosition(sUV, hitDepth, tanHalfFov, aspectRatio, historyUV, expectedDepth)
+                            && RTGIHistoryDepthMatches(expectedDepth, historyDepth.SampleLevel(pointClamp, historyUV, 0)))
+                            rad += Compress(prevGI.SampleLevel(linearClamp, historyUV, 0).rgb) * bounceIntensity;
+                    }
 
                     // Receiver cosine: light arriving from the occluder direction.
                     float ndl = saturate(dot(normal, sHorizon));

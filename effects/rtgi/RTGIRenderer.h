@@ -9,6 +9,7 @@ namespace RTGIRenderer
     void Shutdown();
 
     // Update camera data from the framework's DustCameraData.
+    void CaptureCamera(ID3D11DeviceContext* ctx, uint64_t frameIndex);
     void UpdateCameraData(const DustCameraData* camera);
 
     // Main render: ray trace -> temporal -> denoise. Returns final GI SRV (RGBA16F).

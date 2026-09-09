@@ -1,6 +1,7 @@
 #include "../common/LazyResources.h"
 #include "RTGIRenderer.h"
 #include "RTGITemporal.h"
+#include "RTGICamera.h"
 #include "RTGIConfig.h"
 #include "rtgi_bluenoise.h"
 #include "DustLog.h"
@@ -28,6 +29,9 @@ static float   gFarClip = 0.0f;
 static float   gPrevFarClip = 0.0f;
 static float   gPrevTanHalfFov = 0.0f;
 static uint64_t gLastRenderedFrame = 0;
+static RTGICamera gGpuCamera;
+static bool gPreviousUsedGpuCamera = false;
+static ID3D11Buffer* gCameraHistoryCB = nullptr;
 
 // ==================== Textures ====================
 
@@ -503,6 +507,8 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
 
 void Shutdown()
 {
+    gGpuCamera.Reset();
+    SAFE_RELEASE(gCameraHistoryCB);
     gTargets.Reset(ReleaseTextures);
 
     SAFE_RELEASE(gBlueNoiseTex);  SAFE_RELEASE(gBlueNoiseSRV);
@@ -539,10 +545,12 @@ bool IsInitialized() { return gInitialized; }
 bool HasValidCameraData() { return gHasValidCameraData; }
 void GetRenderSize(UINT* w, UINT* h) { *w = gRenderWidth; *h = gRenderHeight; }
 
+void CaptureCamera(ID3D11DeviceContext* ctx, uint64_t frame) { gGpuCamera.Capture(ctx, frame); }
+
 void UpdateCameraData(const DustCameraData* camera)
 {
     gHasValidCameraData = camera && camera->valid;
-    if (!gHasValidCameraData) { gHasPrevFrame = false; return; }
+    if (!gHasValidCameraData) return;
     gFarClip = (gHost && gHost->apiVersion >= 8) ? camera->farZ : 0.0f;
 
     // API v8: use the real camera FOV (from the OGRE projection) instead of the manual TanHalfFov
@@ -617,10 +625,30 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
     // Skipped frames, invalid cameras and projection changes must not reuse it.
     float reprojection[16] = {};
     reprojection[0] = reprojection[5] = reprojection[10] = reprojection[15] = 1;
-    const bool useHistory = gHasPrevFrame && gHasValidCameraData
-        && frameIndex == gLastRenderedFrame + 1
-        && gFarClip == gPrevFarClip && gRTGIConfig.tanHalfFov == gPrevTanHalfFov
-        && RTGITemporal::Reprojection(gInverseView, gPrevInverseView, gFarClip, reprojection);
+    const bool useGpuCamera = gGpuCamera.CurrentReady(frameIndex);
+    const bool consecutive = gHasPrevFrame && frameIndex == gLastRenderedFrame + 1
+        && gRTGIConfig.tanHalfFov == gPrevTanHalfFov;
+    const bool useHistory = consecutive && (useGpuCamera
+        ? gPreviousUsedGpuCamera && gGpuCamera.HistoryReady(frameIndex)
+        : !gPreviousUsedGpuCamera && gHasValidCameraData
+            && gFarClip == gPrevFarClip && gRTGIConfig.tanHalfFov == gPrevTanHalfFov
+            && RTGITemporal::Reprojection(gInverseView, gPrevInverseView, gFarClip, reprojection));
+    struct CameraHistoryCB { float matrix[16]; float farClip, previousFarClip, gpu, valid; } cameraCB = {};
+    memcpy(cameraCB.matrix, reprojection, sizeof(reprojection));
+    cameraCB.farClip = gFarClip; cameraCB.previousFarClip = gPrevFarClip;
+    cameraCB.gpu = useGpuCamera ? 1.f : 0.f; cameraCB.valid = useHistory ? 1.f : 0.f;
+    if (!gCameraHistoryCB) {
+        ID3D11Device* device = nullptr; ctx->GetDevice(&device);
+        gCameraHistoryCB = gHost->CreateConstantBuffer(device, sizeof(cameraCB)); device->Release();
+        if (!gCameraHistoryCB) return nullptr;
+    }
+    gHost->UpdateConstantBuffer(ctx, gCameraHistoryCB, &cameraCB, sizeof(cameraCB));
+    // The host state block saves only b0. Restore our extra slots explicitly.
+    ID3D11Buffer* previousPS[3] = {}, *previousCS[3] = {};
+    ctx->PSGetConstantBuffers(1, 3, previousPS); ctx->CSGetConstantBuffers(1, 3, previousCS);
+    ID3D11Buffer* cameras[3] = {useGpuCamera ? gGpuCamera.Current() : nullptr,
+                              useHistory && useGpuCamera ? gGpuCamera.Previous() : nullptr, gCameraHistoryCB};
+    ctx->PSSetConstantBuffers(1, 3, cameras); ctx->CSSetConstantBuffers(1, 3, cameras);
 
     gHost->SaveState(ctx);
 
@@ -652,8 +680,8 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
         ID3D11ShaderResourceView* prevGISRV = (gAccumWriteIndex == 0) ? gAccumSRVB : gAccumSRVA;
 
         // t0=depth, t1=scene, t2=prevGI, t3=normals, t4=blue noise
-        ID3D11ShaderResourceView* srvs[5] = { depthSRV, sceneSRV, prevGISRV, normalsSRV, gBlueNoiseSRV };
-        ctx->CSSetShaderResources(0, 5, srvs);
+        ID3D11ShaderResourceView* srvs[6] = { depthSRV, sceneSRV, prevGISRV, normalsSRV, gBlueNoiseSRV, gPrevDepthSRV };
+        ctx->CSSetShaderResources(0, 6, srvs);
         ID3D11SamplerState* samplers[2] = { gPointClampSampler, gLinearClampSampler };
         ctx->CSSetSamplers(0, 2, samplers);
 
@@ -690,8 +718,8 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
         // Unbind CS resources
         ID3D11UnorderedAccessView* nullUAV = nullptr;
         ctx->CSSetUnorderedAccessViews(0, 1, &nullUAV, &initialCount);
-        ID3D11ShaderResourceView* nullSRVs[5] = {};
-        ctx->CSSetShaderResources(0, 5, nullSRVs);
+        ID3D11ShaderResourceView* nullSRVs[6] = {};
+        ctx->CSSetShaderResources(0, 6, nullSRVs);
     }
 
     // ---- Pass 2: Temporal Accumulation (single RT: color+AO) ----
@@ -859,7 +887,9 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
     gPrevFarClip = gFarClip;
     gPrevTanHalfFov = gRTGIConfig.tanHalfFov;
     gLastRenderedFrame = frameIndex;
-    gHasPrevFrame = gHasValidCameraData && std::isfinite(gFarClip) && gFarClip > 0;
+    gHasPrevFrame = useGpuCamera || (gHasValidCameraData && std::isfinite(gFarClip) && gFarClip > 0);
+    gPreviousUsedGpuCamera = useGpuCamera;
+    gGpuCamera.Commit(frameIndex);
 
     // Swap accumulation buffer index for next frame
     gAccumWriteIndex = 1 - gAccumWriteIndex;
@@ -867,6 +897,9 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
 
     gFinalGISRV = finalGI;
 
+    ctx->PSSetConstantBuffers(1, 3, previousPS); ctx->CSSetConstantBuffers(1, 3, previousCS);
+    for (auto* buffer : previousPS) if (buffer) buffer->Release();
+    for (auto* buffer : previousCS) if (buffer) buffer->Release();
     gHost->RestoreState(ctx);
 
     return finalGI;

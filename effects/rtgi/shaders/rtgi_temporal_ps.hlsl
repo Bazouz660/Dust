@@ -1,29 +1,6 @@
-// RTGI Temporal Accumulation Pass
-//
-// No-reprojection history read (always at current UV) to avoid buffer contamination
-// that causes ghosting "pop" when camera stops. Instead, uses per-pixel motion vectors
-// from reprojection to scale alpha — pixels that moved get flushed, static pixels
-// accumulate. When camera stops, all motion = 0 → instant convergence, no delay.
-//
-// Output: RGB = accumulated indirect light, A = accumulated AO
-
-// ---- View-space reconstruction ----
-
-float3 ReconstructViewPos(float2 uv, float depth, float thf, float ar)
-{
-    // Kenshi stores ray length / farClip, not view-space Z / farClip.
-    float3 ray = float3((uv.x * 2.0 - 1.0) * ar * thf,
-                       (1.0 - uv.y * 2.0) * thf, 1.0);
-    return normalize(ray) * depth;
-}
-
-float2 ViewPosToUV(float3 vp, float thf, float ar)
-{
-    float2 uv;
-    uv.x = (vp.x / (vp.z * ar * thf)) * 0.5 + 0.5;
-    uv.y = 0.5 - (vp.y / (vp.z * thf)) * 0.5;
-    return uv;
-}
+// Reproject history to the previous surface, reject disocclusions, and clip
+// stale radiance/AO to the current neighborhood before residual smoothing.
+#include "rtgi_camera.hlsl"
 
 // ---- Resources ----
 
@@ -53,79 +30,28 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 {
     int2 pix = int2(pos.xy);
     float depth = depthTex.SampleLevel(pointClamp, uv, 0);
-
     float4 current = currentGI.Load(int3(pix, 0));
-
-    // ---- First frame, history flush, or sky ----
-    // temporalBlend == 0 means the C++ side just recreated the accum/prev-depth
-    // textures (resolution or scale change): their contents are undefined, so
-    // no history may be blended this frame. Returning current still writes the
-    // accumulation output for the next frame; prev-depth is refreshed by the
-    // C++ CopyResource at end of frame regardless.
     if (frameIndex < 1.0 || temporalBlend <= 0.0 || depth <= 0.0001)
         return current;
 
-    // ---- Firefly clamp ----
-    {
-        float4 cN = currentGI.Load(int3(pix + int2(0, -1), 0));
-        float4 cS = currentGI.Load(int3(pix + int2(0,  1), 0));
-        float4 cE = currentGI.Load(int3(pix + int2( 1, 0), 0));
-        float4 cW = currentGI.Load(int3(pix + int2(-1, 0), 0));
-        float3 cMin = min(min(cN.rgb, cS.rgb), min(cE.rgb, cW.rgb));
-        float3 cMax = max(max(cN.rgb, cS.rgb), max(cE.rgb, cW.rgb));
-        current.rgb = clamp(current.rgb, cMin, cMax);
+    float2 previousUV; float expectedDepth;
+    if (!RTGIPreviousPosition(uv, depth, tanHalfFov, aspectRatio, previousUV, expectedDepth)
+        || !RTGIHistoryDepthMatches(expectedDepth, prevDepthTex.SampleLevel(pointClamp, previousUV, 0)))
+        return current;
+
+    float4 history = historyGI.SampleLevel(linearClamp, previousUV, 0);
+    if (!all(isfinite(history))) return current;
+
+    // Clamp HISTORY, not the current frame. Include the center and clamp loads
+    // at image boundaries: first-frame and accumulated output share one signal.
+    uint width, height; currentGI.GetDimensions(width, height);
+    int2 last = int2(width, height) - 1;
+    float4 lower = current, upper = current;
+    [unroll] for (int y = -1; y <= 1; ++y)
+    [unroll] for (int x = -1; x <= 1; ++x) {
+        float4 sample = currentGI.Load(int3(clamp(pix + int2(x,y), int2(0,0), last), 0));
+        lower = min(lower, sample); upper = max(upper, sample);
     }
-
-    float4 history = historyGI.Load(int3(pix, 0));
-
-    // ---- Per-pixel motion vector from reprojection ----
-    // Used ONLY to determine alpha, NOT to read history.
-    float pixelMotion = 0.0;
-
-    float3 viewPos = ReconstructViewPos(uv, depth, tanHalfFov, aspectRatio);
-    float3 prevViewPos = mul(float4(viewPos, 1.0), reprojMatrix).xyz;
-
-    if (prevViewPos.z > 0.0001)
-    {
-        float2 prevUV = ViewPosToUV(prevViewPos, tanHalfFov, aspectRatio);
-        float2 motionVec = abs((prevUV - uv) * viewportSize); // in pixels
-        pixelMotion = max(motionVec.x, motionVec.y); // Chebyshev distance — no sqrt
-    }
-    else
-    {
-        pixelMotion = 100.0;
-    }
-
-    // Dead zone: the game recomputes the view matrix each frame and floating-point
-    // non-determinism produces phantom sub-pixel motion even when the camera is still.
-    // At large world coordinates or certain orientations the jitter can reach 1-2 px,
-    // which otherwise prevents temporal convergence entirely.
-    pixelMotion = max(pixelMotion - 1.5, 0.0);
-
-    // ---- Depth-change detection (catches disocclusion) ----
-    float prevDepth = prevDepthTex.SampleLevel(pointClamp, uv, 0);
-    float depthChange = abs(depth - prevDepth) / max(depth, 0.001);
-    static const float DEPTH_SIGMA_SQ2 = 2.0 * 0.02 * 0.02;
-    float depthStability = exp(-depthChange * depthChange / DEPTH_SIGMA_SQ2);
-
-    // ---- Adaptive alpha ----
-    float baseAlpha = max(1.0 - temporalBlend, 0.08);
-
-    // Motion-based alpha: gradual ramp (after dead zone subtraction)
-    float motionAlpha = saturate(pixelMotion * 0.2);
-
-    // Depth-based alpha: large depth change → flush
-    float depthAlpha = 1.0 - depthStability;
-
-    // Combined: take the stronger signal
-    float dynamicAlpha = max(motionAlpha, depthAlpha);
-
-    // Cap motion alpha — even at max motion, keep some history for noise reduction
-    float alpha = lerp(baseAlpha, 0.8, dynamicAlpha);
-    float aoAlpha = lerp(max(baseAlpha, 0.08), 0.9, dynamicAlpha);
-
-    float4 result;
-    result.rgb = lerp(history.rgb, current.rgb, alpha);
-    result.a   = lerp(history.a,   current.a,   aoAlpha);
-    return result;
+    history = clamp(history, lower, upper);
+    return lerp(current, history, saturate(temporalBlend));
 }

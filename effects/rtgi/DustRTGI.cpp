@@ -94,6 +94,7 @@ static void RTGIPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     if (!gRTGIConfig.enabled || !RTGIRenderer::IsInitialized())
         return;
 
+    RTGIRenderer::CaptureCamera(ctx->context, ctx->frameIndex);
     RTGIRenderer::UpdateCameraData(&ctx->camera);
 }
 

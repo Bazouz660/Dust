@@ -57,9 +57,14 @@ You can pass individual executable names to the native runner, for example
   normals do not outline flat surfaces, real creases still render, and debug
   obeys the same distance exclusions as the composite.
 - `RTGITemporalTests`: world/depth units, handedness, camera rotations and large
-  coordinates; real temporal shader blending against projected world points;
+  coordinates; real temporal shader history clipping and a moving planar gradient;
   real renderer history and bounce resets after disabled/skipped frames,
-  missing depth/camera, projection changes and target recreation.
+  missing depth/camera, projection changes and target recreation. Also checks
+  GPU camera use with missing/stale CPU poses and restoration of extra CB slots.
+- `RTGICameraTests`: queues 32 GPU camera snapshots and shader draws before any
+  readback; checks each frame against double-precision reference reprojection.
+- `ShaderFileLoaderTests`: compiles Outline and RTGI through the production host
+  file loader, including relative shader includes outside the working directory.
 - `EffectResourcesTests`: loads the seven affected Release effect DLLs on WARP,
   compiles their real shaders, observes texture creation, injects an allocation
   failure after a partial allocation, and exercises disabled startup/resize,
