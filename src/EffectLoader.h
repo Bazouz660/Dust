@@ -2,6 +2,7 @@
 
 #include "DustAPI.h"
 #include "GpuTiming.h"
+#include "EffectSettingDefaults.h"
 #include <vector>
 #include <string>
 #include <windows.h>
@@ -10,6 +11,7 @@ struct LoadedEffect {
     HMODULE         hModule;
     DustEffectDesc  desc;
     bool            initialized;
+    EffectSettingDefaults settingDefaults;
 
     // v3: Framework-managed GPU timing
     // Phase 0 = preExecute, phase 1 = postExecute; each double-buffered [slot 0/1]

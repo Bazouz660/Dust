@@ -30,7 +30,12 @@ struct KuwaharaCBData
     int   radius;
     float strength;
     float sharpness;
-    float _pad[3];
+    int   depthEnabled;
+    float depthStart;
+    float depthEnd;
+    float nearRadius;
+    float nearStrength;
+    float _pad[2];
 };
 static ID3D11Buffer* gKuwaharaCB = nullptr;
 
@@ -127,6 +132,7 @@ bool IsInitialized()
 
 void Render(ID3D11DeviceContext* ctx,
             ID3D11ShaderResourceView* sceneCopySRV,
+            ID3D11ShaderResourceView* depthSRV,
             ID3D11RenderTargetView* ldrRTV)
 {
     if (!gInitialized || !ctx || !sceneCopySRV || !ldrRTV || !gHost)
@@ -139,8 +145,13 @@ void Render(ID3D11DeviceContext* ctx,
         cb.texelSize[0] = 1.0f / (float)gWidth;
         cb.texelSize[1] = 1.0f / (float)gHeight;
         cb.radius = gKuwaharaConfig.radius;
-        cb.strength = gKuwaharaConfig.strength;
+        cb.strength = gKuwaharaConfig.debugView ? 1.0f : gKuwaharaConfig.strength;
         cb.sharpness = gKuwaharaConfig.sharpness;
+        cb.depthEnabled = gKuwaharaConfig.depthEnabled && depthSRV;
+        cb.depthStart = gKuwaharaConfig.depthStart;
+        cb.depthEnd = gKuwaharaConfig.depthEnd;
+        cb.nearRadius = gKuwaharaConfig.nearRadius;
+        cb.nearStrength = gKuwaharaConfig.debugView ? 1.0f : gKuwaharaConfig.nearStrength;
         gHost->UpdateConstantBuffer(ctx, gKuwaharaCB, &cb, sizeof(cb));
     }
 
@@ -160,13 +171,14 @@ void Render(ID3D11DeviceContext* ctx,
     ctx->OMSetRenderTargets(1, &ldrRTV, nullptr);
     ctx->OMSetBlendState(gNoBlend, blendFactor, 0xFFFFFFFF);
     ctx->PSSetShader(gKuwaharaPS, nullptr, 0);
-    ctx->PSSetShaderResources(0, 1, &sceneCopySRV);
+    ID3D11ShaderResourceView* srvs[] = { sceneCopySRV, depthSRV };
+    ctx->PSSetShaderResources(0, 2, srvs);
     ctx->PSSetSamplers(0, 1, &gPointClampSampler);
     ctx->PSSetConstantBuffers(0, 1, &gKuwaharaCB);
     ctx->Draw(3, 0);
 
-    ID3D11ShaderResourceView* nullSRV = nullptr;
-    ctx->PSSetShaderResources(0, 1, &nullSRV);
+    ID3D11ShaderResourceView* nullSRVs[2] = {};
+    ctx->PSSetShaderResources(0, 2, nullSRVs);
 
     gHost->RestoreState(ctx);
 }

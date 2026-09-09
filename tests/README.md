@@ -38,6 +38,9 @@ You can pass individual executable names to the native runner, for example
 - `test_shader_fingerprint.py`: the real MSBuild fingerprint target, with
   isolated shader/layout changes and an unrelated source-file control.
 - `LazyResourcesTests`: allocation failure rollback, retry delay, reuse and reset.
+- `KuwaharaDepthTests`: real effect DLL/shader on WARP against an independent
+  legacy-filter reference, depth/blend endpoints, sky and missing-depth fallback,
+  equal/reversed depth endpoints, fractional-radius continuity and preset defaults.
 - `EffectResourcesTests`: loads the seven affected Release effect DLLs on WARP,
   compiles their real shaders, observes texture creation, injects an allocation
   failure after a partial allocation, and exercises disabled startup/resize,

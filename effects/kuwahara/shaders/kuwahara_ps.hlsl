@@ -4,6 +4,7 @@
 // sharp boundaries — the hallmark of painterly rendering.
 
 Texture2D sceneTex : register(t0);
+Texture2D<float> depthTex : register(t1);
 SamplerState pointClamp : register(s0);
 
 cbuffer KuwaharaParams : register(b0)
@@ -12,7 +13,12 @@ cbuffer KuwaharaParams : register(b0)
     int    radius;
     float  strength;
     float  sharpness;
-    float3 _pad;
+    int    depthEnabled;
+    float  depthStart;
+    float  depthEnd;
+    float  nearRadius;
+    float  nearStrength;
+    float2 _pad;
 };
 
 static const int NUM_SECTORS = 8;
@@ -33,7 +39,28 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 {
     float3 original = sceneTex.SampleLevel(pointClamp, uv, 0).rgb;
 
-    int r = radius;
+    float effectiveRadius = clamp((float)radius, 0.0, 8.0);
+    float effectiveStrength = saturate(strength);
+    if (depthEnabled)
+    {
+        float depth = depthTex.SampleLevel(pointClamp, uv, 0);
+        // Kenshi clears sky depth to zero. Treat it as the far endpoint.
+        if (!(depth > 0.0) || !isfinite(depth)) depth = 1.0;
+        float start = min(depthStart, depthEnd);
+        float end = max(depthStart, depthEnd);
+        float t = smoothstep(start, max(end, start + 1e-5), depth);
+        effectiveRadius = lerp(clamp(nearRadius, 0.0, 8.0), effectiveRadius, t);
+        effectiveStrength = lerp(saturate(nearStrength), effectiveStrength, t);
+    }
+    if (effectiveRadius <= 0.0 || effectiveStrength <= 0.0)
+        return float4(original, 1.0);
+
+    // Fade in the next ring of samples at fractional radii. This is continuous
+    // through integer boundaries and preserves the original integer kernels.
+    int r = (int)ceil(effectiveRadius);
+    int innerR = (int)floor(effectiveRadius);
+    float ringWeight = frac(effectiveRadius);
+    float innerRSq = ((float)innerR + 0.5) * ((float)innerR + 0.5);
     float maxRSq = ((float)r + 0.5) * ((float)r + 0.5);
 
     float3 sSum[NUM_SECTORS];
@@ -73,6 +100,8 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 continue;
             }
 
+            float weight = (abs(x) > innerR || abs(y) > innerR || lenSq > innerRSq) ? ringWeight : 1.0;
+            if (weight <= 0.0) continue;
             float3 c = sceneTex.SampleLevel(pointClamp, uv + d * texelSize, 0).rgb;
             float2 nd = d * rsqrt(lenSq);
 
@@ -81,9 +110,9 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             {
                 if (dot(nd, sectorDir[s3]) >= 0.383)
                 {
-                    sSum[s3] += c;
-                    sSumSq[s3] += c * c;
-                    sCount[s3] += 1.0;
+                    sSum[s3] += c * weight;
+                    sSumSq[s3] += c * c * weight;
+                    sCount[s3] += weight;
                 }
             }
         }
@@ -106,5 +135,5 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         }
     }
 
-    return float4(lerp(original, filtered, strength), 1.0);
+    return float4(lerp(original, filtered, effectiveStrength), 1.0);
 }

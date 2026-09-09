@@ -69,6 +69,8 @@ void EffectLoader::EffectConfigLoadFrom(LoadedEffect& le, const std::string& pre
     DWORD attr = GetFileAttributesA(iniPath.c_str());
     if (attr == INVALID_FILE_ATTRIBUTES)
     {
+        for (uint32_t i = 0; i < le.desc.settingCount; ++i)
+            le.settingDefaults.RestoreMissing(le.desc.settings[i], i);
         for (uint32_t i = 0; i < le.desc.settingCount; i++)
         {
             const DustSettingDesc& s = le.desc.settings[i];
@@ -96,7 +98,11 @@ void EffectLoader::EffectConfigLoadFrom(LoadedEffect& le, const std::string& pre
 
         char probe[64];
         GetPrivateProfileStringA(section, key, sentinel, probe, sizeof(probe), iniPath.c_str());
-        if (strcmp(probe, sentinel) == 0) continue;
+        if (strcmp(probe, sentinel) == 0)
+        {
+            le.settingDefaults.RestoreMissing(s, i);
+            continue;
+        }
 
         switch (s.type)
         {
@@ -273,7 +279,7 @@ void EffectLoader::ValidatePreset(int presetIdx)
 
             // Preset-optional settings bridge to player-owned state and are never
             // written into presets, so their absence must not flag "outdated".
-            if (s.settingFlags & DUST_SETTING_FLAG_PRESET_OPTIONAL) continue;
+            if (s.settingFlags & (DUST_SETTING_FLAG_PRESET_OPTIONAL | DUST_SETTING_FLAG_PRESET_DEFAULT)) continue;
 
             char probe[64];
             GetPrivateProfileStringA(section, key, sentinel, probe, sizeof(probe), iniPath.c_str());

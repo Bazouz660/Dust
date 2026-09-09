@@ -32,7 +32,8 @@ static void KuwaharaPostExecute(const DustFrameContext* ctx, const DustHostAPI* 
 
     // strength 0 => output is `lerp(original, filtered, 0)` — identical,
     // skip the scene copy and the (expensive) filter pass entirely
-    if (gKuwaharaConfig.strength <= 0.0f)
+    if (!gKuwaharaConfig.debugView && gKuwaharaConfig.strength <= 0.0f &&
+        (!gKuwaharaConfig.depthEnabled || gKuwaharaConfig.nearStrength <= 0.0f))
         return;
 
     ID3D11RenderTargetView* hdrRTV = host->GetRTV(DUST_RESOURCE_HDR_RT);
@@ -43,7 +44,7 @@ static void KuwaharaPostExecute(const DustFrameContext* ctx, const DustHostAPI* 
     if (!sceneCopy)
         return;
 
-    KuwaharaRenderer::Render(ctx->context, sceneCopy, hdrRTV);
+    KuwaharaRenderer::Render(ctx->context, sceneCopy, host->GetSRV(DUST_RESOURCE_DEPTH), hdrRTV);
 }
 
 static int KuwaharaInit(ID3D11Device* device, uint32_t width, uint32_t height, const DustHostAPI* host)
@@ -78,9 +79,14 @@ static int KuwaharaIsEnabled()
 
 static DustSettingDesc gSettingsArray[] = {
     { "Enabled",    DUST_SETTING_BOOL,  &gKuwaharaConfig.enabled,    0.0f,  1.0f,  "Enabled",   nullptr, "Enable or disable the Kuwahara filter",                     DUST_PERF_MEDIUM },
-    { "Radius",     DUST_SETTING_INT,   &gKuwaharaConfig.radius,     2.0f,  8.0f,  "Radius",    nullptr, "Filter kernel radius (larger = more stylized)",             DUST_PERF_HIGH },
+    { "Radius",     DUST_SETTING_INT,   &gKuwaharaConfig.radius,     0.0f,  8.0f,  "Radius",    nullptr, "Filter radius in pixels; the far radius when Depth Dependent is enabled", DUST_PERF_HIGH },
     { "Strength",   DUST_SETTING_FLOAT, &gKuwaharaConfig.strength,   0.0f,  1.0f,  "Strength",  nullptr, "Blend factor between original and filtered image",          DUST_PERF_NONE },
     { "Sharpness",  DUST_SETTING_FLOAT, &gKuwaharaConfig.sharpness,  1.0f,  16.0f, "Sharpness", nullptr, "Edge preservation sharpness (higher = crisper boundaries)", DUST_PERF_NONE },
+    { "Depth Dependent", DUST_SETTING_BOOL, &gKuwaharaConfig.depthEnabled, 0, 1, "DepthEnabled", nullptr, "Vary radius and strength with camera distance", DUST_PERF_LOW, DUST_SETTING_FLAG_PRESET_DEFAULT },
+    { "Depth Start", DUST_SETTING_FLOAT, &gKuwaharaConfig.depthStart, 0, 1, "DepthStart", nullptr, "Near endpoint: linear distance divided by far clip, using the same units as DoF", DUST_PERF_NONE, DUST_SETTING_FLAG_PRESET_DEFAULT },
+    { "Depth End", DUST_SETTING_FLOAT, &gKuwaharaConfig.depthEnd, 0, 1, "DepthEnd", nullptr, "Far endpoint: reaches Radius and Strength here; endpoints are sorted if reversed", DUST_PERF_NONE, DUST_SETTING_FLAG_PRESET_DEFAULT },
+    { "Near Radius", DUST_SETTING_FLOAT, &gKuwaharaConfig.nearRadius, 0, 8, "NearRadius", nullptr, "Radius at and before Depth Start; zero preserves close-up detail", DUST_PERF_NONE, DUST_SETTING_FLAG_PRESET_DEFAULT },
+    { "Near Strength", DUST_SETTING_FLOAT, &gKuwaharaConfig.nearStrength, 0, 1, "NearStrength", nullptr, "Blend strength at and before Depth Start; zero leaves nearby pixels unchanged", DUST_PERF_NONE, DUST_SETTING_FLAG_PRESET_DEFAULT },
     { "Debug View", DUST_SETTING_BOOL,  &gKuwaharaConfig.debugView,  0.0f,  1.0f,  "DebugView", nullptr, "Show the filtered result without blending",                 DUST_PERF_NONE },
 };
 

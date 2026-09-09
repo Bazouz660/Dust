@@ -735,6 +735,7 @@ int EffectLoader::LoadAll(const char* effectsDir)
         LoadedEffect le = {};
         le.hModule = hMod;
         le.desc = desc;
+        le.settingDefaults.Capture(desc);
         le.initialized = false;
 
         // Derive effect directory from DLL path

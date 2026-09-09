@@ -278,6 +278,9 @@ typedef struct DustSettingDesc {
 // player-owned engine/game state (e.g. shadow atlas resolution, shadow range that
 // persists to settings.cfg) which a distributable preset must not silently clobber.
 #define DUST_SETTING_FLAG_PRESET_OPTIONAL  1
+// Reset to the plugin's startup default if absent in a preset. Use for new
+// opt-in controls so old presets cannot inherit them from a previous preset.
+#define DUST_SETTING_FLAG_PRESET_DEFAULT   2
 
 // Effect descriptor flags (API v3+)
 #define DUST_FLAG_FRAMEWORK_CONFIG  1   // Framework handles INI load/save/hot-reload from settings array

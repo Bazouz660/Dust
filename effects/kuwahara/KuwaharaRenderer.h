@@ -10,6 +10,7 @@ namespace KuwaharaRenderer
     void Shutdown();
     void Render(ID3D11DeviceContext* ctx,
                 ID3D11ShaderResourceView* sceneCopySRV,
+                ID3D11ShaderResourceView* depthSRV,
                 ID3D11RenderTargetView* ldrRTV);
     void OnResolutionChanged(ID3D11Device* device, UINT w, UINT h);
     bool IsInitialized();
