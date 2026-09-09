@@ -1,4 +1,5 @@
 #include "MotionVectors.h"
+#include "ReprojectionMath.h"
 #include <d3d11_1.h>   // ID3D11DeviceContext1::VSSetConstantBuffers1 (per-draw pose bind by offset)
 #include "GeometryCapture.h"
 #include "ShaderMetadata.h"
@@ -385,42 +386,6 @@ static void Identity(float* m)
 {
     for (int i = 0; i < 16; i++) m[i] = (i % 5 == 0) ? 1.0f : 0.0f;
 }
-// r = a*b (column-major: element(row,col) = m[col*4+row])
-static void Mul(const float* a, const float* b, float* r)
-{
-    for (int c = 0; c < 4; c++)
-        for (int row = 0; row < 4; row++)
-        {
-            float s = 0;
-            for (int k = 0; k < 4; k++) s += a[k * 4 + row] * b[c * 4 + k];
-            r[c * 4 + row] = s;
-        }
-}
-static bool Inv(const float* m, float* o)
-{
-    float inv[16];
-    inv[0]  =  m[5]*m[10]*m[15]-m[5]*m[11]*m[14]-m[9]*m[6]*m[15]+m[9]*m[7]*m[14]+m[13]*m[6]*m[11]-m[13]*m[7]*m[10];
-    inv[4]  = -m[4]*m[10]*m[15]+m[4]*m[11]*m[14]+m[8]*m[6]*m[15]-m[8]*m[7]*m[14]-m[12]*m[6]*m[11]+m[12]*m[7]*m[10];
-    inv[8]  =  m[4]*m[9]*m[15]-m[4]*m[11]*m[13]-m[8]*m[5]*m[15]+m[8]*m[7]*m[13]+m[12]*m[5]*m[11]-m[12]*m[7]*m[9];
-    inv[12] = -m[4]*m[9]*m[14]+m[4]*m[10]*m[13]+m[8]*m[5]*m[14]-m[8]*m[6]*m[13]-m[12]*m[5]*m[10]+m[12]*m[6]*m[9];
-    inv[1]  = -m[1]*m[10]*m[15]+m[1]*m[11]*m[14]+m[9]*m[2]*m[15]-m[9]*m[3]*m[14]-m[13]*m[2]*m[11]+m[13]*m[3]*m[10];
-    inv[5]  =  m[0]*m[10]*m[15]-m[0]*m[11]*m[14]-m[8]*m[2]*m[15]+m[8]*m[3]*m[14]+m[12]*m[2]*m[11]-m[12]*m[3]*m[10];
-    inv[9]  = -m[0]*m[9]*m[15]+m[0]*m[11]*m[13]+m[8]*m[1]*m[15]-m[8]*m[3]*m[13]-m[12]*m[1]*m[11]+m[12]*m[3]*m[9];
-    inv[13] =  m[0]*m[9]*m[14]-m[0]*m[10]*m[13]-m[8]*m[1]*m[14]+m[8]*m[2]*m[13]+m[12]*m[1]*m[10]-m[12]*m[2]*m[9];
-    inv[2]  =  m[1]*m[6]*m[15]-m[1]*m[7]*m[14]-m[5]*m[2]*m[15]+m[5]*m[3]*m[14]+m[13]*m[2]*m[7]-m[13]*m[3]*m[6];
-    inv[6]  = -m[0]*m[6]*m[15]+m[0]*m[7]*m[14]+m[4]*m[2]*m[15]-m[4]*m[3]*m[14]-m[12]*m[2]*m[7]+m[12]*m[3]*m[6];
-    inv[10] =  m[0]*m[5]*m[15]-m[0]*m[7]*m[13]-m[4]*m[1]*m[15]+m[4]*m[3]*m[13]+m[12]*m[1]*m[7]-m[12]*m[3]*m[5];
-    inv[14] = -m[0]*m[5]*m[14]+m[0]*m[6]*m[13]+m[4]*m[1]*m[14]-m[4]*m[2]*m[13]-m[12]*m[1]*m[6]+m[12]*m[2]*m[5];
-    inv[3]  = -m[1]*m[6]*m[11]+m[1]*m[7]*m[10]+m[5]*m[2]*m[11]-m[5]*m[3]*m[10]-m[9]*m[2]*m[7]+m[9]*m[3]*m[6];
-    inv[7]  =  m[0]*m[6]*m[11]-m[0]*m[7]*m[10]-m[4]*m[2]*m[11]+m[4]*m[3]*m[10]+m[8]*m[2]*m[7]-m[8]*m[3]*m[6];
-    inv[11] = -m[0]*m[5]*m[11]+m[0]*m[7]*m[9]+m[4]*m[1]*m[11]-m[4]*m[3]*m[9]-m[8]*m[1]*m[7]+m[8]*m[3]*m[5];
-    inv[15] =  m[0]*m[5]*m[10]-m[0]*m[6]*m[9]-m[4]*m[1]*m[10]+m[4]*m[2]*m[9]+m[8]*m[1]*m[6]-m[8]*m[2]*m[5];
-    float det = m[0]*inv[0]+m[1]*inv[4]+m[2]*inv[8]+m[3]*inv[12];
-    if (det == 0.0f) return false;
-    det = 1.0f / det;
-    for (int i = 0; i < 16; i++) o[i] = inv[i] * det;
-    return true;
-}
 static float FrobDiff2(const float* a, const float* b)
 {
     float s = 0; for (int i = 0; i < 16; i++) { float d = a[i] - b[i]; s += d * d; } return s;
@@ -575,10 +540,9 @@ void RenderVelocity(ID3D11DeviceContext* ctx)
         items.push_back({ &d, curM });
         if (hasW)
         {
-            float invW[16], vp[16];
-            if (Inv(worldM.m, invW))
+            float vp[16];
+            if (ReprojectionMath::MultiplyInverse(curM.m, worldM.m, vp))
             {
-                Mul(curM.m, invW, vp);
                 float tr = worldM.m[12]*worldM.m[12] + worldM.m[13]*worldM.m[13] + worldM.m[14]*worldM.m[14];
                 VpCand c; c.trans = tr; memcpy(c.vp.m, vp, 64); vpAll.push_back(c);
             }
@@ -684,8 +648,7 @@ void RenderVelocity(ID3D11DeviceContext* ctx)
     const char* src = "IDENTITY";
     if (haveVP && sHaveVP)
     {
-        float invCur[16];
-        if (Inv(curVP, invCur)) { Mul(sPrevVP.m, invCur, reproj); src = "OK"; }
+        if (ReprojectionMath::MultiplyInverse(sPrevVP.m, curVP, reproj)) src = "OK";
     }
     float rdelta = sHaveLast ? FrobDiff2(reproj, sLastReproj) : 0.0f;
     memcpy(sLastReproj, reproj, sizeof(reproj)); sHaveLast = true;
@@ -1263,12 +1226,10 @@ void InjBeginGBuffer(ID3D11DeviceContext* ctx)
         }
         else
         {
-            float invCur[16];
-            if (Inv(curVP, invCur)) Mul(sInjPrevVP, invCur, reproj);
+            ReprojectionMath::MultiplyInverse(sInjPrevVP, curVP, reproj);
             // A.5: forward reproj (last-frame clip -> this-frame clip) for predicted-screen-space matching —
             // built from LAST frame's VP (still in sInjPrevVP here) and this frame's curVP.
-            float invPrev[16];
-            if (Inv(sInjPrevVP, invPrev)) { Mul(curVP, invPrev, sFwdReproj); sHaveFwd = true; }
+            sHaveFwd = ReprojectionMath::MultiplyInverse(curVP, sInjPrevVP, sFwdReproj);
         }
     }
     if (haveVP) { memcpy(sInjPrevVP, curVP, 64); sInjHavePrev = true; }

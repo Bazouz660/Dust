@@ -196,6 +196,7 @@
     <ClInclude Include="ShaderMetadata.h" />
     <ClInclude Include="GeometryCapture.h" />
     <ClInclude Include="MotionVectors.h" />
+    <ClInclude Include="ReprojectionMath.h" />
     <ClInclude Include="D3D12Interop.h" />
     <ClInclude Include="UpscalerFSR3.h" />
     <ClInclude Include="CameraAccess.h" />
