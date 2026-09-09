@@ -7,6 +7,7 @@
 #include "SurveyRecorder.h"
 #include "SurveyWriter.h"
 #include "ShaderPatch.h"
+#include "ShadowCasterBias.h"
 #include "ShaderMetadata.h"
 #include "GeometryCapture.h"
 #include "MotionVectors.h"
@@ -133,6 +134,7 @@ static std::atomic<bool> gShadowResizePending{false};
 static UINT  gShadowResizeTarget = 0;          // 0 = dismantle all replacements
 static uint64_t gShadowCreationFrame = ~0ull;
 static bool  gInShadowPass = false;
+static ShadowCasterBias::Binding gShadowCasterBias;
 
 UINT GetShadowBaseResolution()           { return gShadowVanillaSize; }
 
@@ -2010,6 +2012,8 @@ static void STDMETHODCALLTYPE HookedDraw(
 {
     if (gShutdownSignaled) { oDraw(pThis, VertexCount, StartVertexLocation); return; }
 
+    if (gInShadowPass) gShadowCasterBias.BeforeDraw(pThis);
+
     ++gDrawHookCallCount;
 
     // Try to install swap chain hooks early — DustBoot may already have captured the
@@ -2282,6 +2286,8 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
 {
     if (gShutdownSignaled) { oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation); return; }
 
+    if (gInShadowPass) gShadowCasterBias.BeforeDraw(pThis);
+
     ++gDrawHookCallCount;
 
     if (Survey::IsActive())
@@ -2312,6 +2318,8 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
     UINT StartIndexLocation, INT BaseVertexLocation, UINT StartInstanceLocation)
 {
     if (gShutdownSignaled) { oDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation); return; }
+
+    if (gInShadowPass) gShadowCasterBias.BeforeDraw(pThis);
 
     ++gDrawHookCallCount;
 
@@ -2345,6 +2353,8 @@ static void STDMETHODCALLTYPE HookedDrawInstanced(
     UINT StartVertexLocation, UINT StartInstanceLocation)
 {
     if (gShutdownSignaled) { oDrawInstanced(pThis, VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation); return; }
+
+    if (gInShadowPass) gShadowCasterBias.BeforeDraw(pThis);
 
     ++gDrawHookCallCount;
 
@@ -2820,6 +2830,8 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
     if (gShutdownSignaled)
     { oOMSetRenderTargets(pThis, NumViews, ppRenderTargetViews, pDepthStencilView); return; }
 
+    gShadowCasterBias.EndPass(pThis);
+
     // OGRE's D3D11 _setRenderTarget calls ClearState() before every bind (plugin RE + capture: 55
     // ClearState/OMSetRenderTargets pairs per frame), which silently unbinds Dust's b12/b13. The
     // VSSetConstantBuffers observer cannot see that, so drop the tracked state here (one re-pin per pass).
@@ -2882,6 +2894,9 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargets(
         oOMSetRenderTargets(pThis, NumViews,
             sb.swapped ? sb.rtvs : ppRenderTargetViews, sb.dsv);
         gShadowPassScale = sb.scale;
+        // Use the scale of the successfully bound replacement, not the UI
+        // request: allocation failures and native-size fallback need factor 1.
+        gShadowCasterBias.BeginPass(pThis, sb.scale);
 
         // OGRE sets RSSetViewports BEFORE OMSetRenderTargets, so the viewport
         // hook (gated on gInShadowPass) misses it. On shadow-pass entry, query
@@ -2935,6 +2950,16 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargetsAndUAV(
         return;
     }
 
+    // KEEP leaves the RTV/DSV binding (and its caster compensation) intact.
+    const bool keepTargets = NumRTVs == D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL;
+    if (keepTargets)
+    {
+        oOMSetRenderTargetsAndUAV(pThis, NumRTVs, ppRenderTargetViews,
+            pDepthStencilView, UAVStartSlot, NumUAVs, ppUnorderedAccessViews, pUAVInitialCounts);
+        return;
+    }
+    gShadowCasterBias.EndPass(pThis);
+
     // Motion-vector pass: GBuffer-pass tracking (see the plain-OMSet hook). OGRE 2.0
     // binds the GBuffer MRT through this combined call, so detection must live here too.
     bool isGBufU = GeometryCapture::CheckGBufferConfig(NumRTVs, ppRenderTargetViews, pDepthStencilView);
@@ -2965,6 +2990,7 @@ static void STDMETHODCALLTYPE HookedOMSetRenderTargetsAndUAV(
             sb.dsv, UAVStartSlot, NumUAVs, ppUnorderedAccessViews,
             pUAVInitialCounts);
         gShadowPassScale = sb.scale;
+        gShadowCasterBias.BeginPass(pThis, sb.scale);
 
         if (!gInShadowPass && sb.scale != 1.0f)
         {

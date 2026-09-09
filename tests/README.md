@@ -22,6 +22,12 @@ You can pass individual executable names to the native runner, for example
   large-coordinate camera pairs, stationary cameras, and invalid inputs.
 - `ShaderCacheStampTests`: locked cache, locked stamp, absent cache, unchanged
   stamp and damaged stamp, using isolated temporary files.
+- `ShadowCasterBiasTests`: renders slope-bias probes on WARP with viewports
+  from 1024 to 16384, checking RTW compensation, the original maximum bias,
+  unchanged native/CSM calculations, unbound-buffer fallback, resolution
+  switches, and constant-buffer cleanup. To additionally compile eight real
+  game shader variants, run `tests/build/ShadowCasterBiasTests/ShadowCasterBiasTests.exe`
+  with the path to Kenshi's `data/materials/common/shadowcaster.hlsl`.
 - `test_shader_fingerprint.py`: the real MSBuild fingerprint target, with
   isolated shader/layout changes and an unrelated source-file control.
 - `LazyResourcesTests`: allocation failure rollback, retry delay, reuse and reset.

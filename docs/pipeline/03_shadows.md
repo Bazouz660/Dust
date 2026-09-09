@@ -122,3 +122,25 @@ Before shadow rendering, 4 draws generate an RTW (Real-Time Warp) map:
 
 This warp map optimizes shadow cascade distribution, stored as a 513x2 texture
 bound to SRV slot 4 in the deferred lighting pass.
+
+## RTWSM bias when overriding atlas resolution
+
+The vanilla caster adds `min(maxSlopeBias, slopeBias * length(ddx/ddy(depth)))`
+to its stored depth. Enlarging the atlas shrinks these per-pixel derivatives,
+but RTW tessellation uses a fixed clip-space edge threshold and does not become
+finer with the atlas. This reduces the bias covering warp interpolation errors
+and can expose more acne at higher resolutions.
+
+Dust patches RTW `shadow_fs` variants to multiply the derivative term by
+`max(actualAtlasSize / nativeAtlasSize, 1)` before the existing clamp. Both OM
+binding hooks supply the successfully bound replacement's scale at PS b13;
+an allocation fallback uses the native scale. The small constant buffer is
+reused until the scale changes, rebound after pass changes/ClearState, and
+removed when leaving the pass. Caster draws rebind it after OGRE's material
+setup, which can overwrite reflected cbuffers. This adds no per-draw uploads
+or texture taps.
+
+The fixed bias and maximum slope bias remain unchanged. Downsampling never
+reduces vanilla bias, and non-RTW shader variants retain their original
+calculation. This addresses bias lost through Dust's atlas enlargement; it
+does not remove every source of RTW warp or geometry-related self-shadowing.
