@@ -44,6 +44,11 @@ You can pass individual executable names to the native runner, for example
 - `EffectOrderTests`: production dispatch bodies with callback fixtures; repeated
   HDR/LDR switches, DoF/Kuwahara order, fixed barriers, tied ranks, unchanged pre
   callbacks, disabled-effect hot reload, old API behavior and preset defaults.
+  Drag placement covers non-adjacent before/after insertion, self/adjacent no-ops,
+  disabled effects, cross-group rejection and jumping over a fixed pass.
+- `EffectDragDropTests`: real vendored ImGui frames and mouse drags through the
+  production header widget; expanded/collapsed effects, insertion before/after,
+  visual order, retained expansion and rejected cross-group/fixed-effect drops.
 - `EffectPresetTests`: production preset INI reader/writer, testing order and
   new controls through save/load, old/missing presets and player-owned settings.
 - `ClarityLuminanceTests`: real DLL/shaders on WARP, legacy Gaussian/composite

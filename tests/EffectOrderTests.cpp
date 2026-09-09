@@ -17,8 +17,8 @@ public:
     PostProcessOrder::Schedule postSchedule_;
     uint64_t configPollFrame_ = UINT64_MAX;
     const std::vector<size_t>& GetPostOrder(DustInjectionPoint);
-    bool CanMovePostEffect(size_t, int) const;
-    bool MovePostEffect(size_t, int);
+    bool CanPlacePostEffect(size_t, size_t, bool) const;
+    bool PlacePostEffect(size_t, size_t, bool);
     void PrepareDispatch(uint64_t);
     void DispatchPre(DustInjectionPoint, const DustFrameContext*);
     void DispatchPost(DustInjectionPoint, const DustFrameContext*);
@@ -76,16 +76,32 @@ int main() {
         assert((calls == (stage ? std::vector<int>{10,0,2,3,4,5,1,6} : std::vector<int>{10,0,1,2,3,4,5,6})));
     }
     stage = 1; loader.GetPostOrder(DUST_INJECT_POST_TONEMAP);
-    assert(loader.MovePostEffect(1, -1)); frame(13);
+    assert(loader.PlacePostEffect(1, 5, false)); frame(13);
     assert((calls == std::vector<int>{10,0,2,3,4,1,5,6}));
-    assert(loader.MovePostEffect(1, -1));
-    assert(!loader.CanMovePostEffect(1, -1)); // cannot cross LUT
-    assert(!loader.MovePostEffect(3, 1)); // fixed pass cannot move
-    assert(!loader.MovePostEffect(2, 1)); // cannot cross stage boundary
-    assert(!loader.MovePostEffect(100, 1));
+    assert(loader.PlacePostEffect(1, 4, false));
+    assert(!loader.CanPlacePostEffect(1, 3, false)); // cannot cross LUT
+    assert(!loader.PlacePostEffect(3, 4, true)); // fixed pass cannot move
+    assert(!loader.PlacePostEffect(2, 4, true)); // cannot cross stage boundary
+    assert(!loader.PlacePostEffect(100, 4, true));
     clarity = dof = ldr = bloom = 0; loader.GetPostOrder(DUST_INJECT_POST_TONEMAP);
-    assert(loader.MovePostEffect(1, 1)); // tied ranks get distinct values
+    assert(loader.PlacePostEffect(1, 4, true)); // tied ranks get distinct values
     frame(14); assert((calls == std::vector<int>{10,0,2,3,4,1,5,6}));
+    // Non-adjacent drag, both insertion sides, and adjacent/self no-ops.
+    assert(loader.PlacePostEffect(1, 6, true));
+    assert((loader.GetPostOrder(DUST_INJECT_POST_TONEMAP) == std::vector<size_t>{3,4,5,6,1}));
+    assert(loader.PlacePostEffect(1, 4, false));
+    assert((loader.GetPostOrder(DUST_INJECT_POST_TONEMAP) == std::vector<size_t>{3,1,4,5,6}));
+    assert(!loader.PlacePostEffect(1, 4, false));
+    assert(!loader.PlacePostEffect(1, 1, true));
+    // Endpoints being movable is insufficient when a fixed pass is between them.
+    loader.effects_[5].desc.settings = nullptr;
+    loader.GetPostOrder(DUST_INJECT_POST_TONEMAP);
+    assert(!loader.CanPlacePostEffect(1, 6, true));
+    assert(!loader.PlacePostEffect(6, 1, false));
+    loader.effects_[5].desc.settings = &orders[2];
+    enabled = false;
+    assert(loader.PlacePostEffect(1, 4, true)); // disabled effects still reorder
+    assert(!loader.PlacePostEffect(1, 4, true));
     // Config changes are read once at frame start even for a disabled effect.
     enabled = false; onPoll = [] { stage = 0; }; frame(15); onPoll = nullptr;
     assert((calls == std::vector<int>{0,2,3,4,5,6})); assert(polls == 7 * 16);

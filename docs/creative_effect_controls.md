@@ -24,9 +24,16 @@ position in that stage is immediately after DoF, so it filters the DoF output.
 The original HDR stage remains the default for existing presets. HDR and LDR
 orders are saved independently, so switching stages preserves both arrangements.
 
-Expand **Effect Order** above the effect settings to move compatible effects up
-or down within their stage. Disabled effects retain their positions. An asterisk
-marks an order changed since loading/saving the preset. Use **Save** or **Save
+The settings list is grouped by rendering stage, and its visual order is the
+execution order. Drag an effect's header onto the upper or lower half of another
+header to insert it before or after that effect. The insertion line shows the
+drop position. You can drag collapsed or expanded effects; settings move with
+their header. Hover near the list's top or bottom edge to scroll while dragging.
+Groups can be collapsed, and search retains the underlying order. Drops cannot
+cross groups or fixed passes. Kuwahara's **Render Stage** changes its group.
+
+Disabled effects retain their positions. An asterisk on an effect header marks
+an order changed since loading/saving the preset. Use **Save** or **Save
 As** in the preset controls to keep the arrangement. Loading an older preset
 restores the default order and Kuwahara's original HDR stage.
 

@@ -74,18 +74,27 @@ public:
         }
     }
     const std::vector<size_t>& Group(DustInjectionPoint point) const { return groups_[point]; }
-    bool CanMove(size_t index, int direction) const {
-        if (index >= entries_.size() || !entries_[index].movable || (direction != -1 && direction != 1)) return false;
+    bool CanPlace(size_t index, size_t target, bool after) const {
+        if (index >= entries_.size() || target >= entries_.size() || index == target ||
+            !entries_[index].movable || !entries_[target].movable ||
+            entries_[index].point != entries_[target].point) return false;
         const auto& group = groups_[entries_[index].point];
-        auto it = std::find(group.begin(), group.end(), index);
-        if (it == group.end() || (direction < 0 ? it == group.begin() : it + 1 == group.end())) return false;
-        return entries_[*(it + direction)].movable;
+        auto from = std::find(group.begin(), group.end(), index);
+        auto to = std::find(group.begin(), group.end(), target);
+        if (from == group.end() || to == group.end()) return false;
+        // Validate the entire path, not just the destination: a drag must not
+        // jump across a fixed callback in the middle of the group.
+        for (auto it = (std::min)(from, to); it <= (std::max)(from, to); ++it)
+            if (!entries_[*it].movable) return false;
+        return after ? to + 1 != from : from + 1 != to;
     }
-    template<class GetDesc> bool Move(size_t index, int direction, GetDesc get) {
-        if (!CanMove(index, direction)) return false;
+    template<class GetDesc> bool Place(size_t index, size_t target, bool after, GetDesc get) {
+        if (!CanPlace(index, target, after)) return false;
         auto& group = groups_[entries_[index].point];
-        size_t pos = std::find(group.begin(), group.end(), index) - group.begin();
-        std::swap(group[pos], group[pos + direction]);
+        group.erase(std::find(group.begin(), group.end(), index));
+        auto destination = std::find(group.begin(), group.end(), target) + (after ? 1 : 0);
+        size_t pos = destination - group.begin();
+        group.insert(destination, index);
         size_t begin = pos, end = pos + 1;
         while (begin > 0 && entries_[group[begin - 1]].movable) --begin;
         while (end < group.size() && entries_[group[end]].movable) ++end;

@@ -911,14 +911,15 @@ const std::vector<size_t>& EffectLoader::GetPostOrder(DustInjectionPoint point)
     return postSchedule_.Group(point);
 }
 
-bool EffectLoader::CanMovePostEffect(size_t index, int direction) const
+bool EffectLoader::CanPlacePostEffect(size_t index, size_t target, bool after) const
 {
-    return postSchedule_.CanMove(index, direction);
+    return postSchedule_.CanPlace(index, target, after);
 }
 
-bool EffectLoader::MovePostEffect(size_t index, int direction)
+bool EffectLoader::PlacePostEffect(size_t index, size_t target, bool after)
 {
-    return postSchedule_.Move(index, direction, [&](size_t i) -> const DustEffectDesc& { return effects_[i].desc; });
+    postSchedule_.Refresh(effects_.size(), [&](size_t i) -> const DustEffectDesc& { return effects_[i].desc; });
+    return postSchedule_.Place(index, target, after, [&](size_t i) -> const DustEffectDesc& { return effects_[i].desc; });
 }
 
 void EffectLoader::PrepareDispatch(uint64_t frameIndex)

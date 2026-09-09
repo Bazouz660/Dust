@@ -2,6 +2,7 @@
 #include "DustGUI_DInputHook.h"
 #include "DustLog.h"
 #include "EffectLoader.h"
+#include "EffectDragDrop.h"
 #include "FilePicker.h"
 #include "Survey.h"
 #include "SurveyRecorder.h"
@@ -1522,51 +1523,7 @@ static void DrawResetButton(size_t effectIdx, uint32_t settingIdx)
     ImGui::PopID();
 }
 
-static void DrawEffectOrder()
-{
-    if (!ImGui::CollapsingHeader(DustLoc::T("Effect Order"))) return;
-    ImGui::TextWrapped("%s", DustLoc::T("Effects run from top to bottom within each stage. Save the preset to keep changes. Fixed effects cannot be crossed."));
-    const DustInjectionPoint points[] = { DUST_INJECT_POST_LIGHTING, DUST_INJECT_POST_TONEMAP };
-    const char* labels[] = { "Before tonemapping (HDR)", "After tonemapping (LDR)" };
-    int moveDirection = 0;
-    size_t moveIndex = 0;
-    for (int group = 0; group < 2; ++group)
-    {
-        ImGui::Spacing();
-        ImGui::TextColored(DustHeadingColor(), "%s", DustLoc::T(labels[group]));
-        const auto order = gEffectLoader.GetPostOrder(points[group]);
-        for (size_t index : order)
-        {
-            const auto& le = gEffectLoader.GetEffect(index);
-            if (index >= gEffectStates.size() || !gEffectStates[index].snapshotted) SnapshotEffect(index);
-            const bool movable = PostProcessOrder::OrderSetting(le.desc) != nullptr;
-            bool dirty = false;
-            if (index < gEffectStates.size())
-                for (uint32_t s = 0; s < le.desc.settingCount && s < gEffectStates[index].diskValues.size(); ++s)
-                    if (le.desc.settings[s].settingFlags & (DUST_SETTING_FLAG_POST_ORDER_HDR | DUST_SETTING_FLAG_POST_ORDER_LDR))
-                        dirty |= IsDirty(le.desc.settings[s], gEffectStates[index].diskValues[s]);
-            ImGui::PushID((int)index);
-            const bool noEarlier = !gEffectLoader.CanMovePostEffect(index, -1);
-            PushVisualDisabled(noEarlier);
-            if (ImGui::ArrowButton("##earlier", ImGuiDir_Up) && !noEarlier) { moveIndex = index; moveDirection = -1; }
-            PopVisualDisabled(noEarlier);
-            ImGui::SameLine();
-            const bool noLater = !gEffectLoader.CanMovePostEffect(index, 1);
-            PushVisualDisabled(noLater);
-            if (ImGui::ArrowButton("##later", ImGuiDir_Down) && !noLater) { moveIndex = index; moveDirection = 1; }
-            PopVisualDisabled(noLater);
-            ImGui::SameLine();
-            ImGui::Text("%s%s  %s", DustLoc::T(le.desc.name ? le.desc.name : "Unnamed"), dirty ? " *" : "",
-                !movable ? DustLoc::T("(fixed)") : !IsEffectEnabled(le) ? DustLoc::T("[OFF]") : "");
-            ImGui::PopID();
-        }
-    }
-    if (moveDirection) gEffectLoader.MovePostEffect(moveIndex, moveDirection);
-    ImGui::Spacing();
-    ImGui::Separator();
-}
-
-static void DrawEffectSection(size_t idx)
+static void DrawEffectSection(size_t idx, EffectDragDrop::Drop& drop)
 {
     const LoadedEffect& le = gEffectLoader.GetEffect(idx);
     if (!le.initialized) return;
@@ -1581,8 +1538,14 @@ static void DrawEffectSection(size_t idx)
     // Build header label with enabled status
     bool enabled = IsEffectEnabled(le);
     char headerLabel[256];
-    snprintf(headerLabel, sizeof(headerLabel), "%s  %s###effect_%zu",
-             name, enabled ? DustLoc::T("[ON]") : DustLoc::T("[OFF]"), idx);
+    const bool movable = le.desc.postExecute && PostProcessOrder::OrderSetting(le.desc) != nullptr;
+    bool orderDirty = false;
+    for (uint32_t i = 0; i < le.desc.settingCount; ++i)
+        if (le.desc.settings[i].settingFlags & (DUST_SETTING_FLAG_POST_ORDER_HDR | DUST_SETTING_FLAG_POST_ORDER_LDR))
+            orderDirty |= IsDirty(le.desc.settings[i], gEffectStates[idx].diskValues[i]);
+    snprintf(headerLabel, sizeof(headerLabel), "%s%s  %s  %s###effect_%zu",
+             name, orderDirty ? " *" : "", enabled ? DustLoc::T("[ON]") : DustLoc::T("[OFF]"),
+             movable ? "" : DustLoc::T("(fixed)"), idx);
 
     // Color the header text
     if (gForceCollapseState != 0)
@@ -1590,6 +1553,10 @@ static void DrawEffectSection(size_t idx)
     ImGui::PushStyleColor(ImGuiCol_Text, DustHeadingColor());
     bool open = ImGui::CollapsingHeader(headerLabel, ImGuiTreeNodeFlags_DefaultOpen);
     ImGui::PopStyleColor();
+    EffectDragDrop::Header(idx, name, movable,
+        [](size_t source, size_t target, bool after) { return gEffectLoader.CanPlacePostEffect(source, target, after); }, drop);
+    if (!ImGui::GetDragDropPayload() && ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", DustLoc::T(movable ? "Drag this header to reorder within its group" : "This effect has a fixed position"));
 
     if (!open)
         return;
@@ -2451,35 +2418,75 @@ void Render()
             // Scrollable effects area
             ImGui::BeginChild("##effects", ImVec2(0, 0), false);
 
-            DrawEffectOrder();
-
             int shown = 0;
             int initializedCount = 0;
             const char* firstInitializedName = nullptr;
             ImVec2 effectsAvail = ImGui::GetContentRegionAvail();
-            for (size_t i = 0; i < count; i++)
+            EffectDragDrop::Drop drop;
+            // Snapshot every group before drawing controls: changing Kuwahara's
+            // stage while editing its settings must not draw it twice this frame.
+            std::array<std::vector<size_t>, 5> groups;
+            for (int point = 0; point < 5; ++point)
+                groups[point] = gEffectLoader.GetPostOrder((DustInjectionPoint)point);
+            for (size_t i = 0; i < count; ++i)
             {
-                const LoadedEffect& le = gEffectLoader.GetEffect(i);
+                const auto& le = gEffectLoader.GetEffect(i);
                 if (!le.initialized) continue;
-                initializedCount++;
+                ++initializedCount;
                 if (!firstInitializedName) firstInitializedName = le.desc.name ? le.desc.name : "Unnamed";
-
-                if (sFilterBuf[0] &&
-                    !EffectNameMatchesFilter(le.desc.name, sFilterBuf) &&
-                    !EffectNameMatchesFilter(DustLoc::T(le.desc.name), sFilterBuf))
-                    continue;
-
-                if (shown > 0)
+                if (i >= gEffectStates.size() || !gEffectStates[i].snapshotted) SnapshotEffect(i);
+            }
+            // Third-party plugins with only a pre callback still get settings,
+            // before the post callbacks in their stage. They cannot be dragged.
+            for (size_t i = count; i-- > 0;)
+            {
+                const auto& le = gEffectLoader.GetEffect(i);
+                const int point = le.desc.injectionPoint;
+                if (!le.desc.postExecute && point >= 0 && point < 5)
+                    groups[point].insert(groups[point].begin(), i);
+            }
+            const char* groupNames[] = { "Geometry", "Before tonemapping (HDR)", "After fog (HDR)",
+                                         "After tonemapping (LDR)", "Before presentation" };
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+            ImGui::TextWrapped("%s", DustLoc::T("Drag effect headers to reorder within a group. Save the preset to keep changes."));
+            ImGui::PopStyleColor();
+            for (int point = 0; point < 5; ++point)
+            {
+                std::vector<size_t> visible;
+                for (size_t i : groups[point])
+                {
+                    const auto& le = gEffectLoader.GetEffect(i);
+                    if (!le.initialized) continue;
+                    if (sFilterBuf[0] &&
+                        !EffectNameMatchesFilter(le.desc.name, sFilterBuf) &&
+                        !EffectNameMatchesFilter(DustLoc::T(le.desc.name), sFilterBuf)) continue;
+                    visible.push_back(i);
+                }
+                if (visible.empty()) continue;
+                shown += (int)visible.size();
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+                char label[160];
+                snprintf(label, sizeof(label), "%s###effect_stage_%d", DustLoc::T(groupNames[point]), point);
+                if (gForceCollapseState != 0 || sFilterBuf[0])
+                    ImGui::SetNextItemOpen(gForceCollapseState > 0 || sFilterBuf[0]);
+                ImGui::PushStyleColor(ImGuiCol_Text, DustHeadingColor());
+                const bool groupOpen = ImGui::CollapsingHeader(label, ImGuiTreeNodeFlags_DefaultOpen);
+                ImGui::PopStyleColor();
+                if (!groupOpen) continue;
+                ImGui::Indent();
+                for (size_t i : visible)
                 {
                     ImGui::Spacing();
-                    ImGui::Spacing();
+                    ImGui::PushID((int)i); // stable across reordering and stage changes
+                    DrawEffectSection(i, drop);
+                    ImGui::PopID();
                 }
-
-                ImGui::PushID((int)i);
-                DrawEffectSection(i);
-                ImGui::PopID();
-                ++shown;
+                ImGui::Unindent();
             }
+            if (drop.pending) gEffectLoader.PlacePostEffect(drop.source, drop.target, drop.after);
+            EffectDragDrop::AutoScroll();
 
             static int sEffectListDiagFrame = 0;
             if ((sEffectListDiagFrame++ % 120) == 0)

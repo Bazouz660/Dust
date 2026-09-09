@@ -90,7 +90,7 @@ static DustSettingDesc gSettingsArray[] = {
     { "Near Radius", DUST_SETTING_FLOAT, &gKuwaharaConfig.nearRadius, 0, 8, "NearRadius", nullptr, "Radius at and before Depth Start; zero preserves close-up detail", DUST_PERF_NONE, DUST_SETTING_FLAG_PRESET_DEFAULT },
     { "Near Strength", DUST_SETTING_FLOAT, &gKuwaharaConfig.nearStrength, 0, 1, "NearStrength", nullptr, "Blend strength at and before Depth Start; zero leaves nearby pixels unchanged", DUST_PERF_NONE, DUST_SETTING_FLAG_PRESET_DEFAULT },
     { "Debug View", DUST_SETTING_BOOL,  &gKuwaharaConfig.debugView,  0.0f,  1.0f,  "DebugView", nullptr, "Show the filtered result without blending",                 DUST_PERF_NONE },
-    { "Render Stage", DUST_SETTING_ENUM, &gKuwaharaConfig.renderStage, 0, 1, "RenderStage", gRenderStages, "Choose LDR to filter the DoF result; adjust its position in Effect Order", DUST_PERF_NONE, DUST_SETTING_FLAG_POST_STAGE | DUST_SETTING_FLAG_PRESET_DEFAULT },
+    { "Render Stage", DUST_SETTING_ENUM, &gKuwaharaConfig.renderStage, 0, 1, "RenderStage", gRenderStages, "Choose LDR to filter the DoF result; drag the effect header to adjust its position in that group", DUST_PERF_NONE, DUST_SETTING_FLAG_POST_STAGE | DUST_SETTING_FLAG_PRESET_DEFAULT },
     { "HDR Order", DUST_SETTING_HIDDEN_INT, &gKuwaharaConfig.hdrOrder, -10000, 10000, "HDROrder", nullptr, nullptr, DUST_PERF_NONE, DUST_SETTING_FLAG_POST_ORDER_HDR | DUST_SETTING_FLAG_PRESET_DEFAULT },
     { "LDR Order", DUST_SETTING_HIDDEN_INT, &gKuwaharaConfig.ldrOrder, -10000, 10000, "LDROrder", nullptr, nullptr, DUST_PERF_NONE, DUST_SETTING_FLAG_POST_ORDER_LDR | DUST_SETTING_FLAG_PRESET_DEFAULT },
 };

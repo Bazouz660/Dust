@@ -77,8 +77,8 @@ public:
     void SaveEffectConfig(size_t index);
     void LoadEffectConfig(size_t index);
     const std::vector<size_t>& GetPostOrder(DustInjectionPoint point);
-    bool CanMovePostEffect(size_t index, int direction) const;
-    bool MovePostEffect(size_t index, int direction);
+    bool CanPlacePostEffect(size_t index, size_t target, bool after) const;
+    bool PlacePostEffect(size_t index, size_t target, bool after);
 
     // A framework-config effect may write its OWN base INI during OnSettingChanged
     // (e.g. Shadows mirrors its atlas Resolution for the early-startup apply). That
