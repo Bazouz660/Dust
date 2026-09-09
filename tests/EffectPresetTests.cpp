@@ -36,11 +36,13 @@ int main() {
     depth = true; stage = 1; order = 17; strength = .25f; luminanceProtect = .75f;
     EffectLoader::EffectConfigSaveTo(le, modern.string());
     const auto ini = (modern / "Fixture.ini").string();
-    assert(GetPrivateProfileIntA("Fixture", "Order", -1, ini.c_str()) == 17);
+    assert(GetPrivateProfileIntA("Fixture", "Order", -1, ini.c_str()) == -1);
+    // Old presets may still contain custom ordering. Ignore it on load.
+    assert(WritePrivateProfileStringA("Fixture", "Order", "17", ini.c_str()));
     assert(GetPrivateProfileIntA("Fixture", "Player", -1, ini.c_str()) == -1);
     depth = false; stage = 0; order = 80; strength = 1; luminanceProtect = 0;
     EffectLoader::EffectConfigLoadFrom(le, modern.string());
-    assert(depth && stage == 1 && order == 17 && strength == .25f && luminanceProtect == .75f);
+    assert(depth && stage == 1 && order == 80 && strength == .25f && luminanceProtect == .75f);
     assert(WritePrivateProfileStringA("Fixture", "Strength", "0.6", (old / "Fixture.ini").string().c_str()));
     EffectLoader::EffectConfigLoadFrom(le, old.string());
     assert(!depth && stage == 0 && order == 80 && strength == .6f && luminanceProtect == 0);

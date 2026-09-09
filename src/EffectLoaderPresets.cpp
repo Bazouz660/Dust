@@ -90,6 +90,11 @@ void EffectLoader::EffectConfigLoadFrom(LoadedEffect& le, const std::string& pre
     for (uint32_t i = 0; i < le.desc.settingCount; i++)
     {
         const DustSettingDesc& s = le.desc.settings[i];
+        if (s.settingFlags & (DUST_SETTING_FLAG_POST_ORDER_HDR | DUST_SETTING_FLAG_POST_ORDER_LDR))
+        {
+            le.settingDefaults.RestoreMissing(s, i);
+            continue;
+        }
         if (s.type == DUST_SETTING_SECTION) continue;
         if (!s.valuePtr) continue;
 
@@ -175,7 +180,7 @@ void EffectLoader::EffectConfigSaveTo(LoadedEffect& le, const std::string& prese
         if (!s.valuePtr) continue;
         // Preset-optional settings bridge to player-owned state; never bake them
         // into a preset (see DUST_SETTING_FLAG_PRESET_OPTIONAL).
-        if (s.settingFlags & DUST_SETTING_FLAG_PRESET_OPTIONAL) continue;
+        if (s.settingFlags & (DUST_SETTING_FLAG_PRESET_OPTIONAL | DUST_SETTING_FLAG_POST_ORDER_HDR | DUST_SETTING_FLAG_POST_ORDER_LDR)) continue;
 
         const char* key = s.iniKey ? s.iniKey : s.name;
         if (!key) continue;

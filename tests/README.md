@@ -44,15 +44,11 @@ You can pass individual executable names to the native runner, for example
   A spatial near/far fixture also checks texture orientation, the distance-fade
   preview, missing-depth indication and preview with zero filter strength.
 - `EffectOrderTests`: production dispatch bodies with callback fixtures; repeated
-  HDR/LDR switches, DoF/Kuwahara order, fixed barriers, tied ranks, unchanged pre
-  callbacks, disabled-effect hot reload, old API behavior and preset defaults.
-  Drag placement covers non-adjacent before/after insertion, self/adjacent no-ops,
-  disabled effects, cross-group rejection and jumping over a fixed pass.
-- `EffectDragDropTests`: real vendored ImGui frames and mouse drags through the
-  production header widget; expanded/collapsed effects, insertion before/after,
-  visual order, retained expansion and rejected cross-group/fixed-effect drops.
+  HDR/LDR switches, fixed DoF/Kuwahara order, unchanged pre callbacks,
+  disabled-effect hot reload, old API behavior and preset defaults.
 - `EffectPresetTests`: production preset INI reader/writer, testing order and
-  new controls through save/load, old/missing presets and player-owned settings.
+  new controls through save/load, ignored old ordering values, old/missing presets
+  and player-owned settings.
 - `ClarityLuminanceTests`: real DLL/shaders on WARP, legacy Gaussian/composite
   reference, unchanged protected dark pixels, preserved daylight enhancement,
   per-input-pixel luminance ramp, partial protection, reversed/equal thresholds

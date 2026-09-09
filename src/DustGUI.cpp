@@ -2,7 +2,6 @@
 #include "DustGUI_DInputHook.h"
 #include "DustLog.h"
 #include "EffectLoader.h"
-#include "EffectDragDrop.h"
 #include "FilePicker.h"
 #include "Survey.h"
 #include "SurveyRecorder.h"
@@ -170,11 +169,8 @@ static SavedValue GetValue(const DustSettingDesc& s)
     SavedValue v = {};
     if (!s.valuePtr) return v;
     switch (s.type) {
-    case DUST_SETTING_HIDDEN_BOOL:
     case DUST_SETTING_BOOL:   v.bVal = *(bool*)s.valuePtr; break;
-    case DUST_SETTING_HIDDEN_FLOAT:
     case DUST_SETTING_FLOAT:  v.fVal = *(float*)s.valuePtr; break;
-    case DUST_SETTING_HIDDEN_INT:
     case DUST_SETTING_INT:
     case DUST_SETTING_ENUM:   v.iVal = *(int*)s.valuePtr; break;
     case DUST_SETTING_COLOR3: {
@@ -191,11 +187,8 @@ static void SetValue(const DustSettingDesc& s, const SavedValue& v)
 {
     if (!s.valuePtr) return;
     switch (s.type) {
-    case DUST_SETTING_HIDDEN_BOOL:
     case DUST_SETTING_BOOL:   *(bool*)s.valuePtr = v.bVal; break;
-    case DUST_SETTING_HIDDEN_FLOAT:
     case DUST_SETTING_FLOAT:  *(float*)s.valuePtr = v.fVal; break;
-    case DUST_SETTING_HIDDEN_INT:
     case DUST_SETTING_INT:
     case DUST_SETTING_ENUM:   *(int*)s.valuePtr = v.iVal; break;
     case DUST_SETTING_COLOR3: {
@@ -211,11 +204,8 @@ static bool IsDirty(const DustSettingDesc& s, const SavedValue& saved)
 {
     if (!s.valuePtr) return false;
     switch (s.type) {
-    case DUST_SETTING_HIDDEN_BOOL:
     case DUST_SETTING_BOOL:   return *(bool*)s.valuePtr != saved.bVal;
-    case DUST_SETTING_HIDDEN_FLOAT:
     case DUST_SETTING_FLOAT:  return *(float*)s.valuePtr != saved.fVal;
-    case DUST_SETTING_HIDDEN_INT:
     case DUST_SETTING_INT:
     case DUST_SETTING_ENUM:   return *(int*)s.valuePtr != saved.iVal;
     case DUST_SETTING_COLOR3: {
@@ -1523,7 +1513,7 @@ static void DrawResetButton(size_t effectIdx, uint32_t settingIdx)
     ImGui::PopID();
 }
 
-static void DrawEffectSection(size_t idx, EffectDragDrop::Drop& drop)
+static void DrawEffectSection(size_t idx)
 {
     const LoadedEffect& le = gEffectLoader.GetEffect(idx);
     if (!le.initialized) return;
@@ -1538,14 +1528,8 @@ static void DrawEffectSection(size_t idx, EffectDragDrop::Drop& drop)
     // Build header label with enabled status
     bool enabled = IsEffectEnabled(le);
     char headerLabel[256];
-    const bool movable = le.desc.postExecute && PostProcessOrder::OrderSetting(le.desc) != nullptr;
-    bool orderDirty = false;
-    for (uint32_t i = 0; i < le.desc.settingCount; ++i)
-        if (le.desc.settings[i].settingFlags & (DUST_SETTING_FLAG_POST_ORDER_HDR | DUST_SETTING_FLAG_POST_ORDER_LDR))
-            orderDirty |= IsDirty(le.desc.settings[i], gEffectStates[idx].diskValues[i]);
-    snprintf(headerLabel, sizeof(headerLabel), "%s%s  %s  %s###effect_%zu",
-             name, orderDirty ? " *" : "", enabled ? DustLoc::T("[ON]") : DustLoc::T("[OFF]"),
-             movable ? "" : DustLoc::T("(fixed)"), idx);
+    snprintf(headerLabel, sizeof(headerLabel), "%s  %s###effect_%zu",
+             name, enabled ? DustLoc::T("[ON]") : DustLoc::T("[OFF]"), idx);
 
     // Color the header text
     if (gForceCollapseState != 0)
@@ -1553,10 +1537,6 @@ static void DrawEffectSection(size_t idx, EffectDragDrop::Drop& drop)
     ImGui::PushStyleColor(ImGuiCol_Text, DustHeadingColor());
     bool open = ImGui::CollapsingHeader(headerLabel, ImGuiTreeNodeFlags_DefaultOpen);
     ImGui::PopStyleColor();
-    EffectDragDrop::Header(idx, name, movable,
-        [](size_t source, size_t target, bool after) { return gEffectLoader.CanPlacePostEffect(source, target, after); }, drop);
-    if (!ImGui::GetDragDropPayload() && ImGui::IsItemHovered())
-        ImGui::SetTooltip("%s", DustLoc::T(movable ? "Drag this header to reorder within its group" : "This effect has a fixed position"));
 
     if (!open)
         return;
@@ -2422,71 +2402,29 @@ void Render()
             int initializedCount = 0;
             const char* firstInitializedName = nullptr;
             ImVec2 effectsAvail = ImGui::GetContentRegionAvail();
-            EffectDragDrop::Drop drop;
-            // Snapshot every group before drawing controls: changing Kuwahara's
-            // stage while editing its settings must not draw it twice this frame.
-            std::array<std::vector<size_t>, 5> groups;
-            for (int point = 0; point < 5; ++point)
-                groups[point] = gEffectLoader.GetPostOrder((DustInjectionPoint)point);
-            for (size_t i = 0; i < count; ++i)
+            for (size_t i = 0; i < count; i++)
             {
-                const auto& le = gEffectLoader.GetEffect(i);
+                const LoadedEffect& le = gEffectLoader.GetEffect(i);
                 if (!le.initialized) continue;
-                ++initializedCount;
+                initializedCount++;
                 if (!firstInitializedName) firstInitializedName = le.desc.name ? le.desc.name : "Unnamed";
-                if (i >= gEffectStates.size() || !gEffectStates[i].snapshotted) SnapshotEffect(i);
-            }
-            // Third-party plugins with only a pre callback still get settings,
-            // before the post callbacks in their stage. They cannot be dragged.
-            for (size_t i = count; i-- > 0;)
-            {
-                const auto& le = gEffectLoader.GetEffect(i);
-                const int point = le.desc.injectionPoint;
-                if (!le.desc.postExecute && point >= 0 && point < 5)
-                    groups[point].insert(groups[point].begin(), i);
-            }
-            const char* groupNames[] = { "Geometry", "Before tonemapping (HDR)", "After fog (HDR)",
-                                         "After tonemapping (LDR)", "Before presentation" };
-            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-            ImGui::TextWrapped("%s", DustLoc::T("Drag effect headers to reorder within a group. Save the preset to keep changes."));
-            ImGui::PopStyleColor();
-            for (int point = 0; point < 5; ++point)
-            {
-                std::vector<size_t> visible;
-                for (size_t i : groups[point])
-                {
-                    const auto& le = gEffectLoader.GetEffect(i);
-                    if (!le.initialized) continue;
-                    if (sFilterBuf[0] &&
-                        !EffectNameMatchesFilter(le.desc.name, sFilterBuf) &&
-                        !EffectNameMatchesFilter(DustLoc::T(le.desc.name), sFilterBuf)) continue;
-                    visible.push_back(i);
-                }
-                if (visible.empty()) continue;
-                shown += (int)visible.size();
-                ImGui::Spacing();
-                ImGui::Separator();
-                ImGui::Spacing();
-                char label[160];
-                snprintf(label, sizeof(label), "%s###effect_stage_%d", DustLoc::T(groupNames[point]), point);
-                if (gForceCollapseState != 0 || sFilterBuf[0])
-                    ImGui::SetNextItemOpen(gForceCollapseState > 0 || sFilterBuf[0]);
-                ImGui::PushStyleColor(ImGuiCol_Text, DustHeadingColor());
-                const bool groupOpen = ImGui::CollapsingHeader(label, ImGuiTreeNodeFlags_DefaultOpen);
-                ImGui::PopStyleColor();
-                if (!groupOpen) continue;
-                ImGui::Indent();
-                for (size_t i : visible)
+
+                if (sFilterBuf[0] &&
+                    !EffectNameMatchesFilter(le.desc.name, sFilterBuf) &&
+                    !EffectNameMatchesFilter(DustLoc::T(le.desc.name), sFilterBuf))
+                    continue;
+
+                if (shown > 0)
                 {
                     ImGui::Spacing();
-                    ImGui::PushID((int)i); // stable across reordering and stage changes
-                    DrawEffectSection(i, drop);
-                    ImGui::PopID();
+                    ImGui::Spacing();
                 }
-                ImGui::Unindent();
+
+                ImGui::PushID((int)i);
+                DrawEffectSection(i);
+                ImGui::PopID();
+                ++shown;
             }
-            if (drop.pending) gEffectLoader.PlacePostEffect(drop.source, drop.target, drop.after);
-            EffectDragDrop::AutoScroll();
 
             static int sEffectListDiagFrame = 0;
             if ((sEffectListDiagFrame++ % 120) == 0)

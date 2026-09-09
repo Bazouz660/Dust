@@ -74,34 +74,5 @@ public:
         }
     }
     const std::vector<size_t>& Group(DustInjectionPoint point) const { return groups_[point]; }
-    bool CanPlace(size_t index, size_t target, bool after) const {
-        if (index >= entries_.size() || target >= entries_.size() || index == target ||
-            !entries_[index].movable || !entries_[target].movable ||
-            entries_[index].point != entries_[target].point) return false;
-        const auto& group = groups_[entries_[index].point];
-        auto from = std::find(group.begin(), group.end(), index);
-        auto to = std::find(group.begin(), group.end(), target);
-        if (from == group.end() || to == group.end()) return false;
-        // Validate the entire path, not just the destination: a drag must not
-        // jump across a fixed callback in the middle of the group.
-        for (auto it = (std::min)(from, to); it <= (std::max)(from, to); ++it)
-            if (!entries_[*it].movable) return false;
-        return after ? to + 1 != from : from + 1 != to;
-    }
-    template<class GetDesc> bool Place(size_t index, size_t target, bool after, GetDesc get) {
-        if (!CanPlace(index, target, after)) return false;
-        auto& group = groups_[entries_[index].point];
-        group.erase(std::find(group.begin(), group.end(), index));
-        auto destination = std::find(group.begin(), group.end(), target) + (after ? 1 : 0);
-        size_t pos = destination - group.begin();
-        group.insert(destination, index);
-        size_t begin = pos, end = pos + 1;
-        while (begin > 0 && entries_[group[begin - 1]].movable) --begin;
-        while (end < group.size() && entries_[group[end]].movable) ++end;
-        // Assign distinct ranks to the whole movable run, including tied INIs.
-        for (size_t i = begin; i < end; ++i) *OrderSetting(get(group[i])) = int(i - begin);
-        Refresh(entries_.size(), get);
-        return true;
-    }
 };
 }

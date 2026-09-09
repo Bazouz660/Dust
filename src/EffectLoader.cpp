@@ -432,6 +432,13 @@ void EffectLoader::EffectConfigLoad(LoadedEffect& le)
     for (uint32_t i = 0; i < le.desc.settingCount; i++)
     {
         const DustSettingDesc& s = le.desc.settings[i];
+        // Former ordering keys remain recognized for old INIs, but execution
+        // uses the plugin defaults while user reordering is withdrawn.
+        if (s.settingFlags & (DUST_SETTING_FLAG_POST_ORDER_HDR | DUST_SETTING_FLAG_POST_ORDER_LDR))
+        {
+            le.settingDefaults.RestoreMissing(s, i);
+            continue;
+        }
         if (s.type == DUST_SETTING_SECTION) continue;
         if (!s.valuePtr) continue;
 
@@ -909,17 +916,6 @@ const std::vector<size_t>& EffectLoader::GetPostOrder(DustInjectionPoint point)
 {
     postSchedule_.Refresh(effects_.size(), [&](size_t i) -> const DustEffectDesc& { return effects_[i].desc; });
     return postSchedule_.Group(point);
-}
-
-bool EffectLoader::CanPlacePostEffect(size_t index, size_t target, bool after) const
-{
-    return postSchedule_.CanPlace(index, target, after);
-}
-
-bool EffectLoader::PlacePostEffect(size_t index, size_t target, bool after)
-{
-    postSchedule_.Refresh(effects_.size(), [&](size_t i) -> const DustEffectDesc& { return effects_[i].desc; });
-    return postSchedule_.Place(index, target, after, [&](size_t i) -> const DustEffectDesc& { return effects_[i].desc; });
 }
 
 void EffectLoader::PrepareDispatch(uint64_t frameIndex)

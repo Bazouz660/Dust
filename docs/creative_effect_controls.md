@@ -20,7 +20,7 @@ filter stronger nearby. To filter distant objects only, leave both near values
 at zero and increase the far values. **Distance Fade Preview** shows the near
 region as black, the far region as white, and the transition as gray. Magenta
 indicates disabled/unavailable depth modulation. Later effects can modify this
-preview, so view it in LDR near the end of the group when diagnosing the ramp.
+preview, so view it in LDR with later effects disabled when diagnosing the ramp.
 
 The feature defaults off. Loading an older preset without these controls resets
 them to their defaults, even after a preset that enabled them. **Preview Full
@@ -29,36 +29,15 @@ retaining the depth-dependent radius. Where strength is already 1 it produces
 the same image. Distance Fade Preview takes precedence when both are enabled.
 The saved INI key remains `DebugView` for compatibility.
 
-## Effect order and DoF into Kuwahara
+## Kuwahara after DoF
 
-Set Kuwahara's **Render Stage** to **After tonemapping (LDR)**. Its default
-position in that stage is immediately after DoF, so it filters the DoF output.
-The original HDR stage remains the default for existing presets. HDR and LDR
-orders are saved independently, so switching stages preserves both arrangements.
+Set Kuwahara's **Render Stage** to **After tonemapping (LDR)** to filter the
+DoF output. The original HDR stage remains the default for existing presets.
 
-The settings list is grouped by rendering stage, and its visual order is the
-execution order. Drag an effect's header onto the upper or lower half of another
-header to insert it before or after that effect. The insertion line shows the
-drop position. You can drag collapsed or expanded effects; settings move with
-their header. Hover near the list's top or bottom edge to scroll while dragging.
-Groups can be collapsed, and search retains the underlying order. Drops cannot
-cross groups or fixed passes. Kuwahara's **Render Stage** changes its group.
-
-Disabled effects retain their positions. An asterisk on an effect header marks
-an order changed since loading/saving the preset. Use **Save** or **Save
-As** in the preset controls to keep the arrangement. Loading an older preset
-restores the default order and Kuwahara's original HDR stage.
-
-Fixed passes are barriers. In particular, LUT rebuilds the LDR image from HDR,
-so it must precede effects that consume that image. Shadow and lighting passes
-also stay fixed. The ordering controls affect post callbacks; autofocus, HDR
-capture and other pre callbacks retain their original timing.
-
-Plugin API v9 uses flags on existing settings (no struct size change):
-`POST_STAGE` is an enum selecting HDR/LDR; `POST_ORDER_HDR` and `POST_ORDER_LDR`
-mark integer order settings. Effects must explicitly opt in. Plugins built
-against earlier APIs retain their fixed scheduling. Dispatch caches ordered
-indices and rebuilds only when scheduling changes; effect objects stay in place.
+Interactive effect ordering has been removed for now. The settings list is
+compact again and effects use their fixed default execution order. Previously
+saved custom ordering values are ignored and are no longer written to presets.
+The direct Kuwahara stage choice remains available.
 
 ## Clarity luminance protection
 
@@ -72,7 +51,7 @@ LDR image (0 = black, 1 = white).
 This mask multiplies the existing midtone mask. It does not alter exposure or
 darken the input image: it suppresses Clarity's contribution to dark pixels.
 Bright lights at night can still receive enhancement. "Original" means the
-image entering Clarity, including earlier effects in the selected order.
+image entering Clarity, including earlier effects in the pipeline.
 Reversed/equal thresholds are handled without division by zero. The debug view
 continues to show the raw extracted detail layer. Old presets default protection
 to 0, including when loaded after a preset that enables it.

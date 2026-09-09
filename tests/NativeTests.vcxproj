@@ -19,11 +19,5 @@
     <Link><AdditionalDependencies>d3d11.lib;d3d12.lib;dxgi.lib;d3dcompiler.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
   </ItemDefinitionGroup>
   <ItemGroup><ClCompile Include="$(TestName).cpp" /></ItemGroup>
-  <ItemGroup Condition="'$(TestName)'=='EffectDragDropTests'">
-    <ClCompile Include="..\src\imgui\imgui.cpp" />
-    <ClCompile Include="..\src\imgui\imgui_draw.cpp" />
-    <ClCompile Include="..\src\imgui\imgui_widgets.cpp" />
-    <ClCompile Include="..\src\imgui\imgui_tables.cpp" />
-  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

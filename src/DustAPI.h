@@ -284,8 +284,8 @@ typedef struct DustSettingDesc {
 // API v9: scheduling metadata, with no struct layout changes. POST_STAGE is an
 // ENUM (0 = POST_LIGHTING/HDR, 1 = POST_TONEMAP/LDR). Only effects that support
 // both targets should expose it. It changes postExecute only, never preExecute.
-// POST_ORDER_* are INT/HIDDEN_INT settings: opt in to reordering postExecute
-// within that stage. Non-opt-in callbacks form fixed barriers in the order.
+// POST_ORDER_* retain fixed per-stage defaults. Previously saved user ordering
+// values are ignored; the interactive ordering feature is currently withdrawn.
 #define DUST_SETTING_FLAG_POST_STAGE       4
 #define DUST_SETTING_FLAG_POST_ORDER_HDR    8
 #define DUST_SETTING_FLAG_POST_ORDER_LDR   16
