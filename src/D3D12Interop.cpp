@@ -51,6 +51,15 @@ namespace
 
     bool gReady    = false;
     bool gInitDone = false;
+    bool gUnfencedWork = false; // Execute succeeded but its completion signal failed
+
+    bool CheckInteropResult(HRESULT hr, const char* operation)
+    {
+        if (SUCCEEDED(hr)) return true;
+        Log("D3D12Interop: %s failed (0x%08X); bridge disabled", operation, hr);
+        gReady = false;
+        return false;
+    }
 
     // Tints the LEFT HALF green (rgb *= .3,1,.3 for x < split); right half is an identity passthrough.
     // A clean split in-game proves the copy-in, the compute dispatch, and the copy-back all landed.
@@ -69,17 +78,40 @@ namespace
     // Bounded CPU wait for the last submitted D3D12 work — the same fence wait BeginD3D12Work does
     // before the allocator reset. D3D12 resources must outlive GPU execution, so this must run
     // before releasing or recreating anything an in-flight command list can still reference.
-    void WaitForLastWork()
+    GpuWaitResult WaitForLastWork()
     {
-        if (!gFence || !gLastDone || gFence->GetCompletedValue() >= gLastDone) return;
-        gFence->SetEventOnCompletion(gLastDone, gFenceEvent);
-        if (WaitForSingleObject(gFenceEvent, 1000) != WAIT_OBJECT_0)
-            Log("D3D12Interop: fence wait timed out before resource release");
+        if (gDev && FAILED(gDev->GetDeviceRemovedReason()))
+        {
+            gReady = false;
+            return GpuWaitResult::DeviceRemoved;
+        }
+        if (!gFence || !gLastDone) return GpuWaitResult::Completed;
+        // If the post-submit signal failed, the old fence value proves nothing.
+        // A later successful signal on the same queue covers the submitted work.
+        if (gUnfencedWork)
+        {
+            if (!CheckInteropResult(gQueue->Signal(gFence, gLastDone), "retirement Signal"))
+                return GpuWaitResult::Pending;
+            gUnfencedWork = false;
+        }
+        UINT64 completed = gFence->GetCompletedValue();
+        if (completed == UINT64_MAX) { gReady = false; return GpuWaitResult::DeviceRemoved; }
+        if (completed >= gLastDone) return GpuWaitResult::Completed;
+        if (!CheckInteropResult(gFence->SetEventOnCompletion(gLastDone, gFenceEvent), "SetEventOnCompletion"))
+            return GpuWaitResult::Pending;
+        const DWORD wait = WaitForSingleObject(gFenceEvent, 1000);
+        // Recheck even after a signaled event: a timed-out earlier registration
+        // can wake this wait, and device removal also signals fence events.
+        completed = gFence->GetCompletedValue();
+        if (completed == UINT64_MAX) { gReady = false; return GpuWaitResult::DeviceRemoved; }
+        if (completed >= gLastDone) return GpuWaitResult::Completed;
+        Log("D3D12Interop: GPU work still pending (wait=%lu); retaining resources", wait);
+        return GpuWaitResult::Pending;
     }
 
-    void ReleaseSharedTextures()
+    bool ReleaseSharedTextures()
     {
-        WaitForLastWork();
+        if (WaitForLastWork() == GpuWaitResult::Pending) return false;
         SafeRelease(gShared11In);
         SafeRelease(gShared11Out);
         SafeRelease(gSharedIn);
@@ -87,6 +119,7 @@ namespace
         SafeRelease(gComputeOut);
         gTexW = gTexH = 0;
         gTexFmt = DXGI_FORMAT_UNKNOWN;
+        return true;
     }
 
     // Create the shared texture on the GAME's D3D11 device and open it on our D3D12 device from the same
@@ -128,7 +161,7 @@ namespace
     bool EnsureSharedTextures(UINT w, UINT h, DXGI_FORMAT fmt)
     {
         if (gShared11In && gShared11Out && w == gTexW && h == gTexH && fmt == gTexFmt) return true;
-        ReleaseSharedTextures();
+        if (!ReleaseSharedTextures() || !gReady) return false;
 
         // Diagnostic: the compute pass writes the output via a typed UAV store, which BGRA (fmt 87, Kenshi's
         // ldr) does not guarantee. If this logs "NOT supported" and the tint doesn't appear, that's why —
@@ -221,7 +254,7 @@ bool Init(ID3D11Device* d3d11Device)
     hr = gDev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, gAlloc, nullptr,
                                  __uuidof(ID3D12GraphicsCommandList), (void**)&gList);
     if (FAILED(hr)) { Log("D3D12Interop: CreateCommandList failed 0x%08X", hr); Shutdown(); return false; }
-    gList->Close();   // created open; reset per-use in RunTintTest
+    if (!CheckInteropResult(gList->Close(), "initial Close")) { Shutdown(); return false; }
 
     // 3. Shared fence — the cross-API sync primitive. If the game device isn't D3D11.4 or the fence can't
     //    be opened (a real possibility under Proton), we bail here and the spike stays a no-op.
@@ -360,9 +393,9 @@ ID3D12Device* GetDevice() { return gDev; }
 
 // Exported copy of the internal fence wait, for the FSR3 backend: it must not release its shared
 // textures or destroy the FFX context while the previous frame's D3D12 work is still in flight.
-void WaitForGpuIdle()
+GpuWaitResult WaitForGpuIdle()
 {
-    WaitForLastWork();
+    return WaitForLastWork();
 }
 
 bool CreateSharedTexture(uint32_t w, uint32_t h, uint32_t fmt,
@@ -374,7 +407,7 @@ bool CreateSharedTexture(uint32_t w, uint32_t h, uint32_t fmt,
 
 void Transition(ID3D12Resource* r, uint32_t fromState, uint32_t toState)
 {
-    if (r && gList) Barrier(r, (D3D12_RESOURCE_STATES)fromState, (D3D12_RESOURCE_STATES)toState);
+    if (r && gList && gCtx4Frame) Barrier(r, (D3D12_RESOURCE_STATES)fromState, (D3D12_RESOURCE_STATES)toState);
 }
 
 ID3D12GraphicsCommandList* BeginD3D12Work(ID3D11DeviceContext* ctx)
@@ -385,26 +418,28 @@ ID3D12GraphicsCommandList* BeginD3D12Work(ID3D11DeviceContext* ctx)
     ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), (void**)&ctx4);
     if (!ctx4) { Log("D3D12Interop: ID3D11DeviceContext4 unavailable (no D3D11.4 Signal/Wait)"); gReady = false; return nullptr; }
 
-    // D3D11 signals that the caller's copies into the shared inputs are done; the D3D12 queue waits for it.
-    UINT64 vReady = ++gFenceVal;
-    ctx4->Signal(gFence11, vReady);
-    gQueue->Wait(gFence, vReady);
-
-    // Allocator-reset safety: the GPU must have finished LAST frame's list before Reset(). Bounded CPU wait
-    // (the prior frame's Present has already flushed its D3D11 signal, so this returns fast in practice).
-    if (gLastDone && gFence->GetCompletedValue() < gLastDone)
+    // Check completion BEFORE publishing a higher value on the shared fence.
+    // Otherwise the new D3D11 ready signal could masquerade as D3D12 completion.
+    if (WaitForLastWork() != GpuWaitResult::Completed || !gReady)
     {
-        gFence->SetEventOnCompletion(gLastDone, gFenceEvent);
-        if (WaitForSingleObject(gFenceEvent, 1000) != WAIT_OBJECT_0)
-        {
-            Log("D3D12Interop: fence wait timed out — skipping frame (allocator busy)");
-            ctx4->Release();
-            return nullptr;   // don't Reset a possibly in-flight allocator
-        }
+        ctx4->Release();
+        return nullptr;
+    }
+    if (!CheckInteropResult(gAlloc->Reset(), "allocator Reset") ||
+        !CheckInteropResult(gList->Reset(gAlloc, nullptr), "command list Reset"))
+    {
+        ctx4->Release();
+        return nullptr;
+    }
+    const UINT64 vReady = ++gFenceVal;
+    if (!CheckInteropResult(ctx4->Signal(gFence11, vReady), "D3D11 Signal") ||
+        !CheckInteropResult(gQueue->Wait(gFence, vReady), "D3D12 Wait"))
+    {
+        gList->Close(); // discard this unsubmitted recording
+        ctx4->Release();
+        return nullptr;
     }
 
-    gAlloc->Reset();
-    gList->Reset(gAlloc, nullptr);   // caller sets its own PSO
     gCtx4Frame = ctx4;               // released in SubmitD3D12Work
     return gList;
 }
@@ -414,23 +449,31 @@ bool SubmitD3D12Work(ID3D11DeviceContext* ctx)
     (void)ctx;
     if (!gReady || !gCtx4Frame) return false;
 
-    gList->Close();
+    if (!CheckInteropResult(gList->Close(), "command list Close"))
+    {
+        SafeRelease(gCtx4Frame);
+        return false;
+    }
     ID3D12CommandList* lists[] = { gList };
     gQueue->ExecuteCommandLists(1, lists);
-    UINT64 vDone = ++gFenceVal;
-    gQueue->Signal(gFence, vDone);
-    gLastDone = vDone;               // next frame's allocator reset waits on this
-
-    gCtx4Frame->Wait(gFence11, vDone);   // D3D11 waits for the D3D12 work before the caller reads the output
-    gCtx4Frame->Release();
-    gCtx4Frame = nullptr;
-    return true;
+    gLastDone = ++gFenceVal;
+    gUnfencedWork = true; // retain resources if Signal fails after submission
+    if (!CheckInteropResult(gQueue->Signal(gFence, gLastDone), "D3D12 Signal"))
+    {
+        SafeRelease(gCtx4Frame);
+        return false;
+    }
+    gUnfencedWork = false;
+    const bool ok = CheckInteropResult(gCtx4Frame->Wait(gFence11, gLastDone), "D3D11 Wait");
+    SafeRelease(gCtx4Frame);
+    return ok;
 }
 
 void Shutdown()
 {
+    gReady = false;
+    if (!ReleaseSharedTextures()) return; // keep the queue, allocator and fence for a later retry
     SafeRelease(gCtx4Frame);
-    ReleaseSharedTextures();
     SafeRelease(gFence11);
     SafeRelease(gFence);
     SafeRelease(gHeap);
@@ -445,6 +488,7 @@ void Shutdown()
     gReady = false;
     gFenceVal = 0;
     gLastDone = 0;
+    gUnfencedWork = false;
     // gInitDone stays true so a failed init doesn't retry every frame; Shutdown on real teardown is final.
 }
 
