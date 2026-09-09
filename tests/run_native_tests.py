@@ -32,6 +32,13 @@ for name in names:
         output = root / "build/ShaderFileLoader.generated.h"
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(source[begin:end])
+    if name == "RTWShadowTests":
+        source = (root.parent / "src/ShaderPatch.cpp").read_text()
+        begin = source.index("static std::string PatchDeferredShader(")
+        end = source.index("static std::string PatchObjectsShader(", begin)
+        output = root / "build/DeferredShader.generated.h"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(source[begin:end])
     if name == "ShadowAtlasTests":
         # Compile the actual shadow manager/hook bodies in isolation from the
         # upscaler, GUI and Kenshi hooks in the rest of D3D11Hook.cpp. The probe
