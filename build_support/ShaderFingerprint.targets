@@ -1,0 +1,27 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <ShaderFingerprintRoot Condition="'$(ShaderFingerprintRoot)'==''">$(MSBuildThisFileDirectory)..\</ShaderFingerprintRoot>
+    <ShaderFingerprintDir Condition="'$(ShaderFingerprintDir)'==''">$(IntDir)</ShaderFingerprintDir>
+  </PropertyGroup>
+  <!-- Includes injection text, its CPU-side bindings/layouts, and shadow shader inputs.
+       Every build checks content; no version bump or checked-in generated file is required. -->
+  <ItemGroup Condition="'@(ShaderFingerprintInput)'==''">
+    <ShaderFingerprintInput Include="$(ShaderFingerprintRoot)src\ShaderPatch.cpp;$(ShaderFingerprintRoot)src\ShaderPatch.h;$(ShaderFingerprintRoot)src\MotionVectors.cpp;$(ShaderFingerprintRoot)src\MotionVectors.h;$(ShaderFingerprintRoot)src\D3D11Hook.cpp;$(ShaderFingerprintRoot)src\D3D11Hook.h;$(ShaderFingerprintRoot)src\DustAPI.h;$(ShaderFingerprintRoot)effects\shadows\*.cpp;$(ShaderFingerprintRoot)effects\shadows\*.h;$(ShaderFingerprintRoot)effects\shadows\shaders\*.hlsl" />
+  </ItemGroup>
+  <Target Name="GenerateShaderFingerprint" BeforeTargets="ClCompile">
+    <MakeDir Directories="$(ShaderFingerprintDir)" />
+    <GetFileHash Files="@(ShaderFingerprintInput)" Algorithm="SHA256">
+      <Output TaskParameter="Items" ItemName="ShaderFingerprintHashes" />
+    </GetFileHash>
+    <!-- Relative filenames keep the fingerprint independent of the checkout directory. -->
+    <WriteLinesToFile File="$(ShaderFingerprintDir)shader-fingerprint.inputs"
+      Lines="@(ShaderFingerprintHashes->'%(Filename)%(Extension)|%(FileHash)')"
+      Overwrite="true" WriteOnlyWhenDifferent="true" />
+    <GetFileHash Files="$(ShaderFingerprintDir)shader-fingerprint.inputs" Algorithm="SHA256">
+      <Output TaskParameter="Hash" PropertyName="ShaderFingerprintHash" />
+    </GetFileHash>
+    <WriteLinesToFile File="$(ShaderFingerprintDir)ShaderFingerprint.generated.h"
+      Lines="#define DUST_SHADER_FINGERPRINT &quot;$(ShaderFingerprintHash)&quot;"
+      Overwrite="true" WriteOnlyWhenDifferent="true" />
+  </Target>
+</Project>
