@@ -632,46 +632,19 @@ void EffectLoader::AbsorbConfigSelfWrite(size_t index)
 
 void EffectLoader::CollectTiming(LoadedEffect& le, ID3D11DeviceContext* ctx, int phase)
 {
-    if (le.timingWarmup[phase] < 2) return;
-
-    int readSlot = 1 - le.timingSlot[phase];
-    if (!le.tsDisjoint[phase][readSlot] || !le.tsBegin[phase][readSlot] || !le.tsEnd[phase][readSlot])
-        return;
-
-    D3D11_QUERY_DATA_TIMESTAMP_DISJOINT disjoint;
-    UINT64 tsBegin, tsEnd;
-    if (ctx->GetData(le.tsDisjoint[phase][readSlot], &disjoint, sizeof(disjoint), 0) == S_OK
-        && !disjoint.Disjoint
-        && ctx->GetData(le.tsBegin[phase][readSlot], &tsBegin, sizeof(tsBegin), 0) == S_OK
-        && ctx->GetData(le.tsEnd[phase][readSlot], &tsEnd, sizeof(tsEnd), 0) == S_OK)
-    {
-        float ms = (float)((double)(tsEnd - tsBegin) / (double)disjoint.Frequency * 1000.0);
-        if (phase == 0) le.gpuTimePre = ms;
-        else            le.gpuTimePost = ms;
+    float& time = phase == 0 ? le.gpuTimePre : le.gpuTimePost;
+    if (le.timing[phase].Collect(ctx, time))
         le.gpuTimeMs = le.gpuTimePre + le.gpuTimePost;
-    }
 }
 
 void EffectLoader::BeginTiming(LoadedEffect& le, ID3D11DeviceContext* ctx, int phase)
 {
-    // Check all three queries for the slot actually being recorded into —
-    // a failed CreateQuery leaves that slot null (see InitAll).
-    int slot = le.timingSlot[phase];
-    if (!le.tsDisjoint[phase][slot] || !le.tsBegin[phase][slot] || !le.tsEnd[phase][slot])
-        return;
-    ctx->Begin(le.tsDisjoint[phase][slot]);
-    ctx->End(le.tsBegin[phase][slot]);
+    le.timing[phase].Begin(ctx);
 }
 
 void EffectLoader::EndTiming(LoadedEffect& le, ID3D11DeviceContext* ctx, int phase)
 {
-    int slot = le.timingSlot[phase];
-    if (!le.tsDisjoint[phase][slot] || !le.tsBegin[phase][slot] || !le.tsEnd[phase][slot])
-        return;
-    ctx->End(le.tsEnd[phase][slot]);
-    ctx->End(le.tsDisjoint[phase][slot]);
-    le.timingSlot[phase] = 1 - le.timingSlot[phase];
-    if (le.timingWarmup[phase] < 2) le.timingWarmup[phase]++;
+    le.timing[phase].End(ctx);
 }
 
 float EffectLoader::GetEffectGpuTime(size_t index) const
@@ -868,20 +841,11 @@ bool EffectLoader::InitAll(ID3D11Device* device, uint32_t w, uint32_t h)
         // v3: Create GPU timing queries (2 phases × 2 double-buffer slots)
         if (le.desc.apiVersion >= 3 && (le.desc.flags & DUST_FLAG_FRAMEWORK_TIMING))
         {
-            D3D11_QUERY_DESC qd = {};
             bool timingOk = true;
-            for (int phase = 0; phase < 2; phase++)
-            for (int slot = 0; slot < 2; slot++)
-            {
-                qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
-                if (FAILED(device->CreateQuery(&qd, &le.tsDisjoint[phase][slot])))
-                { le.tsDisjoint[phase][slot] = nullptr; timingOk = false; }
-                qd.Query = D3D11_QUERY_TIMESTAMP;
-                if (FAILED(device->CreateQuery(&qd, &le.tsBegin[phase][slot])))
-                { le.tsBegin[phase][slot] = nullptr; timingOk = false; }
-                if (FAILED(device->CreateQuery(&qd, &le.tsEnd[phase][slot])))
-                { le.tsEnd[phase][slot] = nullptr; timingOk = false; }
-            }
+            for (auto& timing : le.timing)
+                if (!timing.Init(device)) timingOk = false;
+            if (!timingOk)
+                for (auto& timing : le.timing) timing.Release();
             if (!timingOk)
                 Log("WARNING: GPU timing query creation failed for '%s' — timing disabled",
                     le.desc.name ? le.desc.name : "unnamed");
@@ -912,15 +876,7 @@ bool EffectLoader::ReinitAll(ID3D11Device* device, uint32_t w, uint32_t h)
             le.desc.Shutdown();
 
         // Release framework timing queries
-        for (int phase = 0; phase < 2; phase++)
-        for (int slot = 0; slot < 2; slot++)
-        {
-            if (le.tsDisjoint[phase][slot]) { le.tsDisjoint[phase][slot]->Release(); le.tsDisjoint[phase][slot] = nullptr; }
-            if (le.tsBegin[phase][slot])    { le.tsBegin[phase][slot]->Release();    le.tsBegin[phase][slot] = nullptr; }
-            if (le.tsEnd[phase][slot])      { le.tsEnd[phase][slot]->Release();      le.tsEnd[phase][slot] = nullptr; }
-        }
-        le.timingSlot[0] = le.timingSlot[1] = 0;
-        le.timingWarmup[0] = le.timingWarmup[1] = 0;
+        for (auto& timing : le.timing) timing.Release();
         le.gpuTimePre = le.gpuTimePost = le.gpuTimeMs = 0.0f;
 
         le.initialized = false;
@@ -1060,13 +1016,7 @@ void EffectLoader::ShutdownAll()
         }
 
         // Release framework timing queries
-        for (int phase = 0; phase < 2; phase++)
-        for (int slot = 0; slot < 2; slot++)
-        {
-            if (le.tsDisjoint[phase][slot]) { le.tsDisjoint[phase][slot]->Release(); le.tsDisjoint[phase][slot] = nullptr; }
-            if (le.tsBegin[phase][slot])    { le.tsBegin[phase][slot]->Release();    le.tsBegin[phase][slot] = nullptr; }
-            if (le.tsEnd[phase][slot])      { le.tsEnd[phase][slot]->Release();      le.tsEnd[phase][slot] = nullptr; }
-        }
+        for (auto& timing : le.timing) timing.Release();
 
         if (le.hModule)
             FreeLibrary(le.hModule);

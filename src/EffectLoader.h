@@ -1,6 +1,7 @@
 #pragma once
 
 #include "DustAPI.h"
+#include "GpuTiming.h"
 #include <vector>
 #include <string>
 #include <windows.h>
@@ -12,11 +13,7 @@ struct LoadedEffect {
 
     // v3: Framework-managed GPU timing
     // Phase 0 = preExecute, phase 1 = postExecute; each double-buffered [slot 0/1]
-    ID3D11Query*    tsDisjoint[2][2]  = {};
-    ID3D11Query*    tsBegin[2][2]     = {};
-    ID3D11Query*    tsEnd[2][2]       = {};
-    int             timingSlot[2]     = {};   // per-phase: which buffer to record into
-    int             timingWarmup[2]   = {};   // per-phase: counts up to 2 before valid read
+    GpuTimingPhase  timing[2];
     float           gpuTimePre        = 0.0f;
     float           gpuTimePost       = 0.0f;
     float           gpuTimeMs         = 0.0f; // combined
