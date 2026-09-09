@@ -113,6 +113,9 @@ struct ShadowAtlasEntry {
     bool                      isDepth;      // DSV-bound depth vs RTV+SRV color
     uint64_t                  lastSeen;     // gFrameIndex of the last bind/sample
                                             // that resolved to this entry
+    uint64_t                  renderedFrame; // frame + 1; zero means no caster bind
+    bool                      renderedReplacement;
+    bool                      needsCompanion;
     ID3D11Texture2D*          newTex;       // replacement (null if no resize active)
     UINT                      newSize;      // replacement dimension (square)
     float                     vpScale;      // newSize / desc.Width (1.0 = no swap)
@@ -132,7 +135,6 @@ static bool  gShadowSwapActive = false;        // fast-path flag: any replacemen
 static float gShadowPassScale = 1.0f;          // viewport scale of the current shadow pass
 static std::atomic<bool> gShadowResizePending{false};
 static UINT  gShadowResizeTarget = 0;          // 0 = dismantle all replacements
-static uint64_t gShadowCreationFrame = ~0ull;
 static bool  gInShadowPass = false;
 static ShadowCasterBias::Binding gShadowCasterBias;
 
@@ -191,6 +193,8 @@ static int FindShadowEntry(ID3D11Resource* res)
 
 static void ReleaseShadowReplacement(ShadowAtlasEntry& e)
 {
+    e.renderedFrame = 0;
+    e.renderedReplacement = false;
     e.newIdentity = nullptr;
     e.newSize = 0;
     e.vpScale = 1.0f;
@@ -200,24 +204,6 @@ static void ReleaseShadowReplacement(ShadowAtlasEntry& e)
     if (e.newRTV)  { e.newRTV->Release();  e.newRTV = nullptr; }
     if (e.newSRV)  { e.newSRV->Release();  e.newSRV = nullptr; }
     if (e.newTex)  { e.newTex->Release();  e.newTex = nullptr; }
-}
-
-static void ResetShadowTracking()
-{
-    size_t count = gShadowEntryCount.load(std::memory_order_acquire);
-    for (size_t i = 0; i < count; i++)
-    {
-        ReleaseShadowReplacement(gShadowEntries[i]);
-        if (gShadowEntries[i].tex) { gShadowEntries[i].tex->Release(); gShadowEntries[i].tex = nullptr; }
-    }
-    gShadowEntryCount.store(0, std::memory_order_release);
-    gShadowVanillaSize = 0;
-    gShadowSwapActive = false;
-    gShadowPassScale = 1.0f;
-    gShadowResizeTarget = 0;
-    gShadowResizePending.store(false, std::memory_order_relaxed);
-    gInShadowPass = false;
-    Log("Shadow tracking reset (workspace recreate, frame %llu)", (unsigned long long)gFrameIndex);
 }
 
 static void ApplyPendingShadowResize()
@@ -317,6 +303,17 @@ static void ApplyPendingShadowResize()
                 Log("  entry %zu: CreateSRV FAILED (0x%08X)", i, hr);
         }
 
+        // A texture with failed views is not a usable replacement. Keeping it
+        // marked ready also suppresses retries and makes sampling disagree
+        // with the all-or-nothing caster bind.
+        bool viewsReady = e.isDepth ? e.newDSV != nullptr : e.newRTV != nullptr;
+        if ((d.BindFlags & D3D11_BIND_SHADER_RESOURCE) && !e.newSRV) viewsReady = false;
+        if (!viewsReady)
+        {
+            ReleaseShadowReplacement(e);
+            continue;
+        }
+
         // Remember the replacement's identity (weak, backed by the newTex
         // ref) so the bind classifier recognizes re-binds of our own
         // replacement views and never adopts them as "originals".
@@ -332,18 +329,14 @@ static void ApplyPendingShadowResize()
             e.newTex, e.newDSV, e.newRTV, e.newSRV);
     }
 
-    // If no depth entry was tracked (OGRE reused a pooled depth buffer),
-    // create a companion depth texture for color entries so the RTV+DSV
-    // dimensions match during shadow rendering.
-    bool hasDepth = false;
-    for (size_t i = 0; i < count; i++)
-        if (gShadowEntries[i].isDepth) { hasDepth = true; break; }
-    if (!hasDepth)
+    // A foreign pooled DSV needs a companion for THIS color atlas. An idle
+    // depth entry from the other shadow mode must not suppress its creation.
     {
         for (size_t i = 0; i < count; i++)
         {
             ShadowAtlasEntry& e = gShadowEntries[i];
-            if (e.isDepth || !e.newTex || e.companionDSV) continue;
+            if (e.isDepth || !e.newTex || !e.needsCompanion || e.companionDSV) continue;
+            if (e.companionDepthTex) { e.companionDepthTex->Release(); e.companionDepthTex = nullptr; }
             D3D11_TEXTURE2D_DESC dd = {};
             dd.Width = e.newSize;
             dd.Height = e.newSize;
@@ -387,6 +380,8 @@ static void ClearShadowReplacements()
     for (size_t i = 0; i < count; i++)
     {
         ShadowAtlasEntry& e = gShadowEntries[i];
+        e.renderedFrame = 0;
+        e.renderedReplacement = false;
         if (e.isDepth && e.newDSV)
             gContext->ClearDepthStencilView(e.newDSV, D3D11_CLEAR_DEPTH, 1.0f, 0);
         if (!e.isDepth && e.newRTV)
@@ -988,6 +983,7 @@ typedef void(STDMETHODCALLTYPE* PFN_PSSetShaderResources)(
 typedef void(STDMETHODCALLTYPE* PFN_RSSetViewports)(
     ID3D11DeviceContext* pThis, UINT NumViewports,
     const D3D11_VIEWPORT* pViewports);
+typedef void(STDMETHODCALLTYPE* PFN_ClearState)(ID3D11DeviceContext* pThis);
 
 typedef HRESULT(STDMETHODCALLTYPE* PFN_Map)(
     ID3D11DeviceContext* pThis, ID3D11Resource* pResource, UINT Subresource,
@@ -1025,6 +1021,7 @@ static PFN_OMSetRenderTargets       oOMSetRenderTargets = nullptr;
 static PFN_OMSetRenderTargetsAndUAV oOMSetRenderTargetsAndUAV = nullptr;
 static PFN_PSSetShaderResources     oPSSetShaderResources = nullptr;
 static PFN_RSSetViewports           oRSSetViewports = nullptr;
+static PFN_ClearState               oClearState = nullptr;
 static PFN_Map                      oMap = nullptr;
 static PFN_Unmap                    oUnmap = nullptr;
 static PFN_VSSetShader              oVSSetShader = nullptr;
@@ -1402,6 +1399,9 @@ static HRESULT STDMETHODCALLTYPE HookedCreateSamplerState(
     return oCreateSamplerState(pThis, pDesc, ppSamplerState);
 }
 
+static int AdoptShadowTexture(ID3D11Texture2D* tex, const D3D11_TEXTURE2D_DESC& desc);
+static void ObserveLightingShadowAtlas(ID3D11DeviceContext* context);
+
 static HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
     ID3D11Device* pThis, const D3D11_TEXTURE2D_DESC* pDesc,
     const D3D11_SUBRESOURCE_DATA* pInitialData, ID3D11Texture2D** ppTexture2D)
@@ -1431,61 +1431,9 @@ static HRESULT STDMETHODCALLTYPE HookedCreateTexture2D(
     if (SUCCEEDED(hr) && pDesc && ppTexture2D && *ppTexture2D &&
         IsShadowAtlasDesc(pDesc))
     {
-        // The game recreates its shadow workspace when the user switches
-        // shadow type or resolution in the options — drop stale tracking so
-        // the new atlas generation starts clean. Same-frame creations are
-        // the color+depth pair of one atlas and must accumulate.
-        if (gShadowEntryCount.load(std::memory_order_relaxed) > 0 &&
-            gFrameIndex != gShadowCreationFrame)
-        {
-            ResetShadowTracking();
-        }
-        gShadowCreationFrame = gFrameIndex;
-
-        bool isDepth = (pDesc->BindFlags & D3D11_BIND_DEPTH_STENCIL) != 0;
-        IUnknown* unk = nullptr;
-        (*ppTexture2D)->QueryInterface(IID_IUnknown, (void**)&unk);
-
-        // Entry tracking (shadow-pass detection + runtime resize swapping).
-        // NOTE: creation-time tracking alone is incomplete — a shadow-mode
-        // switch can rebuild the workspace from OGRE's texture pool with no
-        // creation call; those textures are adopted at bind time instead
-        // (AdoptShadowTexture).
-        if (unk)
-        {
-            size_t eidx = gShadowEntryCount.load(std::memory_order_relaxed);
-            if (eidx < kMaxShadowIdentities)
-            {
-                ShadowAtlasEntry& e = gShadowEntries[eidx];
-                e = {};
-                e.tex = *ppTexture2D;
-                e.tex->AddRef();
-                e.identity = unk;  // weak ref, backed by e.tex
-                e.desc = *pDesc;
-                e.isDepth = isDepth;
-                e.lastSeen = gFrameIndex;
-                e.vpScale = 1.0f;
-                if (gShadowVanillaSize == 0)
-                    gShadowVanillaSize = pDesc->Width;
-                gShadowEntryCount.store(eidx + 1, std::memory_order_release);
-
-                // Re-queue a pending resize so an active override survives
-                // shadow type switches (the fresh atlas is vanilla-sized).
-                UINT wanted = gShadowAtlasOverride;
-                if (wanted != 0 && wanted != pDesc->Width &&
-                    !gShadowResizePending.load(std::memory_order_relaxed))
-                {
-                    gShadowResizeTarget = wanted;
-                    gShadowResizePending.store(true, std::memory_order_release);
-                }
-            }
-            unk->Release();
-        }
-
-        Log("Shadow atlas %s texture captured: tex=%p identity=%p (%ux%u) entry=%zu",
-            isDepth ? "DSV" : "color", *ppTexture2D, unk,
-            pDesc->Width, pDesc->Height,
-            gShadowEntryCount.load(std::memory_order_relaxed) - 1);
+        // Different generations can coexist in OGRE's pool. A new color
+        // texture must not discard the still-live depth texture from CSM.
+        AdoptShadowTexture(*ppTexture2D, *pDesc);
     }
 
     return hr;
@@ -2216,6 +2164,7 @@ static void STDMETHODCALLTYPE HookedDraw(
         // Extract camera data at POST_LIGHTING (deferred CB is bound)
         if (dip == static_cast<DustInjectionPoint>(InjectionPoint::POST_LIGHTING))
         {
+            ObserveLightingShadowAtlas(pThis);
             ExtractCameraData(pThis);
             // Repack this frame's skinned poses so next frame's patched skin VS can read them as
             // "previous" from b12 and emit true animation velocity.
@@ -2593,8 +2542,29 @@ static void EvictStaleShadowEntries()
 // "broken cascades" report). Returns the new entry index, or -1.
 static int AdoptShadowTexture(ID3D11Texture2D* tex, const D3D11_TEXTURE2D_DESC& desc)
 {
+    int existing = FindShadowEntry(tex);
+    if (existing >= 0) return existing;
     EvictStaleShadowEntries();
     size_t eidx = gShadowEntryCount.load(std::memory_order_relaxed);
+    if (eidx >= kMaxShadowIdentities)
+    {
+        // Rapid switches can fill the table before the idle timeout. Reclaim
+        // the oldest entry unused this frame; never evict an active pair.
+        size_t oldest = eidx;
+        for (size_t i = 0; i < eidx; ++i)
+            if (gShadowEntries[i].lastSeen < gFrameIndex &&
+                (oldest == eidx || gShadowEntries[i].lastSeen < gShadowEntries[oldest].lastSeen))
+                oldest = i;
+        if (oldest < eidx)
+        {
+            ReleaseShadowReplacement(gShadowEntries[oldest]);
+            gShadowEntries[oldest].tex->Release();
+            gShadowEntries[oldest] = gShadowEntries[eidx - 1];
+            gShadowEntries[eidx - 1] = {};
+            --eidx;
+            gShadowEntryCount.store(eidx, std::memory_order_release);
+        }
+    }
     if (eidx >= kMaxShadowIdentities)
     {
         static int sFullLogs = 0;
@@ -2641,6 +2611,42 @@ static int AdoptShadowTexture(ID3D11Texture2D* tex, const D3D11_TEXTURE2D_DESC& 
         gShadowResizePending.store(true, std::memory_order_release);
     }
     return (int)eidx;
+}
+
+// CSM can reuse a depth-only atlas without ever creating a texture or binding
+// a matching color RTV. A confirmed deferred-lighting t5 sample proves this
+// is the shadow atlas, unlike an arbitrary pooled depth-only OM bind.
+static void ObserveLightingShadowAtlas(ID3D11DeviceContext* context)
+{
+    ID3D11ShaderResourceView* srv = nullptr;
+    context->PSGetShaderResources(5, 1, &srv);
+    if (!srv) return;
+    D3D11_SHADER_RESOURCE_VIEW_DESC view = {};
+    srv->GetDesc(&view);
+    ID3D11Resource* resource = nullptr;
+    if (view.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D && view.Format == DXGI_FORMAT_R32_FLOAT)
+        srv->GetResource(&resource);
+    srv->Release();
+    if (!resource) return;
+    ID3D11Texture2D* texture = nullptr;
+    resource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&texture);
+    resource->Release();
+    if (!texture) return;
+    D3D11_TEXTURE2D_DESC desc = {};
+    texture->GetDesc(&desc);
+    IUnknown* identity = nullptr;
+    texture->QueryInterface(IID_IUnknown, (void**)&identity);
+    bool replacement = false;
+    int entry = LookupShadowEntry(identity, &replacement);
+    if (identity) identity->Release();
+    if (entry >= 0 || IsShadowAtlasDesc(&desc))
+    {
+        if (entry < 0 && gShadowAtlasOverride != 0)
+            entry = AdoptShadowTexture(texture, desc);
+        // Refresh even for previously tracked/reused generations.
+        gShadowVanillaSize = entry >= 0 ? gShadowEntries[entry].desc.Width : desc.Width;
+    }
+    texture->Release();
 }
 
 // Full classification of one OMSetRenderTargets bind: is it a shadow caster
@@ -2789,11 +2795,18 @@ static void ClassifyShadowBind(UINT NumViews, ID3D11RenderTargetView* const* ppR
             // color: substitute a companion depth so the target dimensions
             // match the swapped RTV.
             ID3D11DepthStencilView* comp = nullptr;
-            size_t cnt = gShadowEntryCount.load(std::memory_order_acquire);
-            for (size_t i = 0; i < cnt; i++)
+            for (UINT i = 0; i < n; i++)
             {
-                if (!gShadowEntries[i].isDepth && gShadowEntries[i].companionDSV)
-                    { comp = gShadowEntries[i].companionDSV; break; }
+                if (rtvEntry[i] < 0) continue;
+                ShadowAtlasEntry& color = gShadowEntries[rtvEntry[i]];
+                color.needsCompanion = true;
+                comp = color.companionDSV;
+                if (!comp)
+                {
+                    gShadowResizeTarget = gShadowAtlasOverride;
+                    gShadowResizePending.store(true, std::memory_order_release);
+                }
+                break;
             }
             if (comp) finalDSV = comp;
             else      allAvailable = false;
@@ -2814,6 +2827,22 @@ static void ClassifyShadowBind(UINT NumViews, ID3D11RenderTargetView* const* ppR
             out.dsv = pDSV;
             out.swapped = false;
             out.scale = 1.0f;
+        }
+
+        // Lighting must sample the same resource that this caster bind used,
+        // including native fallbacks while a new generation is being adopted.
+        for (UINT i = 0; i < n; ++i)
+            if (rtvEntry[i] >= 0)
+            {
+                ShadowAtlasEntry& e = gShadowEntries[rtvEntry[i]];
+                e.renderedFrame = gFrameIndex + 1;
+                e.renderedReplacement = out.rtvs[i] == e.newRTV;
+            }
+        if (dsvEntry >= 0)
+        {
+            ShadowAtlasEntry& e = gShadowEntries[dsvEntry];
+            e.renderedFrame = gFrameIndex + 1;
+            e.renderedReplacement = out.dsv == e.newDSV;
         }
     }
 
@@ -3045,7 +3074,9 @@ static void STDMETHODCALLTYPE HookedPSSetShaderResources(
         swapped[i]->GetResource(&res);
         int idx = FindShadowEntry(res);
         if (res) res->Release();
-        if (idx >= 0 && gShadowEntries[idx].newSRV)
+        if (idx >= 0 && gShadowEntries[idx].newSRV &&
+            gShadowEntries[idx].renderedFrame == gFrameIndex + 1 &&
+            gShadowEntries[idx].renderedReplacement)
         {
             swapped[i] = gShadowEntries[idx].newSRV;
             anySwap = true;
@@ -3060,6 +3091,20 @@ static void STDMETHODCALLTYPE HookedPSSetShaderResources(
 
 // Scales viewports set DURING the shadow pass (the on-entry catch-up in the
 // OM hooks covers the viewport OGRE sets before binding the targets).
+static void STDMETHODCALLTYPE HookedClearState(ID3D11DeviceContext* pThis)
+{
+    oClearState(pThis);
+    if (gShutdownSignaled || (gContext && pThis != gContext)) return;
+    // OGRE clears before setting the next viewport and targets. Without this,
+    // RSSetViewports can scale the new mode's viewport with the old mode's
+    // atlas ratio, and OM then thinks it is already in the shadow pass.
+    gShadowCasterBias.EndPass(pThis);
+    gInShadowPass = false;
+    gShadowPassScale = 1.0f;
+    gFwdScenePass = false;
+    MotionVectors::InjNoteRenderTargetsRebound();
+}
+
 static void STDMETHODCALLTYPE HookedRSSetViewports(
     ID3D11DeviceContext* pThis, UINT NumViewports,
     const D3D11_VIEWPORT* pViewports)
@@ -3318,6 +3363,7 @@ static const int VTIDX_CTX_DrawInstanced            = 21;
 static const int VTIDX_CTX_OMSetRenderTargets       = 33;
 static const int VTIDX_CTX_OMSetRenderTargetsAndUAV = 34;
 static const int VTIDX_CTX_RSSetViewports           = 44;
+static const int VTIDX_CTX_ClearState               = 110;
 // VTIDX_SC_* constants moved to top of file (needed by deferred hook code)
 
 bool Install()
@@ -3385,6 +3431,7 @@ bool Install()
     void* addrOMSetRTUAV   = ctxVtable[VTIDX_CTX_OMSetRenderTargetsAndUAV];
     void* addrPSSetSRVs    = ctxVtable[VTIDX_CTX_PSSetShaderResources];
     void* addrRSSetVPs     = ctxVtable[VTIDX_CTX_RSSetViewports];
+    void* addrClearState   = ctxVtable[VTIDX_CTX_ClearState];
     void* addrPresent      = scVtable[VTIDX_SC_Present];
     void* addrResizeBuf    = scVtable[VTIDX_SC_ResizeBuffers];
 
@@ -3557,6 +3604,10 @@ bool Install()
     if (KenshiLib::AddHook(addrRSSetVPs, (void*)HookedRSSetViewports,
                            (void**)&oRSSetViewports) != KenshiLib::SUCCESS)
     { Log("ERROR: Failed to hook RSSetViewports"); ok = false; }
+
+    if (KenshiLib::AddHook(addrClearState, (void*)HookedClearState,
+                           (void**)&oClearState) != KenshiLib::SUCCESS)
+    { Log("ERROR: Failed to hook ClearState"); ok = false; }
 
     // Present/Present1/ResizeBuffers hooks are DEFERRED until the first Draw call.
     // This avoids a race with overlay DLLs (Steam, Discord, ReShade) that also hook

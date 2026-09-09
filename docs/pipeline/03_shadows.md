@@ -144,3 +144,24 @@ The fixed bias and maximum slope bias remain unchanged. Downsampling never
 reduces vanilla bias, and non-RTW shader variants retain their original
 calculation. This addresses bias lost through Dust's atlas enlargement; it
 does not remove every source of RTW warp or geometry-related self-shadowing.
+
+## Live CSM / RTWSM switches
+
+OGRE can retain both shadow generations in its texture pool. Dust tracks each
+identity independently: creation of a new RTW color atlas no longer discards
+a still-live CSM depth atlas. Depth-only pool reuse is recognized from the
+confirmed deferred lighting pass's `shadowDepthMap` at t5; an arbitrary pooled
+DSV bind remains insufficient evidence for adoption.
+
+Replacement SRVs are used only after the matching caster bind actually used
+the replacement in the current frame. Incomplete color/depth replacements
+fall back together to the original atlas, including its lighting sample.
+The Shadows plugin reads the bound atlas size for filtering, rather than
+assuming the requested resolution is already available. Companion depth is
+associated with the actual color atlas, even when another generation's depth
+is still tracked. Rapid switches may evict the oldest entry unused this frame
+instead of leaving the fixed tracking table permanently full.
+
+The ClearState hook drops the previous pass's shadow/viewport state before
+OGRE sets up the next pass. This prevents the old mode's scale from being
+applied to the new mode's viewport before the new targets are bound.
