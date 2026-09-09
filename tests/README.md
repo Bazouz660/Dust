@@ -38,6 +38,13 @@ You can pass individual executable names to the native runner, for example
 - `test_shader_fingerprint.py`: the real MSBuild fingerprint target, with
   isolated shader/layout changes and an unrelated source-file control.
 - `LazyResourcesTests`: allocation failure rollback, retry delay, reuse and reset.
+- `OutlineNormalsTests`: real DLL/shaders on WARP; short and variable-length
+  normals do not outline flat surfaces, real creases still render, and debug
+  obeys the same distance exclusions as the composite.
+- `RTGITemporalTests`: world/depth units, handedness, camera rotations and large
+  coordinates; real temporal shader blending against projected world points;
+  real renderer history and bounce resets after disabled/skipped frames,
+  missing depth/camera, projection changes and target recreation.
 - `EffectResourcesTests`: loads the seven affected Release effect DLLs on WARP,
   compiles their real shaders, observes texture creation, injects an allocation
   failure after a partial allocation, and exercises disabled startup/resize,
