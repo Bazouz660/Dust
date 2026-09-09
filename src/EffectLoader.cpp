@@ -251,7 +251,7 @@ static ID3DBlob* HostCompileShaderFromFile(const char* filePath, const char* ent
     // Compile with filename for error messages
     ID3DBlob* blob = nullptr;
     ID3DBlob* errors = nullptr;
-    HRESULT hr = D3DCompile(buffer, fileSize, filePath, nullptr, nullptr,
+    HRESULT hr = D3DCompile(buffer, fileSize, filePath, nullptr, D3D_COMPILE_STANDARD_FILE_INCLUDE,
                             entryPoint, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
                             &blob, &errors);
     delete[] buffer;
