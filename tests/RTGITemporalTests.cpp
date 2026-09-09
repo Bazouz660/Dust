@@ -18,6 +18,7 @@ static_assert(sizeof(TemporalCB) == 112);
 static std::vector<TemporalCB> temporalUploads;
 static std::vector<float> bounceUploads;
 static std::vector<float> gpuUploads;
+static std::vector<float> previousFovUploads;
 
 int main()
 {
@@ -81,12 +82,13 @@ int main()
     p.SetNormals(std::vector<Pixel>(p.W*p.H,Pixel{.2f,.2f,.2f,.2f})); // history
     std::vector<float> depths(p.W*p.H,.1f);
     p.ctx->UpdateSubresource(p.depth.Get(),0,nullptr,depths.data(),p.W*sizeof(float),0);
-    struct CameraCB { float matrix[16]; float farClip, previousFar, gpu, valid; };
+    struct CameraCB { float matrix[16]; float farClip, previousFar, gpu, valid; float previousFov, padding[3]; };
     ComPtr<ID3D11Buffer> cameraBuffer; cameraBuffer.Attach(p.host.CreateConstantBuffer(p.device.Get(),sizeof(CameraCB)));
     auto draw = [&](const TemporalCB& cb) {
         p.ctx->ClearState();
         CameraCB camera = {}; std::memcpy(camera.matrix,cb.matrix,sizeof(camera.matrix));
         camera.farClip = camera.previousFar = 2000; camera.valid = 1;
+        camera.previousFov = cb.fov;
         p.host.UpdateConstantBuffer(p.ctx.Get(),cameraBuffer.Get(),&camera,sizeof(camera));
         auto cameraB = cameraBuffer.Get(); p.ctx->PSSetConstantBuffers(3,1,&cameraB);
         p.host.UpdateConstantBuffer(p.ctx.Get(),buffer.Get(),&cb,sizeof(cb));
@@ -141,7 +143,10 @@ int main()
     // until a successful consecutive frame, and none after skipped work/reset.
     p.host.UpdateConstantBuffer = [](ID3D11DeviceContext* ctx,ID3D11Buffer* cb,const void* data,uint32_t bytes) {
         if (bytes == sizeof(TemporalCB)) temporalUploads.push_back(*static_cast<const TemporalCB*>(data));
-        if (bytes == 80) gpuUploads.push_back(static_cast<const float*>(data)[18]);
+        if (bytes == 96) {
+            gpuUploads.push_back(static_cast<const float*>(data)[18]);
+            previousFovUploads.push_back(static_cast<const float*>(data)[20]);
+        }
         if (bytes == 128) bounceUploads.push_back(static_cast<const float*>(data)[10]);
         D3D11_MAPPED_SUBRESOURCE map = {}; assert(SUCCEEDED(ctx->Map(cb,0,D3D11_MAP_WRITE_DISCARD,0,&map)));
         std::memcpy(map.pData,data,bytes); ctx->Unmap(cb,0);
@@ -158,8 +163,10 @@ int main()
     ComPtr<ID3D11Buffer> gameCamera;
     gameCamera.Attach(p.host.CreateConstantBuffer(p.device.Get(),192));
     bool useGpu = false;
+    float lastRenderedFov = 0;
     auto render = [&](uint64_t index,bool history) {
         p.ctx->ClearState(); temporalUploads.clear(); bounceUploads.clear(); gpuUploads.clear(); frame.frameIndex = index;
+        previousFovUploads.clear();
         if (useGpu) {
             float raw[48] = {}; raw[8] = 3000; Camera(raw+32,20000+float(index));
             p.host.UpdateConstantBuffer(p.ctx.Get(),gameCamera.Get(),raw,sizeof(raw));
@@ -173,6 +180,9 @@ int main()
         assert((temporalUploads[0].blend > 0) == history);
         assert((bounceUploads[0] > 0) == history);
         assert(gpuUploads.size() == 1 && (gpuUploads[0] > 0) == useGpu);
+        assert(previousFovUploads.size() == 1);
+        if (history) assert(previousFovUploads[0] == lastRenderedFov);
+        lastRenderedFov = temporalUploads[0].fov;
         ID3D11Buffer* restored[3] = {};
         p.ctx->PSGetConstantBuffers(1,3,restored);
         for (auto* cb : restored) { assert(cb == gameCamera.Get()); cb->Release(); }
@@ -189,7 +199,8 @@ int main()
     frame.camera.valid = 0; render(108,false);
     frame.camera.valid = 1; render(109,false); render(110,true);
     frame.camera.farZ = 3000; render(111,false); render(112,true);
-    frame.camera.tanHalfFov = .7f; render(113,false); render(114,true);
+    // Projection changes must reproject history, not globally drop bounce lighting.
+    frame.camera.tanHalfFov = .7f; render(113,true); render(114,true);
     p.Setting<int>("ResolutionScale") = 100; render(115,false); render(116,true);
     p.Setting<float>("GIIntensity") = p.Setting<float>("AOIntensity") = 0;
     frame.frameIndex = 117; p.effect.preExecute(&frame,&p.host); p.effect.postExecute(&frame,&p.host);
@@ -199,7 +210,8 @@ int main()
     useGpu = true; frame.camera.valid = 0;
     render(120,false); render(121,true); render(122,true);
     frame.camera.valid = 1; Camera(frame.camera.inverseView,-10000); // deliberately stale/wrong
-    render(123,true); render(124,true);
+    frame.camera.tanHalfFov = std::nextafter(.7f,1.f); render(123,true);
+    frame.camera.tanHalfFov = .6f; render(124,true);
     useGpu = false; render(125,false); render(126,true);
     std::puts("RTGI world/depth units, handedness, large-coordinate stability, radiance clipping and history/bounce resets passed");
 }

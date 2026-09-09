@@ -622,21 +622,47 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
     }, ReleaseTextures)) return nullptr;
 
     // History belongs to the last completed GI render, not the last camera callback.
-    // Skipped frames, invalid cameras and projection changes must not reuse it.
+    // Skipped frames and invalid cameras must not reuse it. FOV changes use the
+    // previous projection below, otherwise even one ULP drops bounce globally.
     float reprojection[16] = {};
     reprojection[0] = reprojection[5] = reprojection[10] = reprojection[15] = 1;
     const bool useGpuCamera = gGpuCamera.CurrentReady(frameIndex);
-    const bool consecutive = gHasPrevFrame && frameIndex == gLastRenderedFrame + 1
-        && gRTGIConfig.tanHalfFov == gPrevTanHalfFov;
+    const bool consecutive = gHasPrevFrame && frameIndex == gLastRenderedFrame + 1;
     const bool useHistory = consecutive && (useGpuCamera
         ? gPreviousUsedGpuCamera && gGpuCamera.HistoryReady(frameIndex)
         : !gPreviousUsedGpuCamera && gHasValidCameraData
-            && gFarClip == gPrevFarClip && gRTGIConfig.tanHalfFov == gPrevTanHalfFov
+            && gFarClip == gPrevFarClip
             && RTGITemporal::Reprojection(gInverseView, gPrevInverseView, gFarClip, reprojection));
-    struct CameraHistoryCB { float matrix[16]; float farClip, previousFarClip, gpu, valid; } cameraCB = {};
+    struct CameraHistoryCB {
+        float matrix[16]; float farClip, previousFarClip, gpu, valid;
+        float previousTanHalfFov, padding[3];
+    } cameraCB = {};
+    static_assert(sizeof(CameraHistoryCB) == 96);
     memcpy(cameraCB.matrix, reprojection, sizeof(reprojection));
     cameraCB.farClip = gFarClip; cameraCB.previousFarClip = gPrevFarClip;
     cameraCB.gpu = useGpuCamera ? 1.f : 0.f; cameraCB.valid = useHistory ? 1.f : 0.f;
+    cameraCB.previousTanHalfFov = gPrevTanHalfFov;
+
+    // Diagnose remaining whole-image jumps without GPU readbacks or per-frame
+    // logging. Repeated resets report a count, at most once every five seconds.
+    if (!useHistory) {
+        static uint64_t lastLog = 0;
+        static unsigned pendingResets = 0;
+        ++pendingResets;
+        const uint64_t now = GetTickCount64();
+        if (!lastLog || now - lastLog >= 5000) {
+            const char* reason = !gHasPrevFrame ? "empty history"
+                : !consecutive ? "skipped frame"
+                : useGpuCamera != gPreviousUsedGpuCamera ? "camera source changed"
+                : useGpuCamera ? "GPU history unavailable"
+                : !gHasValidCameraData ? "CPU camera unavailable"
+                : gFarClip != gPrevFarClip ? "CPU depth range changed" : "invalid CPU transform";
+            Log("RTGI: history reset (%s), frame=%llu previous=%llu gpu=%d resets=%u fov=%.9g previousFov=%.9g",
+                reason, frameIndex, gLastRenderedFrame, useGpuCamera, pendingResets,
+                gRTGIConfig.tanHalfFov, gPrevTanHalfFov);
+            lastLog = now; pendingResets = 0;
+        }
+    }
     if (!gCameraHistoryCB) {
         ID3D11Device* device = nullptr; ctx->GetDevice(&device);
         gCameraHistoryCB = gHost->CreateConstantBuffer(device, sizeof(cameraCB)); device->Release();
