@@ -23,8 +23,11 @@ indicates disabled/unavailable depth modulation. Later effects can modify this
 preview, so view it in LDR near the end of the group when diagnosing the ramp.
 
 The feature defaults off. Loading an older preset without these controls resets
-them to their defaults, even after a preset that enabled them. Debug View shows
-full filter strength, retaining the depth-dependent radius.
+them to their defaults, even after a preset that enabled them. **Preview Full
+Strength** (formerly Debug View) temporarily sets near and far strength to 1,
+retaining the depth-dependent radius. Where strength is already 1 it produces
+the same image. Distance Fade Preview takes precedence when both are enabled.
+The saved INI key remains `DebugView` for compatibility.
 
 ## Effect order and DoF into Kuwahara
 

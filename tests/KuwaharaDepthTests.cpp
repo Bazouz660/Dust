@@ -38,6 +38,17 @@ int main() {
     p.Setting<int>("Radius") = 3;
     auto legacy = p.Render(input, .01f);
     AssertImagesNear(legacy, Legacy(input, 3));
+    // Full-strength preview is intentionally identical at strength 1, but
+    // must bypass both a partial blend and the strength-zero early return.
+    p.Setting<bool>("DebugView") = true;
+    AssertImagesNear(p.Render(input, .01f), legacy);
+    p.Setting<float>("Strength") = .25f;
+    AssertImagesNear(p.Render(input, .01f), legacy);
+    p.Setting<float>("Strength") = 0;
+    AssertImagesNear(p.Render(input, .01f), legacy);
+    p.Setting<bool>("DebugView") = false;
+    AssertImagesNear(p.Render(input, .01f), input);
+    p.Setting<float>("Strength") = 1;
     p.Setting<bool>("DepthEnabled") = true;
     p.Setting<float>("DepthStart") = .1f; p.Setting<float>("DepthEnd") = .5f;
     AssertImagesNear(p.Render(input, .05f), input);
@@ -68,6 +79,9 @@ int main() {
     auto expected = legacy;
     for (size_t i = 0; i < input.size(); ++i) for (int c = 0; c < 3; ++c) expected[i][c] = (input[i][c]+legacy[i][c])*.5f;
     AssertImagesNear(halfway, expected);
+    p.Setting<bool>("DebugView") = true;
+    AssertImagesNear(p.Render(input, .05f), legacy); // near strength also overridden
+    p.Setting<bool>("DebugView") = false;
     p.Setting<float>("Strength") = 0; p.Setting<float>("NearStrength") = 1;
     AssertImagesNear(p.Render(input, .05f), legacy); // far zero must not skip near effect
     AssertImagesNear(p.Render(input, .6f), input);
