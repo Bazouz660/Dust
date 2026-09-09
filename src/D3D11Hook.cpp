@@ -784,12 +784,14 @@ static void RunUpscaler(ID3D11DeviceContext* ctx)
                     :                 Upscaler::Evaluate(ctx, colSR, upsDepth, mv, out, jx, jy, mvsx, mvsy, 0.0f, sUpsResetNext, nullptr);
             if (ok)
             {
+                // A failed evaluation did not consume the requested reset.
+                // Keep it armed until a backend successfully resolves a frame.
+                sUpsResetNext = false;
                 if (sUpsSharpness > 0.0f && sUpsOutSRV)
                     MotionVectors::SharpenBlit(ctx, sUpsOutSRV, colorRTV, sUpsSharpness, gWidth, gHeight);
                 else
                     ctx->CopyResource(color, out);   // AA'd image back into the scene color for UI + present
             }
-            sUpsResetNext = false;
         }
     }
     if (color) color->Release();
