@@ -184,7 +184,13 @@ static void SSAOPreExecute(const DustFrameContext* ctx, const DustHostAPI* host)
     ID3D11ShaderResourceView* aoSRV = SSAORenderer::RenderAO(ctx->context, depthSRV, normalsSRV, &ctx->camera);
     if (!aoSRV)
     {
-        Log("[SSAO] WARNING: RenderAO returned null, binding white fallback");
+        static ULONGLONG nextWarning = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (now >= nextWarning)
+        {
+            Log("[SSAO] WARNING: RenderAO unavailable, binding white fallback");
+            nextWarning = now + 1000;
+        }
         aoSRV = gWhiteSRV;
     }
 

@@ -1,3 +1,4 @@
+#include "../common/LazyResources.h"
 #include "DOFRenderer.h"
 #include "DOFConfig.h"
 #include "DustLog.h"
@@ -96,6 +97,8 @@ static bool CreateTexture(ID3D11Device* device, UINT width, UINT height,
     return true;
 }
 
+static LazyResources gTargets;
+
 static void ReleaseTextures()
 {
 #define SAFE_RELEASE(p) if (p) { (p)->Release(); (p) = nullptr; }
@@ -178,8 +181,7 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
 
     // Textures
     gLastDownscale = gDOFConfig.blurDownscale;
-    if (!CreateSizedResources(device, width, height))
-        return false;
+    // Sized textures are allocated only when Render consumes them.
 
     HRESULT hr;
 
@@ -244,7 +246,7 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
 
 void Shutdown()
 {
-    ReleaseTextures();
+    gTargets.Reset(ReleaseTextures);
 #define SAFE_RELEASE(p) if (p) { (p)->Release(); (p) = nullptr; }
     SAFE_RELEASE(gCocPS);        SAFE_RELEASE(gDownsamplePS);
     SAFE_RELEASE(gBlurHPS);      SAFE_RELEASE(gBlurVPS);
@@ -262,21 +264,10 @@ void Shutdown()
 
 void OnResolutionChanged(ID3D11Device* device, UINT newWidth, UINT newHeight)
 {
-    if (newWidth == gWidth && newHeight == gHeight)
-        return;
-
-    Log("DOF: Resolution changed: %ux%u -> %ux%u", gWidth, gHeight, newWidth, newHeight);
-
-    ReleaseTextures();
+    if (!newWidth || !newHeight || (newWidth == gWidth && newHeight == gHeight)) return;
+    gTargets.Reset(ReleaseTextures);
     gWidth = newWidth;
     gHeight = newHeight;
-    gLastDownscale = gDOFConfig.blurDownscale;
-
-    if (!CreateSizedResources(device, newWidth, newHeight))
-    {
-        Log("DOF: WARNING: Failed to recreate textures");
-        gInitialized = false;
-    }
 }
 
 // Recreate blur textures if downscale factor changed at runtime
@@ -286,20 +277,22 @@ void CheckDownscaleChanged(ID3D11DeviceContext* ctx)
     if (cur < 2) cur = 2;
     if (cur > 4) cur = 4;
     if (cur == gLastDownscale) return;
-
-    ID3D11Device* device = nullptr;
-    ctx->GetDevice(&device);
-    if (!device) return;
-
-    Log("DOF: Blur downscale changed %d -> %d, recreating textures", gLastDownscale, cur);
-    ReleaseTextures();
+    gTargets.Reset(ReleaseTextures);
     gLastDownscale = cur;
-    if (!CreateSizedResources(device, gWidth, gHeight))
-    {
-        Log("DOF: WARNING: Failed to recreate textures after downscale change");
-        gInitialized = false;
-    }
-    device->Release();
+}
+
+static bool EnsureSizedTextures(ID3D11DeviceContext* ctx)
+{
+    CheckDownscaleChanged(ctx);
+    if (!gWidth || !gHeight) return false;
+    return gTargets.Ensure(GetTickCount64(), [&] {
+        ID3D11Device* device = nullptr;
+        ctx->GetDevice(&device);
+        if (!device) return false;
+        const bool ok = CreateSizedResources(device, gWidth, gHeight);
+        device->Release();
+        return ok;
+    }, ReleaseTextures);
 }
 
 bool IsInitialized()
@@ -315,8 +308,7 @@ void Render(ID3D11DeviceContext* ctx,
     if (!gInitialized || !ctx || !sceneCopySRV || !depthSRV || !ldrRTV || !gHost)
         return;
 
-    CheckDownscaleChanged(ctx);
-    if (!gInitialized) return;
+    if (!EnsureSizedTextures(ctx)) return;
 
     gHost->SaveState(ctx);
 
@@ -444,6 +436,8 @@ void RenderDebugOverlay(ID3D11DeviceContext* ctx,
 {
     if (!gInitialized || !ctx || !depthSRV || !ldrRTV || !gHost)
         return;
+
+    if (!EnsureSizedTextures(ctx)) return;
 
     gHost->SaveState(ctx);
 

@@ -1,3 +1,4 @@
+#include "../common/LazyResources.h"
 // DustBloom.cpp - HDR bloom effect plugin for Dust (API v3)
 // Extracts bright areas from the HDR scene, builds a gaussian bloom
 // via progressive downsample/upsample, then composites additively.
@@ -78,6 +79,9 @@ struct BloomMip {
 
 static BloomMip gMips[BLOOM_MIP_MAX];
 static int gActiveMipCount = 5;
+
+static LazyResources gTargets;
+static uint32_t gTargetWidth = 0, gTargetHeight = 0;
 
 static void ReleaseMips()
 {
@@ -207,11 +211,7 @@ static int BloomInit(ID3D11Device* device, uint32_t width, uint32_t height, cons
     rd.CullMode = D3D11_CULL_NONE;
     if (FAILED(device->CreateRasterizerState(&rd, &gRasterState))) return -7;
 
-    // Mip chain
-    int mipCount = gConfig.mipLevels;
-    if (mipCount < 3) mipCount = 3;
-    if (mipCount > BLOOM_MIP_MAX) mipCount = BLOOM_MIP_MAX;
-    if (!CreateMips(device, width, height, mipCount)) return -8;
+    // Mip chain is created at first use with the current settings.
 
     Log("Bloom: Initialized (%ux%u, %d mip levels)", width, height, gActiveMipCount);
     return 0;
@@ -219,7 +219,8 @@ static int BloomInit(ID3D11Device* device, uint32_t width, uint32_t height, cons
 
 static void BloomShutdown()
 {
-    ReleaseMips();
+    gTargets.Reset(ReleaseMips);
+    gHdrCopySRV = nullptr;
     if (gRasterState)   { gRasterState->Release();   gRasterState = nullptr; }
     if (gNoDepth)       { gNoDepth->Release();       gNoDepth = nullptr; }
     if (gAdditiveBlend) { gAdditiveBlend->Release(); gAdditiveBlend = nullptr; }
@@ -236,9 +237,9 @@ static void BloomShutdown()
 
 static void BloomOnResolutionChanged(ID3D11Device* device, uint32_t w, uint32_t h)
 {
-    if (!CreateMips(device, w, h, gActiveMipCount))
-        Log("Bloom: WARNING: mip recreation failed (%ux%u) — will retry next frame", w, h);
-    Log("Bloom: Resolution changed to %ux%u", w, h);
+    gTargets.Reset(ReleaseMips);
+    gHdrCopySRV = nullptr;
+    gTargetWidth = w; gTargetHeight = h;
 }
 
 // ==================== Per-frame ====================
@@ -271,48 +272,24 @@ static void BloomPostExecute(const DustFrameContext* ctx, const DustHostAPI* hos
 
     ID3D11DeviceContext* dc = ctx->context;
 
-    // Mip chain missing (allocation failed at resize or mip-count change):
-    // retry here so a transient failure doesn't leave null views bound.
-    // Creation is sequential, so the last mip existing implies the whole chain.
-    if (!gMips[0].rtv || !gMips[gActiveMipCount - 1].rtv)
+    int wantedMips = gConfig.mipLevels;
+    if (wantedMips < 3) wantedMips = 3;
+    if (wantedMips > BLOOM_MIP_MAX) wantedMips = BLOOM_MIP_MAX;
+    if (wantedMips != gActiveMipCount || ctx->width != gTargetWidth || ctx->height != gTargetHeight)
     {
-        ID3D11Device* device = nullptr;
-        dc->GetDevice(&device);
-        if (device) {
-            CreateMips(device, ctx->width, ctx->height, gActiveMipCount);
-            device->Release();
-        }
-        if (!gMips[0].rtv || !gMips[gActiveMipCount - 1].rtv)
-        {
-            gHdrCopySRV = nullptr;
-            return;
-        }
+        gTargets.Reset(ReleaseMips);
+        gActiveMipCount = wantedMips;
+        gTargetWidth = ctx->width; gTargetHeight = ctx->height;
+    }
+    if (!ctx->width || !ctx->height || !gTargets.Ensure(GetTickCount64(), [&] {
+        return CreateMips(gDevice, ctx->width, ctx->height, wantedMips);
+    }, ReleaseMips))
+    {
+        gHdrCopySRV = nullptr;
+        return;
     }
 
     host->SaveState(dc);
-
-    // Check if mip count changed at runtime
-    {
-        int wantedMips = gConfig.mipLevels;
-        if (wantedMips < 3) wantedMips = 3;
-        if (wantedMips > BLOOM_MIP_MAX) wantedMips = BLOOM_MIP_MAX;
-        if (wantedMips != gActiveMipCount)
-        {
-            ID3D11Device* device = nullptr;
-            dc->GetDevice(&device);
-            if (device) {
-                if (!CreateMips(device, ctx->width, ctx->height, wantedMips))
-                {
-                    Log("Bloom: WARNING: mip recreation failed after mip-count change");
-                    host->RestoreState(dc);
-                    gHdrCopySRV = nullptr;
-                    device->Release();
-                    return;
-                }
-                device->Release();
-            }
-        }
-    }
 
     // Common state for all passes
     dc->OMSetDepthStencilState(gNoDepth, 0);

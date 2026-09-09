@@ -1,3 +1,4 @@
+#include "../common/LazyResources.h"
 #include "ClarityRenderer.h"
 #include "ClarityConfig.h"
 #include "DustLog.h"
@@ -82,6 +83,30 @@ static bool CreateLDRTexture(ID3D11Device* device, UINT width, UINT height,
 
 // ==================== Public API ====================
 
+static LazyResources gTargets;
+static void ReleaseSizedTextures()
+{
+    if (gBlurTex) { gBlurTex->Release(); gBlurTex = nullptr; }
+    if (gBlurRTV) { gBlurRTV->Release(); gBlurRTV = nullptr; }
+    if (gBlurSRV) { gBlurSRV->Release(); gBlurSRV = nullptr; }
+    if (gBlurTempTex) { gBlurTempTex->Release(); gBlurTempTex = nullptr; }
+    if (gBlurTempRTV) { gBlurTempRTV->Release(); gBlurTempRTV = nullptr; }
+    if (gBlurTempSRV) { gBlurTempSRV->Release(); gBlurTempSRV = nullptr; }
+}
+static bool EnsureSizedTextures(ID3D11DeviceContext* ctx)
+{
+    if (!gWidth || !gHeight) return false;
+    return gTargets.Ensure(GetTickCount64(), [&] {
+        ID3D11Device* device = nullptr;
+        ctx->GetDevice(&device);
+        if (!device) return false;
+        const bool ok = CreateLDRTexture(device, gWidth, gHeight, &gBlurTex, &gBlurRTV, &gBlurSRV) &&
+              CreateLDRTexture(device, gWidth, gHeight, &gBlurTempTex, &gBlurTempRTV, &gBlurTempSRV);
+        device->Release();
+        return ok;
+    }, ReleaseSizedTextures);
+}
+
 bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host, const char* effectDir)
 {
     if (gInitialized)
@@ -131,11 +156,7 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
     debugBlob->Release();
     if (FAILED(hr)) return false;
 
-    // Textures
-    if (!CreateLDRTexture(device, width, height, &gBlurTex, &gBlurRTV, &gBlurSRV))
-        return false;
-    if (!CreateLDRTexture(device, width, height, &gBlurTempTex, &gBlurTempRTV, &gBlurTempSRV))
-        return false;
+    // Sized textures are created when first rendered.
 
     // No-blend
     {
@@ -187,9 +208,8 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
 
 void Shutdown()
 {
+    gTargets.Reset(ReleaseSizedTextures);
 #define SAFE_RELEASE(p) if (p) { (p)->Release(); (p) = nullptr; }
-    SAFE_RELEASE(gBlurTex);     SAFE_RELEASE(gBlurRTV);     SAFE_RELEASE(gBlurSRV);
-    SAFE_RELEASE(gBlurTempTex); SAFE_RELEASE(gBlurTempRTV); SAFE_RELEASE(gBlurTempSRV);
     SAFE_RELEASE(gFullscreenVS);
     SAFE_RELEASE(gBlurHPS);     SAFE_RELEASE(gBlurVPS);
     SAFE_RELEASE(gCompositePS); SAFE_RELEASE(gDebugPS);
@@ -205,25 +225,12 @@ void Shutdown()
 
 void OnResolutionChanged(ID3D11Device* device, UINT newWidth, UINT newHeight)
 {
-    if (newWidth == gWidth && newHeight == gHeight)
-        return;
-
-    Log("Clarity: Resolution changed: %ux%u -> %ux%u", gWidth, gHeight, newWidth, newHeight);
-
-#define SAFE_RELEASE(p) if (p) { (p)->Release(); (p) = nullptr; }
-    SAFE_RELEASE(gBlurTex);     SAFE_RELEASE(gBlurRTV);     SAFE_RELEASE(gBlurSRV);
-    SAFE_RELEASE(gBlurTempTex); SAFE_RELEASE(gBlurTempRTV); SAFE_RELEASE(gBlurTempSRV);
-#undef SAFE_RELEASE
-
+    if (!newWidth || !newHeight || (newWidth == gWidth && newHeight == gHeight)) return;
+    gTargets.Reset(ReleaseSizedTextures);
     gWidth = newWidth;
     gHeight = newHeight;
-    if (!CreateLDRTexture(device, newWidth, newHeight, &gBlurTex, &gBlurRTV, &gBlurSRV)
-        || !CreateLDRTexture(device, newWidth, newHeight, &gBlurTempTex, &gBlurTempRTV, &gBlurTempSRV))
-    {
-        Log("Clarity: WARNING: Failed to recreate textures after resolution change");
-        gInitialized = false;
-    }
 }
+
 
 bool IsInitialized()
 {
@@ -308,6 +315,8 @@ void Render(ID3D11DeviceContext* ctx,
     if (!gInitialized || !ctx || !sceneCopySRV || !ldrRTV || !gHost)
         return;
 
+    if (!EnsureSizedTextures(ctx)) return;
+
     gHost->SaveState(ctx);
 
     UpdateClarityCB(ctx);
@@ -353,6 +362,8 @@ void RenderDebugOverlay(ID3D11DeviceContext* ctx,
 {
     if (!gInitialized || !ctx || !sceneCopySRV || !ldrRTV || !gHost)
         return;
+
+    if (!EnsureSizedTextures(ctx)) return;
 
     gHost->SaveState(ctx);
 

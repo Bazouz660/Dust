@@ -1,3 +1,4 @@
+#include "../common/LazyResources.h"
 #include "SSAORenderer.h"
 #include "SSAOConfig.h"
 #include "DustLog.h"
@@ -102,6 +103,30 @@ static bool CreateR8Texture(ID3D11Device* device, UINT width, UINT height,
 
 // ==================== Public API ====================
 
+static LazyResources gTargets;
+static void ReleaseSizedTextures()
+{
+    if (gAoTex) { gAoTex->Release(); gAoTex = nullptr; }
+    if (gAoRTV) { gAoRTV->Release(); gAoRTV = nullptr; }
+    if (gAoSRV) { gAoSRV->Release(); gAoSRV = nullptr; }
+    if (gAoBlurTex) { gAoBlurTex->Release(); gAoBlurTex = nullptr; }
+    if (gAoBlurRTV) { gAoBlurRTV->Release(); gAoBlurRTV = nullptr; }
+    if (gAoBlurSRV) { gAoBlurSRV->Release(); gAoBlurSRV = nullptr; }
+}
+static bool EnsureSizedTextures(ID3D11DeviceContext* ctx)
+{
+    if (!gWidth || !gHeight) return false;
+    return gTargets.Ensure(GetTickCount64(), [&] {
+        ID3D11Device* device = nullptr;
+        ctx->GetDevice(&device);
+        if (!device) return false;
+        const bool ok = CreateR8Texture(device, gWidth, gHeight, &gAoTex, &gAoRTV, &gAoSRV) &&
+              CreateR8Texture(device, gWidth, gHeight, &gAoBlurTex, &gAoBlurRTV, &gAoBlurSRV);
+        device->Release();
+        return ok;
+    }, ReleaseSizedTextures);
+}
+
 bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host, const char* effectDir)
 {
     if (gInitialized)
@@ -151,11 +176,7 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
     debugBlob->Release();
     if (FAILED(hr)) { Log("Failed to create debug PS: 0x%08X", hr); return false; }
 
-    // Full-res textures (always needed)
-    if (!CreateR8Texture(device, width, height, &gAoTex, &gAoRTV, &gAoSRV))
-        return false;
-    if (!CreateR8Texture(device, width, height, &gAoBlurTex, &gAoBlurRTV, &gAoBlurSRV))
-        return false;
+    // Full-res textures are created on first RenderAO.
 
     // No blend
     {
@@ -253,9 +274,8 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
 
 void Shutdown()
 {
+    gTargets.Reset(ReleaseSizedTextures);
 #define SAFE_RELEASE(p) if (p) { (p)->Release(); (p) = nullptr; }
-    SAFE_RELEASE(gAoTex);         SAFE_RELEASE(gAoRTV);         SAFE_RELEASE(gAoSRV);
-    SAFE_RELEASE(gAoBlurTex);     SAFE_RELEASE(gAoBlurRTV);     SAFE_RELEASE(gAoBlurSRV);
     SAFE_RELEASE(gFullscreenVS);
     SAFE_RELEASE(gSSAOGenPS);  SAFE_RELEASE(gSSAOBlurHPS);
     SAFE_RELEASE(gSSAOBlurVPS); SAFE_RELEASE(gSSAODebugPS);
@@ -272,25 +292,12 @@ void Shutdown()
 
 void OnResolutionChanged(ID3D11Device* device, UINT newWidth, UINT newHeight)
 {
-    if (newWidth == gWidth && newHeight == gHeight)
-        return;
-
-    Log("Resolution changed: %ux%u -> %ux%u", gWidth, gHeight, newWidth, newHeight);
-
-#define SAFE_RELEASE(p) if (p) { (p)->Release(); (p) = nullptr; }
-    SAFE_RELEASE(gAoTex);         SAFE_RELEASE(gAoRTV);         SAFE_RELEASE(gAoSRV);
-    SAFE_RELEASE(gAoBlurTex);     SAFE_RELEASE(gAoBlurRTV);     SAFE_RELEASE(gAoBlurSRV);
-#undef SAFE_RELEASE
-
+    if (!newWidth || !newHeight || (newWidth == gWidth && newHeight == gHeight)) return;
+    gTargets.Reset(ReleaseSizedTextures);
     gWidth = newWidth;
     gHeight = newHeight;
-    if (!CreateR8Texture(device, newWidth, newHeight, &gAoTex, &gAoRTV, &gAoSRV)
-        || !CreateR8Texture(device, newWidth, newHeight, &gAoBlurTex, &gAoBlurRTV, &gAoBlurSRV))
-    {
-        Log("WARNING: Failed to recreate AO textures after resolution change");
-        gInitialized = false;
-    }
 }
+
 
 bool IsInitialized()
 {
@@ -352,6 +359,8 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
         }
     }
     gFrameIndex++;
+
+    if (!EnsureSizedTextures(ctx)) return nullptr;
 
     gHost->SaveState(ctx);
 
@@ -461,6 +470,8 @@ void RenderDebugOverlay(ID3D11DeviceContext* ctx,
 {
     if (!gInitialized || !ctx || !hdrRTV || !gSSAOConfig.debugView || !gHost)
         return;
+
+    if (!gTargets.Ready()) return;
 
     gHost->SaveState(ctx);
 
