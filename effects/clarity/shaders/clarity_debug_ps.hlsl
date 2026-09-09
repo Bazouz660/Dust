@@ -12,7 +12,10 @@ cbuffer ClarityParams : register(b0)
     float  strength;
     float  midtoneProtect;
     float  blurRadius;
-    float  _pad;
+    float  luminanceProtect;
+    float  luminanceStart;
+    float  luminanceEnd;
+    float2 _pad;
 };
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target

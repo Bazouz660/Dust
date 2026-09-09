@@ -46,6 +46,10 @@ You can pass individual executable names to the native runner, for example
   callbacks, disabled-effect hot reload, old API behavior and preset defaults.
 - `EffectPresetTests`: production preset INI reader/writer, testing order and
   new controls through save/load, old/missing presets and player-owned settings.
+- `ClarityLuminanceTests`: real DLL/shaders on WARP, legacy Gaussian/composite
+  reference, unchanged protected dark pixels, preserved daylight enhancement,
+  per-input-pixel luminance ramp, partial protection, reversed/equal thresholds
+  and unchanged raw-detail debug view.
 - `EffectResourcesTests`: loads the seven affected Release effect DLLs on WARP,
   compiles their real shaders, observes texture creation, injects an allocation
   failure after a partial allocation, and exercises disabled startup/resize,

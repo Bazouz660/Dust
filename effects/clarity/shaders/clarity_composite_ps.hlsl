@@ -13,7 +13,10 @@ cbuffer ClarityParams : register(b0)
     float  strength;
     float  midtoneProtect;
     float  blurRadius;
-    float  _pad;
+    float  luminanceProtect;
+    float  luminanceStart;
+    float  luminanceEnd;
+    float2 _pad;
 };
 
 float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
@@ -29,6 +32,13 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     float luma = dot(original, float3(0.299, 0.587, 0.114));
     float midtoneMask = smoothstep(0.0, 0.25, luma) * smoothstep(1.0, 0.75, luma);
     float mask = lerp(1.0, midtoneMask, midtoneProtect);
+
+    // Measure the unmodified input pixel, not blurred detail or the enhanced
+    // result. At full protection, dark pixels receive exactly zero Clarity.
+    float start = min(luminanceStart, luminanceEnd);
+    float end = max(luminanceStart, luminanceEnd);
+    float luminanceMask = smoothstep(start, max(end, start + 1e-5), luma);
+    mask *= lerp(1.0, luminanceMask, saturate(luminanceProtect));
 
     float3 result = original + detail * strength * mask;
     return float4(saturate(result), 1.0);

@@ -11,7 +11,10 @@ cbuffer ClarityParams : register(b0)
     float  strength;
     float  midtoneProtect;
     float  blurRadius;
-    float  _pad;
+    float  luminanceProtect;
+    float  luminanceStart;
+    float  luminanceEnd;
+    float2 _pad;
     // Normalized gaussian weights for |offset| = index, precomputed on the
     // CPU (sigma = radius / 3). Saves up to 65 exp() per pixel per pass.
     float4 blurWeights[33];

@@ -44,7 +44,10 @@ struct ClarityCBData
     float strength;
     float midtoneProtect;
     float blurRadius;
-    float _pad;
+    float luminanceProtect;
+    float luminanceStart;
+    float luminanceEnd;
+    float _pad[2];
     // Normalized gaussian weights for |offset| = index (float4-aligned to
     // match the HLSL cbuffer array layout; only .x of each entry is used).
     // Precomputed here so the blur shaders don't evaluate exp() per tap.
@@ -249,6 +252,9 @@ static void UpdateClarityCB(ID3D11DeviceContext* ctx)
     cb.strength = gClarityConfig.strength;
     cb.midtoneProtect = gClarityConfig.midtoneProtect;
     cb.blurRadius = gClarityConfig.blurRadius;
+    cb.luminanceProtect = gClarityConfig.luminanceProtect;
+    cb.luminanceStart = gClarityConfig.luminanceStart;
+    cb.luminanceEnd = gClarityConfig.luminanceEnd;
 
     // Gaussian weights (sigma = radius / 3, 99.7% of energy within radius),
     // pre-normalized so the shaders skip both exp() and the weight sum

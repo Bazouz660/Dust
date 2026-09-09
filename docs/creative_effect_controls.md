@@ -40,3 +40,20 @@ Plugin API v9 uses flags on existing settings (no struct size change):
 mark integer order settings. Effects must explicitly opt in. Plugins built
 against earlier APIs retain their fixed scheduling. Dispatch caches ordered
 indices and rebuilds only when scheduling changes; effect objects stay in place.
+
+## Clarity luminance protection
+
+**Luminance Protect** fades Clarity according to each input pixel's luminance
+before Clarity modifies it. At **1**, pixels at or below **Luminance Start**
+receive no enhancement. The contribution ramps smoothly to full strength at
+**Luminance End**. Values between 0 and 1 provide partial protection; 0 preserves
+the previous behavior. The starting thresholds are 0.05 and 0.25 in the current
+LDR image (0 = black, 1 = white).
+
+This mask multiplies the existing midtone mask. It does not alter exposure or
+darken the input image: it suppresses Clarity's contribution to dark pixels.
+Bright lights at night can still receive enhancement. "Original" means the
+image entering Clarity, including earlier effects in the selected order.
+Reversed/equal thresholds are handled without division by zero. The debug view
+continues to show the raw extracted detail layer. Old presets default protection
+to 0, including when loaded after a preset that enables it.

@@ -96,7 +96,10 @@ static DustSettingDesc gSettingsArray[] = {
     { "Effect Order", DUST_SETTING_HIDDEN_INT, &gPostOrder, -10000, 10000, "PostOrder", nullptr, nullptr, DUST_PERF_NONE, DUST_SETTING_FLAG_POST_ORDER_LDR | DUST_SETTING_FLAG_PRESET_DEFAULT },
     { "Enabled",          DUST_SETTING_BOOL,  &gClarityConfig.enabled,        0.0f, 1.0f,  "Enabled",        nullptr, "Enable or disable the clarity effect",                    DUST_PERF_LOW    },
     { "Strength",         DUST_SETTING_FLOAT, &gClarityConfig.strength,       0.0f, 2.0f,  "Strength",       nullptr, "Intensity of local contrast enhancement",                 DUST_PERF_NONE   },
-    { "Midtone Protect",  DUST_SETTING_FLOAT, &gClarityConfig.midtoneProtect, 0.0f, 1.0f,  "MidtoneProtect", nullptr, "Protect midtones from over-sharpening (0 = no protection)", DUST_PERF_NONE },
+    { "Midtone Protect",  DUST_SETTING_FLOAT, &gClarityConfig.midtoneProtect, 0.0f, 1.0f,  "MidtoneProtect", nullptr, "Concentrate contrast enhancement in midtones, protecting shadows and highlights", DUST_PERF_NONE },
+    { "Luminance Protect", DUST_SETTING_FLOAT, &gClarityConfig.luminanceProtect, 0, 1, "LuminanceProtect", nullptr, "Reduce Clarity in dark pixels using their luminance before Clarity; 1 fully protects pixels below Luminance Start", DUST_PERF_NONE, DUST_SETTING_FLAG_PRESET_DEFAULT },
+    { "Luminance Start", DUST_SETTING_FLOAT, &gClarityConfig.luminanceStart, 0, 1, "LuminanceStart", nullptr, "LDR luminance below which Clarity is suppressed; 0 = black, 1 = white", DUST_PERF_NONE, DUST_SETTING_FLAG_PRESET_DEFAULT },
+    { "Luminance End", DUST_SETTING_FLOAT, &gClarityConfig.luminanceEnd, 0, 1, "LuminanceEnd", nullptr, "LDR luminance where Clarity reaches full strength; endpoints are sorted if reversed", DUST_PERF_NONE, DUST_SETTING_FLAG_PRESET_DEFAULT },
     { "Blur Radius",      DUST_SETTING_FLOAT, &gClarityConfig.blurRadius,     1.0f, 32.0f, "BlurRadius",     nullptr, "Size of the detail extraction blur",                      DUST_PERF_HIGH   },
     { "Debug View",       DUST_SETTING_BOOL,  &gClarityConfig.debugView,      0.0f, 1.0f,  "DebugView",      nullptr, "Show the extracted detail layer",                         DUST_PERF_NONE   },
 };
