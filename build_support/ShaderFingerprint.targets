@@ -8,6 +8,9 @@
   <ItemGroup Condition="'@(ShaderFingerprintInput)'==''">
     <ShaderFingerprintInput Include="$(ShaderFingerprintRoot)src\ShaderPatch.cpp;$(ShaderFingerprintRoot)src\ShaderPatch.h;$(ShaderFingerprintRoot)src\MotionVectors.cpp;$(ShaderFingerprintRoot)src\MotionVectors.h;$(ShaderFingerprintRoot)src\D3D11Hook.cpp;$(ShaderFingerprintRoot)src\D3D11Hook.h;$(ShaderFingerprintRoot)src\DustAPI.h;$(ShaderFingerprintRoot)effects\shadows\*.cpp;$(ShaderFingerprintRoot)effects\shadows\*.h;$(ShaderFingerprintRoot)effects\shadows\shaders\*.hlsl" />
   </ItemGroup>
+  <ItemGroup>
+    <ShaderFingerprintInput Include="$(ShaderFingerprintRoot)src\ShadowCasterBias.h" />
+  </ItemGroup>
   <Target Name="GenerateShaderFingerprint" BeforeTargets="ClCompile">
     <MakeDir Directories="$(ShaderFingerprintDir)" />
     <GetFileHash Files="@(ShaderFingerprintInput)" Algorithm="SHA256">

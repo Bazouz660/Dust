@@ -1,4 +1,5 @@
 #include "ShaderPatch.h"
+#include "ShadowCasterBias.h"
 #include "DustLog.h"
 #include "SurveyRecorder.h"
 #include "D3D11Hook.h"
@@ -1098,6 +1099,38 @@ HRESULT WINAPI HookedD3DCompile(
                             pDefines, pInclude, pEntrypoint, pTarget,
                             Flags1, Flags2, ppCode, ppErrorMsgs);
 
+
+    // RTWSM tessellation is independent of atlas resolution, but the caster's
+    // ddx/ddy depth bias shrinks when we enlarge its viewport. Restore its
+    // native-resolution footprint, retaining the original fixed bias and cap.
+    // The helper compiles to the unchanged expression for non-RTW variants.
+    if (pEntrypoint && pTarget && pTarget[0] == 'p' && pSrcData && SrcDataSize &&
+        strcmp(pEntrypoint, "shadow_fs") == 0)
+    {
+        std::string src((const char*)pSrcData, SrcDataSize);
+        std::string patched = ShadowCasterBias::Patch(src);
+        if (patched != src)
+        {
+            HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
+                pDefines, pInclude, pEntrypoint, pTarget, Flags1, Flags2, ppCode, ppErrorMsgs);
+            if (SUCCEEDED(hr))
+            {
+                DumpInjection("shadow", pSourceName, pEntrypoint, src, patched, pDefines);
+                if (ppCode && *ppCode)
+                    SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
+                        pEntrypoint, pTarget, pSourceName,
+                        (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+                return hr;
+            }
+            Log("ShaderPatch: caster bias patch failed, using original shadow_fs");
+            if (ppErrorMsgs && *ppErrorMsgs)
+            {
+                Log("ShaderPatch: error: %s", (const char*)(*ppErrorMsgs)->GetBufferPointer());
+                (*ppErrorMsgs)->Release();
+                *ppErrorMsgs = nullptr;
+            }
+        }
+    }
 
     // Detect the deferred lighting pixel shader: entry point is "main_fs"
     // and source contains deferred-specific identifiers.
