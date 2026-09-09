@@ -2,6 +2,8 @@
 // Depth: Laplacian (2nd derivative) — rejects smooth gradients at grazing angles.
 // Normals: Roberts Cross with hard smoothstep threshold — only sharp edges pass.
 
+#include "outline_normals.hlsl"
+
 Texture2D sceneTex   : register(t0);
 Texture2D depthTex   : register(t1);
 Texture2D normalsTex : register(t2);
@@ -53,7 +55,7 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     float3 n10 = normalsTex.SampleLevel(pointClamp, uv + float2(offset.x, 0.0), 0).rgb * 2.0 - 1.0;
     float3 n01 = normalsTex.SampleLevel(pointClamp, uv + float2(0.0, offset.y), 0).rgb * 2.0 - 1.0;
 
-    float nEdge = (1.0 - dot(n00, n11)) + (1.0 - dot(n10, n01));
+    float nEdge = OutlineNormalDifference(n00, n11) + OutlineNormalDifference(n10, n01);
     // Tight smoothstep — only sharp normal breaks pass
     // (epsilon on the far endpoint: threshold 0 would make smoothstep(0,0) NaN)
     float normalFactor = smoothstep(normalThreshold, normalThreshold * 1.5 + 1e-5, nEdge);

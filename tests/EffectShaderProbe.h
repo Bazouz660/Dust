@@ -19,14 +19,15 @@ struct EffectShaderProbe {
     static constexpr UINT W = 24, H = 16;
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> ctx;
-    ComPtr<ID3D11Texture2D> scene, depth, output, staging;
-    ComPtr<ID3D11ShaderResourceView> sceneSRV, depthSRV;
+    ComPtr<ID3D11Texture2D> scene, depth, normals, output, staging;
+    ComPtr<ID3D11ShaderResourceView> sceneSRV, depthSRV, normalsSRV;
     ComPtr<ID3D11RenderTargetView> outputRTV;
     HMODULE module = nullptr;
     DustEffectDesc effect = {};
     DustHostAPI host = {};
     std::filesystem::path shaderDir;
     bool hasDepth = true;
+    bool hasNormals = true;
     std::string lastTarget;
 
     static ID3DBlob* Compile(const char* path, const char* entry, const char* target) {
@@ -49,6 +50,9 @@ struct EffectShaderProbe {
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         assert(SUCCEEDED(device->CreateTexture2D(&td, nullptr, &scene)));
         assert(SUCCEEDED(device->CreateShaderResourceView(scene.Get(), nullptr, &sceneSRV)));
+        assert(SUCCEEDED(device->CreateTexture2D(&td, nullptr, &normals)));
+        assert(SUCCEEDED(device->CreateShaderResourceView(normals.Get(), nullptr, &normalsSRV)));
+        SetNormals(std::vector<Pixel>(W * H, Pixel{.5f, .5f, 1.f, 1.f}));
         td.BindFlags = D3D11_BIND_RENDER_TARGET;
         assert(SUCCEEDED(device->CreateTexture2D(&td, nullptr, &output)));
         assert(SUCCEEDED(device->CreateRenderTargetView(output.Get(), nullptr, &outputRTV)));
@@ -72,7 +76,10 @@ struct EffectShaderProbe {
             assert(SUCCEEDED(c->Map(cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &map)));
             std::memcpy(map.pData, data, bytes); c->Unmap(cb, 0);
         };
-        host.GetSRV = [](const char*) { return active->hasDepth ? active->depthSRV.Get() : nullptr; };
+        host.GetSRV = [](const char* name) {
+            if (!std::strcmp(name, DUST_RESOURCE_DEPTH)) return active->hasDepth ? active->depthSRV.Get() : nullptr;
+            return active->hasNormals ? active->normalsSRV.Get() : nullptr;
+        };
         host.GetRTV = [](const char* name) { active->lastTarget = name; return active->outputRTV.Get(); };
         host.GetSceneCopy = [](ID3D11DeviceContext*, const char*) { return active->sceneSRV.Get(); };
         host.SaveState = [](ID3D11DeviceContext*) {};
@@ -90,6 +97,10 @@ struct EffectShaderProbe {
             if (effect.settings[i].iniKey && !std::strcmp(effect.settings[i].iniKey, key))
                 return *static_cast<T*>(effect.settings[i].valuePtr);
         assert(false); std::abort();
+    }
+    void SetNormals(const std::vector<Pixel>& values) {
+        assert(values.size() == W * H);
+        ctx->UpdateSubresource(normals.Get(), 0, nullptr, values.data(), W * sizeof(Pixel), 0);
     }
     std::vector<Pixel> Render(const std::vector<Pixel>& input, float distance,
                              DustInjectionPoint point = DUST_INJECT_POST_LIGHTING) {
