@@ -1,3 +1,4 @@
+#include "../common/LazyResources.h"
 #include "RTGIRenderer.h"
 #include "RTGIConfig.h"
 #include "rtgi_bluenoise.h"
@@ -293,6 +294,8 @@ static bool CreateR32FTexture(ID3D11Device* device, UINT width, UINT height,
 
 #define SAFE_RELEASE(p) if (p) { (p)->Release(); (p) = nullptr; }
 
+static LazyResources gTargets;
+
 static void ReleaseTextures()
 {
     SAFE_RELEASE(gRawTex);     SAFE_RELEASE(gRawSRV);     SAFE_RELEASE(gRawUAV);
@@ -302,6 +305,10 @@ static void ReleaseTextures()
     SAFE_RELEASE(gDenoiseTexA);SAFE_RELEASE(gDenoiseSRVA);SAFE_RELEASE(gDenoiseUAVA);
     SAFE_RELEASE(gDenoiseTexB);SAFE_RELEASE(gDenoiseSRVB);SAFE_RELEASE(gDenoiseUAVB);
     SAFE_RELEASE(gPrevDepthTex);SAFE_RELEASE(gPrevDepthSRV);
+    gHasPrevFrame = false;
+    gFrameIndex = 0;
+    gAccumWriteIndex = 0;
+    gFinalGISRV = nullptr;
 }
 
 static bool CreateTextures(ID3D11Device* device, UINT width, UINT height)
@@ -417,9 +424,7 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
     dbgBlob->Release();
     if (FAILED(hr)) return false;
 
-    // Textures
-    if (!CreateTextures(device, width, height))
-        return false;
+    // Sized textures are allocated on the first RenderGI call.
 
     // Blue-noise texture (immutable, embedded data)
     {
@@ -521,13 +526,13 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
 
     gLastResScale = gRTGIConfig.resolutionScale;
     gInitialized = true;
-    Log("RTGI: Initialized successfully (%ux%u, render %ux%u)", width, height, gRenderWidth, gRenderHeight);
+    Log("RTGI: Initialized (%ux%u); render textures deferred until first use", width, height);
     return true;
 }
 
 void Shutdown()
 {
-    ReleaseTextures();
+    gTargets.Reset(ReleaseTextures);
 
     SAFE_RELEASE(gBlueNoiseTex);  SAFE_RELEASE(gBlueNoiseSRV);
     SAFE_RELEASE(gFullscreenVS);
@@ -553,28 +558,10 @@ void Shutdown()
 
 void OnResolutionChanged(ID3D11Device* device, UINT newWidth, UINT newHeight)
 {
-    if (newWidth == gWidth && newHeight == gHeight) return;
-    if (newWidth == 0 || newHeight == 0) return;
-
-    Log("RTGI: Resolution changed: %ux%u -> %ux%u", gWidth, gHeight, newWidth, newHeight);
-    ReleaseTextures();
+    if (!newWidth || !newHeight || (newWidth == gWidth && newHeight == gHeight)) return;
+    gTargets.Reset(ReleaseTextures); // includes temporal validity and borrowed SRVs
     gWidth = newWidth;
     gHeight = newHeight;
-
-    if (!CreateTextures(device, newWidth, newHeight))
-    {
-        Log("RTGI: WARNING: Failed to recreate textures");
-        gInitialized = false;
-    }
-
-    // Reset temporal state. gFrameIndex must restart too: the accum/prev-depth
-    // textures were just recreated with undefined contents, and the per-frame
-    // UpdateCameraData call re-sets gHasPrevFrame before the next RenderGI, so
-    // only the shader's frameIndex/temporalBlend early-out can guarantee the
-    // flush frame blends zero history.
-    gHasPrevFrame = false;
-    gFrameIndex = 0;
-    gAccumWriteIndex = 0;
 }
 
 bool IsInitialized() { return gInitialized; }
@@ -640,29 +627,23 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
         if (!gInitialized) return nullptr;
     }
 
-    // Detect resolution-scale change at runtime and recreate textures
     if (gRTGIConfig.resolutionScale != gLastResScale)
     {
-        Log("RTGI: Resolution scale changed: %d%% -> %d%%, recreating textures", gLastResScale, gRTGIConfig.resolutionScale);
         gLastResScale = gRTGIConfig.resolutionScale;
-        ReleaseTextures();
+        gTargets.Reset(ReleaseTextures);
+    }
+    if (!gWidth || !gHeight) return nullptr;
+    if (!gTargets.Ensure(GetTickCount64(), [&] {
         ID3D11Device* device = nullptr;
         ctx->GetDevice(&device);
-        if (device)
-        {
-            if (!CreateTextures(device, gWidth, gHeight))
-            {
-                Log("RTGI: WARNING: Failed to recreate textures after resolution-mode change");
-                gInitialized = false;
-                device->Release();
-                return nullptr;
-            }
-            device->Release();
-        }
-        gHasPrevFrame = false;
-        gFrameIndex = 0;
-        gAccumWriteIndex = 0;
-    }
+        if (!device) return false;
+        // UpdateCameraData may have run during frames without textures. The
+        // first successful allocation must still start with empty history.
+        gHasPrevFrame = false; gFrameIndex = 0; gAccumWriteIndex = 0;
+        const bool ok = CreateTextures(device, gWidth, gHeight);
+        device->Release();
+        return ok;
+    }, ReleaseTextures)) return nullptr;
 
     gHost->SaveState(ctx);
 

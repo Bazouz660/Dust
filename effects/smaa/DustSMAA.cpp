@@ -1,3 +1,4 @@
+#include "../common/LazyResources.h"
 #include "../../src/DustAPI.h"
 #include "DustLog.h"
 #include "SMAAAreaTex.h"
@@ -71,6 +72,13 @@ static void ReleaseTexture(SMAATexture& t)
     if (t.srv) { t.srv->Release(); t.srv = nullptr; }
     if (t.rtv) { t.rtv->Release(); t.rtv = nullptr; }
     if (t.tex) { t.tex->Release(); t.tex = nullptr; }
+}
+
+static LazyResources gTargets;
+static void ReleaseSizedTextures()
+{
+    ReleaseTexture(gEdgeTex);
+    ReleaseTexture(gBlendTex);
 }
 
 static bool CreateTexture(ID3D11Device* dev, uint32_t w, uint32_t h,
@@ -164,7 +172,7 @@ static int SMAAInit(ID3D11Device* device, uint32_t width, uint32_t height, const
     rd.CullMode = D3D11_CULL_NONE;
     if (FAILED(device->CreateRasterizerState(&rd, &gRasterState))) return -7;
 
-    if (!CreateTextures(device, width, height)) return -8;
+    gWidth = width; gHeight = height; // render targets are created at first use
 
     {
         D3D11_TEXTURE2D_DESC td = {};
@@ -213,8 +221,7 @@ static int SMAAInit(ID3D11Device* device, uint32_t width, uint32_t height, const
 
 static void SMAAShutdown()
 {
-    ReleaseTexture(gEdgeTex);
-    ReleaseTexture(gBlendTex);
+    gTargets.Reset(ReleaseSizedTextures);
     if (gSearchSRV)     { gSearchSRV->Release();      gSearchSRV = nullptr; }
     if (gSearchTexture) { gSearchTexture->Release();   gSearchTexture = nullptr; }
     if (gAreaSRV)       { gAreaSRV->Release();         gAreaSRV = nullptr; }
@@ -234,9 +241,8 @@ static void SMAAShutdown()
 
 static void SMAAOnResolutionChanged(ID3D11Device* device, uint32_t w, uint32_t h)
 {
-    if (!CreateTextures(device, w, h))
-        Log("SMAA: WARNING: texture recreation failed (%ux%u) — will retry next frame", w, h);
-    Log("SMAA: Resolution changed to %ux%u", w, h);
+    gTargets.Reset(ReleaseSizedTextures);
+    gWidth = w; gHeight = h;
 }
 
 static void SMAAPostExecute(const DustFrameContext* ctx, const DustHostAPI* host)
@@ -251,19 +257,11 @@ static void SMAAPostExecute(const DustFrameContext* ctx, const DustHostAPI* host
 
     ID3D11DeviceContext* dc = ctx->context;
 
-    // Render targets missing (recreation failed at resize): retry here so a
-    // transient failure doesn't leave null views bound until the next resize.
-    if (!gEdgeTex.rtv || !gBlendTex.rtv)
-    {
-        ID3D11Device* device = nullptr;
-        dc->GetDevice(&device);
-        if (device) {
-            CreateTextures(device, ctx->width, ctx->height);
-            device->Release();
-        }
-        if (!gEdgeTex.rtv || !gBlendTex.rtv)
-            return;
-    }
+    if (gWidth != ctx->width || gHeight != ctx->height)
+        SMAAOnResolutionChanged(gDevice, ctx->width, ctx->height);
+    if (!ctx->width || !ctx->height || !gTargets.Ensure(GetTickCount64(), [&] {
+        return CreateTextures(gDevice, ctx->width, ctx->height);
+    }, ReleaseSizedTextures)) return;
 
     host->SaveState(dc);
 

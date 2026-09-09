@@ -1,3 +1,4 @@
+#include "../common/LazyResources.h"
 #include "SSILRenderer.h"
 #include "SSILConfig.h"
 #include "DustLog.h"
@@ -92,6 +93,30 @@ static bool CreateRGBTexture(ID3D11Device* device, UINT width, UINT height,
 
 // ==================== Public API ====================
 
+static LazyResources gTargets;
+static void ReleaseSizedTextures()
+{
+    if (gILTex) { gILTex->Release(); gILTex = nullptr; }
+    if (gILRTV) { gILRTV->Release(); gILRTV = nullptr; }
+    if (gILSRV) { gILSRV->Release(); gILSRV = nullptr; }
+    if (gILBlurTex) { gILBlurTex->Release(); gILBlurTex = nullptr; }
+    if (gILBlurRTV) { gILBlurRTV->Release(); gILBlurRTV = nullptr; }
+    if (gILBlurSRV) { gILBlurSRV->Release(); gILBlurSRV = nullptr; }
+}
+static bool EnsureSizedTextures(ID3D11DeviceContext* ctx)
+{
+    if (!gWidth || !gHeight) return false;
+    return gTargets.Ensure(GetTickCount64(), [&] {
+        ID3D11Device* device = nullptr;
+        ctx->GetDevice(&device);
+        if (!device) return false;
+        const bool ok = CreateRGBTexture(device, gWidth, gHeight, &gILTex, &gILRTV, &gILSRV) &&
+              CreateRGBTexture(device, gWidth, gHeight, &gILBlurTex, &gILBlurRTV, &gILBlurSRV);
+        device->Release();
+        return ok;
+    }, ReleaseSizedTextures);
+}
+
 bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host, const char* effectDir)
 {
     if (gInitialized)
@@ -142,10 +167,6 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
     if (FAILED(hr)) { Log("SSIL: Failed to create debug PS: 0x%08X", hr); return false; }
 
     // Textures — R11G11B10_FLOAT for indirect light color
-    if (!CreateRGBTexture(device, width, height, &gILTex, &gILRTV, &gILSRV))
-        return false;
-    if (!CreateRGBTexture(device, width, height, &gILBlurTex, &gILBlurRTV, &gILBlurSRV))
-        return false;
 
     // No blend
     {
@@ -197,9 +218,8 @@ bool Init(ID3D11Device* device, UINT width, UINT height, const DustHostAPI* host
 
 void Shutdown()
 {
+    gTargets.Reset(ReleaseSizedTextures);
 #define SAFE_RELEASE(p) if (p) { (p)->Release(); (p) = nullptr; }
-    SAFE_RELEASE(gILTex);     SAFE_RELEASE(gILRTV);     SAFE_RELEASE(gILSRV);
-    SAFE_RELEASE(gILBlurTex); SAFE_RELEASE(gILBlurRTV); SAFE_RELEASE(gILBlurSRV);
     SAFE_RELEASE(gFullscreenVS);
     SAFE_RELEASE(gSSILGenPS);  SAFE_RELEASE(gSSILBlurHPS);
     SAFE_RELEASE(gSSILBlurVPS); SAFE_RELEASE(gSSILDebugPS);
@@ -214,27 +234,12 @@ void Shutdown()
 
 void OnResolutionChanged(ID3D11Device* device, UINT newWidth, UINT newHeight)
 {
-    if (newWidth == gWidth && newHeight == gHeight)
-        return;
-    if (newWidth == 0 || newHeight == 0)
-        return;
-
-    Log("SSIL: Resolution changed: %ux%u -> %ux%u", gWidth, gHeight, newWidth, newHeight);
-
-#define SAFE_RELEASE(p) if (p) { (p)->Release(); (p) = nullptr; }
-    SAFE_RELEASE(gILTex);     SAFE_RELEASE(gILRTV);     SAFE_RELEASE(gILSRV);
-    SAFE_RELEASE(gILBlurTex); SAFE_RELEASE(gILBlurRTV); SAFE_RELEASE(gILBlurSRV);
-#undef SAFE_RELEASE
-
+    if (!newWidth || !newHeight || (newWidth == gWidth && newHeight == gHeight)) return;
+    gTargets.Reset(ReleaseSizedTextures);
     gWidth = newWidth;
     gHeight = newHeight;
-    if (!CreateRGBTexture(device, newWidth, newHeight, &gILTex, &gILRTV, &gILSRV)
-        || !CreateRGBTexture(device, newWidth, newHeight, &gILBlurTex, &gILBlurRTV, &gILBlurSRV))
-    {
-        Log("SSIL: WARNING: Failed to recreate IL textures after resolution change");
-        gInitialized = false;
-    }
 }
+
 
 bool IsInitialized()
 {
@@ -291,10 +296,12 @@ ID3D11ShaderResourceView* RenderIL(ID3D11DeviceContext* ctx,
             }
             res->Release();
         }
-        // OnResolutionChanged may have failed and set gInitialized = false
+        // Initialization remains valid across deferred texture recreation.
         if (!gInitialized)
             return nullptr;
     }
+
+    if (!EnsureSizedTextures(ctx)) return nullptr;
 
     gHost->SaveState(ctx);
 
@@ -404,6 +411,8 @@ void RenderDebugOverlay(ID3D11DeviceContext* ctx,
 {
     if (!gInitialized || !ctx || !hdrRTV || !gSSILConfig.debugView || !gHost)
         return;
+
+    if (!gTargets.Ready()) return;
 
     gHost->SaveState(ctx);
 

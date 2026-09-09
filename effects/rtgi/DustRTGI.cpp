@@ -1,3 +1,4 @@
+#include "../common/LazyResources.h"
 // DustRTGI.cpp - Screen-Space Global Illumination effect plugin for Dust (API v3)
 // Visibility-bitmask horizon GI (Therrien 2023): sweeps depth-buffer slices per
 // pixel, tracking occluded hemisphere sectors in a 32-bit mask — directional
@@ -52,6 +53,9 @@ static ID3D11ShaderResourceView* gLastGISRV = nullptr;
 static ID3D11Texture2D*          gRtgiAoTex = nullptr;
 static ID3D11RenderTargetView*   gRtgiAoRTV = nullptr;
 static ID3D11ShaderResourceView* gRtgiAoSRV = nullptr;
+
+static LazyResources gAoTargets;
+static uint32_t gAoWidth = 0, gAoHeight = 0;
 
 static void ReleaseRtgiAoTex()
 {
@@ -172,6 +176,15 @@ static void RTGIPostExecute(const DustFrameContext* ctx, const DustHostAPI* host
     // BEFORE water/transparents, so those are never darkened.
     if (gRTGIConfig.aoIntensity > 0.0f)
     {
+        if (gAoWidth != ctx->width || gAoHeight != ctx->height)
+        {
+            gAoTargets.Reset(ReleaseRtgiAoTex);
+            gAoWidth = ctx->width; gAoHeight = ctx->height;
+        }
+        gAoTargets.Ensure(GetTickCount64(), [&] {
+            return CreateRtgiAoTex(gDevice, ctx->width, ctx->height);
+        }, ReleaseRtgiAoTex); // optional: opaque AO still works if this fails
+
         ID3D11ShaderResourceView* srvs[3] = { giSRV, depthSRV, normalsSRV };
         dc->PSSetShaderResources(0, 3, srvs);
         dc->PSSetSamplers(0, 2, samplers);
@@ -288,10 +301,7 @@ static int RTGIInit(ID3D11Device* device, uint32_t width, uint32_t height, const
     gCompositeCB = host->CreateConstantBuffer(device, sizeof(CompositeCBData));
     if (!gCompositeCB) return -9;
 
-    // Full-res AO texture published to the framework for per-light AO (light_fs).
-    // Non-fatal if it fails — RTGI still applies opaque AO; local lights just don't get it.
-    if (!CreateRtgiAoTex(device, width, height))
-        Log("RTGI: WARNING: failed to create light-volume AO texture");
+    // Full-res light-volume AO is created only when AO is rendered.
 
     Log("RTGI: Initialized (%ux%u)", width, height);
     return 0;
@@ -300,7 +310,7 @@ static int RTGIInit(ID3D11Device* device, uint32_t width, uint32_t height, const
 static void RTGIShutdown()
 {
     RTGIRenderer::Shutdown();
-    ReleaseRtgiAoTex();
+    gAoTargets.Reset(ReleaseRtgiAoTex);
 
 #define SR(p) if (p) { (p)->Release(); (p) = nullptr; }
     SR(gCompositePS); SR(gAOCompositePS);
@@ -316,7 +326,8 @@ static void RTGIShutdown()
 static void RTGIOnResolutionChanged(ID3D11Device* device, uint32_t w, uint32_t h)
 {
     RTGIRenderer::OnResolutionChanged(device, w, h);
-    CreateRtgiAoTex(device, w, h);
+    gAoTargets.Reset(ReleaseRtgiAoTex);
+    gLastGISRV = nullptr;
     Log("RTGI: Resolution changed to %ux%u", w, h);
 }
 
