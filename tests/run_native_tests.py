@@ -18,6 +18,28 @@ if not names:
 for name in names:
     if not name.isidentifier() or not (root / (name + ".cpp")).is_file():
         raise SystemExit("Unknown test: " + name)
+    if name == "ShadowAtlasTests":
+        # Compile the actual shadow manager/hook bodies in isolation from the
+        # upscaler, GUI and Kenshi hooks in the rest of D3D11Hook.cpp. The probe
+        # supplies raw WARP calls as trampolines; no game process is touched.
+        source = (root.parent / "src/D3D11Hook.cpp").read_text()
+        spans = [
+            ("// Runtime shadow atlas resize state.", "// ===================== Temporal sub-pixel jitter"),
+            ("static bool IsShadowAtlasDesc(", "static HRESULT STDMETHODCALLTYPE HookedCreateSamplerState("),
+            ("static int LookupShadowEntry(", "// ==================== Install ===================="),
+        ]
+        # The last span ends after the viewport hook, before unrelated Present code.
+        last_start = source.index(spans[2][0])
+        viewport_end = source.index("    oRSSetViewports(pThis, NumViewports, pViewports);", last_start)
+        viewport_end = source.index("\n}", viewport_end) + 2
+        slices = [source[source.index(a):source.index(b, source.index(a))] for a, b in spans[:2]]
+        slices.append(source[last_start:viewport_end])
+        plugin = (root.parent / "effects/shadows/DustShadows.cpp").read_text()
+        a = plugin.index("static uint32_t GetEffectiveShadowResolution(")
+        slices.append(plugin[a:plugin.index("static void ApplyDustShadows();", a)])
+        output = root / "build/ShadowAtlasHooks.generated.h"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text("\n".join(slices))
     result = subprocess.run([
         msbuild, str(root / "NativeTests.vcxproj"), "/nologo", "/verbosity:minimal",
         "/p:Configuration=Release", "/p:Platform=x64", "/p:TestName=" + name,

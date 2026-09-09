@@ -28,6 +28,13 @@ You can pass individual executable names to the native runner, for example
   switches, and constant-buffer cleanup. To additionally compile eight real
   game shader variants, run `tests/build/ShadowCasterBiasTests/ShadowCasterBiasTests.exe`
   with the path to Kenshi's `data/materials/common/shadowcaster.hlsl`.
+- `ShadowAtlasTests`: exercises the production atlas manager and OM/SRV/
+  viewport/ClearState hooks on WARP, using raw D3D calls as their trampolines.
+  Covers repeated switches between pooled depth-only CSM and RTW color/depth
+  pairs, failed depth allocation, native sampling fallback, per-atlas companion
+  depth, filter texel size, and rapid switches exceeding the tracking table.
+  The runner extracts the relevant production bodies into an ignored generated
+  header so the test does not require the GUI/upscalers or install game hooks.
 - `test_shader_fingerprint.py`: the real MSBuild fingerprint target, with
   isolated shader/layout changes and an unrelated source-file control.
 - `LazyResourcesTests`: allocation failure rollback, retry delay, reuse and reset.

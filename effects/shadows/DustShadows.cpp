@@ -68,10 +68,40 @@ static uint32_t GetSelectedShadowResolution()
     return kShadowResolutions[idx];
 }
 
-// Atlas size actually in effect — for texel-size compensation when the
-// override is off ("Vanilla").
-static uint32_t GetEffectiveShadowResolution()
+// Read the actual deferred atlas, including the native-size transition frame
+// after a mode switch or replacement allocation failure. The requested size
+// may not be available yet. Slot 5 holds shadowDepthMap in both shadow modes.
+static uint32_t GetEffectiveShadowResolution(ID3D11DeviceContext* context)
 {
+    ID3D11ShaderResourceView* srv = nullptr;
+    context->PSGetShaderResources(5, 1, &srv);
+    uint32_t actual = 0;
+    if (srv)
+    {
+        D3D11_SHADER_RESOURCE_VIEW_DESC view = {};
+        srv->GetDesc(&view);
+        if (view.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D && view.Format == DXGI_FORMAT_R32_FLOAT)
+        {
+            ID3D11Resource* resource = nullptr;
+            srv->GetResource(&resource);
+            ID3D11Texture2D* texture = nullptr;
+            if (resource)
+            {
+                resource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&texture);
+                resource->Release();
+            }
+            if (texture)
+            {
+                D3D11_TEXTURE2D_DESC desc = {};
+                texture->GetDesc(&desc);
+                if (desc.Width == desc.Height && desc.Width >= 1024 && desc.Width <= 16384 && desc.ArraySize == 1)
+                    actual = desc.Width;
+                texture->Release();
+            }
+        }
+        srv->Release();
+    }
+    if (actual) return actual;
     uint32_t sel = GetSelectedShadowResolution();
     if (sel == 0 && gHost && gHost->GetShadowBaseResolution)
         sel = gHost->GetShadowBaseResolution();
@@ -403,7 +433,8 @@ static void ShadowPreExecute(const DustFrameContext* ctx, const DustHostAPI* hos
     // The 0.001 factor was tuned for a 4096 atlas; at lower resolutions the
     // Poisson samples cluster on a single texel and produce visible squares.
     // (4096 / atlasRes) preserves the existing tuning at 4096.
-    float resScale           = 4096.0f / (float)GetEffectiveShadowResolution();
+    float atlasRes           = (float)GetEffectiveShadowResolution(ctx->context);
+    float resScale           = 4096.0f / atlasRes;
     data.rtwFilterRadius     = gConfig.filterRadius * 0.001f * resScale;
     data.rtwLightSize        = gConfig.lightSize * 0.001f * resScale;
     data.rtwPcssEnabled      = gConfig.pcssEnabled ? 1.0f : 0.0f;
@@ -415,11 +446,10 @@ static void ShadowPreExecute(const DustFrameContext* ctx, const DustHostAPI* hos
     data.csmBlendEnabled     = gConfig.csmBlendEnabled ? 1.0f : 0.0f;
     data.csmBlendWidth       = gConfig.csmBlendWidth;
     data.csmFarSoftness      = gConfig.csmFarSoftness;
-    data.shadowTexel         = 1.0f / (float)GetEffectiveShadowResolution();
+    data.shadowTexel         = 1.0f / atlasRes;
 
     // Resolution-tiered RTW PCF tap count: bigger atlases need fewer taps
     // for the same visual softness.
-    float atlasRes = (float)GetEffectiveShadowResolution();
     if      (atlasRes >= 12288.0f) data.rtwQuality = 4.0f;
     else if (atlasRes >=  8192.0f) data.rtwQuality = 8.0f;
     else                           data.rtwQuality = 12.0f;
