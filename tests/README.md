@@ -53,6 +53,13 @@ You can pass individual executable names to the native runner, for example
   reference, unchanged protected dark pixels, preserved daylight enhancement,
   per-input-pixel luminance ramp, partial protection, reversed/equal thresholds
   and unchanged raw-detail debug view.
+- `OutlineNormalsTests`: real DLL/shaders on WARP; short and variable-length
+  normals do not outline flat surfaces, real creases still render, and debug
+  obeys the same distance exclusions as the composite.
+- `RTGITemporalTests`: world/depth units, handedness, camera rotations and large
+  coordinates; real temporal shader blending against projected world points;
+  real renderer history and bounce resets after disabled/skipped frames,
+  missing depth/camera, projection changes and target recreation.
 - `EffectResourcesTests`: loads the seven affected Release effect DLLs on WARP,
   compiles their real shaders, observes texture creation, injects an allocation
   failure after a partial allocation, and exercises disabled startup/resize,

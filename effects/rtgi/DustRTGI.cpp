@@ -122,7 +122,7 @@ static void RTGIPostExecute(const DustFrameContext* ctx, const DustHostAPI* host
         return;
 
     // Render the GI (scene color with Reinhard normalization for colored bounce lighting)
-    ID3D11ShaderResourceView* giSRV = RTGIRenderer::RenderGI(ctx->context, depthSRV, sceneSRV, normalsSRV);
+    ID3D11ShaderResourceView* giSRV = RTGIRenderer::RenderGI(ctx->context, depthSRV, sceneSRV, normalsSRV, ctx->frameIndex);
     if (!giSRV)
         return;
 

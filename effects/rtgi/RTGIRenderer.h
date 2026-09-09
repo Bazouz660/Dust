@@ -16,7 +16,7 @@ namespace RTGIRenderer
     ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
                                         ID3D11ShaderResourceView* depthSRV,
                                         ID3D11ShaderResourceView* sceneSRV,
-                                        ID3D11ShaderResourceView* normalsSRV);
+                                        ID3D11ShaderResourceView* normalsSRV, uint64_t frameIndex);
 
     void RenderDebugOverlay(ID3D11DeviceContext* ctx, ID3D11RenderTargetView* hdrRTV,
                             ID3D11ShaderResourceView* depthSRV = nullptr,

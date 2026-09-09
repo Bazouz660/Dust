@@ -1,5 +1,6 @@
 #include "../common/LazyResources.h"
 #include "RTGIRenderer.h"
+#include "RTGITemporal.h"
 #include "RTGIConfig.h"
 #include "rtgi_bluenoise.h"
 #include "DustLog.h"
@@ -23,7 +24,10 @@ static float   gInverseView[16] = {};
 static float   gPrevInverseView[16] = {};
 static bool    gHasPrevFrame = false;
 static uint64_t gFrameIndex = 0;
-static float   gSmoothedMotion = 0.0f; // EMA of motion magnitude, decays over ~30 frames
+static float   gFarClip = 0.0f;
+static float   gPrevFarClip = 0.0f;
+static float   gPrevTanHalfFov = 0.0f;
+static uint64_t gLastRenderedFrame = 0;
 
 // ==================== Textures ====================
 
@@ -140,8 +144,8 @@ struct TemporalCBData
     float aspectRatio;
     float temporalBlend;
     float frameIndex;
-    float reprojMatrix[16]; // currentInvView * prevView — direct view-to-prevView transform
-    float motionMagnitude;  // length of translation in reprojection matrix (pixels approx)
+    float reprojMatrix[16]; // LH current-to-previous view in depth / farClip units
+    float _reservedMotion; // Reserved to preserve the shader constant-buffer layout
     float _pad0;
     float _pad1;
     float _pad2;
@@ -189,39 +193,6 @@ struct DebugCBData
 
 
 // ==================== Helpers ====================
-
-// Compute reprojection matrix: currentInvView * prevView
-// Transforms current view-space positions directly to previous view-space,
-// avoiding world-space intermediate (which causes catastrophic cancellation
-// when camera position has large absolute coordinates).
-static void ComputeReprojectionMatrix(const float* curInv, const float* prevInv, float* out)
-{
-    // Compute prevView = inverse(prevInvView)
-    // For row-major layout with mul(v, M):
-    //   invView = [R | 0; T | 1] where R is 3x3 rotation, T is translation
-    //   view = [R^T | 0; -T*R^T | 1]
-    float pv[16];
-    // Transpose 3x3 rotation
-    pv[0]  = prevInv[0]; pv[1]  = prevInv[4]; pv[2]  = prevInv[8];  pv[3]  = 0;
-    pv[4]  = prevInv[1]; pv[5]  = prevInv[5]; pv[6]  = prevInv[9];  pv[7]  = 0;
-    pv[8]  = prevInv[2]; pv[9]  = prevInv[6]; pv[10] = prevInv[10]; pv[11] = 0;
-    // Translation: -(camPos * R^T)
-    float px = prevInv[12], py = prevInv[13], pz = prevInv[14];
-    pv[12] = -(px * pv[0] + py * pv[4] + pz * pv[8]);
-    pv[13] = -(px * pv[1] + py * pv[5] + pz * pv[9]);
-    pv[14] = -(px * pv[2] + py * pv[6] + pz * pv[10]);
-    pv[15] = 1;
-
-    // Multiply: out = curInv * pv (row-major 4x4)
-    for (int i = 0; i < 4; i++)
-        for (int j = 0; j < 4; j++)
-        {
-            float s = 0;
-            for (int k = 0; k < 4; k++)
-                s += curInv[i * 4 + k] * pv[k * 4 + j];
-            out[i * 4 + j] = s;
-        }
-}
 
 // outRTV == nullptr means the texture is UAV/SRV-only: the RENDER_TARGET bind
 // flag is omitted so the driver doesn't have to allow for RTV usage.
@@ -570,19 +541,16 @@ void GetRenderSize(UINT* w, UINT* h) { *w = gRenderWidth; *h = gRenderHeight; }
 
 void UpdateCameraData(const DustCameraData* camera)
 {
-    if (!camera || !camera->valid) return;
+    gHasValidCameraData = camera && camera->valid;
+    if (!gHasValidCameraData) { gHasPrevFrame = false; return; }
+    gFarClip = (gHost && gHost->apiVersion >= 8) ? camera->farZ : 0.0f;
 
     // API v8: use the real camera FOV (from the OGRE projection) instead of the manual TanHalfFov
     // setting. Gate on the host version so we never read the field from an older, smaller struct.
-    if (gHost && gHost->apiVersion >= 8 && camera->tanHalfFov > 0.0f)
+    if (gHost && gHost->apiVersion >= 8 && std::isfinite(camera->tanHalfFov) && camera->tanHalfFov > 0.0f)
         gRTGIConfig.tanHalfFov = camera->tanHalfFov;
 
-    memcpy(gPrevInverseView, gInverseView, sizeof(gInverseView));
     memcpy(gInverseView, camera->inverseView, sizeof(gInverseView));
-
-    if (gHasValidCameraData)
-        gHasPrevFrame = true;
-    gHasValidCameraData = true;
 }
 
 // ==================== Render Passes ====================
@@ -590,7 +558,7 @@ void UpdateCameraData(const DustCameraData* camera)
 ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
                                     ID3D11ShaderResourceView* depthSRV,
                                     ID3D11ShaderResourceView* sceneSRV,
-                                    ID3D11ShaderResourceView* normalsSRV)
+                                    ID3D11ShaderResourceView* normalsSRV, uint64_t frameIndex)
 {
     if (!gInitialized || !ctx || !depthSRV || !sceneSRV || !gHost)
         return nullptr;
@@ -645,6 +613,15 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
         return ok;
     }, ReleaseTextures)) return nullptr;
 
+    // History belongs to the last completed GI render, not the last camera callback.
+    // Skipped frames, invalid cameras and projection changes must not reuse it.
+    float reprojection[16] = {};
+    reprojection[0] = reprojection[5] = reprojection[10] = reprojection[15] = 1;
+    const bool useHistory = gHasPrevFrame && gHasValidCameraData
+        && frameIndex == gLastRenderedFrame + 1
+        && gFarClip == gPrevFarClip && gRTGIConfig.tanHalfFov == gPrevTanHalfFov
+        && RTGITemporal::Reprojection(gInverseView, gPrevInverseView, gFarClip, reprojection);
+
     gHost->SaveState(ctx);
 
     // Common state
@@ -691,7 +668,7 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
         cb.raySteps = (float)gRTGIConfig.raySteps;
         cb.thickness = gRTGIConfig.thickness;
         cb.fadeDistance = gRTGIConfig.fadeDistance;
-        cb.bounceIntensity = gRTGIConfig.bounceIntensity;
+        cb.bounceIntensity = useHistory ? gRTGIConfig.bounceIntensity : 0.0f;
         cb.aoIntensity = gRTGIConfig.aoIntensity;
         cb.frameIndex = (float)gFrameIndex;
         cb.raysPerPixel = (float)gRTGIConfig.raysPerPixel;
@@ -744,27 +721,9 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
         // Fixed residual-smoothing factor (0.9). Baked in: it sat at the
         // shader's 0.08 alpha floor across the whole shipped slider range, so
         // it was never a meaningful knob. 0.0 on history reset flushes accum.
-        cb.temporalBlend = gHasPrevFrame ? 0.9f : 0.0f;
+        cb.temporalBlend = useHistory ? 0.9f : 0.0f;
         cb.frameIndex = (float)gFrameIndex;
-        if (gHasPrevFrame)
-        {
-            ComputeReprojectionMatrix(gInverseView, gPrevInverseView, cb.reprojMatrix);
-            float tx = cb.reprojMatrix[12], ty = cb.reprojMatrix[13], tz = cb.reprojMatrix[14];
-            float instantMotion = sqrtf(tx * tx + ty * ty + tz * tz);
-            // EMA smoothing: fast attack, slow decay (~20 frames to halve)
-            if (instantMotion > gSmoothedMotion)
-                gSmoothedMotion = instantMotion;
-            else
-                gSmoothedMotion = gSmoothedMotion * 0.75f + instantMotion * 0.25f;
-            cb.motionMagnitude = gSmoothedMotion;
-        }
-        else
-        {
-            memset(cb.reprojMatrix, 0, 64);
-            cb.reprojMatrix[0] = cb.reprojMatrix[5] = cb.reprojMatrix[10] = cb.reprojMatrix[15] = 1.0f;
-            cb.motionMagnitude = 0.0f;
-            gSmoothedMotion = 0.0f;
-        }
+        memcpy(cb.reprojMatrix, reprojection, sizeof(reprojection));
         gHost->UpdateConstantBuffer(ctx, gTemporalCB, &cb, sizeof(cb));
         ctx->PSSetConstantBuffers(0, 1, &gTemporalCB);
 
@@ -895,6 +854,12 @@ ID3D11ShaderResourceView* RenderGI(ID3D11DeviceContext* ctx,
             depthResource->Release();
         }
     }
+
+    memcpy(gPrevInverseView, gInverseView, sizeof(gInverseView));
+    gPrevFarClip = gFarClip;
+    gPrevTanHalfFov = gRTGIConfig.tanHalfFov;
+    gLastRenderedFrame = frameIndex;
+    gHasPrevFrame = gHasValidCameraData && std::isfinite(gFarClip) && gFarClip > 0;
 
     // Swap accumulation buffer index for next frame
     gAccumWriteIndex = 1 - gAccumWriteIndex;

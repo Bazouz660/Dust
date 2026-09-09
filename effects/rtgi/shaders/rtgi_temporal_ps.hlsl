@@ -11,11 +11,10 @@
 
 float3 ReconstructViewPos(float2 uv, float depth, float thf, float ar)
 {
-    float3 pos;
-    pos.x = (uv.x * 2.0 - 1.0) * ar * thf * depth;
-    pos.y = (1.0 - uv.y * 2.0) * thf * depth;
-    pos.z = depth;
-    return pos;
+    // Kenshi stores ray length / farClip, not view-space Z / farClip.
+    float3 ray = float3((uv.x * 2.0 - 1.0) * ar * thf,
+                       (1.0 - uv.y * 2.0) * thf, 1.0);
+    return normalize(ray) * depth;
 }
 
 float2 ViewPosToUV(float3 vp, float thf, float ar)
@@ -43,8 +42,8 @@ cbuffer TemporalParams : register(b0)
     float    aspectRatio;
     float    temporalBlend;
     float    frameIndex;
-    row_major float4x4 reprojMatrix; // currentInvView * prevView
-    float    motionMagnitude;
+    row_major float4x4 reprojMatrix; // LH current-to-previous view, translation divided by farClip
+    float    _reservedMotion;
     float    _pad0;
     float    _pad1;
     float    _pad2;
