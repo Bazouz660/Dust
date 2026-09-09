@@ -18,6 +18,13 @@ if not names:
 for name in names:
     if not name.isidentifier() or not (root / (name + ".cpp")).is_file():
         raise SystemExit("Unknown test: " + name)
+    if name == "BootLoadOrderTests":
+        source = (root.parent / "boot/DustBoot.cpp").read_text()
+        begin = source.index("__declspec(dllexport) void startPlugin()")
+        end = source.index("// ==================== DllMain", begin)
+        output = root / "build/BootStartup.generated.h"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(source[begin:end])
     if name == "ShaderFileLoaderTests":
         source = (root.parent / "src/EffectLoader.cpp").read_text()
         begin = source.index("static ID3DBlob* HostCompileShaderFromFile(")

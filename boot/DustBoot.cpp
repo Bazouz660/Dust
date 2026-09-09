@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdarg>
 #include "../crash/CrashClient.h"
+#include "LoadOrder.h"
 
 #include <core/Functions.h>
 #include <Debug.h>
@@ -20,6 +21,7 @@
 // ==================== Logging ====================
 
 static HMODULE gDllModule = nullptr;
+static bool gBootActive = false;
 
 static bool& BootLogEnabled()
 {
@@ -453,7 +455,7 @@ extern "C" __declspec(dllexport) void DustCrashSetPhase(const char* phase)
 }
 extern "C" __declspec(dllexport) void DustCrashShutdown()
 {
-    InterlockedExchange(&DustCrash::shuttingDown,1);
+    if (gBootActive) InterlockedExchange(&DustCrash::shuttingDown,1);
 }
 
 static void StartCrashReporting()
@@ -478,8 +480,27 @@ static void StartCrashReporting()
     BootLog("Automatic crash reporting ready: %%LOCALAPPDATA%%\\Dust\\crash_reports");
 }
 
+static bool DustEnabledInLoadOrder()
+{
+    wchar_t executable[1024];
+    DWORD length = GetModuleFileNameW(nullptr,executable,1024);
+    return length && length < 1024 && DustLoadOrder::EnabledForExecutable(executable);
+}
+
+static bool PinBootModule()
+{
+    // Pin only when enabled, before installing permanent KenshiLib trampolines.
+    HMODULE pin = nullptr;
+    return GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+        reinterpret_cast<LPCWSTR>(gDllModule),&pin) != FALSE;
+}
+
 __declspec(dllexport) void startPlugin()
 {
+    // RE_Kenshi preloads this DLL even for disabled mods. Do not start logs,
+    // a helper, exception filters or graphics hooks unless Dust.mod is active.
+    if (gBootActive || !DustEnabledInLoadOrder() || !PinBootModule()) return;
+    gBootActive = true;
     BootLogInit();
     StartCrashReporting();
     BootLog("DustBoot preload plugin starting...");
@@ -504,25 +525,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hModule);
         gDllModule = hModule;
-        // Pin the DLL so FreeLibrary can never unmap it while KenshiLib trampoline
-        // hooks are still pointing into our code. The hooks can't be removed, so
-        // any unload would leave dangling jumps in DXGI and crash on the next
-        // CreateSwapChain* call. GET_MODULE_HANDLE_EX_FLAG_PIN pins permanently,
-        // with no path lookup (the old GetModuleFileNameA + LoadLibraryA pin could
-        // silently fail on MAX_PATH truncation, leaving the DLL unloadable).
-        {
-            HMODULE hPin = nullptr;
-            if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_PIN |
-                                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-                                    (LPCSTR)hModule, &hPin))
-            {
-                // Fallback: refcount bump via path, checked this time.
-                char selfPath[MAX_PATH];
-                if (!GetModuleFileNameA(hModule, selfPath, MAX_PATH) ||
-                    !LoadLibraryA(selfPath))
-                    OutputDebugStringA("[DustBoot] FATAL: could not pin module — hooks may dangle on unload\n");
-            }
-        }
+        // Activation and pinning belong to startPlugin, after the load-order check.
         break;
     case DLL_PROCESS_DETACH:
         DustCrashShutdown();

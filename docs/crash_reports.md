@@ -4,6 +4,19 @@ Dust enables crash recording from **DustBoot**, before its effect plugins and
 GUI initialize. It works during startup and save loading, with file logging
 enabled or disabled.
 
+DustBoot reads the game's `data/mods.cfg` before doing any setup. It activates
+only when that file contains a `Dust.mod` entry; the presence of a `.mod` file
+on disk is never used as the enabled check. If the entry is absent, or the
+load-order file cannot be read, it stays inactive: no logging,
+crash helper, exception filters, graphics hooks or permanent DLL pinning. The
+file is resolved beside the game executable, independently of the Workshop
+installation path or working directory. Restart after changing the load order.
+
+RE_Kenshi's [plugin loader](https://github.com/BFrizzleFoShizzle/RE_Kenshi/blob/master/Plugins.cpp)
+preloads from `availabelModsOrderedList` after `GameWorld::initModsList`, while
+ordinary `Plugins` load from `activeMods`. That is why the preload DLL requires
+its own activation guard even though Dust.dll already follows the active list.
+
 After a crash, press **Win+R** and open:
 
 ```text

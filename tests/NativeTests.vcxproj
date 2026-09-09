@@ -21,4 +21,7 @@
   <ItemGroup><ClCompile Include="$(TestName).cpp" /></ItemGroup>
   <ItemGroup Condition="'$(TestName)'=='CrashReportTests'"><ClCompile Include="..\external\miniz\miniz.c" /></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="BuildBootDependencyStub" BeforeTargets="PrepareForBuild" Condition="'$(TestName)'=='BootLoadOrderTests'">
+    <MSBuild Projects="$(ProjectDir)BootDependencyStub.vcxproj" Targets="Build" Properties="Configuration=Release;Platform=x64" />
+  </Target>
 </Project>

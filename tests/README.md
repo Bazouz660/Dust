@@ -18,6 +18,13 @@ You can pass individual executable names to the native runner, for example
   worker faults, stack overflow, normal/handled exceptions, handler chaining,
   opt-out, missing helper, unwritable output and shutdown suppression. Build
   `crash/DustCrashReporter.vcxproj` first (included in `build.ps1`).
+- `BootLoadOrderTests`: exact filename/encoding handling and the production boot
+  entry point with observed side effects; disabled, missing or unreadable load
+  orders cause no pinning, logs, reporter or hooks. Enabled startup runs once,
+  and the load-order path follows the game executable rather than the working directory.
+  Explicitly checks file-present/unlisted and file-absent/listed cases. Also loads
+  the actual disabled DustBoot DLL with a KenshiLib dependency shim and verifies
+  it unloads without pinning or calling any game logging/hook functions.
 
 - `InteropLifetimeTests`: blocks a real D3D12 WARP queue across timeout and
   shutdown, then verifies completion, recovery of a missing completion signal,
