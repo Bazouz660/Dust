@@ -87,6 +87,10 @@
       <AdditionalDependencies>KenshiLib.lib;d3d11.lib;d3d12.lib;dxgi.lib;d3dcompiler.lib;dinput8.lib;dxguid.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
+  <ItemDefinitionGroup>
+    <ClCompile><AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories></ClCompile>
+  </ItemDefinitionGroup>
+  <Import Project="..\build_support\ShaderFingerprint.targets" />
   <!-- DLSS/NGX: only wired in when the SDK is present (external/DLSS is gitignored). When absent,
        DUST_HAVE_DLSS stays undefined so Upscaler.cpp compiles to stubs and the repo still builds.
        Fetch the SDK with a shallow git clone of github.com/NVIDIA/DLSS into external/DLSS. -->
@@ -193,6 +197,7 @@
     <ClInclude Include="SurveyRecorder.h" />
     <ClInclude Include="SurveyWriter.h" />
     <ClInclude Include="ShaderPatch.h" />
+    <ClInclude Include="ShaderCacheStamp.h" />
     <ClInclude Include="ShaderMetadata.h" />
     <ClInclude Include="GeometryCapture.h" />
     <ClInclude Include="MotionVectors.h" />

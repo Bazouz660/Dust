@@ -12,6 +12,8 @@
 #include "EffectLoader.h"
 #include "PssmDetour.h"
 #include "CameraAccess.h"
+#include "ShaderCacheStamp.h"
+#include "ShaderFingerprint.generated.h"
 
 static HMODULE gDllModule = nullptr;
 
@@ -85,42 +87,9 @@ static std::string GetGameDir()
 // patches baked in and D3DCompile can be skipped for cached shaders.
 static std::string BuildCacheStamp(const std::string& modDir)
 {
-#ifdef DUST_VERSION
-    #define DUST_STAMP_STR2(x) #x
-    #define DUST_STAMP_STR(x) DUST_STAMP_STR2(x)
-    std::string stamp = "dust|" DUST_STAMP_STR(DUST_VERSION);
-#else
-    std::string stamp = "dust|dev";
-#endif
-
-    // Bump this suffix when ShaderPatch HLSL injection changes, so RE_Kenshi
-    // discards cached bytecode that was compiled with an older injection.
-    // mvend: the injected MV interpolants are now APPENDED to each entry function's parameter list
-    // instead of inserted after a TEXCOORDn anchor. Mid-list insertion shifted every later parameter
-    // down a register — with COLOURING it moved the vertex COLOR0 from reg7 to reg9 while Kenshi's
-    // un-injected forward icon shader (rtticons.hlsl, backwards-compat => links by REGISTER) kept
-    // reading reg7 and got the clip position as the item's colour. Every cached shader from before
-    // this change has the old register layout, so the bump is required.
-    // mvsgv: the injected PS inputs are now placed BEFORE any SV_IsFrontFace parameter — appending
-    // after it is an fxc error (X4576) that silently dropped the whole MV injection from every
-    // DOUBLESIDED variant via the original-source compile fallback.
-    // mvskinapp: skin.hlsl main_vs is back to END-APPEND placement (the 2026-07-18 'mvskin' anchor
-    // placement put oDustCur at output register 7 — the register where Kenshi's UNINJECTED icon
-    // shader rtticons.hlsl [COLOURING] reads its COLOR0 dye-colour input. D3D11 links matched
-    // semantics by NAME (so placement never mattered for the injected pairs), but a PS input with
-    // NO matching VS output is undefined, and on NV it reads the same-register VS output — clip
-    // position as the dye colour = the quadrant-coloured clothing icons. End-append keeps every
-    // vanilla output register intact, which is the actual invariant. See InjSkinVS in ShaderPatch.
-    // nosnap: DustStabilizeThreshold no longer snaps thresholds to 0.32 (it hollowed/darkened icons
-    // rendered through the deferred icon path) — the injected HLSL changed, so the cache must go.
-    // regroute: the pipeline routes VS->PS varyings BY REGISTER (live-proven 2026-07-20: a VS-only
-    // COLOR0 pad shifted the injected outputs and broke skin-family + plain-objects MVs — black
-    // characters/trees in the MV view). Scheme now: skin family = anchor placement both sides
-    // (4ed6cf0), objects/severed_limb = end-append + SYMMETRIC COLOR0 pad on VS and PS.
-    // iconcol: rtticons.hlsl COLOR input moved before SV_IsFrontFace (disasm-proven root cause of
-    // the quadrant icons: the SGV pushed COLOR0 to v8 = the injected oDustCur register; vanilla
-    // read past the VS outputs = the black dyed-icon jank). Icon PS text changed -> cache must go.
-    stamp += "|patch=shadow-b7-csm-r9-mvsgv-regroute-iconcol-nosnap";
+    // Generated from injection sources and CPU-side layouts on every build.
+    // Unrelated version bumps do not require throwing away compiled shaders.
+    std::string stamp = "dust|sha256=" DUST_SHADER_FINGERPRINT;
 
     // The MV-injection gate ([Upscaling] DLSS / ShowMotionVectors, read once per session) decides
     // whether every GBuffer VS/PS compiles WITH or WITHOUT the injected velocity interpolants.
@@ -158,46 +127,30 @@ static void ManageShaderCache(const std::string& gameDir, const std::string& mod
 
     std::string currentStamp = BuildCacheStamp(modDir);
 
-    // Read existing stamp
-    std::string storedStamp;
+    std::string reDir = gameDir + "RE_Kenshi";
+    if (!CreateDirectoryA(reDir.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
     {
-        FILE* f = fopen(stampPath.c_str(), "r");
-        if (f)
-        {
-            char buf[256] = {};
-            if (fgets(buf, sizeof(buf), f))
-                storedStamp = buf;
-            fclose(f);
-            // Strip trailing newline
-            while (!storedStamp.empty() &&
-                   (storedStamp.back() == '\n' || storedStamp.back() == '\r'))
-                storedStamp.pop_back();
-        }
-    }
-
-    if (storedStamp == currentStamp)
-    {
-        Log("Shader cache stamp matches (%s), keeping cached bytecode", currentStamp.c_str());
+        Log("ERROR: Cannot create shader cache directory (error %lu)", GetLastError());
         return;
     }
-
-    // Stamp mismatch — invalidate cache and write new stamp
-    if (DeleteFileA(cachePath.c_str()))
-        Log("Invalidated RE_Kenshi shader cache (stamp changed: '%s' -> '%s')",
-            storedStamp.c_str(), currentStamp.c_str());
-    else
-        Log("Shader cache not present or already clean (new stamp: %s)", currentStamp.c_str());
-
-    // Ensure RE_Kenshi directory exists
-    std::string reDir = gameDir + "RE_Kenshi";
-    CreateDirectoryA(reDir.c_str(), nullptr);
-
-    FILE* f = fopen(stampPath.c_str(), "w");
-    if (f)
+    DWORD error = ERROR_SUCCESS;
+    const auto result = ShaderCacheStamp::Update(cachePath, stampPath, currentStamp, error);
+    switch (result)
     {
-        fprintf(f, "%s\n", currentStamp.c_str());
-        fclose(f);
+    case ShaderCacheStamp::Result::Unchanged:
+        Log("Shader cache stamp matches (%s), keeping cached bytecode", currentStamp.c_str());
+        break;
+    case ShaderCacheStamp::Result::Updated:
+        Log("Shader cache invalidated; saved stamp %s", currentStamp.c_str());
+        break;
+    case ShaderCacheStamp::Result::InvalidationFailed:
+        Log("ERROR: Cannot invalidate shader cache (error %lu); stamp left unchanged. Close Kenshi and remove %s before restarting.", error, cachePath.c_str());
+        break;
+    case ShaderCacheStamp::Result::StampWriteFailed:
+        Log("ERROR: Shader cache invalidated but stamp could not be saved (error %lu); next launch will retry", error);
+        break;
     }
+
 }
 
 // ==================== Game loop hook ====================
