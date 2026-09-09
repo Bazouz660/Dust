@@ -16,6 +16,7 @@
 #include "ShaderFingerprint.generated.h"
 
 static HMODULE gDllModule = nullptr;
+static void (*gCrashShutdown)() = nullptr;
 
 // ==================== Shutdown exception filter ====================
 // Once our DllMain DETACH has run (gShutdownSignaled), any further unhandled
@@ -200,6 +201,11 @@ void GameWorld__mainLoop_GPUSensitiveStuff_hook(GameWorld* thisptr, float time)
 // Do NOT use extern "C" here.
 __declspec(dllexport) void startPlugin()
 {
+    if (HMODULE boot = GetModuleHandleW(L"DustBoot.dll")) {
+        gCrashShutdown = reinterpret_cast<void(*)()>(GetProcAddress(boot,"DustCrashShutdown"));
+        auto phase = reinterpret_cast<void(*)(const char*)>(GetProcAddress(boot,"DustCrashSetPhase"));
+        if (phase) phase("Dust host startup / save loading");
+    }
     // Install our shutdown exception filter as early as possible. Chains to
     // RE_Kenshi's filter (installed earlier) so legitimate gameplay crashes
     // still surface their dialog.
@@ -294,6 +300,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
         }
         break;
     case DLL_PROCESS_DETACH:
+        if (gCrashShutdown) gCrashShutdown();
         // Tell hook trampolines to pass through — any in-flight call from another
         // thread (or DXGI) must skip our logic now that teardown has begun.
         D3D11Hook::SignalShutdown();

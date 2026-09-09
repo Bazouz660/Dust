@@ -40,4 +40,5 @@ namespace BugReport
 
     // New-issue URL with the system summary prefilled into the issue form.
     std::string BuildGitHubIssueURL();
+    void OpenCrashReports();
 }

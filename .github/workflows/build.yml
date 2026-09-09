@@ -183,6 +183,9 @@ jobs:
           /p:Configuration=Release
           /p:Platform=x64
 
+      - name: Build automatic crash reporter
+        run: msbuild crash\DustCrashReporter.vcxproj /p:Configuration=Release /p:Platform=x64
+
       - name: Build host (Dust.dll)
         run: >
           msbuild src\Dust.vcxproj
@@ -292,6 +295,7 @@ jobs:
           mkdir release\Dust\effects
           mkdir release\Dust\effects\shaders
           copy boot\build\Release\DustBoot.dll release\Dust\
+          copy crash\build\Release\DustCrashReporter.exe release\Dust\
           copy src\build\Release\Dust.dll release\Dust\
           copy effects\ssao\build\Release\DustSSAO.dll release\Dust\effects\
           copy effects\lut\build\Release\DustLUT.dll release\Dust\effects\
@@ -355,3 +359,13 @@ jobs:
         with:
           name: Dust-${{ steps.version.outputs.label }}
           path: release\Dust\
+
+      - name: Preserve matching crash-analysis symbols
+        uses: actions/upload-artifact@v5
+        with:
+          name: Dust-symbols-${{ steps.version.outputs.label }}
+          path: |
+            boot/build/Release/*.pdb
+            src/build/Release/*.pdb
+            effects/*/build/Release/*.pdb
+            crash/build/Release/*.pdb

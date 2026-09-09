@@ -19,5 +19,6 @@
     <Link><AdditionalDependencies>d3d11.lib;d3d12.lib;dxgi.lib;d3dcompiler.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
   </ItemDefinitionGroup>
   <ItemGroup><ClCompile Include="$(TestName).cpp" /></ItemGroup>
+  <ItemGroup Condition="'$(TestName)'=='CrashReportTests'"><ClCompile Include="..\external\miniz\miniz.c" /></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

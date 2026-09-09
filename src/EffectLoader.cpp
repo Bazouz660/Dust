@@ -810,6 +810,9 @@ int EffectLoader::LoadAll(const char* effectsDir)
 
 bool EffectLoader::InitAll(ID3D11Device* device, uint32_t w, uint32_t h)
 {
+    HMODULE boot = GetModuleHandleW(L"DustBoot.dll");
+    auto crashPhase = boot ? reinterpret_cast<void(*)(const char*)>(GetProcAddress(boot,"DustCrashSetPhase")) : nullptr;
+    if (crashPhase) crashPhase("Initializing effect plugins");
     // Compile and cache fullscreen VS if not already done
     if (!gFullscreenVS)
     {
@@ -831,6 +834,10 @@ bool EffectLoader::InitAll(ID3D11Device* device, uint32_t w, uint32_t h)
         if (le.initialized || !le.desc.Init)
             continue;
 
+        if (crashPhase) {
+            char phase[64]; snprintf(phase,sizeof(phase),"Initializing effect: %s",le.desc.name ? le.desc.name : "unnamed");
+            crashPhase(phase);
+        }
         int result = le.desc.Init(device, w, h, &hostAPI_);
         if (result != 0)
         {
@@ -868,6 +875,7 @@ bool EffectLoader::InitAll(ID3D11Device* device, uint32_t w, uint32_t h)
     for (int i = 0; i < (int)presets_.size(); i++)
         ValidatePreset(i);
 
+    if (crashPhase) crashPhase("Effects initialized / gameplay");
     return allOk;
 }
 

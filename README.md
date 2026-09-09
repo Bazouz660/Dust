@@ -11,6 +11,7 @@ Effects are loaded as separate DLL plugins from an `effects/` folder using a sta
 - **GPU performance monitoring**: Per-effect GPU timing via D3D11 timestamp queries (handled automatically by the framework)
 - **Hot-reloadable configs**: Edit `.ini` files while the game is running; framework reloads them automatically
 - **On-demand render targets**: Large temporary effect textures are allocated when first used, with cleanup and delayed retries after allocation failures
+- **Automatic crash reports**: A preload recorder saves minidumps, logs and settings even when a save crashes before effects load. See [crash reports](docs/crash_reports.md).
 - **Pipeline detection**: Identifies render passes by GPU state (render target formats, SRV bindings) rather than fragile shader hashes
 - **Runtime shader patching**: Modifies the game's deferred lighting shader bytecode in memory at startup. No files replaced on disk
 - **State save/restore**: Full D3D11 state capture ensures effects don't interfere with the game's rendering

@@ -31,6 +31,7 @@ function Build-Project($vcxproj) {
 }
 
 # Build boot (preload plugin)
+Build-Project (Join-Path $Root "crash\DustCrashReporter.vcxproj")
 Build-Project (Join-Path $Root "boot\DustBoot.vcxproj")
 
 # Build host
@@ -58,6 +59,7 @@ function Publish-Build($Dest, [switch]$Clean) {
     New-Item -ItemType Directory -Force -Path "$Dest\presets"         | Out-Null
 
     Copy-Item "$Root\boot\build\Release\DustBoot.dll" "$Dest\"
+    Copy-Item "$Root\crash\build\Release\DustCrashReporter.exe" "$Dest\"
     Copy-Item "$Root\src\build\Release\Dust.dll"  "$Dest\"
     Copy-Item "$Root\mod\RE_Kenshi.json"          "$Dest\"
     Copy-Item "$Root\mod\Dust.mod"                "$Dest\"

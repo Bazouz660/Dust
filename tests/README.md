@@ -13,6 +13,12 @@ python -m unittest discover -s tests -p "test_*.py"
 You can pass individual executable names to the native runner, for example
 `python tests/run_native_tests.py InteropLifetimeTests`.
 
+- `CrashReportTests`: real exceptions in disposable child processes using the
+  production client and reporter; verifies dump streams and archive contents,
+  worker faults, stack overflow, normal/handled exceptions, handler chaining,
+  opt-out, missing helper, unwritable output and shutdown suppression. Build
+  `crash/DustCrashReporter.vcxproj` first (included in `build.ps1`).
+
 - `InteropLifetimeTests`: blocks a real D3D12 WARP queue across timeout and
   shutdown, then verifies completion, recovery of a missing completion signal,
   and explicit device removal. Only the standalone test's device is removed.
