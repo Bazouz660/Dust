@@ -18,6 +18,13 @@ if not names:
 for name in names:
     if not name.isidentifier() or not (root / (name + ".cpp")).is_file():
         raise SystemExit("Unknown test: " + name)
+    if name == "ShaderFileLoaderTests":
+        source = (root.parent / "src/EffectLoader.cpp").read_text()
+        begin = source.index("static ID3DBlob* HostCompileShaderFromFile(")
+        end = source.index("static void HostDrawFullscreenTriangle(", begin)
+        output = root / "build/ShaderFileLoader.generated.h"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(source[begin:end])
     if name == "ShadowAtlasTests":
         # Compile the actual shadow manager/hook bodies in isolation from the
         # upscaler, GUI and Kenshi hooks in the rest of D3D11Hook.cpp. The probe
