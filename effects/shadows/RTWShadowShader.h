@@ -104,7 +104,12 @@ float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,
         b += (cf_steep * cf_steep) * cf_gate * 0.0032;
     }
 
-    float noise = frac(52.9829189 * frac(dot(screenPos, float2(0.06711056, 0.00583715))));
+    // Interleaved gradient noise nearly alternates between neighbouring pixels, so a
+    // static tap rotation reads as a one-pixel checker in the penumbra. While a
+    // temporal AA integrates frames the host advances dustFrame and the pattern
+    // averages out; dustFrame is 0 otherwise (a moving pattern would just boil).
+    float2 noisePosition = screenPos + 5.588238 * dustFrame;
+    float noise = frac(52.9829189 * frac(dot(noisePosition, float2(0.06711056, 0.00583715))));
     float ang = noise * 6.28318530718;
     float sa, ca;
     sincos(ang, sa, ca);

@@ -8,6 +8,7 @@
 #include "SurveyWriter.h"
 #include "ShaderPatch.h"
 #include "ShadowCasterBias.h"
+#include "DeferredJitter.h"
 #include "ShaderMetadata.h"
 #include "GeometryCapture.h"
 #include "MotionVectors.h"
@@ -1579,6 +1580,60 @@ static UINT ResolveAoSlot(ID3D11DeviceContext* ctx, uint32_t baseSlot)
     return baseSlot - 2;                              // no-shadow mode: shifted down
 }
 
+// Per-frame parameters for the patched sun pass (DeferredJitter.h): this frame's G-buffer
+// jitter, so world positions are rebuilt on the sample's own ray, and a frame counter that
+// moves the shadow sampling noise while a temporal AA is integrating frames.
+// 16 bytes, created once and deliberately never released: the device can already be gone
+// when statics are torn down at process exit.
+static ID3D11Buffer* gSunFrameParamsCB = nullptr;
+
+// Returns true if the buffer is bound and must be unbound after the draw.
+static bool BindSunFrameParams(ID3D11DeviceContext* ctx)
+{
+    if (!gSunFrameParamsCB)
+    {
+        ID3D11Device* device = nullptr;
+        ctx->GetDevice(&device);
+        if (!device) return false;
+        D3D11_BUFFER_DESC desc = {};
+        desc.ByteWidth = sizeof(DeferredJitter::FrameParams);
+        desc.Usage = D3D11_USAGE_DYNAMIC;
+        desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        HRESULT hr = device->CreateBuffer(&desc, nullptr, &gSunFrameParamsCB);
+        device->Release();
+        if (FAILED(hr)) { gSunFrameParamsCB = nullptr; return false; }
+    }
+    DeferredJitter::FrameParams params = {};
+    float jx = 0, jy = 0;
+    GetTemporalJitter(jx, jy);
+    const bool temporal = (jx != 0.0f || jy != 0.0f);
+    params.jitterX = jx;
+    params.jitterY = jy;
+    params.frame = temporal ? (float)(gFrameIndex % 64) : 0.0f;
+    params.temporal = temporal ? 1.0f : 0.0f;
+    D3D11_MAPPED_SUBRESOURCE map = {};
+    if (FAILED(ctx->Map(gSunFrameParamsCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) return false;
+    memcpy(map.pData, &params, sizeof(params));
+    ctx->Unmap(gSunFrameParamsCB, 0);
+    // OGRE reflects injected cbuffers and may have bound its own zero-filled buffer during
+    // material setup; binding here, immediately before the draw, wins.
+    ctx->PSSetConstantBuffers(DeferredJitter::Slot, 1, &gSunFrameParamsCB);
+    return true;
+}
+
+static void UnbindSunFrameParams(ID3D11DeviceContext* ctx)
+{
+    ID3D11Buffer* current = nullptr;
+    ctx->PSGetConstantBuffers(DeferredJitter::Slot, 1, &current);
+    if (current == gSunFrameParamsCB)
+    {
+        ID3D11Buffer* empty = nullptr;
+        ctx->PSSetConstantBuffers(DeferredJitter::Slot, 1, &empty);
+    }
+    if (current) current->Release();
+}
+
 // Snapshot whatever the SSAO plugin bound (logically) at s8/s9 for the sun pass. Called
 // right after DispatchPre at POST_LIGHTING, while those slots still hold the AO map+params.
 static void CaptureLightVolumeAO(ID3D11DeviceContext* ctx)
@@ -2205,8 +2260,12 @@ static void STDMETHODCALLTYPE HookedDraw(
         else if (result.point == InjectionPoint::POST_FOG)
             gLvAoReady = false;
 
+        const bool sunFrameParams = result.point == InjectionPoint::POST_LIGHTING && BindSunFrameParams(pThis);
+
         // Execute the game's original draw call
         oDraw(pThis, VertexCount, StartVertexLocation);
+
+        if (sunFrameParams) UnbindSunFrameParams(pThis);
 
         // POST: effects that operate after the draw
         fctx.timing = DUST_TIMING_POST;

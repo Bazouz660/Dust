@@ -1,5 +1,6 @@
 #include "EffectShaderProbe.h"
 #include "../effects/shadows/RTWShadowShader.h"
+#include "../src/DeferredJitter.h"
 #include <algorithm>
 #include <fstream>
 #include <iterator>

@@ -4,6 +4,7 @@
 #include "RtwCasterDepth.h"
 #include "RtwWarpBuild.h"
 #include "RtwWarpLookup.h"
+#include "DeferredJitter.h"
 #include "../effects/shadows/RTWShadowShader.h"
 #include "DustLog.h"
 #include "SurveyRecorder.h"
@@ -176,6 +177,7 @@ static std::string PatchDeferredShader(const std::string& src)
             "\tfloat dustShadowTexel;\n"
             "\tfloat dustCsmFarSoftness;\n"
             "};\n\n"
+            + std::string(DeferredJitter::Declaration())
             + RTWShadowShader::Source(workshopSteepBias) +
             // CSM Poisson disk for blocker search + PCF. Reuse the same 12-tap
             // table as DustRTWShadow; values are pre-normalized to length ~1.
@@ -442,6 +444,18 @@ static std::string PatchDeferredShader(const std::string& src)
     else
     {
         Log("ShaderPatch: '= computeShadowMultiplier(' not found, CSM redirect skipped");
+    }
+
+    // Rebuild the world position on the jittered G-buffer sample's own ray. Needs the
+    // DustFrameParams declaration injected above; without it the statement is left alone.
+    if (pos3 != std::string::npos)
+    {
+        std::string unjittered = DeferredJitter::Patch(result);
+        if (unjittered != result)
+        {
+            result = unjittered;
+            Log("ShaderPatch: sun pass rebuilds world positions on the jittered sample ray");
+        }
     }
 
     return result;

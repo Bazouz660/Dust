@@ -14,6 +14,7 @@
     <ShaderFingerprintInput Include="$(ShaderFingerprintRoot)src\RtwCasterDepth.h" />
     <ShaderFingerprintInput Include="$(ShaderFingerprintRoot)src\RtwWarpBuild.h" />
     <ShaderFingerprintInput Include="$(ShaderFingerprintRoot)src\RtwWarpLookup.h" />
+    <ShaderFingerprintInput Include="$(ShaderFingerprintRoot)src\DeferredJitter.h" />
   </ItemGroup>
   <Target Name="GenerateShaderFingerprint" BeforeTargets="ClCompile">
     <MakeDir Directories="$(ShaderFingerprintDir)" />

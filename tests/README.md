@@ -28,6 +28,11 @@ You can pass individual executable names to the native runner, for example
   large-coordinate camera pairs, stationary cameras, and invalid inputs.
 - `ShaderCacheStampTests`: locked cache, locked stamp, absent cache, unchanged
   stamp and damaged stamp, using isolated temporary files.
+- `DeferredJitterTests`: renders a grazing ground plane into a distance G-buffer through a
+  sub-pixel-shifted viewport on WARP, then rebuilds positions with the game's statement and with
+  the patched one: unjittered both are exact, jittered the vanilla points are whole units off the
+  surface and the patched ones are not. Pass the installed `deferred/deferred.hlsl` to check that
+  only `main_fs` is rewritten.
 - `RtwWarpLookupTests`: patches both warp lookup spellings and included files (through the include
   wrapper), then samples a 513-knot map on WARP with a linear clamp sampler: knot i is read at
   u = i / 512 and the last stretch of the map still interpolates, where the vanilla lookup is flat.
