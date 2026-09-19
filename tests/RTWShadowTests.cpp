@@ -153,7 +153,8 @@ float4 main(float4 pixel : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
     };
 
     auto render = [&](const SceneParams& scene, ShadowParams shadows, UINT resolution,
-                      bool edge = false, float curvature = 0.f, float towerGap = 0.f) {
+                      bool edge = false, float curvature = 0.f, float towerGap = 0.f,
+                      float stripGap = 0.f) {
         shadows.texel = 1.f / resolution;
         std::vector<float> depths(resolution * resolution);
         for (UINT y = 0; y < resolution; ++y) for (UINT x = 0; x < resolution; ++x) {
@@ -164,6 +165,7 @@ float4 main(float4 pixel : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
             float worldX = unwarpedX / scene.projectionScale;
             float gap = (!edge || worldX < 0) ? scene.blockerGap : 0;
             if (towerGap > 0 && worldX > .5f) gap = towerGap;
+            if (stripGap > 0 && worldX > .1f && worldX < .25f) gap = stripGap;   // a low object on the lit side
             depths[y * resolution + x] = scene.depthOffset + scene.depthScale * (scene.receiverDepth + scene.slope * worldX - gap);
         }
         std::vector<float> warp(513 * 2);
@@ -253,6 +255,26 @@ float4 main(float4 pixel : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
         }
         if (range == 10.f) assert(partialPixels(withPlateau) > 16); // the plateau keeps its own penumbra
     }
+    // A low object standing in the wide penumbra of a far caster keeps its own crisp shadow.
+    // One averaged blocker distance gave both the far caster's kernel and smeared it away.
+    scene = SceneParams{}; scene.slope = 0; scene.blockerGap = 1;
+    {
+        auto farOnly = render(scene, shadows, 2048, true);
+        auto both = render(scene, shadows, 2048, true, 0.f, 0.f, .05f);
+        for (UINT y = 0; y < probe.H; ++y) {
+            // Pixel centres 13 and 14 (x = .125, .208) lie under the low object.
+            for (UINT x : {13u, 14u}) {
+                if (both[y * probe.W + x][0] > .1f)
+                    std::fprintf(stderr, "row %u col %u: low object's shadow washed out, visibility %.2f\n", y, x, both[y * probe.W + x][0]);
+                assert(both[y * probe.W + x][0] <= .1f);
+            }
+            // Beyond the low object's reach the far penumbra is what it was without it.
+            for (UINT x : {16u, 17u, 18u})
+                assert(std::fabs(both[y * probe.W + x][0] - farOnly[y * probe.W + x][0]) <= .09f);
+            assert(farOnly[y * probe.W + 13][0] > .3f);   // and that spot really is in the far penumbra
+        }
+    }
+
     // The penumbra fades out on BOTH sides of the edge. The blocker search used to lose the
     // caster part-way through the lit side, which ended the penumbra in a hard rim there.
     scene = SceneParams{}; scene.slope = 0; scene.blockerGap = 1;
@@ -269,5 +291,5 @@ float4 main(float4 pixel : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
             assert(litSide >= 2 && std::abs(litSide - darkSide) <= 2);
         }
     }
-    std::puts("RTW PCSS: penumbra survives depth-origin, depth-scale and warp changes; contact shadows remain sharper and ignore distant surfaces; penumbrae are two-sided");
+    std::puts("RTW PCSS: penumbra survives depth-origin, depth-scale and warp changes; contact shadows remain sharper and ignore distant surfaces; penumbrae are two-sided and layered");
 }

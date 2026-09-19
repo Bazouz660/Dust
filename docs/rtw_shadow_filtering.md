@@ -63,3 +63,9 @@ Measured on a full-resolution crop of a captured penumbra (59k penumbra pixels, 
 - The PCF uses a Vogel disk, 24 taps for wide penumbrae (atlas tier otherwise), rotated per pixel by the R2 sequence, which does not alternate between neighbours the way interleaved gradient noise does. Under temporal AA the rotation also advances per frame.
 
 Result on the same crop: residual noise 0.038, checker energy 0.050, and a penumbra that fades out on both sides. Cost: 24 search taps (was 12) for every lit pixel, plus one probe per rejected hit, and 24 PCF taps (was 12) inside wide penumbrae.
+
+## Blocker layers
+
+PCSS estimates one blocker distance per pixel and filters with one kernel. Where a near object's shadow lies next to, or inside, the wide penumbra of a far caster, the search finds both, the average lands between them, and the near shadow is smeared with the far one (WARP test: a low object in a far caster's penumbra came out at visibility 0.38 instead of dark).
+
+The search now keeps every accepted blocker's separation and splits them into a near layer, within 4x of the nearest one, and a far layer. Each layer gets its own penumbra radius and its own Vogel-disk PCF that only counts blockers in its separation range; the result is the product of the two visibilities (independent occluders). With a single layer nothing changes and only one PCF runs. A tall single object spans both layers near its base, which is also right: its lower part casts the crisp contact shadow there and its upper part the soft one further out.

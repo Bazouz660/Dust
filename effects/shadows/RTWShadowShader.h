@@ -77,6 +77,27 @@ float DustShadowCmp(sampler2D sm, sampler2D wm, float2 uv, float d, float bias,
     return DustRtwDepth(sm, wm, uv, receiver) >= d - bias ? 1.0 : 0.0;
 }
 
+// Vogel (golden-angle) disk PCF: well spread at any count, and one rotation angle per
+// pixel is enough. Only blockers whose separation from the receiver lies in
+// [nearestSeparation, farthestSeparation) occlude, so blocker layers can be filtered
+// with their own kernels. The atlas-tier count (4 at 12288) assumes a texel-sized
+// filter; a wide penumbra needs the full disk or it is mostly grain.
+float DustRtwDisk(sampler2D sm, sampler2D wm, DustRtwReceiver receiver, float d, float bias,
+                  float tapRotation, float2 radius, float2 baseRadius,
+                  float nearestSeparation, float farthestSeparation) {
+    float taps = any(radius > baseRadius * 2.0) ? 24.0 : dustRtwQuality;
+    float visible = 0;
+    [loop] for (int i = 0; i < 24; i++) {
+        if (i >= (int)taps) break;
+        float tapAngle = i * 2.39996323 + tapRotation;
+        float2 tap = sqrt((i + 0.5) / taps) * float2(cos(tapAngle), sin(tapAngle));
+        float separation = d - DustRtwDepth(sm, wm, receiver.position.xy + tap * radius, receiver);
+        bool occluded = separation > bias && separation >= nearestSeparation && separation < farthestSeparation;
+        visible += occluded ? 0.0 : 1.0;
+    }
+    return visible / taps;
+}
+
 // Sample in the original light projection, then warp each tap independently.
 // A fixed post-warp radius would change its world footprint whenever the
 // camera-dependent importance map redistributes shadow texels.
@@ -117,6 +138,8 @@ float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,
     // atlas resolution and the shadow camera's depth origin.
     float2 baseRadius = dustRtwFilterRadius / max(receiver.warpScale, float2(1e-5, 1e-5));
     float2 filterRadius = baseRadius;
+    float2 farRadius = baseRadius;
+    float layerSplit = 1e30;        // separation (depth units) where the far blocker layer starts
     float centerDepth = DustRtwDepth(sMap, wMap, receiver.position.xy, receiver);
 
     if (dustRtwPcssEnabled > 0.5) {
@@ -130,12 +153,8 @@ float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,
         static const float kMaxBlockerDistance = 500.0;
         float maxReach = min(shadowRange, kMaxBlockerDistance) * dustRtwLightSize;
         float2 searchRadius = max(baseRadius, maxReach * uvScale);
-        float blockerSeparation = 0;
-        float blockerCount = 0;
-        if (centerDepth < sd - b) {
-            blockerSeparation = sd - centerDepth;
-            blockerCount = 1;
-        }
+        float separations[25];      // per search tap; 0 = no blocker
+        separations[24] = centerDepth < sd - b ? sd - centerDepth : 0;
         // Six geometric rings of four FIXED directions, alternate rings turned by 45
         // degrees. A per-pixel rotation made neighbouring pixels disagree about whether
         // a blocker exists, so the filter radius flipped between them: the hatching at
@@ -170,34 +189,47 @@ float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,
                     depth = DustRtwDepth(sMap, wMap, receiver.position.xy + direction * inner, receiver);
                     accepted = depth < sd - b;
                 }
-                if (accepted) {
-                    blockerSeparation += sd - depth;
-                    blockerCount += 1;
-                }
+                separations[j] = accepted ? sd - depth : 0;
+            } else {
+                separations[j] = 0;
             }
         }
-        if (blockerCount > 0) {
-            // RTW stores affine directional-light depth, not distance from a
-            // point light. Dividing by absolute blocker depth makes softness
-            // vary with the shadow camera's near plane. Undo depth scaling only.
-            float worldSeparation = blockerSeparation / (blockerCount * depthScale);
-            float2 penumbra = worldSeparation * dustRtwLightSize * uvScale;
+        // One averaged blocker distance gives one kernel for everything nearby: next to
+        // (or inside) the wide penumbra of a far caster, a near object's shadow was
+        // smeared with it. Split the blockers into a near layer, within kLayerRatio of
+        // the nearest one, and a far layer; each gets its own penumbra.
+        static const float kLayerRatio = 4.0;
+        float nearest = 1e30;
+        [unroll] for (int k = 0; k < 25; k++)
+            if (separations[k] > 0) nearest = min(nearest, separations[k]);
+        float nearSum = 0, nearCount = 0, farSum = 0, farCount = 0;
+        [unroll] for (int m = 0; m < 25; m++) {
+            float separation = separations[m];
+            if (separation > 0) {
+                if (separation <= nearest * kLayerRatio) { nearSum += separation; nearCount += 1; }
+                else { farSum += separation; farCount += 1; }
+            }
+        }
+        // RTW stores affine directional-light depth, not distance from a point light.
+        // Dividing by absolute blocker depth makes softness vary with the shadow
+        // camera's near plane. Undo depth scaling only.
+        if (nearCount > 0) {
+            float2 penumbra = nearSum / (nearCount * depthScale) * dustRtwLightSize * uvScale;
             filterRadius = max(baseRadius * 0.5, min(penumbra, searchRadius));
+        }
+        if (farCount > 0) {
+            float2 penumbra = farSum / (farCount * depthScale) * dustRtwLightSize * uvScale;
+            farRadius = max(baseRadius * 0.5, min(penumbra, searchRadius));
+            layerSplit = nearest * kLayerRatio;
         }
     }
 
-    // A Vogel (golden-angle) disk: well spread at any count, and one rotation angle per
-    // pixel is enough. The atlas-tier count (4 at 12288) assumes a texel-sized filter;
-    // a wide penumbra needs the full disk or it is mostly grain.
-    float taps = any(filterRadius > baseRadius * 2.0) ? 24.0 : dustRtwQuality;
-    float shadow = 0;
-    [loop] for (int i = 0; i < 24; i++) {
-        if (i >= (int)taps) break;
-        float tapAngle = i * 2.39996323 + tapRotation;
-        float2 tap = sqrt((i + 0.5) / taps) * float2(cos(tapAngle), sin(tapAngle));
-        shadow += DustShadowCmp(sMap, wMap, receiver.position.xy + tap * filterRadius, sd, b, receiver);
-    }
-    shadow /= taps;
+    // Independent occluders: the light that passes both layers.
+    float shadow = DustRtwDisk(sMap, wMap, receiver, sd, b, tapRotation, filterRadius, baseRadius,
+                               0.0, layerSplit);
+    [branch] if (layerSplit < 1e29)
+        shadow *= DustRtwDisk(sMap, wMap, receiver, sd, b, tapRotation + 1.0, farRadius, baseRadius,
+                              layerSplit, 1e30);
     return shadow;
 }
 
