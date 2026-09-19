@@ -268,8 +268,11 @@ float4 main(float4 pixel : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
                     std::fprintf(stderr, "row %u col %u: low object's shadow washed out, visibility %.2f\n", y, x, both[y * probe.W + x][0]);
                 assert(both[y * probe.W + x][0] <= .1f);
             }
-            // Beyond the low object's reach the far penumbra is what it was without it.
-            for (UINT x : {16u, 17u, 18u})
+            // Beyond the low object's reach the far penumbra is what it was without it, right
+            // up to the object on both sides: the far caster's wide kernel must not pick the
+            // low object up (that darkened the surroundings and left a lit outline around the
+            // pixels that did separate the layers).
+            for (UINT x : {12u, 15u, 16u, 17u, 18u})
                 assert(std::fabs(both[y * probe.W + x][0] - farOnly[y * probe.W + x][0]) <= .09f);
             assert(farOnly[y * probe.W + 13][0] > .3f);   // and that spot really is in the far penumbra
         }

@@ -78,21 +78,30 @@ float DustShadowCmp(sampler2D sm, sampler2D wm, float2 uv, float d, float bias,
 }
 
 // Vogel (golden-angle) disk PCF: well spread at any count, and one rotation angle per
-// pixel is enough. Only blockers whose separation from the receiver lies in
-// [nearestSeparation, farthestSeparation) occlude, so blocker layers can be filtered
-// with their own kernels. The atlas-tier count (4 at 12288) assumes a texel-sized
-// filter; a wide penumbra needs the full disk or it is mostly grain.
+// pixel is enough. The atlas-tier count (4 at 12288) assumes a texel-sized filter; a wide
+// penumbra needs the full disk or it is mostly grain.
+//
+// A blocker occludes through a tap only if the tap lies within that blocker's own light
+// cone (separation * lightSize, with a x2 tolerance for blockers a little lower than the
+// layer's average). Without it a wide kernel, sized for a far caster, also counted every
+// low object its taps happened to land on, up to the whole kernel radius away: that
+// smeared near shadows into their surroundings, and left a lit outline around them where
+// the layered pixels (which exclude them) met the rest. Taps inside the antialiasing floor
+// always count. Blockers at or beyond farthestSeparation belong to the far layer.
 float DustRtwDisk(sampler2D sm, sampler2D wm, DustRtwReceiver receiver, float d, float bias,
-                  float tapRotation, float2 radius, float2 baseRadius,
-                  float nearestSeparation, float farthestSeparation) {
+                  float tapRotation, float2 radius, float2 baseRadius, float2 uvScale,
+                  float reachPerDepth, float farthestSeparation) {
     float taps = any(radius > baseRadius * 2.0) ? 24.0 : dustRtwQuality;
+    float floorDistance = length(baseRadius / uvScale);
     float visible = 0;
     [loop] for (int i = 0; i < 24; i++) {
         if (i >= (int)taps) break;
         float tapAngle = i * 2.39996323 + tapRotation;
-        float2 tap = sqrt((i + 0.5) / taps) * float2(cos(tapAngle), sin(tapAngle));
-        float separation = d - DustRtwDepth(sm, wm, receiver.position.xy + tap * radius, receiver);
-        bool occluded = separation > bias && separation >= nearestSeparation && separation < farthestSeparation;
+        float2 tap = sqrt((i + 0.5) / taps) * float2(cos(tapAngle), sin(tapAngle)) * radius;
+        float separation = d - DustRtwDepth(sm, wm, receiver.position.xy + tap, receiver);
+        float tapDistance = length(tap / uvScale);
+        bool inCone = separation * reachPerDepth * 2.0 >= tapDistance || tapDistance <= floorDistance;
+        bool occluded = separation > bias && separation < farthestSeparation && inCone;
         visible += occluded ? 0.0 : 1.0;
     }
     return visible / taps;
@@ -142,9 +151,9 @@ float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,
     float layerSplit = 1e30;        // separation (depth units) where the far blocker layer starts
     float centerDepth = DustRtwDepth(sMap, wMap, receiver.position.xy, receiver);
 
+    float depthScale = max(length(shadowMatrix[2].xyz), 1e-8);
+    float2 uvScale = max(float2(length(shadowMatrix[0].xyz), length(shadowMatrix[1].xyz)), 1e-12);
     if (dustRtwPcssEnabled > 0.5) {
-        float depthScale = max(length(shadowMatrix[2].xyz), 1e-8);
-        float2 uvScale = float2(length(shadowMatrix[0].xyz), length(shadowMatrix[1].xyz));
         // A blocker h above the receiver covers part of the light disc only
         // within h * lightSize of it. The widest useful search is therefore
         // the reach of the farthest blocker considered. Shadow Range alone is
@@ -196,17 +205,40 @@ float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,
         }
         // One averaged blocker distance gives one kernel for everything nearby: next to
         // (or inside) the wide penumbra of a far caster, a near object's shadow was
-        // smeared with it. Split the blockers into a near layer, within kLayerRatio of
-        // the nearest one, and a far layer; each gets its own penumbra.
-        static const float kLayerRatio = 4.0;
-        float nearest = 1e30;
-        [unroll] for (int k = 0; k < 25; k++)
-            if (separations[k] > 0) nearest = min(nearest, separations[k]);
+        // smeared with it. Split the blockers into a near and a far layer, each with its
+        // own penumbra. The boundary goes in the middle of the widest empty stretch of
+        // log2(separation), at least two octaves wide; a fixed ratio from the nearest
+        // blocker cut through casters whose own separations span more than that ratio.
+        uint occupied = 0;
+        [unroll] for (int k = 0; k < 25; k++) {
+            if (separations[k] > 0) {
+                float octave = floor(log2(separations[k] / depthScale)) + 10.0;   // 2^-10 .. 2^13 units
+                occupied |= 1u << (uint)clamp(octave, 0.0, 23.0);
+            }
+        }
+        int firstOctave = 24, lastOctave = -1;
+        [unroll] for (int o = 0; o < 24; o++) {
+            if ((occupied >> (uint)o) & 1u) { firstOctave = min(firstOctave, o); lastOctave = o; }
+        }
+        int run = 0, runStart = 0, widest = 0, widestStart = 0;
+        [unroll] for (int e = 0; e < 24; e++) {
+            bool empty = e > firstOctave && e < lastOctave && !((occupied >> (uint)e) & 1u);
+            if (empty) {
+                if (run == 0) runStart = e;
+                run++;
+                if (run > widest) { widest = run; widestStart = runStart; }
+            } else {
+                run = 0;
+            }
+        }
+        float splitSeparation = 1e30;
+        if (widest >= 2)
+            splitSeparation = exp2(widestStart + widest * 0.5 - 10.0) * depthScale;
         float nearSum = 0, nearCount = 0, farSum = 0, farCount = 0;
         [unroll] for (int m = 0; m < 25; m++) {
             float separation = separations[m];
             if (separation > 0) {
-                if (separation <= nearest * kLayerRatio) { nearSum += separation; nearCount += 1; }
+                if (separation < splitSeparation) { nearSum += separation; nearCount += 1; }
                 else { farSum += separation; farCount += 1; }
             }
         }
@@ -220,16 +252,19 @@ float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,
         if (farCount > 0) {
             float2 penumbra = farSum / (farCount * depthScale) * dustRtwLightSize * uvScale;
             farRadius = max(baseRadius * 0.5, min(penumbra, searchRadius));
-            layerSplit = nearest * kLayerRatio;
+            layerSplit = splitSeparation;
         }
     }
 
-    // Independent occluders: the light that passes both layers.
+    // Independent occluders: the light that passes both layers. The near kernel leaves
+    // the far layer's blockers to the far kernel; the far kernel needs no lower bound,
+    // the cone test already keeps near blockers out of its outer taps.
+    float reachPerDepth = dustRtwLightSize / depthScale;
     float shadow = DustRtwDisk(sMap, wMap, receiver, sd, b, tapRotation, filterRadius, baseRadius,
-                               0.0, layerSplit);
+                               uvScale, reachPerDepth, layerSplit);
     [branch] if (layerSplit < 1e29)
         shadow *= DustRtwDisk(sMap, wMap, receiver, sd, b, tapRotation + 1.0, farRadius, baseRadius,
-                              layerSplit, 1e30);
+                              uvScale, reachPerDepth, 1e30);
     return shadow;
 }
 
