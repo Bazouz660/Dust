@@ -18,6 +18,7 @@ class ShaderFingerprintTests(unittest.TestCase):
             "src/ShadowCasterBias.h",
             "src/RtwTessellation.h",
             "src/RtwCasterDepth.h",
+            "src/RtwWarpBuild.h",
             "effects/shadows/DustShadows.cpp", "effects/shadows/layout.h", "effects/shadows/RTWShadowShader.h",
             "effects/shadows/shaders/shadow.hlsl",
         ]

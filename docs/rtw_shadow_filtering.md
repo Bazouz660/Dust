@@ -34,4 +34,8 @@ Two captures of the same spot show the effect. With the camera 1535 units behind
 
 Wide penumbrae now use the full 12-tap disk regardless of the atlas tier, which allowed only 4 taps at 12288.
 
-The straight-edged lit wedge beside the building in those captures is geometry, not a cut: the wall runs along world X, the sun's azimuth is 40 degrees off it, and the shadow edge leaves the building's corner within 8 degrees of the sun's azimuth (ground slope and slanted walls account for the rest). Ground between that edge and the wall sees the sun past the corner.
+## Shadows cut near the camera when zoomed in
+
+`rtw_build` writes 513 warp knots for a 512 texel importance map, so knot `k` is the boundary between importance texels `k-1` and `k`. The knot at the end of the important region (`k == range.y`) is the region's last point and belongs at +1.0, but the game tests `my_u >= range.y` and sends it to the off-map value 1.05 with everything beyond it. The region's last cell is stretched across the map border: in captures it ran from 0.85 to 1.024 in warped UV. Past 1.0 there is no shadow map, so receivers read lit and casters are clipped.
+
+That cell is normally blur padding. It holds visible ground when the important region touches the border of the light-space box, and the camera end of the view frustum is always a corner of that box. Zoomed in close, the visible ground sat in warp cells 508 to 512 and 8% (one capture) and 18% (the other) of the visible pixels fell off the map, as a straight band without shadows. `src/RtwWarpBuild.h` changes the test to `>`: the knot takes the ordinary branch, where the remaining weight is zero, and lands on +1.0. Re-evaluating both captured warp maps with that knot corrected leaves no visible pixel off the map. No other knot moves.

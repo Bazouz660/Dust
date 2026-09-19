@@ -2,6 +2,7 @@
 #include "ShadowCasterBias.h"
 #include "RtwTessellation.h"
 #include "RtwCasterDepth.h"
+#include "RtwWarpBuild.h"
 #include "../effects/shadows/RTWShadowShader.h"
 #include "DustLog.h"
 #include "SurveyRecorder.h"
@@ -993,6 +994,37 @@ HRESULT WINAPI HookedD3DCompile(
                 return hr;
             }
             Log("ShaderPatch: caster bias patch failed, using original shadow_fs");
+            if (ppErrorMsgs && *ppErrorMsgs)
+            {
+                Log("ShaderPatch: error: %s", (const char*)(*ppErrorMsgs)->GetBufferPointer());
+                (*ppErrorMsgs)->Release();
+                *ppErrorMsgs = nullptr;
+            }
+        }
+    }
+
+    // The game's RTWSM warp builder pushes the important region's end knot off the
+    // shadow map, which cuts shadows near the camera when zoomed in (see RtwWarpBuild.h).
+    if (pEntrypoint && pTarget && pTarget[0] == 'p' && pSrcData && SrcDataSize &&
+        strcmp(pEntrypoint, "rtw_build") == 0)
+    {
+        std::string src((const char*)pSrcData, SrcDataSize);
+        std::string patched = RtwWarpBuild::Patch(src);
+        if (patched != src)
+        {
+            HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
+                pDefines, pInclude, pEntrypoint, pTarget, Flags1, Flags2, ppCode, ppErrorMsgs);
+            if (SUCCEEDED(hr))
+            {
+                Log("ShaderPatch: RTW warp builder keeps the region's end knot on the map");
+                DumpInjection("rtwbuild", pSourceName, pEntrypoint, src, patched, pDefines);
+                if (ppCode && *ppCode)
+                    SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
+                        pEntrypoint, pTarget, pSourceName,
+                        (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+                return hr;
+            }
+            Log("ShaderPatch: RTW warp builder patch failed, using original rtw_build");
             if (ppErrorMsgs && *ppErrorMsgs)
             {
                 Log("ShaderPatch: error: %s", (const char*)(*ppErrorMsgs)->GetBufferPointer());

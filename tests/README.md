@@ -28,6 +28,9 @@ You can pass individual executable names to the native runner, for example
   large-coordinate camera pairs, stationary cameras, and invalid inputs.
 - `ShaderCacheStampTests`: locked cache, locked stamp, absent cache, unchanged
   stamp and damaged stamp, using isolated temporary files.
+- `RtwWarpBuildTests`: runs the warp builder's region logic on WARP with an important region that
+  reaches the map border and one that does not: patched, the region's end knot lands on the map
+  edge (+1.0) where the vanilla test pushes it to 1.05, and no other knot moves.
 - `RtwCasterDepthTests`: renders a caster half a depth range sunward of the near plane into an
   R32F map on WARP: the vanilla shape stores 0, the patched one stores -0.5 and still rasterises,
   and cascade (non-RTW) variants are unchanged. Pass the installed game's `data/materials` folder

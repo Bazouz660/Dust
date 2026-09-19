@@ -12,6 +12,7 @@
     <ShaderFingerprintInput Include="$(ShaderFingerprintRoot)src\ShadowCasterBias.h" />
     <ShaderFingerprintInput Include="$(ShaderFingerprintRoot)src\RtwTessellation.h" />
     <ShaderFingerprintInput Include="$(ShaderFingerprintRoot)src\RtwCasterDepth.h" />
+    <ShaderFingerprintInput Include="$(ShaderFingerprintRoot)src\RtwWarpBuild.h" />
   </ItemGroup>
   <Target Name="GenerateShaderFingerprint" BeforeTargets="ClCompile">
     <MakeDir Directories="$(ShaderFingerprintDir)" />
