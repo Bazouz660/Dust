@@ -1,5 +1,6 @@
 #include "ShaderPatch.h"
 #include "ShadowCasterBias.h"
+#include "RtwTessellation.h"
 #include "../effects/shadows/RTWShadowShader.h"
 #include "DustLog.h"
 #include "SurveyRecorder.h"
@@ -991,6 +992,37 @@ HRESULT WINAPI HookedD3DCompile(
                 return hr;
             }
             Log("ShaderPatch: caster bias patch failed, using original shadow_fs");
+            if (ppErrorMsgs && *ppErrorMsgs)
+            {
+                Log("ShaderPatch: error: %s", (const char*)(*ppErrorMsgs)->GetBufferPointer());
+                (*ppErrorMsgs)->Release();
+                *ppErrorMsgs = nullptr;
+            }
+        }
+    }
+
+    // The game's RTWSM caster hull shader under-tessellates edges that cross the
+    // high-resolution zone of the warp (see RtwTessellation.h).
+    if (pEntrypoint && pTarget && pTarget[0] == 'h' && pSrcData && SrcDataSize &&
+        strcmp(pEntrypoint, "tessellator_hs") == 0)
+    {
+        std::string src((const char*)pSrcData, SrcDataSize);
+        std::string patched = RtwTessellation::Patch(src);
+        if (patched != src)
+        {
+            HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
+                pDefines, pInclude, pEntrypoint, pTarget, Flags1, Flags2, ppCode, ppErrorMsgs);
+            if (SUCCEEDED(hr))
+            {
+                Log("ShaderPatch: patched RTW caster tessellation factors (%s)", pTarget);
+                DumpInjection("rtwtess", pSourceName, pEntrypoint, src, patched, pDefines);
+                if (ppCode && *ppCode)
+                    SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
+                        pEntrypoint, pTarget, pSourceName,
+                        (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+                return hr;
+            }
+            Log("ShaderPatch: RTW tessellation patch failed, using original tessellator_hs");
             if (ppErrorMsgs && *ppErrorMsgs)
             {
                 Log("ShaderPatch: error: %s", (const char*)(*ppErrorMsgs)->GetBufferPointer());

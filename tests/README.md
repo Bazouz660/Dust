@@ -28,6 +28,11 @@ You can pass individual executable names to the native runner, for example
   large-coordinate camera pairs, stationary cameras, and invalid inputs.
 - `ShaderCacheStampTests`: locked cache, locked stamp, absent cache, unchanged
   stamp and damaged stamp, using isolated temporary files.
+- `RtwTessellationTests`: runs the patched RTW caster hull shader on WARP and counts the
+  emitted triangles through stream output against literal-factor references: edges that
+  cross warp cells are subdivided even when both ends warp to the same place, small and
+  off-map patches are left alone, and factors cap at 64. Pass the installed game's
+  `data/materials/common/rtwtessellator.hlsl` as an argument to patch and compile the real file.
 - `ShadowCasterBiasTests`: renders slope-bias probes on WARP with viewports
   from 1024 to 16384, checking RTW compensation, the original maximum bias,
   unchanged native/CSM calculations, unbound-buffer fallback, resolution
