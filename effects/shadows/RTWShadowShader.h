@@ -132,25 +132,39 @@ float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,
     if (dustRtwPcssEnabled > 0.5) {
         float depthScale = max(length(shadowMatrix[2].xyz), 1e-8);
         float2 uvScale = float2(length(shadowMatrix[0].xyz), length(shadowMatrix[1].xyz));
-        float2 searchRadius = max(baseRadius, shadowRange * dustRtwLightSize * uvScale);
+        // A blocker h above the receiver covers part of the light disc only
+        // within h * lightSize of it. The widest useful search is therefore
+        // the reach of the farthest blocker considered. Shadow Range alone is
+        // far too generous a bound for that distance: rings hundreds of units
+        // wide sampled unrelated hills and roofs and blurred contact shadows.
+        static const float kMaxBlockerDistance = 500.0;
+        float maxReach = min(shadowRange, kMaxBlockerDistance) * dustRtwLightSize;
+        float2 searchRadius = max(baseRadius, maxReach * uvScale);
         float blockerSeparation = 0;
         float blockerCount = 0;
         if (centerDepth < sd - b) {
             blockerSeparation = sd - centerDepth;
             blockerCount = 1;
         }
-        // Search all four directions at each scale. A single wide ring can
-        // miss every caster after warp clipping; a partial probe cannot prove
-        // that the rest of the search footprint is empty.
-        static const float2 searchDirections[4] = {
-            float2(1, 0), float2(0, 1), float2(-1, 0), float2(0, -1)
+        // Six geometric rings of two opposite taps. A tap counts only if the
+        // surface it finds is high enough for its light cone to reach this
+        // receiver; lower surfaces further away cannot occlude the light disc.
+        // Rings at the antialiasing floor are exempt from the cone test.
+        static const float searchScales[6] = {0.03125, 0.0625, 0.125, 0.25, 0.5, 1.0};
+        static const float2 searchDirections[6] = {
+            float2( 1.000000,  0.000000), float2(-0.737369,  0.675490),
+            float2( 0.087426, -0.996171), float2( 0.608439,  0.793601),
+            float2(-0.984713, -0.174182), float2( 0.843755, -0.536729)
         };
-        static const float searchScales[3] = {0.0625, 0.25, 1.0};
         [unroll] for (int j = 0; j < 12; j++) {
-            float2 radius = max(baseRadius, searchRadius * searchScales[j / 4]);
-            float2 uv = receiver.position.xy + mul(rot, searchDirections[j % 4]) * radius;
+            float ringReach = maxReach * searchScales[j / 2];
+            float2 radius = max(baseRadius, ringReach * uvScale);
+            float2 direction = mul(rot, searchDirections[j / 2]) * ((j % 2) ? -1.0 : 1.0);
+            float2 uv = receiver.position.xy + direction * radius;
             float depth = DustRtwDepth(sMap, wMap, uv, receiver);
-            if (depth < sd - b) {
+            float separation = (sd - depth) / depthScale;
+            bool atFloor = all(radius <= baseRadius);
+            if (depth < sd - b && (atFloor || separation * dustRtwLightSize >= ringReach)) {
                 blockerSeparation += sd - depth;
                 blockerCount += 1;
             }

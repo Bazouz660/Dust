@@ -152,7 +152,7 @@ float4 main(float4 pixel : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
     };
 
     auto render = [&](const SceneParams& scene, ShadowParams shadows, UINT resolution,
-                      bool edge = false, float curvature = 0.f) {
+                      bool edge = false, float curvature = 0.f, float towerGap = 0.f) {
         shadows.texel = 1.f / resolution;
         std::vector<float> depths(resolution * resolution);
         for (UINT y = 0; y < resolution; ++y) for (UINT x = 0; x < resolution; ++x) {
@@ -162,6 +162,7 @@ float4 main(float4 pixel : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
             float unwarpedX = 2 * warpedX / (scene.warpScale + std::sqrt(discriminant));
             float worldX = unwarpedX / scene.projectionScale;
             float gap = (!edge || worldX < 0) ? scene.blockerGap : 0;
+            if (towerGap > 0 && worldX > .5f) gap = towerGap;
             depths[y * resolution + x] = scene.depthOffset + scene.depthScale * (scene.receiverDepth + scene.slope * worldX - gap);
         }
         std::vector<float> warp(513 * 2);
@@ -237,5 +238,19 @@ float4 main(float4 pixel : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
     AssertImagesNear(reference, render(scene, shadows, 2048, true, .6f), .084f);
     scene.blockerGap = 0; scene.slope = .8f;
     for (const auto& pixel : render(scene, shadows, 2048, false, .6f)) assert(pixel[0] == 1.f);
-    std::puts("RTW PCSS: penumbra survives depth-origin, depth-scale and warp changes; contact shadows remain sharper");
+    // A raised surface outside its own light cone cannot occlude the light
+    // disc here. It must not soften an unrelated contact shadow, whatever the
+    // shadow range allows the search to cover.
+    for (float range : {10.f, 10000.f}) {
+        scene = SceneParams{}; scene.slope = 0; scene.blockerGap = .05f; scene.shadowRange = range;
+        auto isolated = render(scene, shadows, 2048, true);
+        auto withPlateau = render(scene, shadows, 2048, true, 0.f, 1.f);
+        // Plateau edge at x = .5 with reach gap * lightSize = .3: columns left of x = .2 are unaffected.
+        for (UINT y = 0; y < probe.H; ++y) for (UINT x = 0; x < 14; ++x) {
+            assert(isolated[y * probe.W + x][0] == (x < 12 ? 0.f : 1.f));
+            assert(withPlateau[y * probe.W + x][0] == isolated[y * probe.W + x][0]);
+        }
+        if (range == 10.f) assert(partialPixels(withPlateau) > 16); // the plateau keeps its own penumbra
+    }
+    std::puts("RTW PCSS: penumbra survives depth-origin, depth-scale and warp changes; contact shadows remain sharper and ignore distant surfaces");
 }
