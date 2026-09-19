@@ -45,14 +45,12 @@ struct ShadowParams {
     float enabled = 1, filterRadius = .01f, lightSize = .03f, pcss = 0;
     float cliffFix = 0, cliffDistance = .1f, csmRadius = 1, csmBlend = 1;
     float csmWidth = .15f, quality = 12, texel = 1.f / 256, csmFar = .85f;
-    float maxPenumbra = 0;   // 0 = uncapped (the 500-unit fallback)
-    float contactRange = 0, pad1 = 0, pad2 = 0;   // 0 = no screen-space march
+    float maxPenumbra = 0, pad0 = 0, pad1 = 0, pad2 = 0;   // 0 = uncapped (the 500-unit fallback)
 };
 
 struct SceneParams {
     float slope = .4f, warpScale = 1, depthOffset = .1f, depthScale = .1f;
     float projectionScale = .1f, receiverDepth = 3, blockerGap = 0, shadowRange = 10;
-    float contactFar = 1, scenePad0 = 0, scenePad1 = 0, scenePad2 = 0;   // scale of the fake scene depth
 };
 
 int main(int argc, char** argv)
@@ -97,7 +95,6 @@ int main(int argc, char** argv)
 cbuffer Scene : register(b0) {
     float slope, warpScale, depthOffset, depthScale;
     float projectionScale, receiverDepth, blockerGap, shadowRange;
-    float contactFar;
 };
 sampler2D depthMap : register(s0);
 sampler2D warpMap : register(s1);
@@ -109,9 +106,7 @@ float4 main(float4 pixel : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
                                0, 0, depthScale, depthOffset,
                                0, 0, 0, 1);
     float visibility = DustRTWShadow(depthMap, warpMap, shadowProjection, world, .00003, 0,
-                                    pixel.xy, normalize(float3(-slope, 0, 1)), 0, shadowRange,
-                                    depthMap, float3(0, 0, -5), shadowProjection, shadowProjection,
-                                    float3(0, 0, 1), contactFar, float2(0, 0));
+                                    pixel.xy, normalize(float3(-slope, 0, 1)), 0, shadowRange);
     return visibility.xxxx;
 })hlsl";
     EffectShaderProbe probe("ssao", "DustSSAO.dll");
@@ -313,31 +308,5 @@ float4 main(float4 pixel : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
         }
     }
 
-    // Screen-space contact shadows run only where the map's centre texel holds a caster
-    // farther than the contact range while light still arrives, and only darken when the
-    // scene depth puts something in the way.
-    scene = SceneParams{}; scene.slope = 0; scene.blockerGap = 1;
-    {
-        ShadowParams contact = shadows;
-        contact.contactRange = 0.5f;                     // the caster is 1 unit up: a candidate
-        auto off = render(scene, shadows, 2048, true);
-        scene.contactFar = 1e6f;                         // scene depth far behind every sample: no hit
-        auto clear = render(scene, contact, 2048, true);
-        scene.contactFar = 0;                            // scene depth in front of every sample: always a hit
-        auto blocked = render(scene, contact, 2048, true);
-        int darkened = 0;
-        for (UINT y = 0; y < probe.H; ++y) for (UINT x = 0; x < probe.W; ++x) {
-            float before = off[y * probe.W + x][0];
-            assert(clear[y * probe.W + x][0] == before);
-            if (x >= probe.W / 2) assert(blocked[y * probe.W + x][0] == before);   // lit side: centre texel unblocked
-            else if (before > .02f) { assert(blocked[y * probe.W + x][0] == 0.f); ++darkened; }
-            else assert(blocked[y * probe.W + x][0] == before);                    // already dark: not marched
-        }
-        assert(darkened > 0);
-        contact.contactRange = 2.f;                      // caster closer than the range: the map's job
-        auto withinRange = render(scene, contact, 2048, true);
-        for (UINT i = 0; i < probe.W * probe.H; ++i) assert(withinRange[i][0] == off[i][0]);
-    }
-
-    std::puts("RTW PCSS: penumbra survives depth-origin, depth-scale and warp changes; contact shadows remain sharper and ignore distant surfaces; penumbrae are two-sided and layered; contact shadows only fill the map's blind spot");
+    std::puts("RTW PCSS: penumbra survives depth-origin, depth-scale and warp changes; contact shadows remain sharper and ignore distant surfaces; penumbrae are two-sided and layered");
 }

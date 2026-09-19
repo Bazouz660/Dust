@@ -177,7 +177,6 @@ static std::string PatchDeferredShader(const std::string& src)
             "\tfloat dustShadowTexel;\n"
             "\tfloat dustCsmFarSoftness;\n"
             "\tfloat dustRtwMaxPenumbra;\n"
-            "\tfloat dustRtwContactRange;\n"
             "};\n\n"
             + std::string(DeferredJitter::Declaration())
             + RTWShadowShader::Source(workshopSteepBias) +
@@ -418,8 +417,7 @@ static std::string PatchDeferredShader(const std::string& src)
 
         std::string newExpr =
             "(dustShadowEnabled > 0.5) "
-            "? DustRTWShadow(" + params + ", pixel.xy, normal, distance, shadow_range, "
-            "gBuf2, viewPos.xyz, proj, inverseView, sunDirection.xyz, pFogParams.x, viewport.zw) "
+            "? DustRTWShadow(" + params + ", pixel.xy, normal, distance, shadow_range) "
             ": " + originalCall;
 
         result.replace(funcStart, closeParen - funcStart + 1, newExpr);
