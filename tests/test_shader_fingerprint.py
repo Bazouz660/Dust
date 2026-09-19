@@ -17,6 +17,7 @@ class ShaderFingerprintTests(unittest.TestCase):
             "src/MotionVectors.h", "src/D3D11Hook.cpp", "src/D3D11Hook.h", "src/DustAPI.h",
             "src/ShadowCasterBias.h",
             "src/RtwTessellation.h",
+            "src/RtwCasterDepth.h",
             "effects/shadows/DustShadows.cpp", "effects/shadows/layout.h", "effects/shadows/RTWShadowShader.h",
             "effects/shadows/shaders/shadow.hlsl",
         ]

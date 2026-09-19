@@ -28,6 +28,10 @@ You can pass individual executable names to the native runner, for example
   large-coordinate camera pairs, stationary cameras, and invalid inputs.
 - `ShaderCacheStampTests`: locked cache, locked stamp, absent cache, unchanged
   stamp and damaged stamp, using isolated temporary files.
+- `RtwCasterDepthTests`: renders a caster half a depth range sunward of the near plane into an
+  R32F map on WARP: the vanilla shape stores 0, the patched one stores -0.5 and still rasterises,
+  and cascade (non-RTW) variants are unchanged. Pass the installed game's `data/materials` folder
+  to patch all ten real RTW caster entry points and compile every variant that compiles unpatched.
 - `RtwTessellationTests`: runs the patched RTW caster hull shader on WARP and counts the
   emitted triangles through stream output against literal-factor references: edges that
   cross warp cells are subdivided even when both ends warp to the same place, small and

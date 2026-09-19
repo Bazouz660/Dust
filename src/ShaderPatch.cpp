@@ -1,6 +1,7 @@
 #include "ShaderPatch.h"
 #include "ShadowCasterBias.h"
 #include "RtwTessellation.h"
+#include "RtwCasterDepth.h"
 #include "../effects/shadows/RTWShadowShader.h"
 #include "DustLog.h"
 #include "SurveyRecorder.h"
@@ -992,6 +993,38 @@ HRESULT WINAPI HookedD3DCompile(
                 return hr;
             }
             Log("ShaderPatch: caster bias patch failed, using original shadow_fs");
+            if (ppErrorMsgs && *ppErrorMsgs)
+            {
+                Log("ShaderPatch: error: %s", (const char*)(*ppErrorMsgs)->GetBufferPointer());
+                (*ppErrorMsgs)->Release();
+                *ppErrorMsgs = nullptr;
+            }
+        }
+    }
+
+    // RTWSM casters sunward of the shadow camera's near plane were stored AT that
+    // plane, which moves with the camera (see RtwCasterDepth.h).
+    if (pEntrypoint && pTarget && (pTarget[0] == 'v' || pTarget[0] == 'd') && pSrcData && SrcDataSize &&
+        RtwCasterDepth::IsCasterEntry(pEntrypoint))
+    {
+        std::string src((const char*)pSrcData, SrcDataSize);
+        std::string patched = RtwCasterDepth::Patch(src, pEntrypoint);
+        if (patched != src)
+        {
+            HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
+                pDefines, pInclude, pEntrypoint, pTarget, Flags1, Flags2, ppCode, ppErrorMsgs);
+            if (SUCCEEDED(hr))
+            {
+                Log("ShaderPatch: RTW caster stores true depth (%s %s)",
+                    pSourceName ? pSourceName : "?", pEntrypoint);
+                DumpInjection("rtwdepth", pSourceName, pEntrypoint, src, patched, pDefines);
+                if (ppCode && *ppCode)
+                    SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
+                        pEntrypoint, pTarget, pSourceName,
+                        (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+                return hr;
+            }
+            Log("ShaderPatch: RTW caster depth patch failed for %s, using original", pEntrypoint);
             if (ppErrorMsgs && *ppErrorMsgs)
             {
                 Log("ShaderPatch: error: %s", (const char*)(*ppErrorMsgs)->GetBufferPointer());

@@ -179,15 +179,18 @@ float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,
         }
     }
 
+    // The atlas-tier tap count (4 at 12288) assumes a texel-sized filter. Spread over a
+    // wide penumbra it is mostly noise, so use the full disk there.
+    float taps = any(filterRadius > baseRadius * 2.0) ? 12.0 : dustRtwQuality;
     float shadow = 0;
     [unroll] for (int i = 0; i < 4; i++)
         shadow += DustShadowCmp(sMap, wMap, receiver.position.xy + mul(rot, pd[i]) * filterRadius, sd, b, receiver);
     float sCount = 4.0;
-    [branch] if (dustRtwQuality > 4.5) {
+    [branch] if (taps > 4.5) {
         [unroll] for (int i = 4; i < 8; i++)
             shadow += DustShadowCmp(sMap, wMap, receiver.position.xy + mul(rot, pd[i]) * filterRadius, sd, b, receiver);
         sCount = 8.0;
-        [branch] if (dustRtwQuality > 8.5) {
+        [branch] if (taps > 8.5) {
             [unroll] for (int i = 8; i < 12; i++)
                 shadow += DustShadowCmp(sMap, wMap, receiver.position.xy + mul(rot, pd[i]) * filterRadius, sd, b, receiver);
             sCount = 12.0;

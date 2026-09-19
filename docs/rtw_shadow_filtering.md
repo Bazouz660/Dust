@@ -22,4 +22,16 @@ Kenshi warps RTWSM casters per vertex and receivers per pixel, so it tessellates
 
 `src/RtwTessellation.h` replaces the factors through the D3DCompile hook: `ceil(3 * warp cells crossed)` per edge from the unwarped positions, clamped to 64, and 1 for edges whose warped end points are both beyond the same map border (the warp is monotonic per axis). Only symmetric operations are used, so triangles sharing an edge agree.
 
-Measured on the 5.0M caster triangles and the live warp map of `vanilla_rtwsm_frame11845.rdc` (2048 map): worst edge placement error 39.8 texels vanilla, 4.1 patched; edges off by more than 4 texels 0.62% vanilla, none patched; emitted triangles 15.0M vanilla, 9.4M patched. Terrain, skinned, foliage and construction casters are not tessellated by the game and are unchanged. In-game verification is pending.
+Measured on the 5.0M caster triangles and the live warp map of `vanilla_rtwsm_frame11845.rdc` (2048 map): worst edge placement error 39.8 texels vanilla, 4.1 patched; edges off by more than 4 texels 0.62% vanilla, none patched; emitted triangles 15.0M vanilla, 9.4M patched. Terrain, skinned, foliage and construction casters are not tessellated by the game and are unchanged. In-game (2026-09-19) this did not change the artifact it was written for; see the next section.
+
+## Caster depth at the near plane
+
+Kenshi fits the RTWSM shadow camera to the light-space bounding box of the main camera's eight frustum corners, far plane at Shadow Range, with no margin (`Kenshi_x64+0x865640`). Casters sunward of that box would be clipped, so every caster shader clamps `z` to the near plane, and the clamped value is also what it writes to the R32F map. Those casters are therefore stored at the near plane, not where they are. The near plane passes through the frustum point nearest the sun, which is the camera itself when it looks down at the ground, so it moves with every camera move.
+
+Two captures of the same spot show the effect. With the camera 1535 units behind the near plane nothing next to the scene was clamped, PCSS measured the building's real height and 39% of pixels sat at the 15 unit penumbra cap. With the camera on the near plane (camera depth -0.00002) 61% of the map was exactly 0, the ground was only 6 to 255 units behind the plane, PCSS measured that distance instead and no pixel reached the cap: the same shadow turned sharp.
+
+`src/RtwCasterDepth.h` reorders the two statements in all ten RTW caster entry points through the D3DCompile hook: the true depth goes to the map, the clamp only to the rasterised `z` (in the tessellated path the clamp moves from the vertex to the domain shader). Cascade variants of the same files are untouched. Casters clamped to the same `z` no longer depth-sort among themselves, so the stored depth is that of the first one drawn; it is still a real caster depth and no longer depends on the camera.
+
+Wide penumbrae now use the full 12-tap disk regardless of the atlas tier, which allowed only 4 taps at 12288.
+
+The straight-edged lit wedge beside the building in those captures is geometry, not a cut: the wall runs along world X, the sun's azimuth is 40 degrees off it, and the shadow edge leaves the building's corner within 8 degrees of the sun's azimuth (ground slope and slanted walls account for the rest). Ground between that edge and the wall sees the sun past the corner.
