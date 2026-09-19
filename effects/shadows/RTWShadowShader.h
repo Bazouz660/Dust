@@ -77,6 +77,9 @@ float DustShadowCmp(sampler2D sm, sampler2D wm, float2 uv, float d, float bias,
     return DustRtwDepth(sm, wm, uv, receiver) >= d - bias ? 1.0 : 0.0;
 }
 
+)hlsl"
+// MSVC caps one string literal at about 16 KB; adjacent literals concatenate.
+R"hlsl(
 // Vogel (golden-angle) disk PCF: well spread at any count, and one rotation angle per
 // pixel is enough. The atlas-tier count (4 at 12288) assumes a texel-sized filter; a wide
 // penumbra needs the full disk or it is mostly grain.
@@ -107,12 +110,45 @@ float DustRtwDisk(sampler2D sm, sampler2D wm, DustRtwReceiver receiver, float d,
     return visible / taps;
 }
 
+// Screen-space contact shadows for the one case a shadow map cannot represent. The map
+// holds one surface per texel, the nearest to the sun; under a far caster's soft edge the
+// ground is still partly lit, but anything standing under that caster is absent from the
+// map, so its crisp shadow stopped at the far caster's footprint. Only there, march a
+// short way toward the sun through the G-buffer depth. Costs nothing anywhere else.
+float DustRtwContactShadow(sampler2D sceneDepth, float3 viewPosition, float4x4 projection,
+                           float3 sunView, float farDistance, float2 pixelSize,
+                           float2 screenPos, float range) {
+    static const int kSteps = 16;
+    // A caster's visible surface hides the space behind it; treat that much as solid.
+    static const float kThickness = 25.0;
+    float start = frac(dot(screenPos, float2(0.7548776662, 0.5698402910)) + dustFrame * 0.6180339887);
+    [loop] for (int i = 0; i < kSteps; i++) {
+        float3 samplePosition = viewPosition + sunView * (0.6 + (i + start) / kSteps * range);
+        float4 clip = mul(projection, float4(samplePosition, 1));
+        if (clip.w <= 0) break;
+        // The G-buffer is rendered through the jittered viewport: the sample sits there too.
+        float2 uv = clip.xy / clip.w * float2(0.5, -0.5) + 0.5 + dustJitterPx * pixelSize;
+        if (any(uv < 0) || any(uv > 1)) break;
+        float sceneDistance = tex2Dlod(sceneDepth, float4(uv, 0, 0)).r * farDistance;
+        float sampleDistance = length(samplePosition);
+        if (sceneDistance < sampleDistance - 0.4 && sampleDistance - sceneDistance < kThickness)
+            return 0.0;
+    }
+    return 1.0;
+}
+
+)hlsl"
+// MSVC caps one string literal at about 16 KB; adjacent literals concatenate.
+R"hlsl(
 // Sample in the original light projection, then warp each tap independently.
 // A fixed post-warp radius would change its world footprint whenever the
 // camera-dependent importance map redistributes shadow texels.
 float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,
                      float3 worldPos, float b, float edgeBias, float2 screenPos,
-                     float3 normal, float dist, float shadowRange) {
+                     float3 normal, float dist, float shadowRange,
+                     sampler2D sceneDepth, float3 viewPosition, float4x4 projection,
+                     float4x4 inverseViewMatrix, float3 sunDirectionWorld,
+                     float farDistance, float2 pixelSize) {
     DustRtwReceiver receiver;
     receiver.position = mul(shadowMatrix, float4(worldPos, 1)).xyz;
     receiver.warpedUV = DustGetOffsetLocationS(wMap, receiver.position.xy, receiver.warpScale);
@@ -270,6 +306,14 @@ float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,
     [branch] if (layerSplit < 1e29)
         shadow *= DustRtwDisk(sMap, wMap, receiver, sd, b, tapRotation + 1.0, farRadius, baseRadius,
                               uvScale, reachPerDepth, 1e30);
+    // The centre texel holds a caster farther than the contact range, and light still
+    // arrives: whatever stands under that caster is missing from the map.
+    [branch] if (dustRtwContactRange > 0.0 && shadow > 0.02 &&
+                 (sd - centerDepth) / depthScale > dustRtwContactRange) {
+        float3 sunView = normalize(mul((float3x3)inverseViewMatrix, sunDirectionWorld));
+        shadow *= DustRtwContactShadow(sceneDepth, viewPosition, projection, sunView, farDistance,
+                                       pixelSize, screenPos, dustRtwContactRange);
+    }
     return shadow;
 }
 
