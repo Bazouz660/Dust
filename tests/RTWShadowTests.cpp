@@ -45,6 +45,7 @@ struct ShadowParams {
     float enabled = 1, filterRadius = .01f, lightSize = .03f, pcss = 0;
     float cliffFix = 0, cliffDistance = .1f, csmRadius = 1, csmBlend = 1;
     float csmWidth = .15f, quality = 12, texel = 1.f / 256, csmFar = .85f;
+    float maxPenumbra = 0, pad0 = 0, pad1 = 0, pad2 = 0;   // 0 = uncapped (the 500-unit fallback)
 };
 
 struct SceneParams {
@@ -294,5 +295,18 @@ float4 main(float4 pixel : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
             assert(litSide >= 2 && std::abs(litSide - darkSide) <= 2);
         }
     }
+    // Max Penumbra caps the soft edge in world units, whatever the caster's height.
+    scene = SceneParams{}; scene.slope = 0; scene.blockerGap = 1;
+    {
+        ShadowParams capped = shadows;
+        capped.maxPenumbra = 0.1f;                       // uncapped reach here is gap * lightSize = 0.3
+        auto wide = render(scene, shadows, 2048, true);
+        auto narrow = render(scene, capped, 2048, true);
+        assert(partialPixels(narrow) > 0 && partialPixels(narrow) * 2 <= partialPixels(wide));
+        for (UINT y = 0; y < probe.H; ++y) {             // and it stays centred on the edge
+            assert(narrow[y * probe.W + 9][0] == 0.f && narrow[y * probe.W + 14][0] == 1.f);
+        }
+    }
+
     std::puts("RTW PCSS: penumbra survives depth-origin, depth-scale and warp changes; contact shadows remain sharper and ignore distant surfaces; penumbrae are two-sided and layered");
 }

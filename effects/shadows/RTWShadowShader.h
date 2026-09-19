@@ -155,12 +155,17 @@ float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,
     float2 uvScale = max(float2(length(shadowMatrix[0].xyz), length(shadowMatrix[1].xyz)), 1e-12);
     if (dustRtwPcssEnabled > 0.5) {
         // A blocker h above the receiver covers part of the light disc only
-        // within h * lightSize of it. The widest useful search is therefore
-        // the reach of the farthest blocker considered. Shadow Range alone is
-        // far too generous a bound for that distance: rings hundreds of units
-        // wide sampled unrelated hills and roofs and blurred contact shadows.
-        static const float kMaxBlockerDistance = 500.0;
-        float maxReach = min(shadowRange, kMaxBlockerDistance) * dustRtwLightSize;
+        // within h * lightSize of it, so the widest useful search is the widest
+        // penumbra allowed. That is a setting in world units (Max Penumbra), not
+        // Shadow Range: rings hundreds of units wide sampled unrelated hills and
+        // roofs, and a shadow map holds one surface per texel, so inside a tall
+        // caster's wide soft edge the crisp shadows of whatever stands under it are
+        // simply absent. A narrow cap keeps that zone a thin strip. An unbound or
+        // zero value falls back to the previous 500-unit blocker distance.
+        float maxReach = dustRtwMaxPenumbra > 0.0
+            ? dustRtwMaxPenumbra
+            : min(shadowRange, 500.0) * dustRtwLightSize;
+        maxReach = min(maxReach, shadowRange * dustRtwLightSize);
         float2 searchRadius = max(baseRadius, maxReach * uvScale);
         float separations[25];      // per search tap; 0 = no blocker
         separations[24] = centerDepth < sd - b ? sd - centerDepth : 0;

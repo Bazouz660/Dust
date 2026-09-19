@@ -176,6 +176,7 @@ static std::string PatchDeferredShader(const std::string& src)
             "\tfloat dustRtwQuality;\n"
             "\tfloat dustShadowTexel;\n"
             "\tfloat dustCsmFarSoftness;\n"
+            "\tfloat dustRtwMaxPenumbra;\n"
             "};\n\n"
             + std::string(DeferredJitter::Declaration())
             + RTWShadowShader::Source(workshopSteepBias) +
