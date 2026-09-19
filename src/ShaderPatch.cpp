@@ -3,6 +3,7 @@
 #include "RtwTessellation.h"
 #include "RtwCasterDepth.h"
 #include "RtwWarpBuild.h"
+#include "RtwWarpLookup.h"
 #include "../effects/shadows/RTWShadowShader.h"
 #include "DustLog.h"
 #include "SurveyRecorder.h"
@@ -1000,6 +1001,22 @@ HRESULT WINAPI HookedD3DCompile(
                 (*ppErrorMsgs)->Release();
                 *ppErrorMsgs = nullptr;
             }
+        }
+    }
+
+    // Every RTWSM warp lookup, in this source and in anything it includes, must use the
+    // same knot placement (see RtwWarpLookup.h). Applied before all other patches.
+    RtwWarpLookup::PatchingInclude warpInclude(pInclude);
+    if (pInclude) pInclude = &warpInclude;
+    std::string warpLookupSource;
+    if (pSrcData && SrcDataSize)
+    {
+        std::string original((const char*)pSrcData, SrcDataSize);
+        warpLookupSource = RtwWarpLookup::Patch(original);
+        if (warpLookupSource != original)
+        {
+            pSrcData = warpLookupSource.c_str();
+            SrcDataSize = warpLookupSource.size();
         }
     }
 

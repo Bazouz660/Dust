@@ -12,7 +12,7 @@
 // metric splits every triangle at least once (inside factor >= 2).
 namespace RtwTessellation
 {
-// Subdivisions per warp cell. The warp is piecewise linear per axis over 513 knots;
+// Subdivisions per warp cell. The warp is piecewise linear per axis over 513 knots (512 cells);
 // on captured geometry x3 brings the worst edge error from 40 to 4 shadow texels (at
 // 2048) while emitting 9.4M triangles where the vanilla metric emits 15.0M.
 constexpr int SegmentsPerCell = 3;
@@ -40,7 +40,7 @@ inline std::string Patch(const std::string& source)
         "\tif (hi.x < -1.0 || hi.y < -1.0 || lo.x > 1.0 || lo.y > 1.0) return 1.0;\n"
         // position is the UNWARPED clip position. Only symmetric operations, so both
         // triangles sharing an edge agree on its factor.
-        "\tfloat2 span = abs(a.position.xy / a.position.w - b.position.xy / b.position.w) * (0.5 * 513.0);\n"
+        "\tfloat2 span = abs(a.position.xy / a.position.w - b.position.xy / b.position.w) * (0.5 * 512.0);\n"
         "\treturn clamp(ceil(max(span.x, span.y) * " + std::to_string(SegmentsPerCell) + ".0), 1.0, 64.0);\n"
         "}\n\n";
     const std::string body =

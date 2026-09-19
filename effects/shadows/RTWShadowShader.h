@@ -11,15 +11,18 @@ inline std::string Source(bool workshopSteepBias)
         : "#define DUST_WORKSHOP_STEEP_BIAS 0\n") + R"hlsl(
 // [Dust] Bilinear warp lookup (replacement for point-sampled GetOffsetLocationS)
 float DustWarp1D(sampler2D wMap, float u, float row, out float scale) {
+    // 513 knots; knot i sits at u = i / 512, as the game's builder places it. Every
+    // caster lookup is patched to the same placement (src/RtwWarpLookup.h).
     const float kWarpW = 513.0;
-    float p = u * kWarpW - 0.5;
-    float pf = clamp(floor(p), 0.0, kWarpW - 2.0);
+    const float kCells = 512.0;
+    float p = u * kCells;
+    float pf = clamp(floor(p), 0.0, kCells - 1.0);
     float t = saturate(p - pf);
     float u0 = (pf + 0.5) / kWarpW;
     float u1 = (pf + 1.5) / kWarpW;
     float v0 = tex2Dlod(wMap, float4(u0, row, 0, 0)).x;
     float v1 = tex2Dlod(wMap, float4(u1, row, 0, 0)).x;
-    scale = 1.0 + (v1 - v0) * kWarpW;
+    scale = 1.0 + (v1 - v0) * kCells;
     return lerp(v0, v1, t);
 }
 float2 DustGetOffsetLocationS(sampler2D wMap, float2 ts, out float2 scale) {
@@ -59,7 +62,7 @@ float DustRtwDepth(sampler2D sm, sampler2D wm, float2 uv, DustRtwReceiver receiv
     // it for nearby taps; only taps crossing a segment need more warp reads.
     float2 localScale = receiver.warpScale;
     float2 warpedUV = receiver.warpedUV + (uv - receiver.position.xy) * localScale;
-    if (any(floor(uv * 513.0 - 0.5) != floor(receiver.position.xy * 513.0 - 0.5)))
+    if (any(floor(uv * 512.0) != floor(receiver.position.xy * 512.0)))
         warpedUV = DustGetOffsetLocationS(wm, uv, localScale);
     if (any(localScale <= 1e-5)) return 1.0;
     float2 sampleUV = (floor(warpedUV / dustShadowTexel) + 0.5) * dustShadowTexel;

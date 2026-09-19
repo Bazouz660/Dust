@@ -167,7 +167,7 @@ float4 main(float4 pixel : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
         }
         std::vector<float> warp(513 * 2);
         for (UINT i = 0; i < warp.size(); ++i) {
-            float u = (i % 513 + .5f) / 513 - .5f;
+            float u = (i % 513) / 512.f - .5f;   // knot i sits at u = i / 512
             warp[i] = (scene.warpScale - 1) * u + curvature * u * u;
         }
         auto depthView = texture(resolution, resolution, depths);

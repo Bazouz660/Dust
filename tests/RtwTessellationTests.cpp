@@ -157,7 +157,7 @@ int main(int argc, char** argv)
         return (unsigned)stats.PrimitivesStorageNeeded;
     };
 
-    const float cell = 2.0f / 513.0f;   // one warp cell in clip units
+    const float cell = 2.0f / 512.0f;   // one warp cell in clip units
 
     // A small on-map triangle is left alone. The vanilla metric splits it anyway.
     PatchData tiny = { { {0, 0, 0.5f, 1}, {0.1f * cell, 0, 0.5f, 1}, {0, 0.1f * cell, 0.5f, 1} },

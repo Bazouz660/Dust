@@ -28,6 +28,11 @@ You can pass individual executable names to the native runner, for example
   large-coordinate camera pairs, stationary cameras, and invalid inputs.
 - `ShaderCacheStampTests`: locked cache, locked stamp, absent cache, unchanged
   stamp and damaged stamp, using isolated temporary files.
+- `RtwWarpLookupTests`: patches both warp lookup spellings and included files (through the include
+  wrapper), then samples a 513-knot map on WARP with a linear clamp sampler: knot i is read at
+  u = i / 512 and the last stretch of the map still interpolates, where the vanilla lookup is flat.
+  Pass the installed game's `data/materials` folder to check that all 8 lookups in the 3 files are
+  patched and that no other shader samples the warp map.
 - `RtwWarpBuildTests`: runs the warp builder's region logic on WARP with an important region that
   reaches the map border and one that does not: patched, the region's end knot lands on the map
   edge (+1.0) where the vanilla test pushes it to 1.05, and no other knot moves.
