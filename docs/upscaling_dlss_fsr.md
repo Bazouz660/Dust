@@ -224,3 +224,11 @@ pipeline. The velocity G-buffer (A) must be verified via debug visualization
   (developer.nvidia.com/sw-notification), ship only the redistributable runtime
   DLL, and do NOT commit the whole SDK to a public repo (NVIDIA sec. 4b:
   no stand-alone SDK redistribution).
+
+## Water flickering against distant terrain under temporal AA (2026-09-19)
+
+Forward scene passes are not viewport-jittered (`JitterForwardPasses` is off by default because it made UI wobble), so forward geometry is depth-tested against G-buffer depth that carries a different sub-pixel offset every frame. For water that moves the waterline: where the plane meets terrain at a grazing angle, which is the normal case on distant LOD terrain, a sub-pixel depth shift is many pixels of shoreline, so the border flickers at the jitter rate. The occlusion-query span (`HookedBegin`/`HookedEnd`) already gave the one `zoneWater` plane the game's query tracks the G-buffer jitter, but other zones' planes and the `waterDistant` material render outside that span.
+
+The host now recognises every water pixel shader (`forward/water.hlsl`, entry `waterFP`: hash noted by the compile hook, or the `GROUND_Colour` uniform name when the bytecode comes from OGRE's microcode cache) and gives each water `DrawIndexed`/`DrawIndexedInstanced` in an unjittered forward scene pass the G-buffer's viewport offset for that draw only (`WaterJitterScope`). Draws whose viewport already has a fractional origin (the query span) are left alone. This restores the vanilla depth relationship and makes water jitter like the rest of the frame the upscaler compensates. Log lines: `water pixel shader recognised` and `water draws outside the occlusion-query span now share the G-buffer viewport jitter`.
+
+Not verifiable in a capture: DLSS does not initialise under RenderDoc injection, so the jitter is off in every capture. In-game verification pending.

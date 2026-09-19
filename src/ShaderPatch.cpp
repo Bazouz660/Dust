@@ -1312,6 +1312,12 @@ HRESULT WINAPI HookedD3DCompile(
                               pDefines, pInclude, pEntrypoint, pTarget,
                               Flags1, Flags2, ppCode, ppErrorMsgs);
 
+    // Water draws must share the G-buffer's temporal jitter; the host recognises them by
+    // pixel shader (see NoteWaterShaderBytecode).
+    if (SUCCEEDED(hr) && ppCode && *ppCode && pEntrypoint && pTarget && pTarget[0] == 'p' &&
+        strcmp(pEntrypoint, "waterFP") == 0)
+        D3D11Hook::NoteWaterShaderBytecode((*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+
     // Record shader source for survey (always, for all shaders)
     if (SUCCEEDED(hr) && ppCode && *ppCode && pSrcData && SrcDataSize > 0)
     {
