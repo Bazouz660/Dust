@@ -253,5 +253,21 @@ float4 main(float4 pixel : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
         }
         if (range == 10.f) assert(partialPixels(withPlateau) > 16); // the plateau keeps its own penumbra
     }
-    std::puts("RTW PCSS: penumbra survives depth-origin, depth-scale and warp changes; contact shadows remain sharper and ignore distant surfaces");
+    // The penumbra fades out on BOTH sides of the edge. The blocker search used to lose the
+    // caster part-way through the lit side, which ended the penumbra in a hard rim there.
+    scene = SceneParams{}; scene.slope = 0; scene.blockerGap = 1;
+    {
+        auto image = render(scene, shadows, 2048, true);
+        for (UINT y = 0; y < probe.H; ++y) {
+            int litSide = 0, darkSide = 0;
+            for (UINT x = 0; x < probe.W; ++x) {
+                float v = image[y * probe.W + x][0];
+                if (v > 0 && v < 1) (x >= probe.W / 2 ? litSide : darkSide)++;
+            }
+            if (litSide < 2 || std::abs(litSide - darkSide) > 2)
+                std::fprintf(stderr, "row %u: %d partial pixels on the lit side, %d on the dark side\n", y, litSide, darkSide);
+            assert(litSide >= 2 && std::abs(litSide - darkSide) <= 2);
+        }
+    }
+    std::puts("RTW PCSS: penumbra survives depth-origin, depth-scale and warp changes; contact shadows remain sharper and ignore distant surfaces; penumbrae are two-sided");
 }

@@ -53,3 +53,13 @@ Temporal AA renders the G-buffer through a viewport shifted by a sub-pixel jitte
 The PCF taps are rotated by interleaved gradient noise, whose value nearly alternates between neighbouring pixels; static, that reads as a one-pixel checker in the penumbra. While a temporal AA is integrating frames the host advances the noise every frame (64-frame cycle) so the pattern averages out. Without temporal AA it stays static, because a moving pattern would boil.
 
 Both values reach the shader through `DustFrameParams` at PS `b8`, which the host binds for the sun draw only and unbinds afterwards. Unbound it reads as zero: no correction and static noise.
+
+## Penumbra quality without temporal AA
+
+Measured on a full-resolution crop of a captured penumbra (59k penumbra pixels, replica of the shader): residual noise 0.103 and one-pixel checker energy 0.158. Tap count and tap rotation were only part of it. The blocker search rotated its two taps per ring per pixel, so neighbouring pixels disagreed about whether a blocker exists (3.2% of neighbours differed by more than 25% in filter radius), and the radius flipped between the texel floor and the full penumbra: hatching along the lit edge.
+
+- The search uses six rings of four fixed directions, alternate rings turned by 45 degrees. Deterministic, so neighbours agree (0.6%).
+- Rings are discrete, so a receiver inside a blocker's cone could fall between the last ring that finds it and the first short enough to pass the cone test; the penumbra then ended in a hard, jagged rim on the lit side. A hit whose reach is shorter than its ring is probed again in the same direction at that reach; still a hit means the receiver is inside the cone. Merely loosening the cone test (tried: 3x) also removed the rim, but let distant casters widen the filter over nearby contact shadows, which the plateau regression test caught.
+- The PCF uses a Vogel disk, 24 taps for wide penumbrae (atlas tier otherwise), rotated per pixel by the R2 sequence, which does not alternate between neighbours the way interleaved gradient noise does. Under temporal AA the rotation also advances per frame.
+
+Result on the same crop: residual noise 0.038, checker energy 0.050, and a penumbra that fades out on both sides. Cost: 24 search taps (was 12) for every lit pixel, plus one probe per rejected hit, and 24 PCF taps (was 12) inside wide penumbrae.

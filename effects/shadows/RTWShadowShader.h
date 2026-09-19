@@ -104,31 +104,13 @@ float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,
         b += (cf_steep * cf_steep) * cf_gate * 0.0032;
     }
 
-    // Interleaved gradient noise nearly alternates between neighbouring pixels, so a
-    // static tap rotation reads as a one-pixel checker in the penumbra. While a
-    // temporal AA integrates frames the host advances dustFrame and the pattern
-    // averages out; dustFrame is 0 otherwise (a moving pattern would just boil).
-    float2 noisePosition = screenPos + 5.588238 * dustFrame;
-    float noise = frac(52.9829189 * frac(dot(noisePosition, float2(0.06711056, 0.00583715))));
-    float ang = noise * 6.28318530718;
-    float sa, ca;
-    sincos(ang, sa, ca);
-    float2x2 rot = float2x2(ca, sa, -sa, ca);
-
-    static const float2 pd[12] = {
-        float2(-0.326212, -0.405810),
-        float2(-0.840144, -0.073580),
-        float2(-0.695914,  0.457137),
-        float2(-0.203345,  0.620716),
-        float2( 0.962340, -0.194983),
-        float2( 0.473434, -0.480026),
-        float2( 0.519456,  0.767022),
-        float2( 0.185461, -0.893124),
-        float2( 0.507431,  0.064425),
-        float2( 0.896420,  0.412458),
-        float2(-0.321940, -0.932615),
-        float2(-0.791559, -0.597705)
-    };
+    // Tap rotation. Interleaved gradient noise nearly alternates between neighbouring
+    // pixels, which read as a one-pixel checker in penumbrae; the R2 low-discrepancy
+    // sequence does not. While a temporal AA integrates frames the host advances
+    // dustFrame (golden-ratio steps) so the remaining grain averages out; it is 0
+    // otherwise, because a moving pattern would just boil.
+    float tapRotation = 6.28318530718 *
+        frac(dot(screenPos, float2(0.7548776662, 0.5698402910)) + dustFrame * 0.6180339887);
 
     // Filter Radius remains a texel-sized antialiasing floor. PCSS Light Size
     // is an angular radius; its world-space footprint is independent of the
@@ -154,27 +136,44 @@ float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,
             blockerSeparation = sd - centerDepth;
             blockerCount = 1;
         }
-        // Six geometric rings of two opposite taps. A tap counts only if the
-        // surface it finds is high enough for its light cone to reach this
-        // receiver; lower surfaces further away cannot occlude the light disc.
-        // Rings at the antialiasing floor are exempt from the cone test.
+        // Six geometric rings of four FIXED directions, alternate rings turned by 45
+        // degrees. A per-pixel rotation made neighbouring pixels disagree about whether
+        // a blocker exists, so the filter radius flipped between them: the hatching at
+        // the lit edge of penumbrae. A surface counts only if it is high enough for its
+        // light cone to reach this receiver; lower surfaces further away cannot occlude
+        // the light disc. Rings at the antialiasing floor are exempt.
+        //
+        // Rings are discrete: a receiver inside a blocker's cone can sit between the last
+        // ring that still finds the blocker and the first that is short enough to pass
+        // the cone test, and the penumbra then ended in a hard rim on its lit side. So a
+        // hit whose reach is shorter than its ring is probed again, in the same
+        // direction, at that reach: still a hit means the receiver is inside the cone.
+        // (Merely loosening the test let distant casters widen the filter over nearby
+        // contact shadows.)
         static const float searchScales[6] = {0.03125, 0.0625, 0.125, 0.25, 0.5, 1.0};
-        static const float2 searchDirections[6] = {
-            float2( 1.000000,  0.000000), float2(-0.737369,  0.675490),
-            float2( 0.087426, -0.996171), float2( 0.608439,  0.793601),
-            float2(-0.984713, -0.174182), float2( 0.843755, -0.536729)
+        static const float2 searchDirections[8] = {
+            float2( 1.0,  0.0), float2( 0.0,  1.0), float2(-1.0,  0.0), float2( 0.0, -1.0),
+            float2( 0.70710678,  0.70710678), float2(-0.70710678,  0.70710678),
+            float2(-0.70710678, -0.70710678), float2( 0.70710678, -0.70710678)
         };
-        [unroll] for (int j = 0; j < 12; j++) {
-            float ringReach = maxReach * searchScales[j / 2];
+        [unroll] for (int j = 0; j < 24; j++) {
+            int ring = j / 4;
+            float ringReach = maxReach * searchScales[ring];
             float2 radius = max(baseRadius, ringReach * uvScale);
-            float2 direction = mul(rot, searchDirections[j / 2]) * ((j % 2) ? -1.0 : 1.0);
-            float2 uv = receiver.position.xy + direction * radius;
-            float depth = DustRtwDepth(sMap, wMap, uv, receiver);
-            float separation = (sd - depth) / depthScale;
-            bool atFloor = all(radius <= baseRadius);
-            if (depth < sd - b && (atFloor || separation * dustRtwLightSize >= ringReach)) {
-                blockerSeparation += sd - depth;
-                blockerCount += 1;
+            float2 direction = searchDirections[(ring % 2) * 4 + (j % 4)];
+            float depth = DustRtwDepth(sMap, wMap, receiver.position.xy + direction * radius, receiver);
+            [branch] if (depth < sd - b) {
+                float reach = (sd - depth) / depthScale * dustRtwLightSize;
+                bool accepted = all(radius <= baseRadius) || reach >= ringReach;
+                [branch] if (!accepted) {
+                    float2 inner = max(baseRadius, reach * uvScale);
+                    depth = DustRtwDepth(sMap, wMap, receiver.position.xy + direction * inner, receiver);
+                    accepted = depth < sd - b;
+                }
+                if (accepted) {
+                    blockerSeparation += sd - depth;
+                    blockerCount += 1;
+                }
             }
         }
         if (blockerCount > 0) {
@@ -187,24 +186,18 @@ float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,
         }
     }
 
-    // The atlas-tier tap count (4 at 12288) assumes a texel-sized filter. Spread over a
-    // wide penumbra it is mostly noise, so use the full disk there.
-    float taps = any(filterRadius > baseRadius * 2.0) ? 12.0 : dustRtwQuality;
+    // A Vogel (golden-angle) disk: well spread at any count, and one rotation angle per
+    // pixel is enough. The atlas-tier count (4 at 12288) assumes a texel-sized filter;
+    // a wide penumbra needs the full disk or it is mostly grain.
+    float taps = any(filterRadius > baseRadius * 2.0) ? 24.0 : dustRtwQuality;
     float shadow = 0;
-    [unroll] for (int i = 0; i < 4; i++)
-        shadow += DustShadowCmp(sMap, wMap, receiver.position.xy + mul(rot, pd[i]) * filterRadius, sd, b, receiver);
-    float sCount = 4.0;
-    [branch] if (taps > 4.5) {
-        [unroll] for (int i = 4; i < 8; i++)
-            shadow += DustShadowCmp(sMap, wMap, receiver.position.xy + mul(rot, pd[i]) * filterRadius, sd, b, receiver);
-        sCount = 8.0;
-        [branch] if (taps > 8.5) {
-            [unroll] for (int i = 8; i < 12; i++)
-                shadow += DustShadowCmp(sMap, wMap, receiver.position.xy + mul(rot, pd[i]) * filterRadius, sd, b, receiver);
-            sCount = 12.0;
-        }
+    [loop] for (int i = 0; i < 24; i++) {
+        if (i >= (int)taps) break;
+        float tapAngle = i * 2.39996323 + tapRotation;
+        float2 tap = sqrt((i + 0.5) / taps) * float2(cos(tapAngle), sin(tapAngle));
+        shadow += DustShadowCmp(sMap, wMap, receiver.position.xy + tap * filterRadius, sd, b, receiver);
     }
-    shadow /= sCount;
+    shadow /= taps;
     return shadow;
 }
 
