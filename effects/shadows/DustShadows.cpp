@@ -26,7 +26,7 @@ struct ShadowConfig {
 
     // === RTWSM ===
     float filterRadius      = 1.0f;   // RTW UV-space filter radius (scaled by 0.001 * resScale)
-    float lightSize         = 3.0f;   // RTW PCSS: tan(angular radius) * 100
+    float lightSize         = 1.0f;   // RTW PCSS: tan(angular radius) * 100 (the sun is about 0.47)
     bool  pcssEnabled       = true;   // RTW PCSS toggle
     bool  cliffFix          = false;  // off by default: previous always-on caused
                                       // close-range vertical shadows to disappear
