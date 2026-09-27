@@ -16,7 +16,9 @@ You can pass individual executable names to the native runner, for example
 - `CrashReportTests`: real exceptions in disposable child processes using the
   production client and reporter; verifies dump streams and archive contents,
   worker faults, stack overflow, normal/handled exceptions, handler chaining,
-  opt-out, missing helper, unwritable output and shutdown suppression. Build
+  opt-out, missing helper, unwritable output and shutdown suppression; a fault
+  inside `DestroyWindow` of the game window is exit noise (no report), inside
+  another window's it is still reported. Build
   `crash/DustCrashReporter.vcxproj` first (included in `build.ps1`).
 
 - `InteropLifetimeTests`: blocks a real D3D12 WARP queue across timeout and

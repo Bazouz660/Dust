@@ -174,7 +174,7 @@ static HRESULT STDMETHODCALLTYPE HookedCreateSwapChain(
                 gCapturedSwapChain->Release();
             gCapturedSwapChain = *ppSwapChain;
             gCapturedSwapChain->AddRef();
-            gCapturedHWND = pDesc->OutputWindow;
+            gCapturedHWND = DustCrash::gameWindow = pDesc->OutputWindow;
             BootLog("Captured swap chain %p (HWND=%p, AddRef'd) via CreateSwapChain",
                     gCapturedSwapChain, gCapturedHWND);
         }
@@ -212,7 +212,7 @@ static HRESULT STDMETHODCALLTYPE HookedCreateSwapChainForHwnd(
                 gCapturedSwapChain->Release();
             gCapturedSwapChain = (IDXGISwapChain*)*ppSwapChain;
             gCapturedSwapChain->AddRef();
-            gCapturedHWND = hWnd;
+            gCapturedHWND = DustCrash::gameWindow = hWnd;
             BootLog("Captured swap chain %p (HWND=%p, AddRef'd) via CreateSwapChainForHwnd",
                     gCapturedSwapChain, gCapturedHWND);
         }
@@ -248,7 +248,7 @@ static HRESULT WINAPI HookedD3D11CreateDeviceAndSwapChain(
             gCapturedSwapChain->Release();
         gCapturedSwapChain = *ppSwapChain;
         gCapturedSwapChain->AddRef();
-        gCapturedHWND = pSwapChainDesc->OutputWindow;
+        gCapturedHWND = DustCrash::gameWindow = pSwapChainDesc->OutputWindow;
         BootLog("Captured swap chain %p (HWND=%p, %ux%u) via D3D11CreateDeviceAndSwapChain",
                 gCapturedSwapChain, gCapturedHWND,
                 pSwapChainDesc->BufferDesc.Width, pSwapChainDesc->BufferDesc.Height);
@@ -475,6 +475,9 @@ static void StartCrashReporting()
     if (KenshiLib::AddHook((void*)SetUnhandledExceptionFilter,(void*)DustCrash::SetNext,
         &originalSetFilter) != KenshiLib::SUCCESS)
         BootLog("WARNING: crash recorder installed, but later exception filters may replace it");
+    if (KenshiLib::AddHook(DestroyWindow,(void*)DustCrash::DestroyWindowHook,
+        &DustCrash::realDestroyWindow) != KenshiLib::SUCCESS)
+        BootLog("WARNING: crashes while the game window closes on exit may be reported");
     BootLog("Automatic crash reporting ready: %%LOCALAPPDATA%%\\Dust\\crash_reports");
 }
 
