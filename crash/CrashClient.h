@@ -13,6 +13,15 @@ inline PVOID volatile nextFilter = nullptr;
 inline LPTOP_LEVEL_EXCEPTION_FILTER WINAPI SetNext(LPTOP_LEVEL_EXCEPTION_FILTER filter) {
     return reinterpret_cast<LPTOP_LEVEL_EXCEPTION_FILTER>(InterlockedExchangePointer(&nextFilter, reinterpret_cast<PVOID>(filter)));
 }
+// Vanilla Kenshi can crash while OGRE destroys the game window on exit (RE_Kenshi's
+// window procedure reads freed state inside DestroyWindow). That is exit noise, not a
+// report: DustBoot hooks DestroyWindow, and destroying gameWindow counts as shutdown.
+inline HWND gameWindow = nullptr;
+inline BOOL (WINAPI* realDestroyWindow)(HWND) = nullptr;
+inline BOOL WINAPI DestroyWindowHook(HWND window) {
+    if (window && window == gameWindow) InterlockedExchange(&shuttingDown,1);
+    return realDestroyWindow(window);
+}
 inline LONG WINAPI Filter(EXCEPTION_POINTERS* ep) {
     if (!InterlockedCompareExchange(&shuttingDown,0,0) && ep && request) {
         if (InterlockedCompareExchange(&reporting,1,0) == 0) {

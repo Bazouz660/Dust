@@ -49,7 +49,10 @@ ZIP packaging then proceeds independently.
 
 DustBoot keeps its recorder ahead of later `SetUnhandledExceptionFilter`
 registrations and preserves the downstream handler chain. Handled exceptions
-do not generate reports. Shutdown noise is excluded after Dust signals teardown.
+do not generate reports. Exit noise is excluded: recording stops once the game's own
+window is being destroyed (vanilla Kenshi can crash there, for example in
+RE_Kenshi's window procedure) and after Dust signals teardown. Other windows,
+such as Dust's temporary startup window, do not count.
 
 This covers ordinary unhandled Windows exceptions, including tested access
 violations on main/worker threads and stack overflow. It cannot guarantee dumps
@@ -67,4 +70,6 @@ in the game mod. Open `crash.dmp` in WinDbg or Visual Studio with those symbols.
 processes, never Kenshi. It verifies the ZIP and minidump exception/thread/module
 streams, the target PID, startup capture without effects, disabled logging,
 normal exit, handled exceptions, worker faults, stack overflow, later handler
-chaining, opt-out, missing helper, unwritable output and shutdown suppression.
+chaining, opt-out, missing helper, unwritable output, shutdown suppression, and
+a fault inside `DestroyWindow` of the game window (no report) versus another
+window (reported).

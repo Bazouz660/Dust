@@ -17,6 +17,16 @@ static LONG WINAPI Previous(EXCEPTION_POINTERS*) {
 static LONG WINAPI Later(EXCEPTION_POINTERS* ep) { return downstream(ep); }
 __declspec(noinline) static void Fault() { *reinterpret_cast<volatile int*>(1) = 7; }
 static void HandledFault() { __try { Fault(); } __except(EXCEPTION_EXECUTE_HANDLER) {} }
+// Faults inside DestroyWindow, as RE_Kenshi's window procedure does when Kenshi exits.
+static LRESULT CALLBACK FaultOnDestroy(HWND window, UINT message, WPARAM w, LPARAM l) {
+    if (message == WM_DESTROY) Fault();
+    return DefWindowProcW(window,message,w,l);
+}
+static HWND ProbeWindow(WNDPROC proc, const wchar_t* name) {
+    WNDCLASSW wc = {}; wc.lpfnWndProc = proc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = name;
+    RegisterClassW(&wc);
+    return CreateWindowExW(0,name,L"",WS_OVERLAPPED,0,0,64,64,nullptr,nullptr,wc.hInstance,nullptr);
+}
 __declspec(noinline) static void Overflow(int depth) {
     volatile char buffer[8192]; buffer[0] = static_cast<char>(depth);
     Overflow(depth+1);
@@ -35,6 +45,15 @@ static int Child(const std::wstring& mode, const fs::path& root) {
     if (mode == L"handled") { HandledFault(); return 0; }
     if (mode == L"shutdown") InterlockedExchange(&DustCrash::shuttingDown,1);
     if (mode == L"late") { downstream = DustCrash::SetNext(Later); assert(downstream == Previous); }
+    if (mode == L"exit" || mode == L"otherwindow") {
+        // Only destroying the captured game window marks shutdown; Dust also destroys
+        // a temporary window at startup, and a crash there must still be reported.
+        HWND faulting = ProbeWindow(FaultOnDestroy,L"DustCrashExitProbe"); assert(faulting);
+        DustCrash::gameWindow = mode == L"exit" ? faulting : ProbeWindow(DefWindowProcW,L"DustCrashOtherProbe");
+        assert(DustCrash::gameWindow);
+        DustCrash::realDestroyWindow = DestroyWindow;
+        DustCrash::DestroyWindowHook(faulting); assert(false);
+    }
     if (mode == L"worker" || mode == L"stack") {
         HANDLE thread = CreateThread(nullptr,0,[](void* p)->DWORD {
             if (p) Overflow(0); else Fault(); return 0;
@@ -74,7 +93,7 @@ int wmain(int argc, wchar_t** argv) {
     if (argc == 4 && std::wstring(argv[1]) == L"--child") return Child(argv[2],argv[3]);
     wchar_t exe[1024]; assert(GetModuleFileNameW(nullptr,exe,1024));
     fs::path base = fs::absolute(fs::path("build")/(L"crash probes \u00e9 "+std::to_wstring(GetCurrentProcessId())));
-    for (const auto& mode : {L"normal",L"handled",L"main",L"worker",L"stack",L"late",L"disabled",L"missing",L"unwritable",L"shutdown"}) {
+    for (const auto& mode : {L"normal",L"handled",L"main",L"worker",L"stack",L"late",L"disabled",L"missing",L"unwritable",L"shutdown",L"exit",L"otherwindow"}) {
         fs::path root = base/mode;
         fs::create_directories(root/L"mod"); fs::create_directories(root/L"game/data");
         if (std::wstring(mode) != L"missing") fs::copy_file("../crash/build/Release/DustCrashReporter.exe",root/L"mod/DustCrashReporter.exe");
@@ -88,8 +107,12 @@ int wmain(int argc, wchar_t** argv) {
         assert(WaitForSingleObject(pi.hProcess,45000) == WAIT_OBJECT_0);
         DWORD code; assert(GetExitCodeProcess(pi.hProcess,&code)); CloseHandle(pi.hProcess);
         const std::wstring m(mode);
-        bool crash = m == L"main" || m == L"worker" || m == L"stack" || m == L"late" || m == L"unwritable" || m == L"shutdown";
-        assert(code == (crash ? (m == L"stack" ? EXCEPTION_STACK_OVERFLOW : EXCEPTION_ACCESS_VIOLATION) : 0));
+        bool crash = m == L"main" || m == L"worker" || m == L"stack" || m == L"late" || m == L"unwritable" || m == L"shutdown"
+            || m == L"exit" || m == L"otherwindow";
+        // A fault inside a window callback ends the process with STATUS_FATAL_USER_CALLBACK_EXCEPTION.
+        const DWORD fault = m == L"stack" ? EXCEPTION_STACK_OVERFLOW
+            : (m == L"exit" || m == L"otherwindow") ? 0xC000041D : EXCEPTION_ACCESS_VIOLATION;
+        assert(code == (crash ? fault : 0));
         DWORD helperPid = 0; { std::ifstream input(root/L"helper.txt"); input >> helperPid; }
         if (helperPid) if (HANDLE helper = OpenProcess(SYNCHRONIZE,FALSE,helperPid)) {
             assert(WaitForSingleObject(helper,15000) == WAIT_OBJECT_0); CloseHandle(helper);
@@ -98,7 +121,7 @@ int wmain(int argc, wchar_t** argv) {
         if (fs::is_directory(root/L"reports")) for (const auto& entry : fs::directory_iterator(root/L"reports")) {
             if (entry.path().extension() == L".zip") { ++archives; CheckArchive(entry.path(),pi.dwProcessId,m == L"stack" ? EXCEPTION_STACK_OVERFLOW : EXCEPTION_ACCESS_VIOLATION); }
         }
-        assert(archives == ((crash && m != L"unwritable" && m != L"shutdown") ? 1 : 0));
+        assert(archives == ((crash && m != L"unwritable" && m != L"shutdown" && m != L"exit") ? 1 : 0));
         if (crash) assert(fs::file_size(root/L"chained.txt") == 7);
         std::printf("Crash recorder %ls: PASS\n",mode); std::fflush(stdout);
     }
