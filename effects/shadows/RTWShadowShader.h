@@ -189,7 +189,11 @@ float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,
             float2( 0.70710678,  0.70710678), float2(-0.70710678,  0.70710678),
             float2(-0.70710678, -0.70710678), float2( 0.70710678, -0.70710678)
         };
-        [unroll] for (int j = 0; j < 24; j++) {
+        // [loop], not [unroll], on this and the layer loops below: unrolled, the search
+        // (with its probe fetches) and the 25-entry bookkeeping expand the sun pass to ~5000
+        // instructions, which NVIDIA's Vulkan compiler (DXVK under Proton) spends minutes on:
+        // the game froze at load on Linux. The results are identical.
+        [loop] for (int j = 0; j < 24; j++) {
             int ring = j / 4;
             float ringReach = maxReach * searchScales[ring];
             float2 radius = max(baseRadius, ringReach * uvScale);
@@ -215,18 +219,18 @@ float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,
         // log2(separation), at least two octaves wide; a fixed ratio from the nearest
         // blocker cut through casters whose own separations span more than that ratio.
         uint occupied = 0;
-        [unroll] for (int k = 0; k < 25; k++) {
+        [loop] for (int k = 0; k < 25; k++) {
             if (separations[k] > 0) {
                 float octave = floor(log2(separations[k] / depthScale)) + 10.0;   // 2^-10 .. 2^13 units
                 occupied |= 1u << (uint)clamp(octave, 0.0, 23.0);
             }
         }
         int firstOctave = 24, lastOctave = -1;
-        [unroll] for (int o = 0; o < 24; o++) {
+        [loop] for (int o = 0; o < 24; o++) {
             if ((occupied >> (uint)o) & 1u) { firstOctave = min(firstOctave, o); lastOctave = o; }
         }
         int run = 0, runStart = 0, widest = 0, widestStart = 0;
-        [unroll] for (int e = 0; e < 24; e++) {
+        [loop] for (int e = 0; e < 24; e++) {
             bool empty = e > firstOctave && e < lastOctave && !((occupied >> (uint)e) & 1u);
             if (empty) {
                 if (run == 0) runStart = e;
@@ -240,7 +244,7 @@ float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,
         if (widest >= 2)
             splitSeparation = exp2(widestStart + widest * 0.5 - 10.0) * depthScale;
         float nearSum = 0, nearCount = 0, farSum = 0, farCount = 0;
-        [unroll] for (int m = 0; m < 25; m++) {
+        [loop] for (int m = 0; m < 25; m++) {
             float separation = separations[m];
             if (separation > 0) {
                 if (separation < splitSeparation) { nearSum += separation; nearCount += 1; }
