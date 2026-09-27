@@ -182,6 +182,11 @@ public:
                                     IID_PPV_ARGS(&reflection))));
         D3D11_SHADER_DESC shaderDesc;
         reflection->GetDesc(&shaderDesc);
+        // Unrolling the PCSS search and layer loops made this ~4700 instructions (~600 as
+        // loops); NVIDIA's Vulkan compiler then took minutes on the sun pass under DXVK and
+        // Kenshi froze at load on Linux. Keep the injected code compact.
+        std::printf("RTW probe shader: %u instructions\n", shaderDesc.InstructionCount);
+        assert(shaderDesc.InstructionCount < 1500);
         for (UINT i = 0; i < shaderDesc.BoundResources; ++i)
         {
             D3D11_SHADER_INPUT_BIND_DESC resource;

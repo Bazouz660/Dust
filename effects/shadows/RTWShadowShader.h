@@ -227,7 +227,11 @@ DustRtwLayers DustRtwFindLayers(sampler2D shadowMap, sampler2D warpMap, DustRtwR
             float2(-0.70710678, -0.70710678),
             float2( 0.70710678, -0.70710678)
         };
-        [unroll]
+        // [loop], not [unroll], on this and the layer loops below: unrolled, the search
+        // (with its probe fetches) and the 25-entry bookkeeping expand the sun pass to ~5000
+        // instructions, which NVIDIA's Vulkan compiler (DXVK under Proton) spends minutes on:
+        // the game froze at load on Linux. The results are identical.
+        [loop]
         for (int j = 0; j < 24; j++)
         {
             int ring = j / 4;
@@ -257,7 +261,7 @@ DustRtwLayers DustRtwFindLayers(sampler2D shadowMap, sampler2D warpMap, DustRtwR
             }
         }
         uint occupied = 0;
-        [unroll]
+        [loop]
         for (int k = 0; k < 25; k++)
         {
             if (separations[k] > 0)
@@ -268,7 +272,7 @@ DustRtwLayers DustRtwFindLayers(sampler2D shadowMap, sampler2D warpMap, DustRtwR
             }
         }
         int firstOctave = 24, lastOctave = -1;
-        [unroll]
+        [loop]
         for (int o = 0; o < 24; o++)
         {
             if ((occupied >> (uint)o) & 1u)
@@ -278,7 +282,7 @@ DustRtwLayers DustRtwFindLayers(sampler2D shadowMap, sampler2D warpMap, DustRtwR
             }
         }
         int run = 0, runStart = 0, widest = 0, widestStart = 0;
-        [unroll]
+        [loop]
         for (int e = 0; e < 24; e++)
         {
             bool empty = e > firstOctave && e < lastOctave && !((occupied >> (uint)e) & 1u);
@@ -306,7 +310,7 @@ DustRtwLayers DustRtwFindLayers(sampler2D shadowMap, sampler2D warpMap, DustRtwR
             splitSeparation = exp2(widestStart + widest * 0.5 - 10.0) * depthScale;
         }
         float nearSum = 0, nearCount = 0, farSum = 0, farCount = 0;
-        [unroll]
+        [loop]
         for (int m = 0; m < 25; m++)
         {
             float separation = separations[m];
