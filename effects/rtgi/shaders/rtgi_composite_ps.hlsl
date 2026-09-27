@@ -1,3 +1,4 @@
+#include "rtgi_finite.hlsl"
 // RTGI Composite Pass — applies GI intensity scaling at the final stage.
 // Drawn with additive blend onto the HDR scene.
 // When rendering below native res, uses joint bilateral upscale guided
@@ -96,7 +97,7 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
     // Never write NaN/Inf into the shared HDR scene. This pass is additive (dest += src),
     // so a single NaN here propagates through tonemap as a full-screen black. 0 = no-op add.
-    if (any(!isfinite(indirect)))
+    if (!all(RtgiIsFinite3(indirect)))
         indirect = float3(0, 0, 0);
 
     return float4(indirect, 1.0);

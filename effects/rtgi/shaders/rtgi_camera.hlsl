@@ -1,3 +1,4 @@
+#include "rtgi_finite.hlsl"
 // These are snapshots of the game's deferred CB, not CPU readbacks.
 cbuffer CurrentCamera : register(b1)
 {
@@ -34,7 +35,7 @@ bool RTGIPreviousPosition(float2 uv, float depth, float thf, float ar,
                           out float2 previousUV, out float previousDepth)
 {
     previousUV = uv; previousDepth = depth;
-    if (cameraHistoryValid < 0.5 || !isfinite(previousTanHalfFov) || previousTanHalfFov <= 0) return false;
+    if (cameraHistoryValid < 0.5 || !RtgiIsFinite(previousTanHalfFov) || previousTanHalfFov <= 0) return false;
     float3 ray = normalize(float3((uv.x * 2 - 1) * ar * thf, (1 - uv.y * 2) * thf, 1));
     float3 previous;
     if (useGpuCamera > 0.5) {
@@ -51,7 +52,7 @@ bool RTGIPreviousPosition(float2 uv, float depth, float thf, float ar,
     } else {
         previous = mul(float4(ray * depth, 1), fallbackReprojection).xyz;
     }
-    if (!all(isfinite(previous)) || previous.z <= 0.00001) return false;
+    if (!all(RtgiIsFinite3(previous)) || previous.z <= 0.00001) return false;
     // The history image was rendered with its own projection. Reusing today's
     // FOV here shifts every history sample during zoom; dropping history instead
     // would switch secondary-bounce lighting off across the whole image.
@@ -63,6 +64,6 @@ bool RTGIPreviousPosition(float2 uv, float depth, float thf, float ar,
 
 bool RTGIHistoryDepthMatches(float expected, float sampled)
 {
-    return isfinite(sampled) && sampled > 0.0001
+    return RtgiIsFinite(sampled) && sampled > 0.0001
         && abs(expected - sampled) <= max(expected * 0.02, 1e-5);
 }

@@ -40,7 +40,7 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         return current;
 
     float4 history = historyGI.SampleLevel(linearClamp, previousUV, 0);
-    if (!all(isfinite(history))) return current;
+    if (!all(RtgiIsFinite4(history))) return current;
 
     // Clamp HISTORY, not the current frame. Include the center and clamp loads
     // at image boundaries: first-frame and accumulated output share one signal.

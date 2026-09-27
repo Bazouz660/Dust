@@ -73,10 +73,10 @@ float3 Compress(float3 c)
     // Sanitize FIRST. The source is the raw HDR scene (blown-out sun/specular can be
     // +Inf) and the bounce feedback is our own prev GI buffer. An Inf here makes k=0 and
     // Inf*0 = NaN, which then rides the temporal (0.9) + bounce (0.3) feedback across the
-    // whole buffer and turns the additive composite into a full-screen black. isfinite is
+    // whole buffer and turns the additive composite into a full-screen black. RtgiIsFinite3 is
     // a bit-pattern test (checks the exponent), so rejecting NaN/Inf here does not depend
     // on any min/max NaN convention; the reciprocal below can then never make a NaN.
-    c = isfinite(c) ? max(c, 0.0) : float3(0.0, 0.0, 0.0);
+    c = RtgiIsFinite3(c) ? max(c, 0.0) : float3(0.0, 0.0, 0.0);
     float k = 1.0 / (1.0 + Luminance(c));
     return c * k * k;
 }
@@ -342,7 +342,7 @@ void main(uint3 tid : SV_DispatchThreadID)
     // can't overflow to +Inf in the buffer and re-enter next frame's bounce feedback. Any
     // NaN/Inf that slipped through (e.g. a normalize() of a degenerate vector) collapses
     // to 0 rather than being made permanent by the temporal + bounce feedback.
-    lighting = isfinite(lighting) ? min(lighting, 65504.0) : float3(0.0, 0.0, 0.0);
+    lighting = RtgiIsFinite3(lighting) ? min(lighting, 65504.0) : float3(0.0, 0.0, 0.0);
 
     outTex[tid.xy] = float4(lighting, ao);
 }
