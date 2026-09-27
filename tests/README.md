@@ -28,6 +28,28 @@ You can pass individual executable names to the native runner, for example
   large-coordinate camera pairs, stationary cameras, and invalid inputs.
 - `ShaderCacheStampTests`: locked cache, locked stamp, absent cache, unchanged
   stamp and damaged stamp, using isolated temporary files.
+- `DeferredJitterTests`: renders a grazing ground plane into a distance G-buffer through a
+  sub-pixel-shifted viewport on WARP, then rebuilds positions with the game's statement and with
+  the patched one: unjittered both are exact, jittered the vanilla points are whole units off the
+  surface and the patched ones are not. Pass the installed `deferred/deferred.hlsl` to check that
+  only `main_fs` is rewritten.
+- `RtwWarpLookupTests`: patches both warp lookup spellings and included files (through the include
+  wrapper), then samples a 513-knot map on WARP with a linear clamp sampler: knot i is read at
+  u = i / 512 and the last stretch of the map still interpolates, where the vanilla lookup is flat.
+  Pass the installed game's `data/materials` folder to check that all 8 lookups in the 3 files are
+  patched and that no other shader samples the warp map.
+- `RtwWarpBuildTests`: runs the warp builder's region logic on WARP with an important region that
+  reaches the map border and one that does not: patched, the region's end knot lands on the map
+  edge (+1.0) where the vanilla test pushes it to 1.05, and no other knot moves.
+- `RtwCasterDepthTests`: renders a caster half a depth range sunward of the near plane into an
+  R32F map on WARP: the vanilla shape stores 0, the patched one stores -0.5 and still rasterises,
+  and cascade (non-RTW) variants are unchanged. Pass the installed game's `data/materials` folder
+  to patch all ten real RTW caster entry points and compile every variant that compiles unpatched.
+- `RtwTessellationTests`: runs the patched RTW caster hull shader on WARP and counts the
+  emitted triangles through stream output against literal-factor references: edges that
+  cross warp cells are subdivided even when both ends warp to the same place, small and
+  off-map patches are left alone, and factors cap at 64. Pass the installed game's
+  `data/materials/common/rtwtessellator.hlsl` as an argument to patch and compile the real file.
 - `ShadowCasterBiasTests`: renders slope-bias probes on WARP with viewports
   from 1024 to 16384, checking RTW compensation, the original maximum bias,
   unchanged native/CSM calculations, unbound-buffer fallback, resolution

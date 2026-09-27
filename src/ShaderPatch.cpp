@@ -1,5 +1,10 @@
 #include "ShaderPatch.h"
 #include "ShadowCasterBias.h"
+#include "RtwTessellation.h"
+#include "RtwCasterDepth.h"
+#include "RtwWarpBuild.h"
+#include "RtwWarpLookup.h"
+#include "DeferredJitter.h"
 #include "../effects/shadows/ShadowShaderSource.h"
 #include "DustLog.h"
 #include "SurveyRecorder.h"
@@ -211,6 +216,18 @@ static std::string PatchDeferredShader(const std::string& src)
     else
     {
         Log("ShaderPatch: '= computeShadowMultiplier(' not found, CSM redirect skipped");
+    }
+
+    // Rebuild the world position on the jittered G-buffer sample's own ray. Needs the
+    // DustFrameParams declaration injected above; without it the statement is left alone.
+    if (pos3 != std::string::npos)
+    {
+        std::string unjittered = DeferredJitter::Patch(result);
+        if (unjittered != result)
+        {
+            result = unjittered;
+            Log("ShaderPatch: sun pass rebuilds world positions on the jittered sample ray");
+        }
     }
 
     return result;
@@ -773,6 +790,116 @@ HRESULT WINAPI HookedD3DCompile(
         }
     }
 
+    // Every RTWSM warp lookup, in this source and in anything it includes, must use the
+    // same knot placement (see RtwWarpLookup.h). Applied before all other patches.
+    RtwWarpLookup::PatchingInclude warpInclude(pInclude);
+    if (pInclude) pInclude = &warpInclude;
+    std::string warpLookupSource;
+    if (pSrcData && SrcDataSize)
+    {
+        std::string original((const char*)pSrcData, SrcDataSize);
+        warpLookupSource = RtwWarpLookup::Patch(original);
+        if (warpLookupSource != original)
+        {
+            pSrcData = warpLookupSource.c_str();
+            SrcDataSize = warpLookupSource.size();
+        }
+    }
+
+    // The game's RTWSM warp builder pushes the important region's end knot off the
+    // shadow map, which cuts shadows near the camera when zoomed in (see RtwWarpBuild.h).
+    if (pEntrypoint && pTarget && pTarget[0] == 'p' && pSrcData && SrcDataSize &&
+        strcmp(pEntrypoint, "rtw_build") == 0)
+    {
+        std::string src((const char*)pSrcData, SrcDataSize);
+        std::string patched = RtwWarpBuild::Patch(src);
+        if (patched != src)
+        {
+            HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
+                pDefines, pInclude, pEntrypoint, pTarget, Flags1, Flags2, ppCode, ppErrorMsgs);
+            if (SUCCEEDED(hr))
+            {
+                Log("ShaderPatch: RTW warp builder keeps the region's end knot on the map");
+                DumpInjection("rtwbuild", pSourceName, pEntrypoint, src, patched, pDefines);
+                if (ppCode && *ppCode)
+                    SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
+                        pEntrypoint, pTarget, pSourceName,
+                        (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+                return hr;
+            }
+            Log("ShaderPatch: RTW warp builder patch failed, using original rtw_build");
+            if (ppErrorMsgs && *ppErrorMsgs)
+            {
+                Log("ShaderPatch: error: %s", (const char*)(*ppErrorMsgs)->GetBufferPointer());
+                (*ppErrorMsgs)->Release();
+                *ppErrorMsgs = nullptr;
+            }
+        }
+    }
+
+    // RTWSM casters sunward of the shadow camera's near plane were stored AT that
+    // plane, which moves with the camera (see RtwCasterDepth.h).
+    if (pEntrypoint && pTarget && (pTarget[0] == 'v' || pTarget[0] == 'd') && pSrcData && SrcDataSize &&
+        RtwCasterDepth::IsCasterEntry(pEntrypoint))
+    {
+        std::string src((const char*)pSrcData, SrcDataSize);
+        std::string patched = RtwCasterDepth::Patch(src, pEntrypoint);
+        if (patched != src)
+        {
+            HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
+                pDefines, pInclude, pEntrypoint, pTarget, Flags1, Flags2, ppCode, ppErrorMsgs);
+            if (SUCCEEDED(hr))
+            {
+                Log("ShaderPatch: RTW caster stores true depth (%s %s)",
+                    pSourceName ? pSourceName : "?", pEntrypoint);
+                DumpInjection("rtwdepth", pSourceName, pEntrypoint, src, patched, pDefines);
+                if (ppCode && *ppCode)
+                    SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
+                        pEntrypoint, pTarget, pSourceName,
+                        (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+                return hr;
+            }
+            Log("ShaderPatch: RTW caster depth patch failed for %s, using original", pEntrypoint);
+            if (ppErrorMsgs && *ppErrorMsgs)
+            {
+                Log("ShaderPatch: error: %s", (const char*)(*ppErrorMsgs)->GetBufferPointer());
+                (*ppErrorMsgs)->Release();
+                *ppErrorMsgs = nullptr;
+            }
+        }
+    }
+
+    // The game's RTWSM caster hull shader under-tessellates edges that cross the
+    // high-resolution zone of the warp (see RtwTessellation.h).
+    if (pEntrypoint && pTarget && pTarget[0] == 'h' && pSrcData && SrcDataSize &&
+        strcmp(pEntrypoint, "tessellator_hs") == 0)
+    {
+        std::string src((const char*)pSrcData, SrcDataSize);
+        std::string patched = RtwTessellation::Patch(src);
+        if (patched != src)
+        {
+            HRESULT hr = oD3DCompile(patched.c_str(), patched.size(), pSourceName,
+                pDefines, pInclude, pEntrypoint, pTarget, Flags1, Flags2, ppCode, ppErrorMsgs);
+            if (SUCCEEDED(hr))
+            {
+                Log("ShaderPatch: patched RTW caster tessellation factors (%s)", pTarget);
+                DumpInjection("rtwtess", pSourceName, pEntrypoint, src, patched, pDefines);
+                if (ppCode && *ppCode)
+                    SurveyRecorder::OnShaderCompiled(patched.c_str(), patched.size(),
+                        pEntrypoint, pTarget, pSourceName,
+                        (*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
+                return hr;
+            }
+            Log("ShaderPatch: RTW tessellation patch failed, using original tessellator_hs");
+            if (ppErrorMsgs && *ppErrorMsgs)
+            {
+                Log("ShaderPatch: error: %s", (const char*)(*ppErrorMsgs)->GetBufferPointer());
+                (*ppErrorMsgs)->Release();
+                *ppErrorMsgs = nullptr;
+            }
+        }
+    }
+
     // Detect the deferred lighting pixel shader: entry point is "main_fs"
     // and source contains deferred-specific identifiers.
     if (pEntrypoint && pSrcData && SrcDataSize > 0 &&
@@ -956,6 +1083,12 @@ HRESULT WINAPI HookedD3DCompile(
     HRESULT hr = oD3DCompile(pSrcData, SrcDataSize, pSourceName,
                               pDefines, pInclude, pEntrypoint, pTarget,
                               Flags1, Flags2, ppCode, ppErrorMsgs);
+
+    // Water draws must share the G-buffer's temporal jitter; the host recognises them by
+    // pixel shader (see NoteWaterShaderBytecode).
+    if (SUCCEEDED(hr) && ppCode && *ppCode && pEntrypoint && pTarget && pTarget[0] == 'p' &&
+        strcmp(pEntrypoint, "waterFP") == 0)
+        D3D11Hook::NoteWaterShaderBytecode((*ppCode)->GetBufferPointer(), (*ppCode)->GetBufferSize());
 
     // Record shader source for survey (always, for all shaders)
     if (SUCCEEDED(hr) && ppCode && *ppCode && pSrcData && SrcDataSize > 0)

@@ -8,6 +8,7 @@
 #include "SurveyWriter.h"
 #include "ShaderPatch.h"
 #include "ShadowCasterBias.h"
+#include "DeferredJitter.h"
 #include "ShaderMetadata.h"
 #include "GeometryCapture.h"
 #include "MotionVectors.h"
@@ -1556,6 +1557,27 @@ void NoteLightVolumeShaderBytecode(const void* bytecode, size_t len)
     gLightVolumeBytecodeHashes.insert(h);
 }
 
+// ---- Water draws share the G-buffer jitter ----
+// Forward scene passes are not viewport-jittered (JitterForwardPasses is off by default: it made
+// UI wobble), so forward geometry is depth-tested against a G-buffer depth that is shifted by a
+// different sub-pixel offset every frame. For water that moves the waterline: where the plane
+// meets terrain at a grazing angle, distant LOD terrain above all, a sub-pixel depth shift is many
+// pixels of shoreline, flickering at the jitter rate. The occlusion-query span (HookedBegin)
+// already jitters the zoneWater plane it tracks, but other zones' planes and the `waterDistant`
+// material render outside that span. Recognise every water pixel shader and give each water draw
+// the G-buffer's viewport offset, which restores the vanilla depth relationship and makes water
+// jitter like the rest of the frame the upscaler compensates.
+static std::unordered_set<uint64_t> gWaterBytecodeHashes;
+static std::unordered_set<ID3D11PixelShader*> gWaterPS;
+
+void NoteWaterShaderBytecode(const void* bytecode, size_t len)
+{
+    if (!bytecode || !len) return;
+    uint64_t h = Fnv1a64(bytecode, len);
+    std::lock_guard<std::mutex> lock(gLightVolumeMutex);
+    gWaterBytecodeHashes.insert(h);
+}
+
 static void ReleaseLightVolumeAO()
 {
     for (int i = 0; i < 2; ++i)
@@ -1577,6 +1599,60 @@ static UINT ResolveAoSlot(ID3D11DeviceContext* ctx, uint32_t baseSlot)
     ctx->PSGetShaderResources(6, 1, &srv6);
     if (srv6) { srv6->Release(); return baseSlot; }   // shadow mode: as declared
     return baseSlot - 2;                              // no-shadow mode: shifted down
+}
+
+// Per-frame parameters for the patched sun pass (DeferredJitter.h): this frame's G-buffer
+// jitter, so world positions are rebuilt on the sample's own ray, and a frame counter that
+// moves the shadow sampling noise while a temporal AA is integrating frames.
+// 16 bytes, created once and deliberately never released: the device can already be gone
+// when statics are torn down at process exit.
+static ID3D11Buffer* gSunFrameParamsCB = nullptr;
+
+// Returns true if the buffer is bound and must be unbound after the draw.
+static bool BindSunFrameParams(ID3D11DeviceContext* ctx)
+{
+    if (!gSunFrameParamsCB)
+    {
+        ID3D11Device* device = nullptr;
+        ctx->GetDevice(&device);
+        if (!device) return false;
+        D3D11_BUFFER_DESC desc = {};
+        desc.ByteWidth = sizeof(DeferredJitter::FrameParams);
+        desc.Usage = D3D11_USAGE_DYNAMIC;
+        desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        HRESULT hr = device->CreateBuffer(&desc, nullptr, &gSunFrameParamsCB);
+        device->Release();
+        if (FAILED(hr)) { gSunFrameParamsCB = nullptr; return false; }
+    }
+    DeferredJitter::FrameParams params = {};
+    float jx = 0, jy = 0;
+    GetTemporalJitter(jx, jy);
+    const bool temporal = (jx != 0.0f || jy != 0.0f);
+    params.jitterX = jx;
+    params.jitterY = jy;
+    params.frame = temporal ? (float)(gFrameIndex % 64) : 0.0f;
+    params.temporal = temporal ? 1.0f : 0.0f;
+    D3D11_MAPPED_SUBRESOURCE map = {};
+    if (FAILED(ctx->Map(gSunFrameParamsCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) return false;
+    memcpy(map.pData, &params, sizeof(params));
+    ctx->Unmap(gSunFrameParamsCB, 0);
+    // OGRE reflects injected cbuffers and may have bound its own zero-filled buffer during
+    // material setup; binding here, immediately before the draw, wins.
+    ctx->PSSetConstantBuffers(DeferredJitter::Slot, 1, &gSunFrameParamsCB);
+    return true;
+}
+
+static void UnbindSunFrameParams(ID3D11DeviceContext* ctx)
+{
+    ID3D11Buffer* current = nullptr;
+    ctx->PSGetConstantBuffers(DeferredJitter::Slot, 1, &current);
+    if (current == gSunFrameParamsCB)
+    {
+        ID3D11Buffer* empty = nullptr;
+        ctx->PSSetConstantBuffers(DeferredJitter::Slot, 1, &empty);
+    }
+    if (current) current->Release();
 }
 
 // Snapshot whatever the SSAO plugin bound (logically) at s8/s9 for the sun pass. Called
@@ -1779,6 +1855,31 @@ static HRESULT STDMETHODCALLTYPE HookedCreatePixelShader(
             {
                 std::lock_guard<std::mutex> lock(gLightVolumeMutex);
                 gLightVolumePS.insert(*ppPixelShader);
+            }
+
+            // Water pixel shaders: exact hash from the compile hook, or (bytecode served from
+            // OGRE's microcode cache never passes through D3DCompile) a uniform name only
+            // forward/water.hlsl declares, which survives in the reflection chunk.
+            bool isWater;
+            {
+                std::lock_guard<std::mutex> lock(gLightVolumeMutex);
+                isWater = gWaterBytecodeHashes.count(h) != 0;
+            }
+            if (!isWater)
+            {
+                const char* p = (const char*)pShaderBytecode;
+                static const char kWaterMark[] = "GROUND_Colour";
+                const size_t mlen = sizeof(kWaterMark) - 1;
+                if (BytecodeLength >= mlen)
+                    for (size_t i = 0, n = BytecodeLength - mlen; i <= n; ++i)
+                        if (memcmp(p + i, kWaterMark, mlen) == 0) { isWater = true; break; }
+            }
+            if (isWater)
+            {
+                std::lock_guard<std::mutex> lock(gLightVolumeMutex);
+                gWaterPS.insert(*ppPixelShader);
+                static bool sLogged = false;
+                if (!sLogged) { sLogged = true; Log("Upscaler: water pixel shader recognised; water draws will share the G-buffer jitter"); }
             }
         }
     }
@@ -2205,8 +2306,12 @@ static void STDMETHODCALLTYPE HookedDraw(
         else if (result.point == InjectionPoint::POST_FOG)
             gLvAoReady = false;
 
+        const bool sunFrameParams = result.point == InjectionPoint::POST_LIGHTING && BindSunFrameParams(pThis);
+
         // Execute the game's original draw call
         oDraw(pThis, VertexCount, StartVertexLocation);
+
+        if (sunFrameParams) UnbindSunFrameParams(pThis);
 
         // POST: effects that operate after the draw
         fctx.timing = DUST_TIMING_POST;
@@ -2228,6 +2333,51 @@ static void STDMETHODCALLTYPE HookedDraw(
         oDraw(pThis, VertexCount, StartVertexLocation);
     }
 }
+
+// Jitters the viewport for one water draw in an unjittered forward scene pass and restores it.
+// Inside the occlusion-query span the viewport is already jittered (fractional origin): skipped.
+struct WaterJitterScope
+{
+    ID3D11DeviceContext* ctx = nullptr;
+    D3D11_VIEWPORT saved[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+    UINT n = 0;
+
+    explicit WaterJitterScope(ID3D11DeviceContext* context)
+    {
+        if (!gJitterEnabled || gJitterForwardPasses || !gFwdScenePass || gInShadowPass ||
+            tSuppressVpJitter != 0 || (gJitterPxX == 0.0f && gJitterPxY == 0.0f) ||
+            GeometryCapture::IsInGBufferPass())
+            return;
+        ID3D11PixelShader* ps = nullptr;
+        context->PSGetShader(&ps, nullptr, nullptr);
+        if (!ps) return;
+        bool water;
+        {
+            std::lock_guard<std::mutex> lock(gLightVolumeMutex);
+            water = gWaterPS.count(ps) != 0;
+        }
+        ps->Release();
+        if (!water) return;
+
+        UINT count = 0;
+        context->RSGetViewports(&count, nullptr);
+        if (count == 0 || count > D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) return;
+        context->RSGetViewports(&count, saved);
+        if (saved[0].TopLeftX != floorf(saved[0].TopLeftX) || saved[0].TopLeftY != floorf(saved[0].TopLeftY))
+            return;   // already carries the jitter
+        D3D11_VIEWPORT jittered[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+        for (UINT i = 0; i < count; i++)
+        { jittered[i] = saved[i]; jittered[i].TopLeftX += gJitterPxX; jittered[i].TopLeftY += gJitterPxY; }
+        oRSSetViewports(context, count, jittered);   // raw: must not be offset a second time
+        ctx = context;
+        n = count;
+        static bool sLogged = false;
+        if (!sLogged) { sLogged = true; Log("Upscaler: water draws outside the occlusion-query span now share the G-buffer viewport jitter"); }
+    }
+    ~WaterJitterScope() { if (n) oRSSetViewports(ctx, n, saved); }
+    WaterJitterScope(const WaterJitterScope&) = delete;
+    WaterJitterScope& operator=(const WaterJitterScope&) = delete;
+};
 
 static void STDMETHODCALLTYPE HookedDrawIndexed(
     ID3D11DeviceContext* pThis, UINT IndexCount, UINT StartIndexLocation,
@@ -2259,6 +2409,7 @@ static void STDMETHODCALLTYPE HookedDrawIndexed(
     // per-draw constant setup). Gated on the feeder so a disabled upscaler binds nothing extra.
     if (sMvFeederActive)
     { if (GeometryCapture::IsInGBufferPass()) MotionVectors::InjEnsureB13(pThis); }   // re-pins b13 only if something overwrote it (tracked through the VSSetConstantBuffers hook)
+    WaterJitterScope waterJitter(pThis);
     oDrawIndexed(pThis, IndexCount, StartIndexLocation, BaseVertexLocation);
 }
 
@@ -2289,6 +2440,7 @@ static void STDMETHODCALLTYPE HookedDrawIndexedInstanced(
     LightVolumeAoScope lvAo(pThis, isLV);
     if (sMvFeederActive)
     { if (GeometryCapture::IsInGBufferPass()) MotionVectors::InjEnsureB13(pThis); }   // re-pins b13 only if something overwrote it (tracked through the VSSetConstantBuffers hook)
+    WaterJitterScope waterJitter(pThis);
     oDrawIndexedInstanced(pThis, IndexCountPerInstance, InstanceCount,
                           StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
 }

@@ -1,5 +1,6 @@
 #include "EffectShaderProbe.h"
 #include "../effects/shadows/ShadowShaderSource.h"
+#include "../src/DeferredJitter.h"
 #include <algorithm>
 #include <fstream>
 #include <iterator>
@@ -76,6 +77,8 @@ struct ShadowParams
     float quality = 12;
     float texel = 1.f / 256;
     float csmFar = 0.85f;
+    // 0 = uncapped (the 500-unit fallback)
+    float maxPenumbra = 0, pad0 = 0, pad1 = 0, pad2 = 0;
 };
 
 struct SceneParams
@@ -216,7 +219,8 @@ public:
     }
 
     std::vector<Pixel> Render(const SceneParams& scene, ShadowParams shadows, UINT resolution,
-                              bool edge = false, float curvature = 0.0f)
+                              bool edge = false, float curvature = 0.0f,
+                              float plateauGap = 0.0f, float stripGap = 0.0f)
     {
         shadows.texel = 1.f / resolution;
         std::vector<float> depths(resolution * resolution);
@@ -234,6 +238,14 @@ public:
                 float unwarpedX = 2 * warpedX / (scene.warpScale + std::sqrt(discriminant));
                 float worldX = unwarpedX / scene.projectionScale;
                 float gap = (!edge || worldX < 0) ? scene.blockerGap : 0;
+                if (plateauGap > 0 && worldX > 0.5f)
+                {
+                    gap = plateauGap;
+                }
+                if (stripGap > 0 && worldX > 0.1f && worldX < 0.25f)
+                {
+                    gap = stripGap;   // a low object on the lit side
+                }
                 depths[y * resolution + x] =
                     scene.depthOffset +
                     scene.depthScale * (scene.receiverDepth + scene.slope * worldX - gap);
@@ -242,7 +254,7 @@ public:
         std::vector<float> warp(513 * 2);
         for (UINT i = 0; i < warp.size(); ++i)
         {
-            float u = (i % 513 + 0.5f) / 513 - 0.5f;
+            float u = (i % 513) / 512.f - 0.5f;   // knot i sits at u = i / 512
             warp[i] = (scene.warpScale - 1) * u + curvature * u * u;
         }
         auto depthView = CreateTexture(resolution, resolution, depths);
@@ -351,6 +363,130 @@ static size_t CountPenumbraPixels(const std::vector<Pixel>& image)
                          [](const Pixel& pixel) { return pixel[0] > 0 && pixel[0] < 1; });
 }
 
+// A raised surface outside its own light cone cannot occlude the light disc
+// here. It must not soften an unrelated contact shadow, whatever the shadow
+// range allows the search to cover.
+static void TestDistantSurfacesIgnored(ShadowFixture& fixture)
+{
+    ShadowParams shadows;
+    shadows.pcss = 1;
+    shadows.filterRadius = 0.001f;
+    shadows.lightSize = 0.3f;
+    for (float range : {10.f, 10000.f})
+    {
+        SceneParams scene;
+        scene.slope = 0;
+        scene.blockerGap = 0.05f;
+        scene.shadowRange = range;
+        auto isolated = fixture.Render(scene, shadows, 2048, true);
+        auto withPlateau = fixture.Render(scene, shadows, 2048, true, 0.0f, 1.0f);
+        // Plateau edge at x = 0.5 with reach gap * lightSize = 0.3: columns
+        // left of x = 0.2 are unaffected.
+        const UINT width = EffectShaderProbe::W;
+        for (UINT y = 0; y < EffectShaderProbe::H; ++y)
+        {
+            for (UINT x = 0; x < 14; ++x)
+            {
+                assert(isolated[y * width + x][0] == (x < 12 ? 0.f : 1.f));
+                assert(withPlateau[y * width + x][0] == isolated[y * width + x][0]);
+            }
+        }
+        if (range == 10.f)
+        {
+            assert(CountPenumbraPixels(withPlateau) > 16); // the plateau keeps its own penumbra
+        }
+    }
+    std::puts("RTW PCSS: surfaces outside their light cone do not soften contact shadows");
+}
+
+// A low object standing in the wide penumbra of a far caster keeps its own crisp shadow.
+// One averaged blocker distance gave both the far caster's kernel and smeared it away.
+static void TestBlockerLayers(ShadowFixture& fixture)
+{
+    SceneParams scene;
+    scene.slope = 0;
+    scene.blockerGap = 1;
+    ShadowParams shadows;
+    shadows.pcss = 1;
+    shadows.filterRadius = 0.001f;
+    shadows.lightSize = 0.3f;
+    auto farOnly = fixture.Render(scene, shadows, 2048, true);
+    auto both = fixture.Render(scene, shadows, 2048, true, 0.0f, 0.0f, 0.05f);
+    const UINT width = EffectShaderProbe::W;
+    for (UINT y = 0; y < EffectShaderProbe::H; ++y)
+    {
+        // Pixel centres 13 and 14 (x = 0.125, 0.208) lie under the low object.
+        for (UINT x : {13u, 14u})
+        {
+            assert(both[y * width + x][0] <= 0.1f);
+        }
+        // Beyond the low object's reach the far penumbra is what it was without it, right up
+        // to the object on both sides: the far caster's wide kernel must not pick the low
+        // object up (that darkened the surroundings and left a lit outline around the pixels
+        // that did separate the layers).
+        for (UINT x : {12u, 15u, 16u, 17u, 18u})
+        {
+            assert(std::fabs(both[y * width + x][0] - farOnly[y * width + x][0]) <= 0.09f);
+        }
+        assert(farOnly[y * width + 13][0] > 0.3f);   // and that spot really is in the far penumbra
+    }
+    std::puts("RTW PCSS: a near object keeps its crisp shadow inside a far caster's penumbra");
+}
+
+// The penumbra fades out on BOTH sides of the edge. The blocker search used to lose the
+// caster part-way through the lit side, which ended the penumbra in a hard rim there.
+static void TestPenumbraIsTwoSided(ShadowFixture& fixture)
+{
+    SceneParams scene;
+    scene.slope = 0;
+    scene.blockerGap = 1;
+    ShadowParams shadows;
+    shadows.pcss = 1;
+    shadows.filterRadius = 0.001f;
+    shadows.lightSize = 0.3f;
+    auto image = fixture.Render(scene, shadows, 2048, true);
+    const UINT width = EffectShaderProbe::W;
+    for (UINT y = 0; y < EffectShaderProbe::H; ++y)
+    {
+        int litSide = 0, darkSide = 0;
+        for (UINT x = 0; x < width; ++x)
+        {
+            float v = image[y * width + x][0];
+            if (v > 0 && v < 1)
+            {
+                (x >= width / 2 ? litSide : darkSide)++;
+            }
+        }
+        assert(litSide >= 2 && std::abs(litSide - darkSide) <= 2);
+    }
+    std::puts("RTW PCSS: penumbrae fade out on both sides of the edge");
+}
+
+// Max Penumbra caps the soft edge in world units, whatever the caster's height.
+static void TestMaxPenumbra(ShadowFixture& fixture)
+{
+    SceneParams scene;
+    scene.slope = 0;
+    scene.blockerGap = 1;
+    ShadowParams shadows;
+    shadows.pcss = 1;
+    shadows.filterRadius = 0.001f;
+    shadows.lightSize = 0.3f;                 // uncapped reach: gap * lightSize = 0.3
+    ShadowParams capped = shadows;
+    capped.maxPenumbra = 0.1f;
+    auto wide = fixture.Render(scene, shadows, 2048, true);
+    auto narrow = fixture.Render(scene, capped, 2048, true);
+    assert(CountPenumbraPixels(narrow) > 0 &&
+           CountPenumbraPixels(narrow) * 2 <= CountPenumbraPixels(wide));
+    const UINT width = EffectShaderProbe::W;
+    for (UINT y = 0; y < EffectShaderProbe::H; ++y)
+    {
+        // and it stays centred on the edge
+        assert(narrow[y * width + 9][0] == 0.f && narrow[y * width + 14][0] == 1.f);
+    }
+    std::puts("RTW PCSS: Max Penumbra caps the soft edge in world units");
+}
+
 static void TestContactHardening(ShadowFixture& fixture)
 {
     // Moving the shadow camera's depth origin does not move either physical
@@ -407,4 +543,8 @@ int main(int argc, char** argv)
     ShadowFixture fixture;
     TestReceiverSlope(fixture);
     TestContactHardening(fixture);
+    TestDistantSurfacesIgnored(fixture);
+    TestPenumbraIsTwoSided(fixture);
+    TestBlockerLayers(fixture);
+    TestMaxPenumbra(fixture);
 }

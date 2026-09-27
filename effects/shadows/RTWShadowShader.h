@@ -7,19 +7,22 @@ namespace RTWShadowShader
 // Embedded in the game deferred shader; no runtime include path is required.
 constexpr char ShaderSource[] = R"hlsl(
 
+// 513 knots; knot i sits at u = i / 512, as the game's builder places it. Every
+// caster lookup is patched to the same placement (src/RtwWarpLookup.h).
 static const float kDustRtwWarpWidth = 513.0;
+static const float kDustRtwWarpCells = 512.0;
 
 // [Dust] Bilinear warp lookup (replacement for point-sampled GetOffsetLocationS)
 float DustWarp1D(sampler2D warpMap, float u, float row, out float scale)
 {
-    float texelPosition = u * kDustRtwWarpWidth - 0.5;
-    float leftTexel = clamp(floor(texelPosition), 0.0, kDustRtwWarpWidth - 2.0);
+    float texelPosition = u * kDustRtwWarpCells;
+    float leftTexel = clamp(floor(texelPosition), 0.0, kDustRtwWarpCells - 1.0);
     float blend = saturate(texelPosition - leftTexel);
     float leftUV = (leftTexel + 0.5) / kDustRtwWarpWidth;
     float rightUV = (leftTexel + 1.5) / kDustRtwWarpWidth;
     float leftOffset = tex2Dlod(warpMap, float4(leftUV, row, 0, 0)).x;
     float rightOffset = tex2Dlod(warpMap, float4(rightUV, row, 0, 0)).x;
-    scale = 1.0 + (rightOffset - leftOffset) * kDustRtwWarpWidth;
+    scale = 1.0 + (rightOffset - leftOffset) * kDustRtwWarpCells;
     return lerp(leftOffset, rightOffset, blend);
 }
 float2 DustGetOffsetLocationS(sampler2D warpMap, float2 uv, out float2 scale)
@@ -67,8 +70,7 @@ float DustRtwDepth(sampler2D shadowMap, sampler2D warpMap, float2 uv, DustRtwRec
     // it for nearby taps; only taps crossing a segment need more warp reads.
     float2 localScale = receiver.warpScale;
     float2 warpedUV = receiver.warpedUV + (uv - receiver.position.xy) * localScale;
-    if (any(floor(uv * kDustRtwWarpWidth - 0.5) !=
-            floor(receiver.position.xy * kDustRtwWarpWidth - 0.5)))
+    if (any(floor(uv * kDustRtwWarpCells) != floor(receiver.position.xy * kDustRtwWarpCells)))
     {
         warpedUV = DustGetOffsetLocationS(warpMap, uv, localScale);
     }
@@ -95,22 +97,6 @@ float DustShadowCmp(sampler2D shadowMap, sampler2D warpMap, float2 uv, float rec
 // Sample in the original light projection, then warp each tap independently.
 // A fixed post-warp radius would change its world footprint whenever the
 // camera-dependent importance map redistributes shadow texels.
-static const float2 kDustRtwPoisson[12] =
-{
-    float2(-0.326212, -0.405810),
-    float2(-0.840144, -0.073580),
-    float2(-0.695914, 0.457137),
-    float2(-0.203345, 0.620716),
-    float2(0.962340, -0.194983),
-    float2(0.473434, -0.480026),
-    float2(0.519456, 0.767022),
-    float2(0.185461, -0.893124),
-    float2(0.507431, 0.064425),
-    float2(0.896420, 0.412458),
-    float2(-0.321940, -0.932615),
-    float2(-0.791559, -0.597705)
-};
-
 DustRtwReceiver DustRtwCreateReceiver(sampler2D warpMap, float4x4 shadowMatrix,
                                       float3 worldPosition)
 {
@@ -147,116 +133,258 @@ float DustRtwReceiverBias(DustRtwReceiver receiver, float depthBias, float edgeB
     return depthBias;
 }
 
-float2x2 DustRtwSampleRotation(float2 screenPosition)
+// Tap rotation. Interleaved gradient noise nearly alternates between neighbouring
+// pixels, which read as a one-pixel checker in penumbrae; the R2 low-discrepancy
+// sequence does not. While a temporal AA integrates frames the host advances
+// dustFrame (golden-ratio steps) so the remaining grain averages out; it is 0
+// otherwise, because a moving pattern would just boil.
+float DustRtwTapRotation(float2 screenPosition)
 {
-    float noise = frac(52.9829189 * frac(dot(screenPosition, float2(0.06711056, 0.00583715))));
-    float angle = noise * 6.28318530718;
-    float sine, cosine;
-    sincos(angle, sine, cosine);
-    return float2x2(cosine, sine, -sine, cosine);
+    return 6.28318530718 * frac(dot(screenPosition, float2(0.7548776662, 0.5698402910)) +
+                                dustFrame * 0.6180339887);
 }
 
-float2 DustRtwFilterRadius(sampler2D shadowMap, sampler2D warpMap, DustRtwReceiver receiver,
-                           float4x4 shadowMatrix, float2x2 rotation, float depthBias,
-                           float shadowRange)
+)hlsl"
+// MSVC caps one string literal at about 16 KB; adjacent literals concatenate.
+R"hlsl(
+// One averaged blocker distance gives one kernel for everything nearby: next to (or
+// inside) the wide penumbra of a far caster, a near object's shadow was smeared with
+// it. Blockers are split into a near and a far layer, each with its own penumbra. The
+// boundary goes in the middle of the widest empty stretch of log2(separation), at least
+// two octaves wide; a fixed ratio from the nearest blocker cut through casters whose own
+// separations span more than that ratio.
+
+struct DustRtwLayers
+{
+    float2 baseRadius;
+    float2 nearRadius;
+    float2 farRadius;
+    float split;        // separation (depth units) where the far layer starts; 1e30 = one layer
+    float2 uvScale;     // shadow UV per world unit
+    float reachPerDepth; // lightSize / depthScale: a blocker's cone radius per unit of separation
+};
+
+DustRtwLayers DustRtwFindLayers(sampler2D shadowMap, sampler2D warpMap, DustRtwReceiver receiver,
+                                float4x4 shadowMatrix, float depthBias, float shadowRange)
 {
     float receiverDepth = saturate(receiver.position.z);
     // Filter Radius remains a texel-sized antialiasing floor. PCSS Light Size
     // is an angular radius; its world-space footprint is independent of the
     // atlas resolution and the shadow camera's depth origin.
     float2 baseRadius = dustRtwFilterRadius / max(receiver.warpScale, float2(1e-5, 1e-5));
-    float2 filterRadius = baseRadius;
+    DustRtwLayers layers;
+    layers.baseRadius = baseRadius;
+    layers.nearRadius = baseRadius;
+    layers.farRadius = baseRadius;
+    layers.split = 1e30;
+    float depthScale = max(length(shadowMatrix[2].xyz), 1e-8);
+    float2 uvScale =
+        max(float2(length(shadowMatrix[0].xyz), length(shadowMatrix[1].xyz)), 1e-12);
+    layers.uvScale = uvScale;
+    layers.reachPerDepth = dustRtwLightSize / depthScale;
     float centerDepth = DustRtwDepth(shadowMap, warpMap, receiver.position.xy, receiver);
 
     if (dustRtwPcssEnabled > 0.5)
     {
-        float depthScale = max(length(shadowMatrix[2].xyz), 1e-8);
-        float2 uvScale = float2(length(shadowMatrix[0].xyz), length(shadowMatrix[1].xyz));
-        float2 searchRadius = max(baseRadius, shadowRange * dustRtwLightSize * uvScale);
-        float blockerSeparation = 0;
-        float blockerCount = 0;
-        if (centerDepth < receiverDepth - depthBias)
+        // A blocker h above the receiver covers part of the light disc only
+        // within h * lightSize of it, so the widest useful search is the widest
+        // penumbra allowed. That is a setting in world units (Max Penumbra), not
+        // Shadow Range: rings hundreds of units wide sampled unrelated hills and
+        // roofs, and a shadow map holds one surface per texel, so inside a tall
+        // caster's wide soft edge the crisp shadows of whatever stands under it are
+        // simply absent. A narrow cap keeps that zone a thin strip. An unbound or
+        // zero value falls back to the previous 500-unit blocker distance.
+        float maxReach = dustRtwMaxPenumbra > 0.0
+            ? dustRtwMaxPenumbra
+            : min(shadowRange, 500.0) * dustRtwLightSize;
+        maxReach = min(maxReach, shadowRange * dustRtwLightSize);
+        float2 searchRadius = max(baseRadius, maxReach * uvScale);
+        float separations[25];      // per search tap; 0 = no blocker
+        separations[24] = centerDepth < receiverDepth - depthBias ? receiverDepth - centerDepth : 0;
+        // Six geometric rings of four FIXED directions, alternate rings turned by 45
+        // degrees. A per-pixel rotation made neighbouring pixels disagree about whether
+        // a blocker exists, so the filter radius flipped between them: the hatching at
+        // the lit edge of penumbrae. A surface counts only if it is high enough for its
+        // light cone to reach this receiver; lower surfaces further away cannot occlude
+        // the light disc. Rings at the antialiasing floor are exempt.
+        //
+        // Rings are discrete: a receiver inside a blocker's cone can sit between the last
+        // ring that still finds the blocker and the first that is short enough to pass
+        // the cone test, and the penumbra then ended in a hard rim on its lit side. So a
+        // hit whose reach is shorter than its ring is probed again, in the same
+        // direction, at that reach: still a hit means the receiver is inside the cone.
+        // (Merely loosening the test let distant casters widen the filter over nearby
+        // contact shadows.)
+        static const float searchScales[6] = {0.03125, 0.0625, 0.125, 0.25, 0.5, 1.0};
+        static const float2 searchDirections[8] =
         {
-            blockerSeparation = receiverDepth - centerDepth;
-            blockerCount = 1;
-        }
-        // Search all four directions at each scale. A single wide ring can
-        // miss every caster after warp clipping; a partial probe cannot prove
-        // that the rest of the search footprint is empty.
-        static const float2 searchDirections[4] =
-        {
-            float2(1, 0),
-            float2(0, 1),
-            float2(-1, 0),
-            float2(0, -1)
+            float2( 1.0,  0.0),
+            float2( 0.0,  1.0),
+            float2(-1.0,  0.0),
+            float2( 0.0, -1.0),
+            float2( 0.70710678,  0.70710678),
+            float2(-0.70710678,  0.70710678),
+            float2(-0.70710678, -0.70710678),
+            float2( 0.70710678, -0.70710678)
         };
-        static const float searchScales[3] = {0.0625, 0.25, 1.0};
         [unroll]
-        for (int j = 0; j < 12; j++)
+        for (int j = 0; j < 24; j++)
         {
-            float2 radius = max(baseRadius, searchRadius * searchScales[j / 4]);
-            float2 uv = receiver.position.xy + mul(rotation, searchDirections[j % 4]) * radius;
-            float depth = DustRtwDepth(shadowMap, warpMap, uv, receiver);
+            int ring = j / 4;
+            float ringReach = maxReach * searchScales[ring];
+            float2 radius = max(baseRadius, ringReach * uvScale);
+            float2 direction = searchDirections[(ring % 2) * 4 + (j % 4)];
+            float depth = DustRtwDepth(shadowMap, warpMap,
+                                       receiver.position.xy + direction * radius, receiver);
+            [branch]
             if (depth < receiverDepth - depthBias)
             {
-                blockerSeparation += receiverDepth - depth;
-                blockerCount += 1;
+                float reach = (receiverDepth - depth) / depthScale * dustRtwLightSize;
+                bool accepted = all(radius <= baseRadius) || reach >= ringReach;
+                [branch]
+                if (!accepted)
+                {
+                    float2 inner = max(baseRadius, reach * uvScale);
+                    depth = DustRtwDepth(shadowMap, warpMap,
+                                         receiver.position.xy + direction * inner, receiver);
+                    accepted = depth < receiverDepth - depthBias;
+                }
+                separations[j] = accepted ? receiverDepth - depth : 0;
+            }
+            else
+            {
+                separations[j] = 0;
             }
         }
-        if (blockerCount > 0)
+        uint occupied = 0;
+        [unroll]
+        for (int k = 0; k < 25; k++)
         {
-            // RTW stores affine directional-light depth, not distance from a
-            // point light. Dividing by absolute blocker depth makes softness
-            // vary with the shadow camera's near plane. Undo depth scaling only.
-            float worldSeparation = blockerSeparation / (blockerCount * depthScale);
-            float2 penumbra = worldSeparation * dustRtwLightSize * uvScale;
-            filterRadius = max(baseRadius * 0.5, min(penumbra, searchRadius));
+            if (separations[k] > 0)
+            {
+                // 2^-10 .. 2^13 world units
+                float octave = floor(log2(separations[k] / depthScale)) + 10.0;
+                occupied |= 1u << (uint)clamp(octave, 0.0, 23.0);
+            }
+        }
+        int firstOctave = 24, lastOctave = -1;
+        [unroll]
+        for (int o = 0; o < 24; o++)
+        {
+            if ((occupied >> (uint)o) & 1u)
+            {
+                firstOctave = min(firstOctave, o);
+                lastOctave = o;
+            }
+        }
+        int run = 0, runStart = 0, widest = 0, widestStart = 0;
+        [unroll]
+        for (int e = 0; e < 24; e++)
+        {
+            bool empty = e > firstOctave && e < lastOctave && !((occupied >> (uint)e) & 1u);
+            if (empty)
+            {
+                if (run == 0)
+                {
+                    runStart = e;
+                }
+                run++;
+                if (run > widest)
+                {
+                    widest = run;
+                    widestStart = runStart;
+                }
+            }
+            else
+            {
+                run = 0;
+            }
+        }
+        float splitSeparation = 1e30;
+        if (widest >= 2)
+        {
+            splitSeparation = exp2(widestStart + widest * 0.5 - 10.0) * depthScale;
+        }
+        float nearSum = 0, nearCount = 0, farSum = 0, farCount = 0;
+        [unroll]
+        for (int m = 0; m < 25; m++)
+        {
+            float separation = separations[m];
+            if (separation > 0)
+            {
+                if (separation < splitSeparation)
+                {
+                    nearSum += separation;
+                    nearCount += 1;
+                }
+                else
+                {
+                    farSum += separation;
+                    farCount += 1;
+                }
+            }
+        }
+        // RTW stores affine directional-light depth, not distance from a point light.
+        // Dividing by absolute blocker depth makes softness vary with the shadow
+        // camera's near plane. Undo depth scaling only.
+        if (nearCount > 0)
+        {
+            float2 penumbra = nearSum / (nearCount * depthScale) * dustRtwLightSize * uvScale;
+            layers.nearRadius = max(baseRadius * 0.5, min(penumbra, searchRadius));
+        }
+        if (farCount > 0)
+        {
+            float2 penumbra = farSum / (farCount * depthScale) * dustRtwLightSize * uvScale;
+            layers.farRadius = max(baseRadius * 0.5, min(penumbra, searchRadius));
+            layers.split = splitSeparation;
         }
     }
 
-    return filterRadius;
+    return layers;
 }
 
+)hlsl"
+// MSVC caps one string literal at about 16 KB; adjacent literals concatenate.
+R"hlsl(
+// Vogel (golden-angle) disk PCF: well spread at any count, and one rotation angle per
+// pixel is enough. The atlas-tier count (4 at 12288) assumes a texel-sized filter; a wide
+// penumbra needs the full disk or it is mostly grain.
+//
+// A blocker occludes through a tap only if the tap lies within that blocker's own light
+// cone (separation * lightSize, with a x2 tolerance for blockers a little lower than the
+// layer's average). Without it a wide kernel, sized for a far caster, also counted every
+// low object its taps happened to land on, up to the whole kernel radius away: that
+// smeared near shadows into their surroundings, and left a lit outline around them where
+// the layered pixels (which exclude them) met the rest. Taps inside the antialiasing floor
+// always count. Blockers at or beyond farthestSeparation belong to the far layer.
 float DustRtwFilterVisibility(sampler2D shadowMap, sampler2D warpMap, DustRtwReceiver receiver,
-                              float2x2 rotation, float2 filterRadius, float depthBias)
+                              DustRtwLayers layers, float tapRotation, float2 filterRadius,
+                              float depthBias, float farthestSeparation)
 {
     float receiverDepth = saturate(receiver.position.z);
-    float shadow = 0;
+    float taps = any(filterRadius > layers.baseRadius * 2.0) ? 24.0 : dustRtwQuality;
+    float floorDistance = length(layers.baseRadius / layers.uvScale);
+    float visible = 0;
 
-    [unroll]
-    for (int i = 0; i < 4; i++)
+    [loop]
+    for (int i = 0; i < 24; i++)
     {
-        float2 uv = receiver.position.xy + mul(rotation, kDustRtwPoisson[i]) * filterRadius;
-        shadow += DustShadowCmp(shadowMap, warpMap, uv, receiverDepth, depthBias, receiver);
+        if (i >= (int)taps)
+        {
+            break;
+        }
+        float tapAngle = i * 2.39996323 + tapRotation;
+        float2 tap = sqrt((i + 0.5) / taps) * float2(cos(tapAngle), sin(tapAngle)) * filterRadius;
+        float separation =
+            receiverDepth - DustRtwDepth(shadowMap, warpMap, receiver.position.xy + tap, receiver);
+        float tapDistance = length(tap / layers.uvScale);
+        bool inCone = separation * layers.reachPerDepth * 2.0 >= tapDistance ||
+                      tapDistance <= floorDistance;
+        bool occluded = separation > depthBias && separation < farthestSeparation && inCone;
+        visible += occluded ? 0.0 : 1.0;
     }
 
-    float sampleCount = 4.0;
-    [branch]
-    if (dustRtwQuality > 4.5)
-    {
-        [unroll]
-        for (int i = 4; i < 8; i++)
-        {
-            float2 uv = receiver.position.xy + mul(rotation, kDustRtwPoisson[i]) * filterRadius;
-            shadow += DustShadowCmp(shadowMap, warpMap, uv, receiverDepth, depthBias, receiver);
-        }
-        sampleCount = 8.0;
-
-        [branch]
-        if (dustRtwQuality > 8.5)
-        {
-            [unroll]
-            for (int i = 8; i < 12; i++)
-            {
-                float2 uv = receiver.position.xy + mul(rotation, kDustRtwPoisson[i]) * filterRadius;
-                shadow += DustShadowCmp(shadowMap, warpMap, uv, receiverDepth, depthBias, receiver);
-            }
-            sampleCount = 12.0;
-        }
-    }
-
-    shadow /= sampleCount;
-    return shadow;
+    return visible / taps;
 }
 
 float DustRTWShadow(sampler2D shadowMap, sampler2D warpMap, float4x4 shadowMatrix,
@@ -266,10 +394,21 @@ float DustRTWShadow(sampler2D shadowMap, sampler2D warpMap, float4x4 shadowMatri
     DustRtwReceiver receiver = DustRtwCreateReceiver(warpMap, shadowMatrix, worldPosition);
     float bias =
         DustRtwReceiverBias(receiver, depthBias, edgeBias, normal, cameraDistance, shadowRange);
-    float2x2 rotation = DustRtwSampleRotation(screenPosition);
-    float2 radius = DustRtwFilterRadius(shadowMap, warpMap, receiver, shadowMatrix, rotation, bias,
-                                        shadowRange);
-    return DustRtwFilterVisibility(shadowMap, warpMap, receiver, rotation, radius, bias);
+    DustRtwLayers layers =
+        DustRtwFindLayers(shadowMap, warpMap, receiver, shadowMatrix, bias, shadowRange);
+    float tapRotation = DustRtwTapRotation(screenPosition);
+    // Independent occluders: the light that passes both layers. The near kernel leaves
+    // the far layer's blockers to the far kernel; the far kernel needs no lower bound,
+    // the cone test already keeps near blockers out of its outer taps.
+    float visibility = DustRtwFilterVisibility(shadowMap, warpMap, receiver, layers, tapRotation,
+                                               layers.nearRadius, bias, layers.split);
+    [branch]
+    if (layers.split < 1e29)
+    {
+        visibility *= DustRtwFilterVisibility(shadowMap, warpMap, receiver, layers,
+                                              tapRotation + 1.0, layers.farRadius, bias, 1e30);
+    }
+    return visibility;
 }
 )hlsl";
 

@@ -26,7 +26,8 @@ struct ShadowConfig {
 
     // === RTWSM ===
     float filterRadius      = 1.0f;   // RTW UV-space filter radius (scaled by 0.001 * resScale)
-    float lightSize         = 3.0f;   // RTW PCSS: tan(angular radius) * 100
+    float lightSize         = 1.0f;   // RTW PCSS: tan(angular radius) * 100 (the sun is about 0.47)
+    float maxPenumbra       = 2.0f;   // RTW PCSS: widest penumbra radius, world units
     bool  pcssEnabled       = true;   // RTW PCSS toggle
     bool  cliffFix          = false;  // off by default: previous always-on caused
                                       // close-range vertical shadows to disappear
@@ -389,6 +390,7 @@ struct alignas(16) ShadowCBData {
     float rtwQuality;
     float shadowTexel;
     float csmFarSoftness;
+    float rtwMaxPenumbra;
 };
 
 static int ShadowInit(ID3D11Device* device, uint32_t w, uint32_t h, const DustHostAPI* host)
@@ -437,6 +439,7 @@ static void ShadowPreExecute(const DustFrameContext* ctx, const DustHostAPI* hos
     float resScale           = 4096.0f / atlasRes;
     data.rtwFilterRadius     = gConfig.filterRadius * 0.001f * resScale;
     data.rtwLightSize        = gConfig.lightSize * 0.01f;
+    data.rtwMaxPenumbra      = gConfig.maxPenumbra;
     data.rtwPcssEnabled      = gConfig.pcssEnabled ? 1.0f : 0.0f;
     data.rtwCliffFixEnabled  = gConfig.cliffFix ? 1.0f : 0.0f;
     data.rtwCliffFixDistance = gConfig.cliffFixDistance;
@@ -559,6 +562,7 @@ static DustSettingDesc gSettings[] = {
     { "RTWSM",               DUST_SETTING_SECTION, nullptr,                 0.0f, 0.0f,  nullptr,            nullptr, nullptr, DUST_PERF_NONE },
     { "Filter Radius",       DUST_SETTING_FLOAT, &gConfig.filterRadius,     0.1f, 5.0f,  "FilterRadius",     nullptr, "Size of the shadow softening filter (RTWSM only).",                                                                                                                           DUST_PERF_NONE   },
     { "Light Size",          DUST_SETTING_FLOAT, &gConfig.lightSize,        0.5f, 10.0f, "LightSize",        nullptr, "Apparent light source size for contact-hardening shadows (RTWSM PCSS). Independent of shadow-map resolution.",                                                                                                     DUST_PERF_NONE   },
+    { "Max Penumbra",        DUST_SETTING_FLOAT, &gConfig.maxPenumbra,      0.25f, 20.0f, "MaxPenumbra",      nullptr, "Widest penumbra radius in world units (RTWSM PCSS). A shadow map holds one surface per texel, so inside a tall caster's soft edge the crisp shadows of objects standing under it are missing; keeping soft edges narrow keeps that zone thin. Lower is also faster.", DUST_PERF_NONE   },
     { "PCSS",                DUST_SETTING_BOOL,  &gConfig.pcssEnabled,      0.0f, 1.0f,  "PCSS",             nullptr, "Enable Percentage-Closer Soft Shadows for RTWSM (distance-based softness).",                                                                                                  DUST_PERF_MEDIUM },
     { "Cliff Shadow Fix",    DUST_SETTING_BOOL,  &gConfig.cliffFix,         0.0f, 1.0f,  "CliffFix",         nullptr, "Reduce shadow acne on steep cliffs and vertical faces (RTWSM only). Can make close-range vertical shadows fade out. Integration of Crunk Aint Dead's Cliff Face Shadow Fix mod.", DUST_PERF_NONE },
     { "Cliff Fix Distance",  DUST_SETTING_FLOAT, &gConfig.cliffFixDistance, 0.0f, 1.0f,  "CliffFixDistance", nullptr, "Fraction of shadow range where the cliff fix smoothly ramps in (higher = preserves more close-range vertical shadows).",                                                    DUST_PERF_NONE },

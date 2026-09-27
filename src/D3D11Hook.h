@@ -40,6 +40,8 @@ namespace D3D11Hook
     // patched light_fs blob, so the CreatePixelShader hook can recognize the resulting
     // pixel shader and feed it the SSAO map at s8/s9 during its (light-volume) draws.
     void NoteLightVolumeShaderBytecode(const void* bytecode, size_t len);
+    // Called by ShaderPatch for every compiled water pixel shader (forward/water.hlsl waterFP).
+    void NoteWaterShaderBytecode(const void* bytecode, size_t len);
 
     // RTGI publishes its per-light AO texture here each frame (via the SetLightVolumeAoTexture
     // host API). Bound at t10 for light_fs; null → white fallback (no-op). Cleared per frame.

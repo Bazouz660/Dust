@@ -24,6 +24,16 @@ cbuffer DustShadowParams : register(b7)
     float dustRtwQuality;
     float dustShadowTexel;
     float dustCsmFarSoftness;
+    float dustRtwMaxPenumbra;
+};
+
+// [Dust] Per-frame parameters (bound by the host at b8 for the sun pass). Must match
+// DeferredJitter::FrameParams in src/DeferredJitter.h; unbound reads as zero.
+cbuffer DustFrameParams : register(b8)
+{
+    float2 dustJitterPx;
+    float dustFrame;
+    float dustTemporal;
 };
 )hlsl";
 
