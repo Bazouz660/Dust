@@ -83,7 +83,12 @@ You can pass individual executable names to the native runner, for example
   and unchanged raw-detail debug view.
 - `OutlineNormalsTests`: real DLL/shaders on WARP; short and variable-length
   normals do not outline flat surfaces, real creases still render, and debug
-  obeys the same distance exclusions as the composite.
+  obeys the same distance exclusions as the composite. NaN/Inf normals never
+  reach the output.
+- `FiniteHelperTests`: the exponent-bit helpers that replace `isfinite()` (absent
+  from vkd3d-shader, Proton's HLSL compiler), from the real Outline and RTGI
+  include files on WARP, match `std::isfinite` in every lane for zeros,
+  denormals, max float, +/-Inf and quiet/negative/signalling NaN.
 - `RTGITemporalTests`: world/depth units, handedness, camera rotations and large
   coordinates; real temporal shader history clipping and a moving planar gradient;
   real renderer history and bounce resets after disabled/skipped frames,
