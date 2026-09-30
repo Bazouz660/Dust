@@ -162,6 +162,7 @@ struct DustRtwLayers
     float split;        // separation (depth units) where the far layer starts; 1e30 = one layer
     float2 uvScale;     // shadow UV per world unit
     float reachPerDepth; // lightSize / depthScale: a blocker's cone radius per unit of separation
+    bool anyBlocker;    // false: the search found no blocker, centre included
 };
 
 DustRtwLayers DustRtwFindLayers(sampler2D shadowMap, sampler2D warpMap, DustRtwReceiver receiver,
@@ -177,6 +178,7 @@ DustRtwLayers DustRtwFindLayers(sampler2D shadowMap, sampler2D warpMap, DustRtwR
     layers.nearRadius = baseRadius;
     layers.farRadius = baseRadius;
     layers.split = 1e30;
+    layers.anyBlocker = true;   // PCSS off: always filter
     float depthScale = max(length(shadowMatrix[2].xyz), 1e-8);
     float2 uvScale =
         max(float2(length(shadowMatrix[0].xyz), length(shadowMatrix[1].xyz)), 1e-12);
@@ -199,12 +201,15 @@ DustRtwLayers DustRtwFindLayers(sampler2D shadowMap, sampler2D warpMap, DustRtwR
             : min(shadowRange, 500.0) * dustRtwLightSize;
         maxReach = min(maxReach, shadowRange * dustRtwLightSize);
         float2 searchRadius = max(baseRadius, maxReach * uvScale);
-        float separations[25];      // per search tap; 0 = no blocker
-        separations[24] = centerDepth < receiverDepth - depthBias ? receiverDepth - centerDepth : 0;
-        // Six geometric rings of four FIXED directions, alternate rings turned by 45
-        // degrees. A per-pixel rotation made neighbouring pixels disagree about whether
-        // a blocker exists, so the filter radius flipped between them: the hatching at
-        // the lit edge of penumbrae. A surface counts only if it is high enough for its
+        float separations[13];      // per search tap, then the centre; 0 = no blocker
+        separations[12] = centerDepth < receiverDepth - depthBias ? receiverDepth - centerDepth : 0;
+        // Three geometric rings (1/16, 1/4 and all of the reach) of four FIXED directions,
+        // the middle ring turned by 45 degrees. Six rings (24 taps) cost 18% more of the
+        // sun pass on a captured frame with no visible difference, since the probe below
+        // already recovers each blocker's exact reach. The directions are fixed: a
+        // per-pixel rotation made neighbouring pixels disagree about whether a blocker
+        // exists, so the filter radius flipped between them: the hatching at the lit
+        // edge of penumbrae. A surface counts only if it is high enough for its
         // light cone to reach this receiver; lower surfaces further away cannot occlude
         // the light disc. Rings at the antialiasing floor are exempt.
         //
@@ -215,7 +220,7 @@ DustRtwLayers DustRtwFindLayers(sampler2D shadowMap, sampler2D warpMap, DustRtwR
         // direction, at that reach: still a hit means the receiver is inside the cone.
         // (Merely loosening the test let distant casters widen the filter over nearby
         // contact shadows.)
-        static const float searchScales[6] = {0.03125, 0.0625, 0.125, 0.25, 0.5, 1.0};
+        static const float searchScales[3] = {0.0625, 0.25, 1.0};
         static const float2 searchDirections[8] =
         {
             float2( 1.0,  0.0),
@@ -228,11 +233,11 @@ DustRtwLayers DustRtwFindLayers(sampler2D shadowMap, sampler2D warpMap, DustRtwR
             float2( 0.70710678, -0.70710678)
         };
         // [loop], not [unroll], on this and the layer loops below: unrolled, the search
-        // (with its probe fetches) and the 25-entry bookkeeping expand the sun pass to ~5000
+        // (with its probe fetches) and the layer bookkeeping expanded the sun pass to ~5000
         // instructions, which NVIDIA's Vulkan compiler (DXVK under Proton) spends minutes on:
         // the game froze at load on Linux. The results are identical.
         [loop]
-        for (int j = 0; j < 24; j++)
+        for (int j = 0; j < 12; j++)
         {
             int ring = j / 4;
             float ringReach = maxReach * searchScales[ring];
@@ -262,7 +267,7 @@ DustRtwLayers DustRtwFindLayers(sampler2D shadowMap, sampler2D warpMap, DustRtwR
         }
         uint occupied = 0;
         [loop]
-        for (int k = 0; k < 25; k++)
+        for (int k = 0; k < 13; k++)
         {
             if (separations[k] > 0)
             {
@@ -311,7 +316,7 @@ DustRtwLayers DustRtwFindLayers(sampler2D shadowMap, sampler2D warpMap, DustRtwR
         }
         float nearSum = 0, nearCount = 0, farSum = 0, farCount = 0;
         [loop]
-        for (int m = 0; m < 25; m++)
+        for (int m = 0; m < 13; m++)
         {
             float separation = separations[m];
             if (separation > 0)
@@ -328,6 +333,7 @@ DustRtwLayers DustRtwFindLayers(sampler2D shadowMap, sampler2D warpMap, DustRtwR
                 }
             }
         }
+        layers.anyBlocker = nearCount + farCount > 0;   // the centre sample included
         // RTW stores affine directional-light depth, not distance from a point light.
         // Dividing by absolute blocker depth makes softness vary with the shadow
         // camera's near plane. Undo depth scaling only.
@@ -400,6 +406,15 @@ float DustRTWShadow(sampler2D shadowMap, sampler2D warpMap, float4x4 shadowMatri
         DustRtwReceiverBias(receiver, depthBias, edgeBias, normal, cameraDistance, shadowRange);
     DustRtwLayers layers =
         DustRtwFindLayers(shadowMap, warpMap, receiver, shadowMatrix, bias, shadowRange);
+    // No blocker anywhere in the search, centre included: fully lit, which is most of
+    // the screen. The filter skipped here samples only the antialiasing floor around a
+    // centre and innermost ring that found nothing; on a captured frame no pixel changed
+    // visibly, and the sun pass got 8% cheaper.
+    [branch]
+    if (!layers.anyBlocker)
+    {
+        return 1.0;
+    }
     float tapRotation = DustRtwTapRotation(screenPosition);
     // Independent occluders: the light that passes both layers. The near kernel leaves
     // the far layer's blockers to the far kernel; the far kernel needs no lower bound,
