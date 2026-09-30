@@ -149,6 +149,7 @@ float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,
     float2 filterRadius = baseRadius;
     float2 farRadius = baseRadius;
     float layerSplit = 1e30;        // separation (depth units) where the far blocker layer starts
+    bool anyBlocker = true;         // PCSS off: always filter
     float centerDepth = DustRtwDepth(sMap, wMap, receiver.position.xy, receiver);
 
     float depthScale = max(length(shadowMatrix[2].xyz), 1e-8);
@@ -167,12 +168,15 @@ float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,
             : min(shadowRange, 500.0) * dustRtwLightSize;
         maxReach = min(maxReach, shadowRange * dustRtwLightSize);
         float2 searchRadius = max(baseRadius, maxReach * uvScale);
-        float separations[25];      // per search tap; 0 = no blocker
-        separations[24] = centerDepth < sd - b ? sd - centerDepth : 0;
-        // Six geometric rings of four FIXED directions, alternate rings turned by 45
-        // degrees. A per-pixel rotation made neighbouring pixels disagree about whether
-        // a blocker exists, so the filter radius flipped between them: the hatching at
-        // the lit edge of penumbrae. A surface counts only if it is high enough for its
+        float separations[13];      // per search tap, then the centre; 0 = no blocker
+        separations[12] = centerDepth < sd - b ? sd - centerDepth : 0;
+        // Three geometric rings (1/16, 1/4 and all of the reach) of four FIXED directions,
+        // the middle ring turned by 45 degrees. Six rings (24 taps) cost 18% more of the
+        // sun pass on a captured frame with no visible difference, since the probe below
+        // already recovers each blocker's exact reach. The directions are fixed: a
+        // per-pixel rotation made neighbouring pixels disagree about whether a blocker
+        // exists, so the filter radius flipped between them: the hatching at the lit
+        // edge of penumbrae. A surface counts only if it is high enough for its
         // light cone to reach this receiver; lower surfaces further away cannot occlude
         // the light disc. Rings at the antialiasing floor are exempt.
         //
@@ -183,17 +187,17 @@ float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,
         // direction, at that reach: still a hit means the receiver is inside the cone.
         // (Merely loosening the test let distant casters widen the filter over nearby
         // contact shadows.)
-        static const float searchScales[6] = {0.03125, 0.0625, 0.125, 0.25, 0.5, 1.0};
+        static const float searchScales[3] = {0.0625, 0.25, 1.0};
         static const float2 searchDirections[8] = {
             float2( 1.0,  0.0), float2( 0.0,  1.0), float2(-1.0,  0.0), float2( 0.0, -1.0),
             float2( 0.70710678,  0.70710678), float2(-0.70710678,  0.70710678),
             float2(-0.70710678, -0.70710678), float2( 0.70710678, -0.70710678)
         };
         // [loop], not [unroll], on this and the layer loops below: unrolled, the search
-        // (with its probe fetches) and the 25-entry bookkeeping expand the sun pass to ~5000
+        // (with its probe fetches) and the layer bookkeeping expanded the sun pass to ~5000
         // instructions, which NVIDIA's Vulkan compiler (DXVK under Proton) spends minutes on:
         // the game froze at load on Linux. The results are identical.
-        [loop] for (int j = 0; j < 24; j++) {
+        [loop] for (int j = 0; j < 12; j++) {
             int ring = j / 4;
             float ringReach = maxReach * searchScales[ring];
             float2 radius = max(baseRadius, ringReach * uvScale);
@@ -219,7 +223,7 @@ float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,
         // log2(separation), at least two octaves wide; a fixed ratio from the nearest
         // blocker cut through casters whose own separations span more than that ratio.
         uint occupied = 0;
-        [loop] for (int k = 0; k < 25; k++) {
+        [loop] for (int k = 0; k < 13; k++) {
             if (separations[k] > 0) {
                 float octave = floor(log2(separations[k] / depthScale)) + 10.0;   // 2^-10 .. 2^13 units
                 occupied |= 1u << (uint)clamp(octave, 0.0, 23.0);
@@ -244,13 +248,14 @@ float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,
         if (widest >= 2)
             splitSeparation = exp2(widestStart + widest * 0.5 - 10.0) * depthScale;
         float nearSum = 0, nearCount = 0, farSum = 0, farCount = 0;
-        [loop] for (int m = 0; m < 25; m++) {
+        [loop] for (int m = 0; m < 13; m++) {
             float separation = separations[m];
             if (separation > 0) {
                 if (separation < splitSeparation) { nearSum += separation; nearCount += 1; }
                 else { farSum += separation; farCount += 1; }
             }
         }
+        anyBlocker = nearCount + farCount > 0;   // the centre sample included
         // RTW stores affine directional-light depth, not distance from a point light.
         // Dividing by absolute blocker depth makes softness vary with the shadow
         // camera's near plane. Undo depth scaling only.
@@ -268,6 +273,11 @@ float DustRTWShadow(sampler2D sMap, sampler2D wMap, float4x4 shadowMatrix,
     // Independent occluders: the light that passes both layers. The near kernel leaves
     // the far layer's blockers to the far kernel; the far kernel needs no lower bound,
     // the cone test already keeps near blockers out of its outer taps.
+    // No blocker anywhere in the search, centre included: fully lit, which is most of
+    // the screen. The filter skipped here samples only the antialiasing floor around a
+    // centre and innermost ring that found nothing; on a captured frame no pixel changed
+    // visibly, and the sun pass got 8% cheaper.
+    [branch] if (!anyBlocker) return 1.0;
     float reachPerDepth = dustRtwLightSize / depthScale;
     float shadow = DustRtwDisk(sMap, wMap, receiver, sd, b, tapRotation, filterRadius, baseRadius,
                                uvScale, reachPerDepth, layerSplit);

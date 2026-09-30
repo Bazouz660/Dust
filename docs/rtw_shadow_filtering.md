@@ -58,11 +58,27 @@ Both values reach the shader through `DustFrameParams` at PS `b8`, which the hos
 
 Measured on a full-resolution crop of a captured penumbra (59k penumbra pixels, replica of the shader): residual noise 0.103 and one-pixel checker energy 0.158. Tap count and tap rotation were only part of it. The blocker search rotated its two taps per ring per pixel, so neighbouring pixels disagreed about whether a blocker exists (3.2% of neighbours differed by more than 25% in filter radius), and the radius flipped between the texel floor and the full penumbra: hatching along the lit edge.
 
-- The search uses six rings of four fixed directions, alternate rings turned by 45 degrees. Deterministic, so neighbours agree (0.6%).
+- The search uses fixed directions, rings of four with alternate rings turned by 45 degrees. Deterministic, so neighbours agree (0.6%). It shipped as six rings (1/32 to 1 of the reach) and now uses three (1/16, 1/4, 1); see Performance below.
 - Rings are discrete, so a receiver inside a blocker's cone could fall between the last ring that finds it and the first short enough to pass the cone test; the penumbra then ended in a hard, jagged rim on the lit side. A hit whose reach is shorter than its ring is probed again in the same direction at that reach; still a hit means the receiver is inside the cone. Merely loosening the cone test (tried: 3x) also removed the rim, but let distant casters widen the filter over nearby contact shadows, which the plateau regression test caught.
 - The PCF uses a Vogel disk, 24 taps for wide penumbrae (atlas tier otherwise), rotated per pixel by the R2 sequence, which does not alternate between neighbours the way interleaved gradient noise does. Under temporal AA the rotation also advances per frame.
 
-Result on the same crop: residual noise 0.038, checker energy 0.050, and a penumbra that fades out on both sides. Cost: 24 search taps (was 12) for every lit pixel, plus one probe per rejected hit, and 24 PCF taps (was 12) inside wide penumbrae.
+Result on the same crop: residual noise 0.038, checker energy 0.050, and a penumbra that fades out on both sides. Cost as shipped in v0.7.6: 24 search taps (was 12) for every lit pixel, plus one probe per rejected hit, and 24 PCF taps (was 12) inside wide penumbrae.
+
+## Performance
+
+Measured by replaying the RTW sun pass of `captures/rtw_layers_frame55489.rdc` (2560x1440, 12288² atlas, Light Size 1, Max Penumbra 2) on an RTX 4090. Each version's patcher is applied to the installed `deferred.hlsl`, and the captured G-buffer, shadow map, warp map, samplers, `$Params` and quad are bound as in the frame. Times are the whole sun pass, including the game's lighting.
+
+| Version | PCSS on | PCSS off |
+|---|---|---|
+| v0.7.5.3 | 0.19 ms | 0.16 ms |
+| v0.7.6 (loops unrolled, 4999 instructions) | 1.85 ms | |
+| v0.7.6.1 (`[loop]`) | 0.93 ms | 0.19 ms |
+| v0.7.6.2 (three search rings, lit early-out, 13-entry array) | 0.69 ms | 0.19 ms |
+
+- Cost comes from the number of shadow-map reads, not from the settings: Light Size 3 costs the same as 1, and Max Penumbra 1 saves 15%.
+- The blocker search was about 60% of the PCSS cost. Three rings instead of six saved 18% of the sun pass; the lit early-out (no blocker, centre included, so skip the filter) saved 8%; shrinking `separations` from 25 to 13 entries saved another 8%. The output differs from v0.7.6.1 in 0.09% of pixels by more than 5% of luminance, along the outer edge of a wide far-caster penumbra, and is not visible side by side at full resolution.
+- Measured and rejected: 16 filter taps instead of 24 was slower (1.33 ms), and skipping rings clamped to the antialiasing floor gained nothing on this frame.
+- The caster pass is the larger cost of the frame: 7.0 of 11.6 ms at a 12288² atlas, of which 4.4 ms is tessellated draws. The v0.7.6 tessellation factors generate 19% fewer domain vertices than vanilla on this frame (4.94M vs 6.09M), so the atlas resolution chosen by the preset is what sets that cost.
 
 ## Blocker layers
 
