@@ -2403,6 +2403,14 @@ void Render()
             sDustCopies = BugReport::CountLoadedDustCopies(&paths);
             if (sDustCopies > 1) Log("WARNING: %d copies of Dust.dll are loaded:\n%s", sDustCopies, paths.c_str());
         }
+        if (D3D11Hook::DriverFrameGenDetected())
+        {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextColored(ImVec4(1.00f, 0.72f, 0.25f, 1.00f), "%s",
+                DustLoc::T("NVIDIA Smooth Motion (driver frame generation) is active. It is known to darken the image and make this menu flicker with Dust: turn it off for Kenshi in the NVIDIA App if you see either."));
+            ImGui::PopTextWrapPos();
+            ImGui::Separator();
+        }
         if (sDustCopies > 1)
         {
             ImGui::PushTextWrapPos(0.0f);

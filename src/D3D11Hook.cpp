@@ -1245,6 +1245,8 @@ static IDXGISwapChain* gHookedSwapChain = nullptr;
 static DWORD gGameRenderThreadId = 0;            // set at confirmed-pipeline device capture (HookedDraw)
 static thread_local int tPresentDepth = 0;       // our Present-hook recursion depth on this thread
 static IDXGISwapChain* gGuiSwapChain = nullptr;  // chain the GUI renders into (weak, compare-only)
+static std::atomic<bool> gDriverFrameGen{false}; // presents arrive off the render thread (Smooth Motion)
+bool DriverFrameGenDetected() { return gDriverFrameGen.load(std::memory_order_relaxed); }
 
 static void TryInstallSwapChainHooks(ID3D11DeviceContext* drawCtx = nullptr)
 {
@@ -3522,10 +3524,29 @@ static bool IsGamePresent(IDXGISwapChain* sc, bool topLevel)
     return true;
 }
 
+// Driver frame generation detection. Under NVIDIA Smooth Motion the game renders into a proxy
+// chain and the driver's pacing thread presents everything (see the IsGamePresent notes above), so
+// top-level presents on the GUI chain stop coming from the game's render thread. A few stray
+// off-thread presents (overlays, loading screens) must not trip it: require a sustained run.
+static void NoteGuiChainPresentThread()
+{
+    if (gDriverFrameGen.load(std::memory_order_relaxed) || gGameRenderThreadId == 0) return;
+    static int sOffThreadRun = 0;
+    if (GetCurrentThreadId() == gGameRenderThreadId) { sOffThreadRun = 0; return; }
+    if (++sOffThreadRun == 240)
+    {
+        gDriverFrameGen.store(true, std::memory_order_relaxed);
+        Log("Driver frame generation detected (NVIDIA Smooth Motion or similar): presents come from thread %u, "
+            "the game renders on thread %u. Known to darken the image and make the Dust menu flicker.",
+            (unsigned)GetCurrentThreadId(), (unsigned)gGameRenderThreadId);
+    }
+}
+
 static HRESULT STDMETHODCALLTYPE HookedPresent(
     IDXGISwapChain* pThis, UINT SyncInterval, UINT Flags)
 {
     ++tPresentDepth;
+    if (!gShutdownSignaled && tPresentDepth == 1 && pThis == gGuiSwapChain) NoteGuiChainPresentThread();
     if (!gShutdownSignaled && IsGamePresent(pThis, tPresentDepth == 1))
         TickGuiOnPresent(pThis, "Present");
     HRESULT hr = oPresent(pThis, SyncInterval, Flags);
@@ -3538,6 +3559,7 @@ static HRESULT STDMETHODCALLTYPE HookedPresent1(
     const DXGI_PRESENT_PARAMETERS* pPresentParameters)
 {
     ++tPresentDepth;
+    if (!gShutdownSignaled && tPresentDepth == 1 && pThis == gGuiSwapChain) NoteGuiChainPresentThread();
     if (!gShutdownSignaled && IsGamePresent(pThis, tPresentDepth == 1))
         TickGuiOnPresent(pThis, "Present1");
     HRESULT hr = oPresent1(pThis, SyncInterval, PresentFlags, pPresentParameters);

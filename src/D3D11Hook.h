@@ -19,6 +19,11 @@ namespace D3D11Hook
 
     // Present hook diagnostics and recovery
     bool IsPresentHooked();     // true if Present hook has actually fired
+
+    // True once driver-level frame generation (NVIDIA Smooth Motion) is seen: the driver then
+    // presents every frame from its own pacing thread, never from the game's render thread.
+    // Sticky for the session. Used for a GUI hint and the bug report (GitHub #20).
+    bool DriverFrameGenDetected();
     void TryRecoverPresent();   // re-attempt swap chain discovery + hook
 
     // Signal all hooks to pass through to originals (game shutting down).

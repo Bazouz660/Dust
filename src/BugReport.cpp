@@ -876,6 +876,8 @@ bool StartGeneration(const LiveStats& stats)
         }
         Appendf(r, "Temporal AA: %s\r\n", aaLine.c_str());
         Appendf(r, "Motion-vector shaders injected this session: %s\r\n", UpscalerControl::MvShadersInjected() ? "yes" : "no");
+        Appendf(r, "Driver frame generation (NVIDIA Smooth Motion): %s\r\n",
+                D3D11Hook::DriverFrameGenDetected() ? "DETECTED - known to darken the image / make the menu flicker" : "not detected");
     }
     Appendf(r, "\r\n");
 
@@ -951,7 +953,8 @@ bool StartGeneration(const LiveStats& stats)
         Appendf(s, "Backbuffer: %.0fx%.0f | %.1f FPS at report time\n",
                 stats.displayW, stats.displayH, stats.fps);
         Appendf(s, "Preset: %s\n", presetName.c_str());
-        Appendf(s, "In game: %s | Temporal AA: %s\n", inGame ? "yes" : "NO (main menu?)", aaLine.c_str());
+        Appendf(s, "In game: %s | Temporal AA: %s%s\n", inGame ? "yes" : "NO (main menu?)", aaLine.c_str(),
+                D3D11Hook::DriverFrameGenDetected() ? " | Smooth Motion: ON" : "");
         Appendf(s, "Effects on: %s\n", enabledEffects.empty() ? "(none)" : enabledEffects.c_str());
         if (modCount >= 0)
             Appendf(s, "Mods: %d entries in load order\n", modCount);
