@@ -965,7 +965,7 @@ void EffectLoader::DispatchPre(DustInjectionPoint point, const DustFrameContext*
     }
 }
 
-void EffectLoader::DispatchPost(DustInjectionPoint point, const DustFrameContext* ctx)
+void EffectLoader::DispatchPost(DustInjectionPoint point, const DustFrameContext* ctx, TemporalAAPhase phase)
 {
     PrepareDispatch(ctx->frameIndex);
     for (size_t index : postSchedule_.Group(point))
@@ -973,6 +973,12 @@ void EffectLoader::DispatchPost(DustInjectionPoint point, const DustFrameContext
         auto& le = effects_[index];
         if (!le.initialized || !le.desc.postExecute)
             continue;
+        if (phase != TemporalAAPhase::All)
+        {
+            const bool afterAA = le.desc.apiVersion >= 3 && (le.desc.flags & DUST_FLAG_AFTER_TEMPORAL_AA);
+            if (afterAA != (phase == TemporalAAPhase::AfterAA))
+                continue;
+        }
         if (le.desc.IsEnabled && !le.desc.IsEnabled())
             continue;
 

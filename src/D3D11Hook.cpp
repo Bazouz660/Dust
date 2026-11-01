@@ -2390,16 +2390,22 @@ static void STDMETHODCALLTYPE HookedDraw(
 
         if (sunFrameParams) UnbindSunFrameParams(pThis);
 
-        // POST: effects that operate after the draw
+        // POST: effects that operate after the draw. At POST_TONEMAP the temporal AA resolve sits in
+        // the middle: effects flagged DUST_FLAG_AFTER_TEMPORAL_AA (grain, vignette, CA, letterbox) run
+        // after it, so DLAA/FSR don't average their per-frame pattern away (#19). With the upscaler
+        // off the resolve is a no-op and the order is the same as a single dispatch.
         fctx.timing = DUST_TIMING_POST;
-        gEffectLoader.DispatchPost(dip, &fctx);
+        const bool tonemapPoint = (result.point == InjectionPoint::POST_TONEMAP);
+        gEffectLoader.DispatchPost(dip, &fctx, tonemapPoint ? EffectLoader::TemporalAAPhase::BeforeAA
+                                                            : EffectLoader::TemporalAAPhase::All);
 
         // Shader-injected motion vectors: the velocity RT is filled during the real GBuffer pass
         // (see HookedOMSetRenderTargets + ShaderPatch). Here we only blit the debug viz over the
         // final image at POST_TONEMAP when [Upscaling] ShowMotionVectors=1, then end the frame.
-        if (result.point == InjectionPoint::POST_TONEMAP)
+        if (tonemapPoint)
         {
             RunUpscaler(pThis);                  // DLSS DLAA resolve (no-op unless [Upscaling] DLSS=1)
+            gEffectLoader.DispatchPost(dip, &fctx, EffectLoader::TemporalAAPhase::AfterAA);
             RunInteropSpike(pThis);              // FSR3/4 D3D12 interop spike (no-op unless D3D12InteropSpike=1)
             MotionVectors::InjDebugBlit(pThis);  // MV debug viz (only if ShowMotionVectors=1)
             MotionVectors::InjEndFrame();

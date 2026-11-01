@@ -189,7 +189,7 @@ extern "C" __declspec(dllexport) int DustEffectCreate(DustEffectDesc* desc)
     desc->IsEnabled         = VignetteIsEnabled;
     desc->settings          = gSettingsArray;
     desc->settingCount      = sizeof(gSettingsArray) / sizeof(gSettingsArray[0]);
-    desc->flags             = DUST_FLAG_FRAMEWORK_CONFIG | DUST_FLAG_FRAMEWORK_TIMING;
+    desc->flags             = DUST_FLAG_FRAMEWORK_CONFIG | DUST_FLAG_FRAMEWORK_TIMING | DUST_FLAG_AFTER_TEMPORAL_AA;
     desc->configSection     = "Vignette";
     desc->priority          = 200;
 

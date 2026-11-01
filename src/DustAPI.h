@@ -293,6 +293,11 @@ typedef struct DustSettingDesc {
 // Effect descriptor flags (API v3+)
 #define DUST_FLAG_FRAMEWORK_CONFIG  1   // Framework handles INI load/save/hot-reload from settings array
 #define DUST_FLAG_FRAMEWORK_TIMING  2   // Framework handles GPU timestamp queries automatically
+// POST_TONEMAP only: run AFTER the host's temporal AA resolve (DLAA / FSR) instead of before it.
+// For screen-space overlays whose per-frame pattern must not be fed through temporal accumulation
+// (film grain is averaged away by it, GitHub #19) or that should stay pixel-exact (vignette,
+// letterbox bars, chromatic fringes). Hosts that predate the flag ignore it (effect runs before AA).
+#define DUST_FLAG_AFTER_TEMPORAL_AA 4
 
 // Effect callback signature
 typedef void (*DustEffectCallback)(const DustFrameContext* ctx, const DustHostAPI* host);
