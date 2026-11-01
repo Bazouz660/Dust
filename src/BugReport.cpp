@@ -1,6 +1,8 @@
 #include "BugReport.h"
 #include "DustLog.h"
 #include "EffectLoader.h"
+#include "D3D11Hook.h"
+#include "UpscalerControl.h"
 #include "../crash/CrashProtocol.h"
 
 #include <dxgi.h>
@@ -365,6 +367,18 @@ static void AppendGpuInfo(std::string& out, ID3D11Device* device)
                     driverStr, d.VendorId, d.DeviceId,
                     (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) ? " [software]" : "",
                     inUse ? "  <== in use" : "");
+            // A wrapper DLL (OptiScaler & co.) can rename an AMD/Intel adapter to an NVIDIA model so
+            // games expose DLSS; the vendor ID stays real. Flag it loudly: it explains DLAA failing
+            // and vendor-specific driver behaviour, and the user often doesn't know it's installed.
+            {
+                const std::string name = WideToUtf8(d.Description);
+                const bool saysNvidia = name.find("NVIDIA") != std::string::npos || name.find("GeForce") != std::string::npos ||
+                                        name.find("RTX") != std::string::npos;
+                const bool saysAmd    = name.find("AMD") != std::string::npos || name.find("Radeon") != std::string::npos;
+                if ((saysNvidia && d.VendorId != 0x10DE) || (saysAmd && d.VendorId != 0x1002))
+                    Appendf(out, "    !! GPU NAME DOES NOT MATCH ITS VENDOR ID: this is really a %s GPU renamed by a wrapper DLL (e.g. OptiScaler) - DLAA cannot work on it\r\n",
+                            GpuVendorName(d.VendorId));
+            }
         }
         adapter->Release();
         adapter = nullptr;
@@ -426,6 +440,28 @@ static void AppendMonitorInfo(std::string& out)
 
 // ==================== Overlay / injected-module detection ====================
 
+int CountLoadedDustCopies(std::string* pathsOut)
+{
+    HMODULE mods[2048];
+    DWORD needed = 0;
+    HANDLE proc = GetCurrentProcess();
+    if (!EnumProcessModules(proc, mods, sizeof(mods), &needed)) return 1;
+    int count = (int)(needed / sizeof(HMODULE));
+    if (count > 2048) count = 2048;
+    int copies = 0;
+    for (int i = 0; i < count; i++)
+    {
+        char path[MAX_PATH] = {};
+        if (!GetModuleFileNameExA(proc, mods[i], path, MAX_PATH)) continue;
+        const char* base = strrchr(path, '\\');
+        base = base ? base + 1 : path;
+        if (_stricmp(base, "Dust.dll") != 0) continue;
+        copies++;
+        if (pathsOut) Appendf(*pathsOut, "  - %s\r\n", path);
+    }
+    return copies;
+}
+
 static void AppendModuleScan(std::string& out, const std::string& gameDir, const std::string& modDir)
 {
     struct Known { const char* module; const char* label; };
@@ -481,7 +517,7 @@ static void AppendModuleScan(std::string& out, const std::string& gameDir, const
         // ones live in System32) — flag any such local system-named DLL.
         if ((base == "dxgi.dll" || base == "d3d11.dll" || base == "d3dcompiler_47.dll")
             && full.compare(0, gameDirL.size(), gameDirL) == 0)
-            Appendf(detected, "  - Local %s in game folder (ReShade or another wrapper)\r\n", base.c_str());
+            Appendf(detected, "  - Local %s in game folder (ReShade, OptiScaler or another wrapper)\r\n", base.c_str());
 
         // Everything loaded from the game dir or the Dust mod dir — catches
         // RE_Kenshi plugins and other injected mods.
@@ -490,6 +526,12 @@ static void AppendModuleScan(std::string& out, const std::string& gameDir, const
             Appendf(gameDirModules, "  - %s\r\n", base.c_str());
     }
 
+    {
+        std::string dustPaths;
+        if (CountLoadedDustCopies(&dustPaths) > 1)
+            Appendf(out, "!! MORE THAN ONE COPY OF DUST IS LOADED (e.g. a Nexus/manual install AND the Workshop one):\r\n%s",
+                    dustPaths.c_str());
+    }
     Appendf(out, "Overlays / capture software detected:\r\n%s",
             detected.empty() ? "  (none detected)\r\n" : detected.c_str());
     if (FileExists(gameDir + "ReShade.ini"))
@@ -812,6 +854,29 @@ bool StartGeneration(const LiveStats& stats)
     Appendf(r, "Game dir: %s\r\n", gameDir.c_str());
     Appendf(r, "Logging enabled: %s\r\n", DustLogEnabled() ? "yes" : "no  <-- enable Logging and reproduce the bug for better reports");
     Appendf(r, "Active preset: %s\r\n", presetName.c_str());
+    // The two questions every under-specified report needs answered - answered by the report itself.
+    const bool inGame = D3D11Hook::gDeviceCaptured;
+    Appendf(r, "In game (3D renderer hooked): %s\r\n",
+            inGame ? "yes" : "NO - no game frame seen yet (main menu?). Effects only start in a loaded save");
+    std::string aaLine;
+    {
+        const bool en = UpscalerControl::GetEnabled();
+        const int  be = UpscalerControl::GetBackend();
+        const char* name = be == 1 ? "FSR2" : be == 2 ? "FSR3/4" : "DLAA";
+        if (!en)
+            aaLine = "Disabled";
+        else if (!UpscalerControl::Probed())
+            aaLine = std::string(name) + " (not started yet)";
+        else if (UpscalerControl::Available())
+            aaLine = std::string(name) + " (running)";
+        else
+        {
+            const char* why = UpscalerControl::UnavailableReason();
+            aaLine = std::string(name) + " (UNAVAILABLE: " + ((why && why[0]) ? why : "no reason reported") + ")";
+        }
+        Appendf(r, "Temporal AA: %s\r\n", aaLine.c_str());
+        Appendf(r, "Motion-vector shaders injected this session: %s\r\n", UpscalerControl::MvShadersInjected() ? "yes" : "no");
+    }
     Appendf(r, "\r\n");
 
     std::string enabledEffects;
@@ -886,6 +951,7 @@ bool StartGeneration(const LiveStats& stats)
         Appendf(s, "Backbuffer: %.0fx%.0f | %.1f FPS at report time\n",
                 stats.displayW, stats.displayH, stats.fps);
         Appendf(s, "Preset: %s\n", presetName.c_str());
+        Appendf(s, "In game: %s | Temporal AA: %s\n", inGame ? "yes" : "NO (main menu?)", aaLine.c_str());
         Appendf(s, "Effects on: %s\n", enabledEffects.empty() ? "(none)" : enabledEffects.c_str());
         if (modCount >= 0)
             Appendf(s, "Mods: %d entries in load order\n", modCount);

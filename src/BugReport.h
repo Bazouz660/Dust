@@ -41,4 +41,9 @@ namespace BugReport
     // New-issue URL with the system summary prefilled into the issue form.
     std::string BuildGitHubIssueURL();
     void OpenCrashReports();
+
+    // Number of Dust.dll modules loaded in this process (normally 1). Two copies (a Nexus/manual
+    // install plus the Workshop one) both hook the game; the menu then controls only one of them,
+    // so toggles appear to do nothing. pathsOut (optional) receives one "  - <path>" line per copy.
+    int CountLoadedDustCopies(std::string* pathsOut = nullptr);
 }

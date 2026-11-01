@@ -7,6 +7,7 @@
 #include "SurveyRecorder.h"
 #include "BugReport.h"
 #include "UpscalerControl.h"
+#include "D3D11Hook.h"
 #include "Upscaler.h"
 #include "MotionVectors.h"
 #include "Localization.h"
@@ -2392,6 +2393,25 @@ void Render()
 
         size_t count = gEffectLoader.Count();
 
+        // Two Dust copies hooked into one game (Nexus/manual + Workshop): each draws its own effects
+        // and this menu only drives one of them, so settings look like they do nothing. Checked
+        // once; module lists don't change after startup in practice.
+        static int sDustCopies = -1;
+        if (sDustCopies < 0)
+        {
+            std::string paths;
+            sDustCopies = BugReport::CountLoadedDustCopies(&paths);
+            if (sDustCopies > 1) Log("WARNING: %d copies of Dust.dll are loaded:\n%s", sDustCopies, paths.c_str());
+        }
+        if (sDustCopies > 1)
+        {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextColored(ImVec4(1.00f, 0.45f, 0.35f, 1.00f), "%s",
+                DustLoc::T("Two copies of Dust are installed and running at once (for example the Nexus version and the Steam Workshop one). Remove one of them, otherwise settings may appear to do nothing."));
+            ImGui::PopTextWrapPos();
+            ImGui::Separator();
+        }
+
         if (count == 0)
         {
             ImGui::TextDisabled("%s", DustLoc::T("No effect plugins loaded"));
@@ -2465,8 +2485,26 @@ void Render()
 
             if (shown == 0 && sFilterBuf[0])
                 ImGui::TextDisabled(DustLoc::T("No effect matches \"%s\""), sFilterBuf);
+            else if (shown == 0 && !D3D11Hook::gDeviceCaptured)
+            {
+                // Effects start on the first frame of the game's 3D scene renderer, which the main
+                // menu never runs. This is the #1 "Dust is broken" report - explain it in place.
+                ImGui::PushTextWrapPos(0.0f);
+                ImGui::TextDisabled("%s", DustLoc::T("Effects appear once you load a save or start a new game. The main menu does not use the 3D renderer Dust hooks into."));
+                ImGui::Spacing();
+                ImGui::TextDisabled("%s", DustLoc::T("Already in a save and still seeing this? Click Report a Bug (bottom-left) and post the generated zip on the Dust Discord or GitHub."));
+                ImGui::PopTextWrapPos();
+            }
             else if (shown == 0)
-                ImGui::TextDisabled("%s", DustLoc::T("No initialized effect plugins to display"));
+            {
+                // In-game (device captured) and still nothing initialized: a real failure. Point at the
+                // one action that gets it diagnosed.
+                ImGui::PushTextWrapPos(0.0f);
+                ImGui::TextColored(ImVec4(1.00f, 0.45f, 0.35f, 1.00f), "%s",
+                                   DustLoc::T("Dust could not start its effects on this system."));
+                ImGui::TextDisabled("%s", DustLoc::T("Click Report a Bug (bottom-left) and post the generated zip on the Dust Discord or GitHub so it can be fixed."));
+                ImGui::PopTextWrapPos();
+            }
             gForceCollapseState = 0;
 
             ImGui::EndChild(); // ##effects
