@@ -606,34 +606,45 @@ static void RebuildFontAtlas()
         b.BuildRanges(&sGlyphRanges);
     }
 
-    char fontPath[MAX_PATH] = {};
-    UINT n = GetWindowsDirectoryA(fontPath, MAX_PATH);
-    bool loaded = false;
-    if (n > 0)
+    // Candidate faces, first present wins. Windows system fonts first (they match the OS look), then
+    // fonts every Wine/Proton prefix has, then Kenshi's OWN UI font: data/gui/fonts/Exo2-Medium.ttf
+    // ships with every install and covers Latin-1, Latin Extended-A and Cyrillic. Without that last
+    // step a Proton prefix (no Segoe UI) fell through to ImGui's built-in ProggyClean, which is
+    // ASCII-only - so a Russian menu rendered as '?' (GitHub #23). CJK faces have no such safety
+    // net (Kenshi ships none); Exo2 then at least keeps Latin/Cyrillic text readable.
+    std::vector<std::string> candidates;
     {
-        const char* fonts[] = {
-            zh ? "\\Fonts\\msyh.ttc"   : ja ? "\\Fonts\\YuGothM.ttc"  : ko ? "\\Fonts\\malgun.ttf" : "\\Fonts\\segoeui.ttf",
-            zh ? "\\Fonts\\simsun.ttc" : ja ? "\\Fonts\\meiryo.ttc"   : ko ? "\\Fonts\\gulim.ttc"  : "\\Fonts\\segoeui.ttf",
-            ja ? "\\Fonts\\msgothic.ttc" : "\\Fonts\\segoeui.ttf",
-            "\\Fonts\\segoeui.ttf"
-        };
-        for (const char* suffix : fonts)
+        char winDir[MAX_PATH] = {};
+        UINT n = GetWindowsDirectoryA(winDir, MAX_PATH);
+        const std::string fontsDir = (n > 0 && n < MAX_PATH) ? std::string(winDir) + "\\Fonts\\" : std::string();
+        auto sys = [&](const char* file) { if (!fontsDir.empty()) candidates.push_back(fontsDir + file); };
+        if (zh)      { sys("msyh.ttc");    sys("simsun.ttc"); }
+        else if (ja) { sys("YuGothM.ttc"); sys("meiryo.ttc"); sys("msgothic.ttc"); }
+        else if (ko) { sys("malgun.ttf");  sys("gulim.ttc"); }
+        sys("segoeui.ttf");
+        sys("tahoma.ttf");   // Wine/Proton ship their own Tahoma (Latin + Cyrillic)
+        sys("arial.ttf");    // Proton maps Liberation Sans here
+        std::string game = DustGameDir();
+        if (!game.empty())
         {
-            strcpy_s(fontPath, sizeof(fontPath), "");
-            GetWindowsDirectoryA(fontPath, MAX_PATH);
-            if (strlen(fontPath) + strlen(suffix) >= MAX_PATH) continue;
-            strcat_s(fontPath, sizeof(fontPath), suffix);
-            if (GetFileAttributesA(fontPath) == INVALID_FILE_ATTRIBUTES) continue;
-            loaded = (io.Fonts->AddFontFromFileTTF(fontPath, px, nullptr, sGlyphRanges.Data) != nullptr);
-            if (loaded) { Log("GUI: font %s for language %s", suffix + 7, lang.c_str()); break; }
+            if (game.back() != '\\' && game.back() != '/') game += "\\";
+            candidates.push_back(game + "data\\gui\\fonts\\Exo2-Medium.ttf");
         }
+    }
+
+    bool loaded = false;
+    for (const std::string& path : candidates)
+    {
+        if (GetFileAttributesA(path.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+        loaded = (io.Fonts->AddFontFromFileTTF(path.c_str(), px, nullptr, sGlyphRanges.Data) != nullptr);
+        if (loaded) { Log("GUI: font %s for language %s", path.c_str(), lang.c_str()); break; }
     }
     if (!loaded)
     {
         ImFontConfig cfg;
         cfg.SizePixels = 13.0f * ResolveUiScale();
         io.Fonts->AddFontDefault(&cfg);
-        Log("GUI: Segoe UI unavailable, using built-in font");
+        Log("GUI: no system or game font found, using built-in ASCII-only font (non-English menu text will show '?')");
     }
 
     io.Fonts->Build();
