@@ -178,10 +178,17 @@ int main(int argc, char** argv)
     for (auto& w : offMap.warped) w[0] += 0.2f;
     assert(triangles(patched, offMap) == 1);
 
+    // Inside the magnified zone a short unwarped edge can be long after warping: the factor
+    // follows the vanilla metric there (never less subdivision than the game itself).
+    // Warped edge lengths 0.707 / 0.5 / 0.5 -> vanilla 8 / 6 / 6; only two cells unwarped.
+    PatchData magnified = { { {0, 0, 0.5f, 1}, {2.0f * cell, 0, 0.5f, 1}, {0, 2.0f * cell, 0.5f, 1} },
+                            { {0, 0, 0, 0}, {0.5f, 0, 0, 0}, {0, 0.5f, 0, 0} } };
+    assert(triangles(patched, magnified) == triangles(FixedFactors(8, 6, 6, 8), magnified));
+
     // Factors never exceed the hardware limit.
     PatchData huge = { { {-0.9f, -0.9f, 0.5f, 1}, {0.9f, -0.9f, 0.5f, 1}, {0, 0.9f, 0.5f, 1} },
                        { {-0.5f, -0.5f, 0, 0}, {0.5f, -0.5f, 0, 0}, {0, 0.5f, 0, 0} } };
     assert(triangles(patched, huge) == triangles(FixedFactors(64, 64, 64, 64), huge));
 
-    std::puts("RTW tessellation: factors follow warp cells crossed, skip off-map and small patches, cap at 64");
+    std::puts("RTW tessellation: factors follow warp cells crossed (floored at vanilla), skip off-map and small patches, cap at 64");
 }
