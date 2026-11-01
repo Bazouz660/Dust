@@ -15,7 +15,7 @@
 
 namespace Upscaler
 {
-static char                 sReason[256] = "";       // why DLSS is unavailable (GUI + bug report); empty = available / not probed
+static char                 sReason[512] = "";       // why DLSS is unavailable (GUI + bug report); empty = available / not probed
 static bool                 sInited     = false;
 static bool                 sAvailable  = false;
 static NVSDK_NGX_Parameter* sParams     = nullptr;   // capability params (also carry the optimal-settings callback)
@@ -35,10 +35,12 @@ bool Init(ID3D11Device* device, const wchar_t* dllSearchPath, const wchar_t* app
     sReason[0] = '\0';
     if (!device) { snprintf(sReason, sizeof(sReason), "no D3D11 device"); return false; }
 
-    // DLSS is NVIDIA-only. Check the adapter's VENDOR ID before touching NGX: wrappers such as
-    // OptiScaler rename an AMD/Intel adapter to an NVIDIA model (the description says "RTX ...") but
-    // leave the vendor ID alone, and NGX then fails with an opaque PlatformError (0xBAD00002). Saying
-    // which GPU it really is turns that support thread into a one-line answer.
+    // DLSS is NVIDIA-only. Check the adapter's VENDOR ID before touching NGX. A name that says
+    // NVIDIA with a non-NVIDIA vendor ID means a D3D11 wrapper sits in between. The common one is
+    // DXVK (dxgi.dll + d3d11.dll in the game folder): it hides NVIDIA GPUs by default, keeping
+    // the real name but reporting an AMD vendor/device ID (seen 2026-11: a real RTX 3080 Ti shown
+    // as vendor 0x1002 device 0x73DF), and DLSS cannot run through its D3D11 at all, so NGX fails
+    // with an opaque PlatformError (0xBAD00002). Don't guess the real vendor: say what was seen.
     {
         IDXGIDevice* dxgiDev = nullptr; IDXGIAdapter* adapter = nullptr; DXGI_ADAPTER_DESC ad = {};
         bool haveDesc = SUCCEEDED(device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDev)) && dxgiDev &&
@@ -53,8 +55,8 @@ bool Init(ID3D11Device* device, const wchar_t* dllSearchPath, const wchar_t* app
             const bool renamed = strstr(name, "NVIDIA") || strstr(name, "GeForce") || strstr(name, "RTX");
             if (renamed)
                 snprintf(sReason, sizeof(sReason),
-                         "this GPU is %s (vendor 0x%04X) but reports itself as \"%s\" - a wrapper DLL such as OptiScaler is renaming it. DLAA needs a real NVIDIA RTX GPU: use FSR2 instead",
-                         vendor, ad.VendorId, name);
+                         "the GPU is named \"%s\" but reports a %s vendor ID (0x%04X): a D3D11 wrapper is in the game folder, most likely DXVK (dxgi.dll + d3d11.dll), which hides NVIDIA GPUs. DLSS cannot run through it: remove the wrapper to use DLAA, or use FSR2",
+                         name, vendor, ad.VendorId);
             else
                 snprintf(sReason, sizeof(sReason), "DLAA needs an NVIDIA RTX GPU (this one is %s: %s). Use FSR2 instead", vendor, name);
             Log("Upscaler[DLSS]: skipped - %s", sReason);

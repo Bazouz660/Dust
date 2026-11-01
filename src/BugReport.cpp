@@ -367,16 +367,17 @@ static void AppendGpuInfo(std::string& out, ID3D11Device* device)
                     driverStr, d.VendorId, d.DeviceId,
                     (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) ? " [software]" : "",
                     inUse ? "  <== in use" : "");
-            // A wrapper DLL (OptiScaler & co.) can rename an AMD/Intel adapter to an NVIDIA model so
-            // games expose DLSS; the vendor ID stays real. Flag it loudly: it explains DLAA failing
-            // and vendor-specific driver behaviour, and the user often doesn't know it's installed.
+            // Name and vendor ID disagree: a D3D11 wrapper is in between. DXVK hides NVIDIA GPUs by
+            // reporting an AMD vendor ID with the real name (a real RTX 3080 Ti showed as 0x1002 /
+            // 0x73DF, 2026-11); OptiScaler-style tools do the opposite. Which side is real can't be
+            // told from here, so report the mismatch, not a guess. It explains DLAA failing.
             {
                 const std::string name = WideToUtf8(d.Description);
                 const bool saysNvidia = name.find("NVIDIA") != std::string::npos || name.find("GeForce") != std::string::npos ||
                                         name.find("RTX") != std::string::npos;
                 const bool saysAmd    = name.find("AMD") != std::string::npos || name.find("Radeon") != std::string::npos;
                 if ((saysNvidia && d.VendorId != 0x10DE) || (saysAmd && d.VendorId != 0x1002))
-                    Appendf(out, "    !! GPU NAME DOES NOT MATCH ITS VENDOR ID: this is really a %s GPU renamed by a wrapper DLL (e.g. OptiScaler) - DLAA cannot work on it\r\n",
+                    Appendf(out, "    !! GPU NAME DOES NOT MATCH ITS VENDOR ID (%s): a D3D11 wrapper is in use, most likely DXVK (hides NVIDIA GPUs as AMD) or OptiScaler - DLAA cannot work through it\r\n",
                             GpuVendorName(d.VendorId));
             }
         }
@@ -517,7 +518,7 @@ static void AppendModuleScan(std::string& out, const std::string& gameDir, const
         // ones live in System32) — flag any such local system-named DLL.
         if ((base == "dxgi.dll" || base == "d3d11.dll" || base == "d3dcompiler_47.dll")
             && full.compare(0, gameDirL.size(), gameDirL) == 0)
-            Appendf(detected, "  - Local %s in game folder (ReShade, OptiScaler or another wrapper)\r\n", base.c_str());
+            Appendf(detected, "  - Local %s in game folder (ReShade, DXVK, OptiScaler or another wrapper)\r\n", base.c_str());
 
         // Everything loaded from the game dir or the Dust mod dir — catches
         // RE_Kenshi plugins and other injected mods.
