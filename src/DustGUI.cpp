@@ -7,6 +7,7 @@
 #include "SurveyRecorder.h"
 #include "BugReport.h"
 #include "UpscalerControl.h"
+#include "D3D11Hook.h"
 #include "Upscaler.h"
 #include "MotionVectors.h"
 #include "Localization.h"
@@ -606,34 +607,45 @@ static void RebuildFontAtlas()
         b.BuildRanges(&sGlyphRanges);
     }
 
-    char fontPath[MAX_PATH] = {};
-    UINT n = GetWindowsDirectoryA(fontPath, MAX_PATH);
-    bool loaded = false;
-    if (n > 0)
+    // Candidate faces, first present wins. Windows system fonts first (they match the OS look), then
+    // fonts every Wine/Proton prefix has, then Kenshi's OWN UI font: data/gui/fonts/Exo2-Medium.ttf
+    // ships with every install and covers Latin-1, Latin Extended-A and Cyrillic. Without that last
+    // step a Proton prefix (no Segoe UI) fell through to ImGui's built-in ProggyClean, which is
+    // ASCII-only - so a Russian menu rendered as '?' (GitHub #23). CJK faces have no such safety
+    // net (Kenshi ships none); Exo2 then at least keeps Latin/Cyrillic text readable.
+    std::vector<std::string> candidates;
     {
-        const char* fonts[] = {
-            zh ? "\\Fonts\\msyh.ttc"   : ja ? "\\Fonts\\YuGothM.ttc"  : ko ? "\\Fonts\\malgun.ttf" : "\\Fonts\\segoeui.ttf",
-            zh ? "\\Fonts\\simsun.ttc" : ja ? "\\Fonts\\meiryo.ttc"   : ko ? "\\Fonts\\gulim.ttc"  : "\\Fonts\\segoeui.ttf",
-            ja ? "\\Fonts\\msgothic.ttc" : "\\Fonts\\segoeui.ttf",
-            "\\Fonts\\segoeui.ttf"
-        };
-        for (const char* suffix : fonts)
+        char winDir[MAX_PATH] = {};
+        UINT n = GetWindowsDirectoryA(winDir, MAX_PATH);
+        const std::string fontsDir = (n > 0 && n < MAX_PATH) ? std::string(winDir) + "\\Fonts\\" : std::string();
+        auto sys = [&](const char* file) { if (!fontsDir.empty()) candidates.push_back(fontsDir + file); };
+        if (zh)      { sys("msyh.ttc");    sys("simsun.ttc"); }
+        else if (ja) { sys("YuGothM.ttc"); sys("meiryo.ttc"); sys("msgothic.ttc"); }
+        else if (ko) { sys("malgun.ttf");  sys("gulim.ttc"); }
+        sys("segoeui.ttf");
+        sys("tahoma.ttf");   // Wine/Proton ship their own Tahoma (Latin + Cyrillic)
+        sys("arial.ttf");    // Proton maps Liberation Sans here
+        std::string game = DustGameDir();
+        if (!game.empty())
         {
-            strcpy_s(fontPath, sizeof(fontPath), "");
-            GetWindowsDirectoryA(fontPath, MAX_PATH);
-            if (strlen(fontPath) + strlen(suffix) >= MAX_PATH) continue;
-            strcat_s(fontPath, sizeof(fontPath), suffix);
-            if (GetFileAttributesA(fontPath) == INVALID_FILE_ATTRIBUTES) continue;
-            loaded = (io.Fonts->AddFontFromFileTTF(fontPath, px, nullptr, sGlyphRanges.Data) != nullptr);
-            if (loaded) { Log("GUI: font %s for language %s", suffix + 7, lang.c_str()); break; }
+            if (game.back() != '\\' && game.back() != '/') game += "\\";
+            candidates.push_back(game + "data\\gui\\fonts\\Exo2-Medium.ttf");
         }
+    }
+
+    bool loaded = false;
+    for (const std::string& path : candidates)
+    {
+        if (GetFileAttributesA(path.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
+        loaded = (io.Fonts->AddFontFromFileTTF(path.c_str(), px, nullptr, sGlyphRanges.Data) != nullptr);
+        if (loaded) { Log("GUI: font %s for language %s", path.c_str(), lang.c_str()); break; }
     }
     if (!loaded)
     {
         ImFontConfig cfg;
         cfg.SizePixels = 13.0f * ResolveUiScale();
         io.Fonts->AddFontDefault(&cfg);
-        Log("GUI: Segoe UI unavailable, using built-in font");
+        Log("GUI: no system or game font found, using built-in ASCII-only font (non-English menu text will show '?')");
     }
 
     io.Fonts->Build();
@@ -867,8 +879,22 @@ static void DrawUpscalingSection()
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("%s", LocOr("tip:Upscaling", "Temporal anti-aliasing / upscaling. DLAA = NVIDIA RTX only (DLSS at native resolution, best quality). FSR2 = any GPU (native D3D11). FSR3 / FSR4 = any DX12 GPU via a D3D12 side-device; FSR4 needs a Radeon RX 9000. Disabled = off."));
 
-    if (sel == 1 && !UpscalerControl::Available())
-        ImGui::TextDisabled("%s", DustLoc::T("DLAA unavailable (needs NVIDIA RTX + recent driver)"));
+    // Selected but unable to run: say WHY (wrong GPU vendor / wrapper renaming the GPU, old driver,
+    // backend missing from this build, ...). Nothing is applied for an unavailable backend: no jitter,
+    // no mip bias, no motion-vector work - the game renders exactly as with "Disabled".
+    if (sel != 0 && UpscalerControl::Probed() && !UpscalerControl::Available())
+    {
+        const char* why = UpscalerControl::UnavailableReason();
+        ImGui::TextColored(ImVec4(1.00f, 0.72f, 0.25f, 1.00f), "%s",
+                           sel == 1 ? DustLoc::T("DLAA unavailable (needs NVIDIA RTX + recent driver)")
+                                    : DustLoc::T("This anti-aliasing mode is unavailable"));
+        if (why && why[0])
+        {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextDisabled("%s", why);
+            ImGui::PopTextWrapPos();
+        }
+    }
 
     // The velocity output is compiled into the game's GBuffer shaders at launch (session-stable gate,
     // see D3D11Hook::MvInjectionWanted). Turning the upscaler / MV viz on in a session that launched
@@ -2367,6 +2393,33 @@ void Render()
 
         size_t count = gEffectLoader.Count();
 
+        // Two Dust copies hooked into one game (Nexus/manual + Workshop): each draws its own effects
+        // and this menu only drives one of them, so settings look like they do nothing. Checked
+        // once; module lists don't change after startup in practice.
+        static int sDustCopies = -1;
+        if (sDustCopies < 0)
+        {
+            std::string paths;
+            sDustCopies = BugReport::CountLoadedDustCopies(&paths);
+            if (sDustCopies > 1) Log("WARNING: %d copies of Dust.dll are loaded:\n%s", sDustCopies, paths.c_str());
+        }
+        if (D3D11Hook::DriverFrameGenDetected())
+        {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextColored(ImVec4(1.00f, 0.72f, 0.25f, 1.00f), "%s",
+                DustLoc::T("NVIDIA Smooth Motion (driver frame generation) is active. It is known to darken the image and make this menu flicker with Dust: turn it off for Kenshi in the NVIDIA App if you see either."));
+            ImGui::PopTextWrapPos();
+            ImGui::Separator();
+        }
+        if (sDustCopies > 1)
+        {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextColored(ImVec4(1.00f, 0.45f, 0.35f, 1.00f), "%s",
+                DustLoc::T("Two copies of Dust are installed and running at once (for example the Nexus version and the Steam Workshop one). Remove one of them, otherwise settings may appear to do nothing."));
+            ImGui::PopTextWrapPos();
+            ImGui::Separator();
+        }
+
         if (count == 0)
         {
             ImGui::TextDisabled("%s", DustLoc::T("No effect plugins loaded"));
@@ -2440,8 +2493,26 @@ void Render()
 
             if (shown == 0 && sFilterBuf[0])
                 ImGui::TextDisabled(DustLoc::T("No effect matches \"%s\""), sFilterBuf);
+            else if (shown == 0 && !D3D11Hook::gDeviceCaptured)
+            {
+                // Effects start on the first frame of the game's 3D scene renderer, which the main
+                // menu never runs. This is the #1 "Dust is broken" report - explain it in place.
+                ImGui::PushTextWrapPos(0.0f);
+                ImGui::TextDisabled("%s", DustLoc::T("Effects appear once you load a save or start a new game. The main menu does not use the 3D renderer Dust hooks into."));
+                ImGui::Spacing();
+                ImGui::TextDisabled("%s", DustLoc::T("Already in a save and still seeing this? Click Report a Bug (bottom-left) and post the generated zip on the Dust Discord or GitHub."));
+                ImGui::PopTextWrapPos();
+            }
             else if (shown == 0)
-                ImGui::TextDisabled("%s", DustLoc::T("No initialized effect plugins to display"));
+            {
+                // In-game (device captured) and still nothing initialized: a real failure. Point at the
+                // one action that gets it diagnosed.
+                ImGui::PushTextWrapPos(0.0f);
+                ImGui::TextColored(ImVec4(1.00f, 0.45f, 0.35f, 1.00f), "%s",
+                                   DustLoc::T("Dust could not start its effects on this system."));
+                ImGui::TextDisabled("%s", DustLoc::T("Click Report a Bug (bottom-left) and post the generated zip on the Dust Discord or GitHub so it can be fixed."));
+                ImGui::PopTextWrapPos();
+            }
             gForceCollapseState = 0;
 
             ImGui::EndChild(); // ##effects

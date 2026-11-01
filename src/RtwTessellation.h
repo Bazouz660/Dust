@@ -12,10 +12,18 @@
 // metric splits every triangle at least once (inside factor >= 2).
 namespace RtwTessellation
 {
-// Subdivisions per warp cell. The warp is piecewise linear per axis over 513 knots (512 cells);
-// on captured geometry x3 brings the worst edge error from 40 to 4 shadow texels (at
-// 2048) while emitting 9.4M triangles where the vanilla metric emits 15.0M.
-constexpr int SegmentsPerCell = 3;
+// Subdivisions per warp cell crossed (the warp is piecewise linear per axis over 513 knots,
+// 512 cells), and never fewer than the vanilla metric gives the same edge.
+//
+// It was 3 per cell with no vanilla floor (v0.7.6). That counts UNWARPED cells, and the RTW
+// shadow camera is fitted tightly to the view frustum, so in close views every nearby caster
+// spans dozens of cells and hit the factor-64 cap: in one capture 45.5M domain-shader
+// invocations where vanilla emits 6.8M, the caster pass 2.5x slower (part of the v0.7.6 RTWSM
+// frame-rate regression; it depends on the view, hence the wildly different user reports).
+// 1 per cell, floored at the vanilla factor, measured on six RTW captures: 9.2M in that view,
+// at or below vanilla in the other five, caster time equal to vanilla within noise; and no edge
+// is ever subdivided less than the game itself does, so accuracy can only improve on vanilla.
+constexpr int SegmentsPerCell = 1;
 
 inline std::string Patch(const std::string& source)
 {
@@ -41,7 +49,11 @@ inline std::string Patch(const std::string& source)
         // position is the UNWARPED clip position. Only symmetric operations, so both
         // triangles sharing an edge agree on its factor.
         "\tfloat2 span = abs(a.position.xy / a.position.w - b.position.xy / b.position.w) * (0.5 * 512.0);\n"
-        "\treturn clamp(ceil(max(span.x, span.y) * " + std::to_string(SegmentsPerCell) + ".0), 1.0, 64.0);\n"
+        // The game's own factor for this edge (warped length / 0.1): concentrates subdivision
+        // where the warp magnifies, which the cell count alone does not see.
+        "\tfloat vanillaFactor = floor(1.0 + length(a.p2d.xy - b.p2d.xy) / 0.1);\n"
+        "\treturn clamp(max(vanillaFactor, ceil(max(span.x, span.y) * " + std::to_string(SegmentsPerCell) +
+        ".0)), 1.0, 64.0);\n"
         "}\n\n";
     const std::string body =
         "edges[0] = DustRtwEdgeFactor(patch[1], patch[2]);\n"

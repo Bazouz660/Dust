@@ -142,7 +142,7 @@ jobs:
             external/DLSS
             external/FidelityFX-SDK
             external/FSR2-DX11
-          key: upscaler-sdks-dlss.${{ env.DLSS_TAG }}-ffx.v2.3.0-fsr2.f2e3f86-v1  # bump to re-fetch/rebuild
+          key: upscaler-sdks-dlss.${{ env.DLSS_TAG }}-ffx.v2.3.0-fsr2.f2e3f86-v2  # bump to re-fetch/rebuild
 
       - name: Fetch DLSS SDK (NVIDIA, prebuilt)
         if: startsWith(github.ref, 'refs/tags/') && steps.upscaler_cache.outputs.cache-hit != 'true'
@@ -189,7 +189,11 @@ jobs:
           git clone https://github.com/optiscaler/FidelityFX-FSR2-DX11.git external/FSR2-DX11
           git -C external/FSR2-DX11 checkout f2e3f86
           ( cd external/FSR2-DX11/build && cmd //c BuildLibs.bat )
-          test -f external/FSR2-DX11/src/ffx-fsr2-api/bin/ffx_fsr2_api/ffx_fsr2_api_dx11_x64.lib
+          # BuildLibs.bat MOVES the libs into the repo-level bin/ once built (src/Dust.vcxproj looks
+          # there first). Testing only the pre-move path failed this step on every release, and
+          # continue-on-error hid it: no release shipped FSR2 until this was caught (2026-11).
+          test -f external/FSR2-DX11/bin/ffx_fsr2_api_dx11_x64.lib \
+            || test -f external/FSR2-DX11/src/ffx-fsr2-api/bin/ffx_fsr2_api/ffx_fsr2_api_dx11_x64.lib
 
       - name: Build boot (DustBoot.dll)
         run: >
@@ -206,6 +210,23 @@ jobs:
           /p:Configuration=Release
           /p:Platform=x64
           /p:ExtraDefines=DUST_VERSION=${{ steps.version.outputs.value }}
+
+      # The SDK fetches above are fail-soft, so a broken fetch/build used to ship a release with that
+      # backend silently stubbed out (FSR2 was missing from every release for months). A v* release
+      # must contain all three backends: check the built Dust.dll for each backend's real-code log
+      # string (the stubs only contain the "built WITHOUT ..." text) and fail loudly otherwise.
+      - name: Verify upscaler backends are compiled in
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -u
+          dll=src/build/Release/Dust.dll
+          fail=0
+          check() { if grep -aq "$2" "$dll"; then echo "  + $1 compiled in"; else echo "::error::$1 is NOT compiled into Dust.dll (SDK fetch/build failed above)"; fail=1; fi; }
+          check DLSS "NGX initialized; DLSS super-resolution AVAILABLE"
+          check FSR2 "initialized (native D3D11 backend)"
+          check FSR3 "ffx-api loaded (loader + upscaler DLLs from mod dir)"
+          exit $fail
 
       - name: Build SSAO plugin (DustSSAO.dll)
         run: >
@@ -363,7 +384,9 @@ jobs:
           fi
           for f in amd_fidelityfx_loader_dx12.dll amd_fidelityfx_upscaler_dx12.dll; do
             src="external/FidelityFX-SDK/Kits/FidelityFX/signedbin/$f"
-            if [ -f "$src" ]; then cp "$src" "$dst/"; echo "  + $f (FSR3/4)"; else echo "  - $f absent — FSR3/4 backend not bundled"; fi
+            if [ -f "$src" ]; then cp "$src" "$dst/"; echo "  + $f (FSR3/4)"
+            elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then echo "::error::$f absent - FSR3/4 is compiled in but could not load"; exit 1
+            else echo "  - $f absent — FSR3/4 backend not bundled"; fi
           done
           echo "=== release/Dust root ===" && ls -1 "$dst"
 

@@ -118,9 +118,14 @@
     </Link>
   </ItemDefinitionGroup>
   <!-- FSR2 native-D3D11 backend (optiscaler/FidelityFX-FSR2-DX11). Absent => DUST_HAVE_FSR2 undefined =>
-       UpscalerFSR2.cpp compiles to stubs. Build libs: external/FSR2-DX11/build BuildLibs (DX11). -->
+       UpscalerFSR2.cpp compiles to stubs. Build libs: external/FSR2-DX11/build BuildLibs (DX11).
+       BuildLibs.bat (f2e3f86) MOVES the libs from src/ffx-fsr2-api/bin/ffx_fsr2_api/ to the repo-level
+       bin/ after building; older manual builds leave them in place. Accept both: looking only at the
+       old path made every CI release since the FSR2 step was added (bed8d46) ship WITHOUT FSR2 (the backend silently stubbed). -->
   <PropertyGroup>
-    <HaveFsr2 Condition="Exists('$(ProjectDir)..\external\FSR2-DX11\src\ffx-fsr2-api\bin\ffx_fsr2_api\ffx_fsr2_api_dx11_x64.lib')">true</HaveFsr2>
+    <Fsr2LibDir Condition="Exists('$(ProjectDir)..\external\FSR2-DX11\bin\ffx_fsr2_api_dx11_x64.lib')">$(ProjectDir)..\external\FSR2-DX11\bin</Fsr2LibDir>
+    <Fsr2LibDir Condition="'$(Fsr2LibDir)'=='' And Exists('$(ProjectDir)..\external\FSR2-DX11\src\ffx-fsr2-api\bin\ffx_fsr2_api\ffx_fsr2_api_dx11_x64.lib')">$(ProjectDir)..\external\FSR2-DX11\src\ffx-fsr2-api\bin\ffx_fsr2_api</Fsr2LibDir>
+    <HaveFsr2 Condition="'$(Fsr2LibDir)'!=''">true</HaveFsr2>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(HaveFsr2)'=='true'">
     <ClCompile>
@@ -128,7 +133,7 @@
       <AdditionalIncludeDirectories>$(ProjectDir)..\external\FSR2-DX11\src\ffx-fsr2-api;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
-      <AdditionalLibraryDirectories>$(ProjectDir)..\external\FSR2-DX11\src\ffx-fsr2-api\bin\ffx_fsr2_api;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalLibraryDirectories>$(Fsr2LibDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>ffx_fsr2_api_x64.lib;ffx_fsr2_api_dx11_x64.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>

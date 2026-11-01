@@ -7,6 +7,7 @@ namespace UpscalerFSR3
 {
     bool Init(ID3D11Device*, const wchar_t*) { return false; }
     bool IsAvailable() { return false; }
+    const char* UnavailableReason() { return "this Dust build was compiled without FSR3"; }
     bool CreateFeature(ID3D11DeviceContext*, uint32_t, uint32_t, uint32_t, uint32_t, bool, bool, int) { return false; }
     bool Evaluate(ID3D11DeviceContext*, ID3D11Resource*, ID3D11Resource*, ID3D11Resource*, ID3D11Resource*,
                   float, float, float, float, float, bool, ID3D11Resource*) { return false; }
@@ -143,6 +144,8 @@ namespace
 }
 
 bool IsAvailable() { return gLoaded && D3D12Interop::IsReady(); }
+static const char* sReason = "";
+const char* UnavailableReason() { return IsAvailable() ? "" : sReason; }
 
 bool Init(ID3D11Device* device, const wchar_t* modDir)
 {
@@ -153,6 +156,7 @@ bool Init(ID3D11Device* device, const wchar_t* modDir)
     if (!D3D12Interop::IsReady() && !D3D12Interop::Init(device))
     {
         Log("FSR3: D3D12 side-device unavailable — FSR3 disabled");
+        sReason = "could not create the D3D12 device FSR3 runs on (needs a DX12 GPU and driver; not available under some Proton/Wine setups). Use FSR2 instead";
         return false;
     }
 
@@ -162,12 +166,13 @@ bool Init(ID3D11Device* device, const wchar_t* modDir)
     // Preload the provider by FULL PATH so the loader's bare LoadLibrary("amd_fidelityfx_upscaler_dx12.dll")
     // resolves to our copy (the mod dir isn't on the default DLL search path; the game exe runs elsewhere).
     gProviderDll = LoadLibraryW((dir + L"amd_fidelityfx_upscaler_dx12.dll").c_str());
-    if (!gProviderDll) { Log("FSR3: LoadLibrary amd_fidelityfx_upscaler_dx12.dll failed (err %lu)", GetLastError()); return false; }
+    if (!gProviderDll) { Log("FSR3: LoadLibrary amd_fidelityfx_upscaler_dx12.dll failed (err %lu)", GetLastError()); sReason = "amd_fidelityfx_upscaler_dx12.dll is missing from the Dust folder - reinstall Dust"; return false; }
     gLoaderDll = LoadLibraryW((dir + L"amd_fidelityfx_loader_dx12.dll").c_str());
     if (!gLoaderDll)
     {
         Log("FSR3: LoadLibrary amd_fidelityfx_loader_dx12.dll failed (err %lu)", GetLastError());
         FreeLibrary(gProviderDll); gProviderDll = nullptr;   // unwind so an Init retry starts clean
+        sReason = "amd_fidelityfx_loader_dx12.dll is missing from the Dust folder - reinstall Dust";
         return false;
     }
 
@@ -182,6 +187,7 @@ bool Init(ID3D11Device* device, const wchar_t* modDir)
         FreeLibrary(gLoaderDll);   gLoaderDll   = nullptr;   // unwind both loads (see above)
         FreeLibrary(gProviderDll); gProviderDll = nullptr;
         gCreateContext = nullptr; gDestroyContext = nullptr; gConfigure = nullptr; gQuery = nullptr; gDispatch = nullptr;
+        sReason = "the FSR3 loader DLL in the Dust folder is incompatible - reinstall Dust";
         return false;
     }
 

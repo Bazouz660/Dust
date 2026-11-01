@@ -31,6 +31,7 @@ bool Init(ID3D11Device* device)
 }
 
 bool IsAvailable() { return sInited && sDevice != nullptr; }
+const char* UnavailableReason() { return (sInited && !sDevice) ? "no D3D11 device" : ""; }
 
 bool CreateFeature(ID3D11DeviceContext* ctx, uint32_t renderW, uint32_t renderH,
                    uint32_t displayW, uint32_t displayH, bool isHDR, bool depthInverted, int /*preset*/)
@@ -133,6 +134,7 @@ bool Init(ID3D11Device*)
     return false;
 }
 bool IsAvailable() { return false; }
+const char* UnavailableReason() { return "this Dust build was compiled without FSR2"; }
 bool CreateFeature(ID3D11DeviceContext*, uint32_t, uint32_t, uint32_t, uint32_t, bool, bool, int) { return false; }
 bool Evaluate(ID3D11DeviceContext*, ID3D11Resource*, ID3D11Resource*, ID3D11Resource*,
               ID3D11Resource*, float, float, float, float, float, bool, ID3D11Resource*) { return false; }

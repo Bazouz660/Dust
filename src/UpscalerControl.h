@@ -5,14 +5,16 @@
 // MotionVectors (SetDebugViz). Preset changes take effect on the next frame (feature is recreated).
 namespace UpscalerControl
 {
-    bool  Available();            // DLSS reported available on this GPU (known after the first frame)
+    bool  Available();            // the SELECTED backend can run on this GPU/build (known once Probed())
+    bool  Probed();               // the selected backend has been initialised/probed this session
+    const char* UnavailableReason(); // why the selected backend can't run ("" when available / unknown)
     bool  GetEnabled();
     void  SetEnabled(bool e);
     int   GetPreset();            // Upscaler::Preset index
     void  SetPreset(int p);
     float GetSharpness();         // [0,1]
     void  SetSharpness(float s);
-    int   GetBackend();           // 0 = DLSS, 1 = FSR2
+    int   GetBackend();           // 0 = DLSS, 1 = FSR2, 2 = FSR3/4
     void  SetBackend(int b);
     // True when this session's game shaders were compiled WITH the injected velocity output. That
     // decision is frozen at launch (D3D11Hook::MvInjectionWanted reads [Upscaling] DLSS /

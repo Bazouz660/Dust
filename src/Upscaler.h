@@ -20,6 +20,10 @@ namespace Upscaler
     // True once NGX is up and DLSS super-resolution is reported available on this GPU.
     bool IsAvailable();
 
+    // Human-readable reason DLSS is unavailable (set by Init; shown in the GUI and the bug report).
+    // Empty when available or not probed yet.
+    const char* UnavailableReason();
+
     // GUI preset choices -> NGX render presets. Default is F (CNN DLAA); K/J are the DLSS-4 transformer
     // (sharpest in theory but blur the static image in this integration).
     enum Preset { PRESET_DEFAULT = 0, PRESET_K, PRESET_J, PRESET_F, PRESET_E, PRESET_COUNT };

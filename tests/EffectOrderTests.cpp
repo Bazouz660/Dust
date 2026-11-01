@@ -19,7 +19,8 @@ public:
     const std::vector<size_t>& GetPostOrder(DustInjectionPoint);
     void PrepareDispatch(uint64_t);
     void DispatchPre(DustInjectionPoint, const DustFrameContext*);
-    void DispatchPost(DustInjectionPoint, const DustFrameContext*);
+    enum class TemporalAAPhase { All, BeforeAA, AfterAA };
+    void DispatchPost(DustInjectionPoint, const DustFrameContext*, TemporalAAPhase = TemporalAAPhase::All);
     void EffectConfigCheckHotReload(LoadedEffect&) { ++polls; if (onPoll) onPoll(); }
     void CollectTiming(LoadedEffect&, ID3D11DeviceContext*, int) {}
     void BeginTiming(LoadedEffect&, ID3D11DeviceContext*, int) {}
@@ -83,5 +84,22 @@ int main() {
     k.apiVersion = 8; stage = 1;
     assert(PostProcessOrder::Point(k) == DUST_INJECT_POST_LIGHTING);
     assert(!PostProcessOrder::OrderSetting(k));
-    std::puts("Production dispatch, stage switches, fixed order, pre callbacks and disabled hot reload passed");
+    // POST_TONEMAP is split around the host's temporal AA resolve: an effect flagged
+    // DUST_FLAG_AFTER_TEMPORAL_AA (film grain, vignette...) runs only in the after-AA half (#19),
+    // every other effect only in the before-AA half, each keeping its relative order.
+    stage = 0;
+    loader.effects_[6].desc.flags |= DUST_FLAG_AFTER_TEMPORAL_AA;
+    {
+        DustFrameContext ctx = {}; ctx.frameIndex = 100; ctx.point = DUST_INJECT_POST_TONEMAP;
+        calls.clear();
+        loader.DispatchPost(DUST_INJECT_POST_TONEMAP, &ctx, EffectLoader::TemporalAAPhase::BeforeAA);
+        assert((calls == std::vector<int>{3,4,5}));
+        calls.clear();
+        loader.DispatchPost(DUST_INJECT_POST_TONEMAP, &ctx, EffectLoader::TemporalAAPhase::AfterAA);
+        assert((calls == std::vector<int>{6}));
+        calls.clear();
+        loader.DispatchPost(DUST_INJECT_POST_TONEMAP, &ctx);
+        assert((calls == std::vector<int>{3,4,5,6}));
+    }
+    std::puts("Production dispatch, stage switches, fixed order, pre callbacks, disabled hot reload and the temporal-AA split passed");
 }

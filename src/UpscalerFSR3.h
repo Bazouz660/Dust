@@ -18,6 +18,7 @@ namespace UpscalerFSR3
     // false and leaves IsAvailable() false on any failure. Safe to call repeatedly.
     bool Init(ID3D11Device* device, const wchar_t* modDir);
     bool IsAvailable();
+    const char* UnavailableReason();   // empty when available / not probed
 
     // (Re)create the FSR upscaler context for a render->display size. renderW==displayW for DLAA. isHDR:
     // color is linear/HDR (pre-tonemap). depthInverted: reversed-Z depth. preset is ignored (FSR has no

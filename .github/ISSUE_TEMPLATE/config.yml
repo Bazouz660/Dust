@@ -1,5 +1,5 @@
-blank_issues_enabled: true
+blank_issues_enabled: false
 contact_links:
   - name: Discord server
     url: https://discord.gg/3fd3c7EFvT
-    about: Ask questions, share presets, or report bugs on Discord.
+    about: Ask questions, share presets, or report bugs on Discord (please attach the in-game Report a Bug zip there too).

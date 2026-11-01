@@ -59,7 +59,10 @@ public:
 
     // Dispatch callbacks for a given injection point
     void DispatchPre(DustInjectionPoint point, const DustFrameContext* ctx);
-    void DispatchPost(DustInjectionPoint point, const DustFrameContext* ctx);
+    // Which POST effects to run, relative to the host's temporal AA resolve (DUST_FLAG_AFTER_TEMPORAL_AA).
+    enum class TemporalAAPhase { All, BeforeAA, AfterAA };
+    void DispatchPost(DustInjectionPoint point, const DustFrameContext* ctx,
+                      TemporalAAPhase phase = TemporalAAPhase::All);
 
     // Dispatch the v5 postLightVolumes callback (point-agnostic). Fired once per
     // frame by the hook after the point/spot light volumes, before fog/tonemap.

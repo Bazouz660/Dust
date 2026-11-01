@@ -618,25 +618,75 @@ static ID3D11Texture2D* EnsureUpscalerOutput(ID3D11Resource* colorRes)
     return sUpsOut;
 }
 
+static void ReadUpscalerConfig()
+{
+    if (sUpsConfigRead) return;
+    sUpsConfigRead = true;
+    std::string iniPath = DustLogDir() + "Dust.ini";
+    sUpsEnabled   = GetPrivateProfileIntA("Upscaling", "DLSS", 0, iniPath.c_str()) != 0;   // "enabled"
+    sUpsPresetIdx = GetPrivateProfileIntA("Upscaling", "DLSSPreset", 3, iniPath.c_str());          // 3 = F (K blurs static image)
+    sUpsSharpness = GetPrivateProfileIntA("Upscaling", "DLSSSharpness", 0, iniPath.c_str()) / 100.0f;
+    sUpsBackend   = GetPrivateProfileIntA("Upscaling", "Backend", 0, iniPath.c_str());     // 0=DLSS 1=FSR2 2=FSR3
+    if (sUpsBackend < 0 || sUpsBackend > 2) sUpsBackend = 0;
+    sUpsDepthConvert     = GetPrivateProfileIntA("Upscaling", "DepthConvert", 1, iniPath.c_str()) != 0;
+    gJitterForwardPasses = GetPrivateProfileIntA("Upscaling", "JitterForwardPasses", 0, iniPath.c_str()) != 0;
+    gTemporalJitterWanted = GetPrivateProfileIntA("Upscaling", "TemporalJitter", 1, iniPath.c_str()) != 0;
+}
+
+static bool BackendAvailable(int backend)
+{
+    return backend == 1 ? UpscalerFSR2::IsAvailable()
+         : backend == 2 ? UpscalerFSR3::IsAvailable()
+         :                 Upscaler::IsAvailable();
+}
+
+static const char* BackendUnavailableReason(int backend)
+{
+    return backend == 1 ? UpscalerFSR2::UnavailableReason()
+         : backend == 2 ? UpscalerFSR3::UnavailableReason()
+         :                 Upscaler::UnavailableReason();
+}
+
+static const char* BackendName(int backend)
+{
+    return backend == 1 ? "FSR2" : backend == 2 ? "FSR3" : "DLAA";
+}
+
+// Init the selected backend once (idempotent per backend; a GUI backend switch re-arms it in
+// RunUpscaler). Called at device capture - BEFORE OGRE creates its material samplers - so the
+// DLSS mip bias and the MV feeder are only engaged when the backend can actually resolve.
+static bool ProbeSelectedUpscaler()
+{
+    if (!gDevice) return false;
+    ReadUpscalerConfig();
+    if (sUpsActiveBackend == sUpsBackend && sUpsInitTried) return BackendAvailable(sUpsBackend);
+    sUpsActiveBackend = sUpsBackend;
+    sUpsInitTried     = true;
+    std::string modDir = DustLogDir(); std::wstring wdir(modDir.begin(), modDir.end());
+    if      (sUpsBackend == 1) UpscalerFSR2::Init(gDevice);
+    else if (sUpsBackend == 2) UpscalerFSR3::Init(gDevice, wdir.c_str());
+    else                       Upscaler::Init(gDevice, wdir.c_str(), wdir.c_str());
+    const bool ok = BackendAvailable(sUpsBackend);
+    if (!ok)
+    {
+        const char* why = BackendUnavailableReason(sUpsBackend);
+        Log("Upscaler: %s unavailable - %s", BackendName(sUpsBackend), (why && why[0]) ? why : "(no reason reported)");
+    }
+    return ok;
+}
+
 static void RunUpscaler(ID3D11DeviceContext* ctx)
 {
-    if (!sUpsConfigRead)
-    {
-        sUpsConfigRead = true;
-        std::string iniPath = DustLogDir() + "Dust.ini";
-        sUpsEnabled   = GetPrivateProfileIntA("Upscaling", "DLSS", 0, iniPath.c_str()) != 0;   // "enabled"
-        sUpsPresetIdx = GetPrivateProfileIntA("Upscaling", "DLSSPreset", 3, iniPath.c_str());          // 3 = F (K blurs static image)
-        sUpsSharpness = GetPrivateProfileIntA("Upscaling", "DLSSSharpness", 0, iniPath.c_str()) / 100.0f;
-        sUpsBackend   = GetPrivateProfileIntA("Upscaling", "Backend", 0, iniPath.c_str());     // 0=DLSS 1=FSR2 2=FSR3
-        sUpsDepthConvert     = GetPrivateProfileIntA("Upscaling", "DepthConvert", 1, iniPath.c_str()) != 0;
-        gJitterForwardPasses = GetPrivateProfileIntA("Upscaling", "JitterForwardPasses", 0, iniPath.c_str()) != 0;
-        gTemporalJitterWanted = GetPrivateProfileIntA("Upscaling", "TemporalJitter", 1, iniPath.c_str()) != 0;
-    }
+    ReadUpscalerConfig();
 
     // Decide whether the MV feeder should run this frame, and drive its cost from that. This runs before
     // every early-out below, so the gate stays correct even when the resolve itself is skipped. Applying
     // the capture flag every frame is a trivial static write and survives a device/resolution reinit.
-    const bool mvNeeded = sUpsEnabled || MotionVectors::DebugVizEnabled();
+    // An enabled-but-UNAVAILABLE backend (AMD GPU on DLAA, a build without FSR2, ...) does not count:
+    // feeding MVs to a resolve that never runs only costs GPU time. The availability read is the last
+    // probe of the active backend; a GUI backend switch re-probes below and the gate follows next frame.
+    const bool upsUsable = sUpsEnabled && sUpsActiveBackend == sUpsBackend && BackendAvailable(sUpsBackend);
+    const bool mvNeeded = upsUsable || MotionVectors::DebugVizEnabled();
     GeometryCapture::SetCaptureFlags(mvNeeded && gCaptureGeometryWanted ? DUST_CAPTURE_GEOMETRY : 0);
     if (mvNeeded != sMvFeederActive)
     {
@@ -669,18 +719,8 @@ static void RunUpscaler(ID3D11DeviceContext* ctx)
     }
 
     // Probe/init the active backend once (so the GUI can report availability before it's switched on).
-    if (!sUpsInitTried)
-    {
-        sUpsInitTried = true;
-        std::string modDir = DustLogDir(); std::wstring wdir(modDir.begin(), modDir.end());
-        if      (backend == 1) UpscalerFSR2::Init(gDevice);
-        else if (backend == 2) UpscalerFSR3::Init(gDevice, wdir.c_str());
-        else                   Upscaler::Init(gDevice, wdir.c_str(), wdir.c_str());
-    }
-
-    const bool avail = backend == 1 ? UpscalerFSR2::IsAvailable()
-                     : backend == 2 ? UpscalerFSR3::IsAvailable()
-                     :                 Upscaler::IsAvailable();
+    // Usually already done at device capture (ProbeSelectedUpscaler); this re-probes after a GUI switch.
+    const bool avail = ProbeSelectedUpscaler();
 
     // Disabled or unavailable: ensure jitter is off (no shimmer) and skip the resolve.
     if (!sUpsEnabled || !avail)
@@ -830,12 +870,57 @@ static void RunInteropSpike(ID3D11DeviceContext* ctx)
 // Extract camera basis vectors from the game's deferred lighting PS constant buffer.
 // The inverse view matrix sits at register c8 (offset 128 bytes / 32 floats).
 // Camera axes are the COLUMNS of the inverse view matrix (= rows of the view matrix).
-// Double-buffered staging: CopyResource into slot N this frame, Map slot N-1
-// (which the GPU finished long ago). Eliminates the CPU-GPU sync stall that
-// was blocking the pipeline every frame.
-static ID3D11Buffer* gCameraStagingCBs[2] = {};
-static int gCameraStagingSlot = 0;
-static bool gCameraStagingReady = false; // false until first copy has been issued
+//
+// GPU readback through a RING of staging buffers, read without stalling (DO_NOT_WAIT).
+// It used to be TWO slots, reading the one copied on the previous frame. When the GPU is the
+// bottleneck (1440p+, heavy effects) the CPU runs up to DXGI's max frame latency (3) frames ahead,
+// so last frame's copy is NEVER finished when we look: every Map failed and the camera data FROZE
+// at the last successful read, indefinitely. Anything that resynchronised CPU and GPU (a screenshot,
+// opening an overlay, VSync, DOF autofocus's blocking readback, a driver change) refreshed it once.
+// Every effect reconstructing view space from it (SSAO, RTGI, ...) then used a stale camera: AO
+// "inverting"/glowing and shadows darkening on camera turns, fixed by a screenshot and pointing
+// the way the camera faced at that moment (GitHub #21, Discord "Weird SSAO", #help 2026-10-28).
+// With kCameraRing >= max frame latency + 1 the oldest slot is always complete, so a read
+// never fails twice in a row; we take the NEWEST completed slot (normally last frame's, as before).
+static const int kCameraRing = 4;
+static ID3D11Buffer* gCameraStagingCBs[kCameraRing] = {};
+static uint64_t gCameraStagingFrame[kCameraRing] = {};   // frame the slot was filled (0 = never)
+static uint64_t gCameraCopySerial = 0;                    // monotonically increasing copy counter
+static uint64_t gCameraLastReadSerial = 0;                // serial of the copy currently in gCameraData
+static int gCameraMissStreak = 0;                         // consecutive frames with no completed slot
+
+static void ReleaseCameraStaging()
+{
+    for (int i = 0; i < kCameraRing; i++)
+    {
+        if (gCameraStagingCBs[i]) { gCameraStagingCBs[i]->Release(); gCameraStagingCBs[i] = nullptr; }
+        gCameraStagingFrame[i] = 0;
+    }
+}
+
+static bool ApplyCameraMatrix(const float* m)
+{
+    for (int i = 0; i < 16; i++)
+        if (!isfinite(m[i])) return false;
+
+    memcpy(gCameraData.inverseView, m, 64);
+    gCameraData.camRight[0]   = m[0]; gCameraData.camRight[1]   = m[4]; gCameraData.camRight[2]   = m[8];
+    gCameraData.camUp[0]      = m[1]; gCameraData.camUp[1]      = m[5]; gCameraData.camUp[2]      = m[9];
+    gCameraData.camForward[0] = m[2]; gCameraData.camForward[1] = m[6]; gCameraData.camForward[2] = m[10];
+    gCameraData.camPosition[0] = m[12]; gCameraData.camPosition[1] = m[13]; gCameraData.camPosition[2] = m[14];
+    // Projection params (API v8) from the OGRE camera — real near/far/fov for effects (RTGI)
+    // and the upscaler. Left 0 if the camera walk isn't reachable this frame.
+    float camN = 0.0f, camF = 0.0f, camFov = 0.0f;
+    if (CameraAccess_GetCameraParams(&camN, &camF, &camFov))
+    {
+        gCameraData.nearZ = camN;
+        gCameraData.farZ  = camF;
+        gCameraData.tanHalfFov = tanf(camFov * 0.5f);
+    }
+    gCameraData.valid = 1;
+    gCameraDataExtracted = true;
+    return true;
+}
 
 static void ExtractCameraData(ID3D11DeviceContext* ctx)
 {
@@ -854,13 +939,7 @@ static void ExtractCameraData(ID3D11DeviceContext* ctx)
         D3D11_BUFFER_DESC stagingDesc;
         gCameraStagingCBs[0]->GetDesc(&stagingDesc);
         if (stagingDesc.ByteWidth != cbDesc.ByteWidth)
-        {
-            gCameraStagingCBs[0]->Release();
-            gCameraStagingCBs[1]->Release();
-            gCameraStagingCBs[0] = nullptr;
-            gCameraStagingCBs[1] = nullptr;
-            gCameraStagingReady = false;
-        }
+            ReleaseCameraStaging();
     }
 
     if (!gCameraStagingCBs[0])
@@ -870,71 +949,61 @@ static void ExtractCameraData(ID3D11DeviceContext* ctx)
         sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         sd.BindFlags = 0;
         sd.MiscFlags = 0;
-        gDevice->CreateBuffer(&sd, nullptr, &gCameraStagingCBs[0]);
-        gDevice->CreateBuffer(&sd, nullptr, &gCameraStagingCBs[1]);
-        if (!gCameraStagingCBs[0] || !gCameraStagingCBs[1])
+        bool ok = true;
+        for (int i = 0; i < kCameraRing && ok; i++)
+            ok = SUCCEEDED(gDevice->CreateBuffer(&sd, nullptr, &gCameraStagingCBs[i])) && gCameraStagingCBs[i];
+        if (!ok)
         {
-            // Partial failure: drop BOTH slots so the next frame retries creation from a
-            // clean state (a lone slot 0 would gate this branch off forever and leak).
-            if (gCameraStagingCBs[0]) { gCameraStagingCBs[0]->Release(); gCameraStagingCBs[0] = nullptr; }
-            if (gCameraStagingCBs[1]) { gCameraStagingCBs[1]->Release(); gCameraStagingCBs[1] = nullptr; }
-            gCameraStagingReady = false;
+            // Partial failure: drop every slot so the next frame retries from a clean state.
+            ReleaseCameraStaging();
             psCB->Release();
             return;
         }
     }
-    if (!gCameraStagingCBs[0] || !gCameraStagingCBs[1]) { psCB->Release(); return; }
 
-    int writeSlot = gCameraStagingSlot;
-    int readSlot = 1 - writeSlot;
-
-    // Copy this frame's CB into the write slot (async, no stall)
-    ctx->CopyResource(gCameraStagingCBs[writeSlot], psCB);
-    psCB->Release();
-
-    // Read LAST frame's data from the other slot (GPU finished it long ago)
-    if (gCameraStagingReady)
+    // Read FIRST (before this frame's copy lands in a slot): newest completed slot wins.
+    // Slots are visited newest -> oldest by fill serial; DO_NOT_WAIT never stalls the render thread.
+    bool got = false;
     {
-        D3D11_MAPPED_SUBRESOURCE mapped;
-        // DO_NOT_WAIT: never block the render thread on the GPU. If the GPU has not finished last
-        // frame's copy yet (it is more than a frame behind), keep the camera data we already have
-        // (it is one frame old by design; a miss makes it two). A blocking map here forced CPU<->GPU
-        // lockstep whenever the GPU lagged: the sawtooth frame graph.
-        const HRESULT mapHr = ctx->Map(gCameraStagingCBs[readSlot], 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
-        if (SUCCEEDED(mapHr))
+        int order[kCameraRing];
+        int n = 0;
+        for (int i = 0; i < kCameraRing; i++)
+            if (gCameraStagingFrame[i] != 0 && gCameraStagingFrame[i] > gCameraLastReadSerial) order[n++] = i;
+        for (int a = 1; a < n; a++)   // insertion sort, newest first (n <= 4)
+            for (int b = a; b > 0 && gCameraStagingFrame[order[b]] > gCameraStagingFrame[order[b - 1]]; b--)
+            { int t = order[b]; order[b] = order[b - 1]; order[b - 1] = t; }
+
+        for (int k = 0; k < n && !got; k++)
         {
+            const int slot = order[k];
+            // Last resort (should not happen with the ring >= frame latency + 1): after two missed
+            // frames, wait for the OLDEST pending copy instead of keeping a stale camera.
+            const bool block = (gCameraMissStreak >= 2) && (k == n - 1);
+            D3D11_MAPPED_SUBRESOURCE mapped;
+            const HRESULT hr = ctx->Map(gCameraStagingCBs[slot], 0, D3D11_MAP_READ,
+                                        block ? 0 : D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+            if (FAILED(hr)) continue;   // DXGI_ERROR_WAS_STILL_DRAWING: try an older slot
             float m[16];
             memcpy(m, (float*)mapped.pData + 32, 64); // c8 offset
-            ctx->Unmap(gCameraStagingCBs[readSlot], 0);
-
-            bool valid = true;
-            for (int i = 0; i < 16; i++)
-                if (!isfinite(m[i])) { valid = false; break; }
-
-            if (valid)
-            {
-                memcpy(gCameraData.inverseView, m, 64);
-                gCameraData.camRight[0]   = m[0]; gCameraData.camRight[1]   = m[4]; gCameraData.camRight[2]   = m[8];
-                gCameraData.camUp[0]      = m[1]; gCameraData.camUp[1]      = m[5]; gCameraData.camUp[2]      = m[9];
-                gCameraData.camForward[0] = m[2]; gCameraData.camForward[1] = m[6]; gCameraData.camForward[2] = m[10];
-                gCameraData.camPosition[0] = m[12]; gCameraData.camPosition[1] = m[13]; gCameraData.camPosition[2] = m[14];
-                // Projection params (API v8) from the OGRE camera — real near/far/fov for effects (RTGI)
-                // and the upscaler. Left 0 if the camera walk isn't reachable this frame.
-                float camN = 0.0f, camF = 0.0f, camFov = 0.0f;
-                if (CameraAccess_GetCameraParams(&camN, &camF, &camFov))
-                {
-                    gCameraData.nearZ = camN;
-                    gCameraData.farZ  = camF;
-                    gCameraData.tanHalfFov = tanf(camFov * 0.5f);
-                }
-                gCameraData.valid = 1;
-                gCameraDataExtracted = true;
-            }
+            ctx->Unmap(gCameraStagingCBs[slot], 0);
+            gCameraLastReadSerial = gCameraStagingFrame[slot];   // anything older is now stale
+            got = ApplyCameraMatrix(m);
+        }
+        if (n > 0)
+        {
+            if (got) gCameraMissStreak = 0;
+            else if (++gCameraMissStreak == 3)
+                Log("Camera: no completed camera readback for 3 frames (GPU far behind) - forcing a wait next time");
         }
     }
 
-    gCameraStagingSlot = readSlot;
-    gCameraStagingReady = true;
+    // Copy this frame's CB into the slot holding the oldest (or no) data.
+    int writeSlot = 0;
+    for (int i = 1; i < kCameraRing; i++)
+        if (gCameraStagingFrame[i] < gCameraStagingFrame[writeSlot]) writeSlot = i;
+    ctx->CopyResource(gCameraStagingCBs[writeSlot], psCB);
+    gCameraStagingFrame[writeSlot] = ++gCameraCopySerial;
+    psCB->Release();
 }
 
 // ==================== Original function pointers ====================
@@ -1176,6 +1245,8 @@ static IDXGISwapChain* gHookedSwapChain = nullptr;
 static DWORD gGameRenderThreadId = 0;            // set at confirmed-pipeline device capture (HookedDraw)
 static thread_local int tPresentDepth = 0;       // our Present-hook recursion depth on this thread
 static IDXGISwapChain* gGuiSwapChain = nullptr;  // chain the GUI renders into (weak, compare-only)
+static std::atomic<bool> gDriverFrameGen{false}; // presents arrive off the render thread (Smooth Motion)
+bool DriverFrameGenDetected() { return gDriverFrameGen.load(std::memory_order_relaxed); }
 
 static void TryInstallSwapChainHooks(ID3D11DeviceContext* drawCtx = nullptr)
 {
@@ -1328,6 +1399,14 @@ static void TryCaptureDevice(ID3D11Device* device)
         // Read DLSS intent early (before OGRE creates its samplers) so the mip-bias hook can apply.
         gDlssWanted = GetPrivateProfileIntA("Upscaling", "DLSS", 0, iniPath.c_str()) != 0;
         gMipBiasSharpen = GetPrivateProfileIntA("Upscaling", "MipBiasSharpen", 1, iniPath.c_str()) != 0;
+        // The -1 bias only makes sense if a temporal resolve will run. Probe the selected backend now
+        // (still before the material samplers exist): on an AMD GPU set to DLAA, or a build without
+        // the chosen backend, the bias would just add texture shimmer with nothing to resolve it.
+        if (gDlssWanted && !ProbeSelectedUpscaler())
+        {
+            gDlssWanted = false;
+            Log("Upscaling: selected backend unavailable -> no texture mip bias this session");
+        }
         if (gDlssWanted && gMipBiasSharpen) Log("Upscaling: DLSS on -> applying %.1f texture mip bias to new samplers", kDlssMipBias);
         else if (gDlssWanted) Log("Upscaling: DLSS on, mip-bias sharpening disabled (MipBiasSharpen=0)");
     }
@@ -2313,16 +2392,22 @@ static void STDMETHODCALLTYPE HookedDraw(
 
         if (sunFrameParams) UnbindSunFrameParams(pThis);
 
-        // POST: effects that operate after the draw
+        // POST: effects that operate after the draw. At POST_TONEMAP the temporal AA resolve sits in
+        // the middle: effects flagged DUST_FLAG_AFTER_TEMPORAL_AA (grain, vignette, CA, letterbox) run
+        // after it, so DLAA/FSR don't average their per-frame pattern away (#19). With the upscaler
+        // off the resolve is a no-op and the order is the same as a single dispatch.
         fctx.timing = DUST_TIMING_POST;
-        gEffectLoader.DispatchPost(dip, &fctx);
+        const bool tonemapPoint = (result.point == InjectionPoint::POST_TONEMAP);
+        gEffectLoader.DispatchPost(dip, &fctx, tonemapPoint ? EffectLoader::TemporalAAPhase::BeforeAA
+                                                            : EffectLoader::TemporalAAPhase::All);
 
         // Shader-injected motion vectors: the velocity RT is filled during the real GBuffer pass
         // (see HookedOMSetRenderTargets + ShaderPatch). Here we only blit the debug viz over the
         // final image at POST_TONEMAP when [Upscaling] ShowMotionVectors=1, then end the frame.
-        if (result.point == InjectionPoint::POST_TONEMAP)
+        if (tonemapPoint)
         {
             RunUpscaler(pThis);                  // DLSS DLAA resolve (no-op unless [Upscaling] DLSS=1)
+            gEffectLoader.DispatchPost(dip, &fctx, EffectLoader::TemporalAAPhase::AfterAA);
             RunInteropSpike(pThis);              // FSR3/4 D3D12 interop spike (no-op unless D3D12InteropSpike=1)
             MotionVectors::InjDebugBlit(pThis);  // MV debug viz (only if ShowMotionVectors=1)
             MotionVectors::InjEndFrame();
@@ -3439,10 +3524,29 @@ static bool IsGamePresent(IDXGISwapChain* sc, bool topLevel)
     return true;
 }
 
+// Driver frame generation detection. Under NVIDIA Smooth Motion the game renders into a proxy
+// chain and the driver's pacing thread presents everything (see the IsGamePresent notes above), so
+// top-level presents on the GUI chain stop coming from the game's render thread. A few stray
+// off-thread presents (overlays, loading screens) must not trip it: require a sustained run.
+static void NoteGuiChainPresentThread()
+{
+    if (gDriverFrameGen.load(std::memory_order_relaxed) || gGameRenderThreadId == 0) return;
+    static int sOffThreadRun = 0;
+    if (GetCurrentThreadId() == gGameRenderThreadId) { sOffThreadRun = 0; return; }
+    if (++sOffThreadRun == 240)
+    {
+        gDriverFrameGen.store(true, std::memory_order_relaxed);
+        Log("Driver frame generation detected (NVIDIA Smooth Motion or similar): presents come from thread %u, "
+            "the game renders on thread %u. Known to darken the image and make the Dust menu flicker.",
+            (unsigned)GetCurrentThreadId(), (unsigned)gGameRenderThreadId);
+    }
+}
+
 static HRESULT STDMETHODCALLTYPE HookedPresent(
     IDXGISwapChain* pThis, UINT SyncInterval, UINT Flags)
 {
     ++tPresentDepth;
+    if (!gShutdownSignaled && tPresentDepth == 1 && pThis == gGuiSwapChain) NoteGuiChainPresentThread();
     if (!gShutdownSignaled && IsGamePresent(pThis, tPresentDepth == 1))
         TickGuiOnPresent(pThis, "Present");
     HRESULT hr = oPresent(pThis, SyncInterval, Flags);
@@ -3455,6 +3559,7 @@ static HRESULT STDMETHODCALLTYPE HookedPresent1(
     const DXGI_PRESENT_PARAMETERS* pPresentParameters)
 {
     ++tPresentDepth;
+    if (!gShutdownSignaled && tPresentDepth == 1 && pThis == gGuiSwapChain) NoteGuiChainPresentThread();
     if (!gShutdownSignaled && IsGamePresent(pThis, tPresentDepth == 1))
         TickGuiOnPresent(pThis, "Present1");
     HRESULT hr = oPresent1(pThis, SyncInterval, PresentFlags, pPresentParameters);
@@ -3819,7 +3924,9 @@ bool MvInjectionWanted()
 // lives as file-static in D3D11Hook, reachable by qualified name from this same translation unit.
 namespace UpscalerControl
 {
-    bool  Available()          { return Upscaler::IsAvailable(); }
+    bool  Available()          { return D3D11Hook::BackendAvailable(D3D11Hook::sUpsBackend); }
+    bool  Probed()             { return D3D11Hook::sUpsInitTried && D3D11Hook::sUpsActiveBackend == D3D11Hook::sUpsBackend; }
+    const char* UnavailableReason() { return D3D11Hook::BackendUnavailableReason(D3D11Hook::sUpsBackend); }
     bool  GetEnabled()         { return D3D11Hook::sUpsEnabled; }
     void  SetEnabled(bool e)   { D3D11Hook::sUpsEnabled = e; }
     int   GetPreset()          { return D3D11Hook::sUpsPresetIdx; }
