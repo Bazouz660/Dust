@@ -34,13 +34,14 @@ cbuffer SSILParams : register(b0)
 
 static const float PI = 3.14159265;
 
+// Kenshi's G-buffer depth is the Euclidean distance along the pixel ray / farClip (deferred.hlsl:
+// viewPos = normalize(ray) * depth * farClip), not view Z. Treating it as z bent every flat surface
+// (up to ~20 degrees at Kenshi's FOV) against its true G-buffer normal: false occlusion growing
+// toward the screen edges and shifting with camera rotation.
 float3 ReconstructViewPos(float2 uv, float depth)
 {
-    float3 pos;
-    pos.x = (uv.x * 2.0 - 1.0) * aspectRatio * tanHalfFov * depth;
-    pos.y = (1.0 - uv.y * 2.0) * tanHalfFov * depth;
-    pos.z = depth;
-    return pos;
+    float3 ray = float3((uv.x * 2.0 - 1.0) * aspectRatio * tanHalfFov, (1.0 - uv.y * 2.0) * tanHalfFov, 1.0);
+    return ray * (depth * rsqrt(dot(ray, ray)));
 }
 
 float InterleavedGradientNoise(float2 screenPos)
@@ -57,13 +58,27 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
     float3 viewPos = ReconstructViewPos(uv, depth);
 
-    // GBuffer world-space normals transformed to view-space
+    // Hemisphere test against the SMOOTH geometric normal (from depth, nearer neighbour per axis so
+    // silhouettes don't bend it). The normal-mapped G-buffer normal tilted the hemisphere at every
+    // texture bump: bright and dark halos on detailed walls. The G-buffer normal only orients it.
     float3 worldN = normalize(normalsTex.Sample(pointClamp, uv).rgb * 2.0 - 1.0);
+    float3 gbufNormal = normalize(float3(dot(worldN, camRight.xyz), dot(worldN, camUp.xyz), -dot(worldN, camForward.xyz)));
     float3 normal;
-    normal.x =  dot(worldN, camRight.xyz);
-    normal.y =  dot(worldN, camUp.xyz);
-    normal.z = -dot(worldN, camForward.xyz);
-    normal = normalize(normal);
+    {
+        float2 px = float2(invViewportSize.x, 0), py = float2(0, invViewportSize.y);
+        float dL = depthTex.Sample(pointClamp, uv - px), dR = depthTex.Sample(pointClamp, uv + px);
+        float dU = depthTex.Sample(pointClamp, uv - py), dD = depthTex.Sample(pointClamp, uv + py);
+        float3 ddxPos = abs(dL - depth) < abs(dR - depth) ? viewPos - ReconstructViewPos(uv - px, dL)
+                                                          : ReconstructViewPos(uv + px, dR) - viewPos;
+        float3 ddyPos = abs(dU - depth) < abs(dD - depth) ? viewPos - ReconstructViewPos(uv - py, dU)
+                                                          : ReconstructViewPos(uv + py, dD) - viewPos;
+        // No isfinite: Proton's HLSL compiler (vkd3d) lacks it. A degenerate cross product
+        // (flat-on samples, sky neighbours) falls back to the G-buffer normal instead.
+        float3 c = cross(ddxPos, ddyPos);
+        float lenSq = dot(c, c);
+        normal = lenSq > 1e-24 ? c * rsqrt(lenSq) : gbufNormal;
+        if (dot(normal, gbufNormal) < 0.0) normal = -normal;
+    }
 
     // Per-pixel rotation
     float noiseAngle = InterleavedGradientNoise(pos.xy) * PI;

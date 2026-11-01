@@ -58,9 +58,10 @@ static const float BIAS_SCALE = 32.0 / (32.0 - 2.0 * SECTOR_BIAS);
 float3 ReconstructViewPos(float2 uv, float depth, float thf, float ar)
 {
     float3 pos;
-    pos.x = (uv.x * 2.0 - 1.0) * ar * thf * depth;
-    pos.y = (1.0 - uv.y * 2.0) * thf * depth;
-    pos.z = depth;
+    // Radial depth (|viewPos| / farClip), the same model as rtgi_camera.hlsl's history
+    // reprojection: treating it as view Z bent flat surfaces by up to ~20 degrees.
+    pos = float3((uv.x * 2.0 - 1.0) * ar * thf, (1.0 - uv.y * 2.0) * thf, 1.0);
+    pos *= depth * rsqrt(dot(pos, pos));
     return pos;
 }
 
