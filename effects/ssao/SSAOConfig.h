@@ -8,9 +8,13 @@ struct SSAOConfig
     // Toggle
     bool enabled = true;
 
-    // AO generation
+    // AO generation (XeGTAO)
+    float radiusMetres = 1.0f;       // world-space radius (Kenshi units / 10)
+    float aoStrength = 1.2f;         // final visibility power = Strength * 1.25
+    float thickness = 0.6f;          // XeGTAO thin-occluder compensation (grass, poles, thin walls)
+
+    // Legacy (pre-XeGTAO) keys: still read from old INIs so they load, no longer used.
     float aoRadius = 0.003f;
-    float aoStrength = 2.537f;
     float aoBias = 0.001f;
     float aoMaxDepth = 0.1f;
     float filterRadius = 0.15f;
@@ -19,7 +23,7 @@ struct SSAOConfig
     float maxScreenRadius = 0.03f;
     float minScreenRadius = 0.001f;
     float depthFadeStart = 0.0f;
-    float normalDetail = 0.5f;
+    float normalDetail = 0.5f;       // normal-map cavity term (0 = none, 1 = full)
 
     // Blur
     float blurSharpness = 0.01f;
@@ -31,8 +35,8 @@ struct SSAOConfig
     float directLightOcclusion = 0.3f;
 
     // Performance
-    int sampleCount = 4;    // Directions (4–12)
-    int stepCount = 4;      // Steps per direction (2–6)
+    int sampleCount = 3;    // GTAO slices (1-9), each = two opposite directions
+    int stepCount = 3;      // Steps per slice side (2-6)
 
     // Debug
     bool debugView = false;

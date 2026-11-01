@@ -86,7 +86,9 @@ function Publish-Build($Dest, [switch]$Clean) {
     foreach ($effect in $Effects) {
         $dll = Get-ChildItem "$Root\effects\$effect\build\Release\Dust*.dll" | Select-Object -First 1
         Copy-Item $dll.FullName "$Dest\effects\"
-        $shaders = Get-ChildItem "$Root\effects\$effect\shaders\*.hlsl" -ErrorAction SilentlyContinue
+        # Every file, like CI's `xcopy shaders\*`: includes (.hlsli/.h, e.g. SSAO's vendored XeGTAO)
+        # must ship next to the .hlsl that includes them.
+        $shaders = Get-ChildItem "$Root\effects\$effect\shaders\*" -File -ErrorAction SilentlyContinue
         if ($shaders) { Copy-Item $shaders.FullName "$Dest\effects\shaders\" }
     }
 

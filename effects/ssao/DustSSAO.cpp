@@ -281,24 +281,30 @@ static int SSAOIsEnabled()
 
 static DustSettingDesc gSettingsArray[] = {
     { "Enabled",            DUST_SETTING_BOOL,  &gSSAOConfig.enabled,             0.0f,    1.0f,   "Enabled",        nullptr, "Enable or disable ambient occlusion",                          DUST_PERF_MEDIUM },
-    { "Radius",             DUST_SETTING_FLOAT, &gSSAOConfig.aoRadius,            0.0005f, 0.01f,  "Radius",         nullptr, "World-space sampling radius for occlusion testing",            DUST_PERF_NONE },
-    { "Strength",           DUST_SETTING_FLOAT, &gSSAOConfig.aoStrength,          0.5f,    10.0f,  "Strength",       nullptr, "Intensity of the occlusion darkening",                         DUST_PERF_NONE },
-    { "Bias",               DUST_SETTING_FLOAT, &gSSAOConfig.aoBias,              0.0f,    0.2f,   "Bias",           nullptr, "Offset to prevent self-occlusion artifacts",                   DUST_PERF_NONE },
+    // XeGTAO (2026-11). The radius is physical now, in metres: the old Radius key held depth01
+    // values (0.005 = ~60 m, only bounded by Max Screen Radius), so it is a new key and the old
+    // one stays hidden for INI compatibility.
+    { "Radius",             DUST_SETTING_FLOAT, &gSSAOConfig.radiusMetres,        0.1f,    5.0f,   "RadiusMeters",   nullptr, "How far around a surface occluders count, in metres (about the size of a person = 1.8)", DUST_PERF_LOW },
+    { "Strength",           DUST_SETTING_FLOAT, &gSSAOConfig.aoStrength,          0.2f,    4.0f,   "Strength",       nullptr, "How dark occluded areas get",                                  DUST_PERF_NONE },
+    { "Thickness",          DUST_SETTING_FLOAT, &gSSAOConfig.thickness,           0.0f,    1.0f,   "Thickness",      nullptr, "Treat thin objects (grass, poles, fences) as thin: they darken less behind them", DUST_PERF_NONE },
     { "Max Depth",          DUST_SETTING_FLOAT, &gSSAOConfig.aoMaxDepth,          0.01f,   1.0f,   "MaxDepth",       nullptr, "Maximum depth to apply occlusion",                             DUST_PERF_MEDIUM },
-    { "Filter Radius",      DUST_SETTING_FLOAT, &gSSAOConfig.filterRadius,        0.01f,   1.0f,   "FilterRadius",   nullptr, "Blur radius for smoothing the AO result",                      DUST_PERF_NONE },
-    { "Foreground Fade",    DUST_SETTING_FLOAT, &gSSAOConfig.foregroundFade,       1.0f,    200.0f, "ForegroundFade", nullptr, "Rate at which effect fades for very close objects",          DUST_PERF_NONE },
-    { "Falloff Power",      DUST_SETTING_FLOAT, &gSSAOConfig.falloffPower,        0.5f,    5.0f,   "FalloffPower",   nullptr, "How quickly occlusion falls off with sample distance",         DUST_PERF_NONE },
-    { "Max Screen Radius",  DUST_SETTING_FLOAT, &gSSAOConfig.maxScreenRadius,     0.005f,  0.2f,   "MaxScreenRadius",nullptr, "Maximum sample radius in screen space",                        DUST_PERF_HIGH },
-    { "Min Screen Radius",  DUST_SETTING_FLOAT, &gSSAOConfig.minScreenRadius,     0.0001f, 0.01f,  "MinScreenRadius",nullptr, "Minimum sample radius in screen space",                        DUST_PERF_HIGH },
-    { "Blur Sharpness",     DUST_SETTING_FLOAT, &gSSAOConfig.blurSharpness,       0.0f,    0.1f,   "BlurSharpness",  nullptr, "Edge-aware blur sharpness (higher = preserves more detail)",   DUST_PERF_NONE },
-    { "Normal Detail",     DUST_SETTING_FLOAT, &gSSAOConfig.normalDetail,        0.0f,    1.0f,   "NormalDetail",   nullptr, "Normal map influence (0 = smooth geometry, 1 = full detail)",   DUST_PERF_LOW },
+    { "Normal Detail",     DUST_SETTING_FLOAT, &gSSAOConfig.normalDetail,        0.0f,    1.0f,   "NormalDetail",   nullptr, "Darken texture detail (bumps, cracks) in the occlusion. It no longer affects how far the occlusion reaches", DUST_PERF_NONE },
     { "Direct Light AO",   DUST_SETTING_FLOAT, &gSSAOConfig.directLightOcclusion, 0.0f,    1.0f,   "DirectLightAO",  nullptr, "How much AO affects directly lit areas",                       DUST_PERF_NONE },
-    { "Samples",            DUST_SETTING_INT,   &gSSAOConfig.sampleCount,         4.0f,    12.0f,  "Samples",        nullptr, "Number of sampling directions per pixel",                      DUST_PERF_HIGH },
-    { "Steps",              DUST_SETTING_INT,   &gSSAOConfig.stepCount,           2.0f,    6.0f,   "Steps",          nullptr, "Number of samples per direction",                              DUST_PERF_HIGH },
+    { "Samples",            DUST_SETTING_INT,   &gSSAOConfig.sampleCount,         1.0f,    9.0f,   "Samples",        nullptr, "Number of sampling slices per pixel (each covers two directions)", DUST_PERF_HIGH },
+    { "Steps",              DUST_SETTING_INT,   &gSSAOConfig.stepCount,           2.0f,    6.0f,   "Steps",          nullptr, "Number of samples along each direction",                       DUST_PERF_HIGH },
     { "Debug View",         DUST_SETTING_BOOL,  &gSSAOConfig.debugView,           0.0f,    1.0f,   "DebugView",      nullptr, "Show raw ambient occlusion before compositing",                DUST_PERF_NONE },
     // Hidden settings: not shown in GUI but persisted in INI
     { "Depth Fade Start",   DUST_SETTING_HIDDEN_FLOAT, &gSSAOConfig.depthFadeStart, 0.0f, 1.0f,   "DepthFadeStart" },
     { "Tan Half FOV",       DUST_SETTING_HIDDEN_FLOAT, &gSSAOConfig.tanHalfFov,     0.1f, 2.0f,   "TanHalfFov" },
+    // Legacy (pre-XeGTAO) keys: loaded so old INIs and presets stay valid, unused.
+    { "Legacy Radius",          DUST_SETTING_HIDDEN_FLOAT, &gSSAOConfig.aoRadius,        0.0005f, 0.01f,  "Radius" },
+    { "Legacy Bias",            DUST_SETTING_HIDDEN_FLOAT, &gSSAOConfig.aoBias,          0.0f,    0.2f,   "Bias" },
+    { "Legacy Filter Radius",   DUST_SETTING_HIDDEN_FLOAT, &gSSAOConfig.filterRadius,    0.01f,   1.0f,   "FilterRadius" },
+    { "Legacy Foreground Fade", DUST_SETTING_HIDDEN_FLOAT, &gSSAOConfig.foregroundFade,  1.0f,    200.0f, "ForegroundFade" },
+    { "Legacy Falloff Power",   DUST_SETTING_HIDDEN_FLOAT, &gSSAOConfig.falloffPower,    0.5f,    5.0f,   "FalloffPower" },
+    { "Legacy Max Screen Radius", DUST_SETTING_HIDDEN_FLOAT, &gSSAOConfig.maxScreenRadius, 0.005f, 0.2f,  "MaxScreenRadius" },
+    { "Legacy Min Screen Radius", DUST_SETTING_HIDDEN_FLOAT, &gSSAOConfig.minScreenRadius, 0.0001f, 0.01f, "MinScreenRadius" },
+    { "Legacy Blur Sharpness",  DUST_SETTING_HIDDEN_FLOAT, &gSSAOConfig.blurSharpness,   0.0f,    0.1f,   "BlurSharpness" },
 };
 
 // No OnSettingChanged needed — values are read live each frame by SSAORenderer

@@ -80,7 +80,7 @@ Effects run at one of the pipeline injection points, in ascending priority order
 | Effect | Prio | Summary |
 |---|---|---|
 | **Shadows (RTWSM)** | -10 | PCSS soft shadows via the RTWSM warp map; variable penumbra, Poisson disk, optional cliff-acne fix, resolution up to 16384 |
-| **SSAO** | 0 | GTAO ambient occlusion applied to indirect/ambient light only — day-night consistent, auto-exposure immune |
+| **SSAO** | 0 | Ambient occlusion based on Intel's XeGTAO (physical radius in metres, smooth-geometry horizons, edge-aware denoise), applied to indirect/ambient light only — day-night consistent, auto-exposure immune |
 | **SSIL** | 10 | One albedo-weighted bounce of colored indirect light, composited before fog |
 | **RTGI** | 20 | Per-pixel screen-space ray-traced GI + AO, multi-bounce, SVGF denoise, full compute pipeline |
 | **Kuwahara** | 40 | Anisotropic painterly filter that preserves edges |
@@ -205,16 +205,17 @@ ShadowResolution=0   # 0=default, or 2048/4096/8192/16384 (requires restart, RTW
 ```ini
 [SSAO]
 Enabled=1
-Radius=0.003
-Strength=2.5
-Bias=0.001
-MaxDepth=0.1
-ForegroundFade=26.6
-FalloffPower=2.0
-MaxScreenRadius=0.1
-MinScreenRadius=0.001
-BlurSharpness=0.01
+RadiusMeters=1.0      ; how far around a surface occluders count, in metres
+Strength=1.2          ; how dark occluded areas get
+Thickness=0.6         ; thin objects (grass, poles) darken less behind them
+MaxDepth=0.7
+NormalDetail=0.3      ; texture-detail cavity darkening (does not change the occlusion reach)
+DirectLightAO=0.7
+Samples=3             ; GTAO slices (1-9)
+Steps=3               ; samples per slice side (2-6)
 DebugView=0
+; Radius, Bias, ForegroundFade, FalloffPower, Max/MinScreenRadius, FilterRadius and
+; BlurSharpness are pre-XeGTAO keys: still read from old INIs, no longer used.
 ```
 
 ### SSIL.ini
@@ -588,6 +589,7 @@ the exception, and [COPYING](COPYING) for the full GPLv3 text.
 
 Third-party components keep their own licenses, including the vendored GPU
 upscaling SDKs: the NVIDIA DLSS / NGX SDK ([NVIDIA RTX SDKs License](external/DLSS/LICENSE.txt))
-and AMD FSR ([MIT](external/FSR2-DX11/LICENSE.txt)). Note that the NVIDIA license
+and AMD FSR ([MIT](external/FSR2-DX11/LICENSE.txt)). SSAO vendors Intel XeGTAO
+([MIT](effects/ssao/shaders/XeGTAO_LICENSE.txt), modified, see `effects/ssao/shaders/xegtao.hlsli`). Note that the NVIDIA license
 also requires attribution (NVIDIA marks in the about/credits screen) and
 pre-release notification before public distribution.
