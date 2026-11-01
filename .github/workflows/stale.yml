@@ -1,0 +1,33 @@
+# Close bug reports that are waiting on the reporter. Only issues the maintainer has labelled
+# `needs-info` are touched: label an issue after asking a question; any reply from anyone removes
+# the stale state, and a closed issue can always be reopened.
+name: Close unanswered reports
+
+on:
+  schedule:
+    - cron: "30 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@v9
+        with:
+          only-labels: needs-info
+          days-before-stale: 14
+          days-before-close: 7
+          days-before-pr-stale: -1
+          days-before-pr-close: -1
+          stale-issue-label: stale
+          remove-stale-when-updated: true
+          stale-issue-message: >
+            This report is waiting for more information (see the question above) and will be closed
+            in 7 days without a reply. If the problem still happens, please attach the zip from
+            F11 → Report a Bug, generated in a loaded save while the problem is visible.
+          close-issue-message: >
+            Closing for lack of information. Comment with a Report a Bug zip and it will be reopened.
+          close-issue-reason: not_planned

@@ -1,0 +1,11 @@
+name: Feature request
+description: Suggest a new effect, setting or improvement
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What would you like?
+      description: Describe the feature and what problem it solves. Reference screenshots (other games, mods) are welcome.
+    validations:
+      required: true
