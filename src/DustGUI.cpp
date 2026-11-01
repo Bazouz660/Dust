@@ -867,8 +867,22 @@ static void DrawUpscalingSection()
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("%s", LocOr("tip:Upscaling", "Temporal anti-aliasing / upscaling. DLAA = NVIDIA RTX only (DLSS at native resolution, best quality). FSR2 = any GPU (native D3D11). FSR3 / FSR4 = any DX12 GPU via a D3D12 side-device; FSR4 needs a Radeon RX 9000. Disabled = off."));
 
-    if (sel == 1 && !UpscalerControl::Available())
-        ImGui::TextDisabled("%s", DustLoc::T("DLAA unavailable (needs NVIDIA RTX + recent driver)"));
+    // Selected but unable to run: say WHY (wrong GPU vendor / wrapper renaming the GPU, old driver,
+    // backend missing from this build, ...). Nothing is applied for an unavailable backend: no jitter,
+    // no mip bias, no motion-vector work - the game renders exactly as with "Disabled".
+    if (sel != 0 && UpscalerControl::Probed() && !UpscalerControl::Available())
+    {
+        const char* why = UpscalerControl::UnavailableReason();
+        ImGui::TextColored(ImVec4(1.00f, 0.72f, 0.25f, 1.00f), "%s",
+                           sel == 1 ? DustLoc::T("DLAA unavailable (needs NVIDIA RTX + recent driver)")
+                                    : DustLoc::T("This anti-aliasing mode is unavailable"));
+        if (why && why[0])
+        {
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextDisabled("%s", why);
+            ImGui::PopTextWrapPos();
+        }
+    }
 
     // The velocity output is compiled into the game's GBuffer shaders at launch (session-stable gate,
     // see D3D11Hook::MvInjectionWanted). Turning the upscaler / MV viz on in a session that launched

@@ -618,25 +618,75 @@ static ID3D11Texture2D* EnsureUpscalerOutput(ID3D11Resource* colorRes)
     return sUpsOut;
 }
 
+static void ReadUpscalerConfig()
+{
+    if (sUpsConfigRead) return;
+    sUpsConfigRead = true;
+    std::string iniPath = DustLogDir() + "Dust.ini";
+    sUpsEnabled   = GetPrivateProfileIntA("Upscaling", "DLSS", 0, iniPath.c_str()) != 0;   // "enabled"
+    sUpsPresetIdx = GetPrivateProfileIntA("Upscaling", "DLSSPreset", 3, iniPath.c_str());          // 3 = F (K blurs static image)
+    sUpsSharpness = GetPrivateProfileIntA("Upscaling", "DLSSSharpness", 0, iniPath.c_str()) / 100.0f;
+    sUpsBackend   = GetPrivateProfileIntA("Upscaling", "Backend", 0, iniPath.c_str());     // 0=DLSS 1=FSR2 2=FSR3
+    if (sUpsBackend < 0 || sUpsBackend > 2) sUpsBackend = 0;
+    sUpsDepthConvert     = GetPrivateProfileIntA("Upscaling", "DepthConvert", 1, iniPath.c_str()) != 0;
+    gJitterForwardPasses = GetPrivateProfileIntA("Upscaling", "JitterForwardPasses", 0, iniPath.c_str()) != 0;
+    gTemporalJitterWanted = GetPrivateProfileIntA("Upscaling", "TemporalJitter", 1, iniPath.c_str()) != 0;
+}
+
+static bool BackendAvailable(int backend)
+{
+    return backend == 1 ? UpscalerFSR2::IsAvailable()
+         : backend == 2 ? UpscalerFSR3::IsAvailable()
+         :                 Upscaler::IsAvailable();
+}
+
+static const char* BackendUnavailableReason(int backend)
+{
+    return backend == 1 ? UpscalerFSR2::UnavailableReason()
+         : backend == 2 ? UpscalerFSR3::UnavailableReason()
+         :                 Upscaler::UnavailableReason();
+}
+
+static const char* BackendName(int backend)
+{
+    return backend == 1 ? "FSR2" : backend == 2 ? "FSR3" : "DLAA";
+}
+
+// Init the selected backend once (idempotent per backend; a GUI backend switch re-arms it in
+// RunUpscaler). Called at device capture - BEFORE OGRE creates its material samplers - so the
+// DLSS mip bias and the MV feeder are only engaged when the backend can actually resolve.
+static bool ProbeSelectedUpscaler()
+{
+    if (!gDevice) return false;
+    ReadUpscalerConfig();
+    if (sUpsActiveBackend == sUpsBackend && sUpsInitTried) return BackendAvailable(sUpsBackend);
+    sUpsActiveBackend = sUpsBackend;
+    sUpsInitTried     = true;
+    std::string modDir = DustLogDir(); std::wstring wdir(modDir.begin(), modDir.end());
+    if      (sUpsBackend == 1) UpscalerFSR2::Init(gDevice);
+    else if (sUpsBackend == 2) UpscalerFSR3::Init(gDevice, wdir.c_str());
+    else                       Upscaler::Init(gDevice, wdir.c_str(), wdir.c_str());
+    const bool ok = BackendAvailable(sUpsBackend);
+    if (!ok)
+    {
+        const char* why = BackendUnavailableReason(sUpsBackend);
+        Log("Upscaler: %s unavailable - %s", BackendName(sUpsBackend), (why && why[0]) ? why : "(no reason reported)");
+    }
+    return ok;
+}
+
 static void RunUpscaler(ID3D11DeviceContext* ctx)
 {
-    if (!sUpsConfigRead)
-    {
-        sUpsConfigRead = true;
-        std::string iniPath = DustLogDir() + "Dust.ini";
-        sUpsEnabled   = GetPrivateProfileIntA("Upscaling", "DLSS", 0, iniPath.c_str()) != 0;   // "enabled"
-        sUpsPresetIdx = GetPrivateProfileIntA("Upscaling", "DLSSPreset", 3, iniPath.c_str());          // 3 = F (K blurs static image)
-        sUpsSharpness = GetPrivateProfileIntA("Upscaling", "DLSSSharpness", 0, iniPath.c_str()) / 100.0f;
-        sUpsBackend   = GetPrivateProfileIntA("Upscaling", "Backend", 0, iniPath.c_str());     // 0=DLSS 1=FSR2 2=FSR3
-        sUpsDepthConvert     = GetPrivateProfileIntA("Upscaling", "DepthConvert", 1, iniPath.c_str()) != 0;
-        gJitterForwardPasses = GetPrivateProfileIntA("Upscaling", "JitterForwardPasses", 0, iniPath.c_str()) != 0;
-        gTemporalJitterWanted = GetPrivateProfileIntA("Upscaling", "TemporalJitter", 1, iniPath.c_str()) != 0;
-    }
+    ReadUpscalerConfig();
 
     // Decide whether the MV feeder should run this frame, and drive its cost from that. This runs before
     // every early-out below, so the gate stays correct even when the resolve itself is skipped. Applying
     // the capture flag every frame is a trivial static write and survives a device/resolution reinit.
-    const bool mvNeeded = sUpsEnabled || MotionVectors::DebugVizEnabled();
+    // An enabled-but-UNAVAILABLE backend (AMD GPU on DLAA, a build without FSR2, ...) does not count:
+    // feeding MVs to a resolve that never runs only costs GPU time. The availability read is the last
+    // probe of the active backend; a GUI backend switch re-probes below and the gate follows next frame.
+    const bool upsUsable = sUpsEnabled && sUpsActiveBackend == sUpsBackend && BackendAvailable(sUpsBackend);
+    const bool mvNeeded = upsUsable || MotionVectors::DebugVizEnabled();
     GeometryCapture::SetCaptureFlags(mvNeeded && gCaptureGeometryWanted ? DUST_CAPTURE_GEOMETRY : 0);
     if (mvNeeded != sMvFeederActive)
     {
@@ -669,18 +719,8 @@ static void RunUpscaler(ID3D11DeviceContext* ctx)
     }
 
     // Probe/init the active backend once (so the GUI can report availability before it's switched on).
-    if (!sUpsInitTried)
-    {
-        sUpsInitTried = true;
-        std::string modDir = DustLogDir(); std::wstring wdir(modDir.begin(), modDir.end());
-        if      (backend == 1) UpscalerFSR2::Init(gDevice);
-        else if (backend == 2) UpscalerFSR3::Init(gDevice, wdir.c_str());
-        else                   Upscaler::Init(gDevice, wdir.c_str(), wdir.c_str());
-    }
-
-    const bool avail = backend == 1 ? UpscalerFSR2::IsAvailable()
-                     : backend == 2 ? UpscalerFSR3::IsAvailable()
-                     :                 Upscaler::IsAvailable();
+    // Usually already done at device capture (ProbeSelectedUpscaler); this re-probes after a GUI switch.
+    const bool avail = ProbeSelectedUpscaler();
 
     // Disabled or unavailable: ensure jitter is off (no shimmer) and skip the resolve.
     if (!sUpsEnabled || !avail)
@@ -1357,6 +1397,14 @@ static void TryCaptureDevice(ID3D11Device* device)
         // Read DLSS intent early (before OGRE creates its samplers) so the mip-bias hook can apply.
         gDlssWanted = GetPrivateProfileIntA("Upscaling", "DLSS", 0, iniPath.c_str()) != 0;
         gMipBiasSharpen = GetPrivateProfileIntA("Upscaling", "MipBiasSharpen", 1, iniPath.c_str()) != 0;
+        // The -1 bias only makes sense if a temporal resolve will run. Probe the selected backend now
+        // (still before the material samplers exist): on an AMD GPU set to DLAA, or a build without
+        // the chosen backend, the bias would just add texture shimmer with nothing to resolve it.
+        if (gDlssWanted && !ProbeSelectedUpscaler())
+        {
+            gDlssWanted = false;
+            Log("Upscaling: selected backend unavailable -> no texture mip bias this session");
+        }
         if (gDlssWanted && gMipBiasSharpen) Log("Upscaling: DLSS on -> applying %.1f texture mip bias to new samplers", kDlssMipBias);
         else if (gDlssWanted) Log("Upscaling: DLSS on, mip-bias sharpening disabled (MipBiasSharpen=0)");
     }
@@ -3848,7 +3896,9 @@ bool MvInjectionWanted()
 // lives as file-static in D3D11Hook, reachable by qualified name from this same translation unit.
 namespace UpscalerControl
 {
-    bool  Available()          { return Upscaler::IsAvailable(); }
+    bool  Available()          { return D3D11Hook::BackendAvailable(D3D11Hook::sUpsBackend); }
+    bool  Probed()             { return D3D11Hook::sUpsInitTried && D3D11Hook::sUpsActiveBackend == D3D11Hook::sUpsBackend; }
+    const char* UnavailableReason() { return D3D11Hook::BackendUnavailableReason(D3D11Hook::sUpsBackend); }
     bool  GetEnabled()         { return D3D11Hook::sUpsEnabled; }
     void  SetEnabled(bool e)   { D3D11Hook::sUpsEnabled = e; }
     int   GetPreset()          { return D3D11Hook::sUpsPresetIdx; }

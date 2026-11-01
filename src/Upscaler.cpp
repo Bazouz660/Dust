@@ -9,9 +9,13 @@
 #include <nvsdk_ngx_helpers.h>
 
 #include <string>
+#include <cstdio>
+#include <cstring>
+#include <dxgi.h>
 
 namespace Upscaler
 {
+static char                 sReason[256] = "";       // why DLSS is unavailable (GUI + bug report); empty = available / not probed
 static bool                 sInited     = false;
 static bool                 sAvailable  = false;
 static NVSDK_NGX_Parameter* sParams     = nullptr;   // capability params (also carry the optimal-settings callback)
@@ -28,7 +32,36 @@ bool Init(ID3D11Device* device, const wchar_t* dllSearchPath, const wchar_t* app
     if (sInited) return sAvailable;
     sInited = true;
     sDevice = device;
-    if (!device) return false;
+    sReason[0] = '\0';
+    if (!device) { snprintf(sReason, sizeof(sReason), "no D3D11 device"); return false; }
+
+    // DLSS is NVIDIA-only. Check the adapter's VENDOR ID before touching NGX: wrappers such as
+    // OptiScaler rename an AMD/Intel adapter to an NVIDIA model (the description says "RTX ...") but
+    // leave the vendor ID alone, and NGX then fails with an opaque PlatformError (0xBAD00002). Saying
+    // which GPU it really is turns that support thread into a one-line answer.
+    {
+        IDXGIDevice* dxgiDev = nullptr; IDXGIAdapter* adapter = nullptr; DXGI_ADAPTER_DESC ad = {};
+        bool haveDesc = SUCCEEDED(device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDev)) && dxgiDev &&
+                        SUCCEEDED(dxgiDev->GetAdapter(&adapter)) && adapter && SUCCEEDED(adapter->GetDesc(&ad));
+        if (adapter) adapter->Release();
+        if (dxgiDev) dxgiDev->Release();
+        if (haveDesc && ad.VendorId != 0x10DE)
+        {
+            const char* vendor = ad.VendorId == 0x1002 ? "AMD" : ad.VendorId == 0x8086 ? "Intel" : "non-NVIDIA";
+            char name[128] = {};
+            WideCharToMultiByte(CP_UTF8, 0, ad.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
+            const bool renamed = strstr(name, "NVIDIA") || strstr(name, "GeForce") || strstr(name, "RTX");
+            if (renamed)
+                snprintf(sReason, sizeof(sReason),
+                         "this GPU is %s (vendor 0x%04X) but reports itself as \"%s\" - a wrapper DLL such as OptiScaler is renaming it. DLAA needs a real NVIDIA RTX GPU: use FSR2 instead",
+                         vendor, ad.VendorId, name);
+            else
+                snprintf(sReason, sizeof(sReason), "DLAA needs an NVIDIA RTX GPU (this one is %s: %s). Use FSR2 instead", vendor, name);
+            Log("Upscaler[DLSS]: skipped - %s", sReason);
+            sDevice = nullptr;   // NGX was never initialised: Shutdown() must not call NGX Shutdown1
+            return false;
+        }
+    }
 
     // Point NGX at our shipped nvngx_dlss.dll so DLSS loads without the app being allowlisted.
     static std::wstring sPath = dllSearchPath ? dllSearchPath : L"";
@@ -43,6 +76,7 @@ bool Init(ID3D11Device* device, const wchar_t* dllSearchPath, const wchar_t* app
     if (NVSDK_NGX_FAILED(r))
     {
         Log("Upscaler[DLSS]: NGX init failed (0x%08x) — DLSS unavailable (non-NVIDIA / driver / missing dll)", r);
+        snprintf(sReason, sizeof(sReason), "NVIDIA NGX failed to start (0x%08X) - update the GPU driver, and check nvngx_dlss.dll is in the Dust folder", (unsigned)r);
         return false;
     }
 
@@ -50,6 +84,7 @@ bool Init(ID3D11Device* device, const wchar_t* dllSearchPath, const wchar_t* app
     if (NVSDK_NGX_FAILED(r) || !sParams)
     {
         Log("Upscaler[DLSS]: GetCapabilityParameters failed (0x%08x)", r);
+        snprintf(sReason, sizeof(sReason), "NVIDIA NGX capability query failed (0x%08X)", (unsigned)r);
         NVSDK_NGX_D3D11_Shutdown1(device);
         return false;
     }
@@ -62,6 +97,10 @@ bool Init(ID3D11Device* device, const wchar_t* dllSearchPath, const wchar_t* app
         NVSDK_NGX_Parameter_GetI(sParams, NVSDK_NGX_Parameter_SuperSampling_FeatureInitResult, &initResult);
         NVSDK_NGX_Parameter_GetI(sParams, NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver, &needsDriver);
         Log("Upscaler[DLSS]: DLSS-SR not available (initResult=0x%08x needsUpdatedDriver=%d)", initResult, needsDriver);
+        if (needsDriver)
+            snprintf(sReason, sizeof(sReason), "DLSS needs a newer NVIDIA driver - update it and restart the game");
+        else
+            snprintf(sReason, sizeof(sReason), "the NVIDIA driver refused DLSS on this GPU (0x%08X) - DLAA needs an RTX card (GTX cards are not supported)", (unsigned)initResult);
         // Same unwind as the GetCapabilityParameters failure above.
         NVSDK_NGX_D3D11_DestroyParameters(sParams); sParams = nullptr;
         NVSDK_NGX_D3D11_Shutdown1(device);
@@ -74,6 +113,7 @@ bool Init(ID3D11Device* device, const wchar_t* dllSearchPath, const wchar_t* app
 }
 
 bool IsAvailable() { return sAvailable; }
+const char* UnavailableReason() { return sReason; }
 
 static const char* kPresetLabels[] = { "Default", "K (transformer, blurs when static)", "J", "F (CNN, recommended)", "E (CNN)" };
 const char* const* PresetLabels() { return kPresetLabels; }
@@ -166,7 +206,7 @@ void Shutdown()
     if (sFeature)          { NVSDK_NGX_D3D11_ReleaseFeature(sFeature); sFeature = nullptr; }
     if (sParams)           { NVSDK_NGX_D3D11_DestroyParameters(sParams); sParams = nullptr; }
     if (sInited && sDevice) NVSDK_NGX_D3D11_Shutdown1(sDevice);
-    sInited = false; sAvailable = false; sDevice = nullptr;
+    sInited = false; sAvailable = false; sDevice = nullptr; sReason[0] = '\0';
 }
 }
 
@@ -181,6 +221,7 @@ bool Init(ID3D11Device*, const wchar_t*, const wchar_t*)
     return false;
 }
 bool IsAvailable() { return false; }
+const char* UnavailableReason() { return "this Dust build was compiled without DLSS"; }
 static const char* kPresetLabels[] = { "Default", "K (transformer, blurs when static)", "J", "F (CNN, recommended)", "E (CNN)" };
 const char* const* PresetLabels() { return kPresetLabels; }
 bool CreateFeature(ID3D11DeviceContext*, uint32_t, uint32_t, uint32_t, uint32_t, bool, bool, int) { return false; }

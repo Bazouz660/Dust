@@ -10,6 +10,7 @@ namespace UpscalerFSR2
 {
     bool Init(ID3D11Device* device);
     bool IsAvailable();   // FSR2 is compute-only — available on any D3D11 device once Init succeeds.
+    const char* UnavailableReason();   // empty when available / not probed
 
     // preset is ignored (FSR2 has no model presets); kept for signature parity with the DLSS backend.
     bool CreateFeature(ID3D11DeviceContext* ctx, uint32_t renderW, uint32_t renderH,
