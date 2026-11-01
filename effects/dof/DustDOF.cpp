@@ -20,8 +20,11 @@ DOFConfig gDOFConfig;
 static HMODULE gPluginModule = nullptr;
 static const DustHostAPI* gHost = nullptr;
 
-// Auto-focus resources (double-buffered to avoid GPU pipeline stalls)
-static const int FOCUS_BUFFER_COUNT = 2;
+// Auto-focus resources: a ring deeper than DXGI's max frame latency (3), read without waiting.
+// It was 2 slots read with a BLOCKING Map: whenever the GPU was more than a frame behind, that
+// stalled the CPU every frame (CPU/GPU lockstep, lost frame rate) - and, as a side effect, hid
+// the camera-readback freeze fixed in D3D11Hook (enabling autofocus "fixed" inverted SSAO).
+static const int FOCUS_BUFFER_COUNT = 4;
 static ID3D11Texture2D* gFocusStagingTex[FOCUS_BUFFER_COUNT] = {};
 static int gFocusWriteIdx = 0;   // which staging texture to write into this frame
 static bool gFocusHasData[FOCUS_BUFFER_COUNT] = {}; // whether a valid copy exists
@@ -78,16 +81,21 @@ static void UpdateAutoFocus(const DustFrameContext* ctx, const DustHostAPI* host
     if (!gDOFConfig.autoFocus || !gFocusStagingTex[0])
         return;
 
-    // Step 1: Read back from the OTHER buffer (written last frame) — should be ready, no stall
-    int readIdx = 1 - gFocusWriteIdx;
-    if (gFocusHasData[readIdx])
+    // Step 1: read the NEWEST completed copy (k = 1 is last frame's), never waiting on the GPU.
+    // Consumed slots - and every older one - are cleared so the focus never steps backwards.
+    for (int k = 1; k <= FOCUS_BUFFER_COUNT; k++)
     {
+        const int readIdx = (gFocusWriteIdx - k + FOCUS_BUFFER_COUNT) % FOCUS_BUFFER_COUNT;
+        if (!gFocusHasData[readIdx]) continue;
         D3D11_MAPPED_SUBRESOURCE mapped;
-        HRESULT hr = ctx->context->Map(gFocusStagingTex[readIdx], 0, D3D11_MAP_READ, 0, &mapped);
-        if (SUCCEEDED(hr))
+        HRESULT hr = ctx->context->Map(gFocusStagingTex[readIdx], 0, D3D11_MAP_READ,
+                                       D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+        if (FAILED(hr)) continue;   // still in flight: try an older copy
         {
             float centerDepth = *(float*)mapped.pData;
             ctx->context->Unmap(gFocusStagingTex[readIdx], 0);
+            for (int j = k; j <= FOCUS_BUFFER_COUNT; j++)
+                gFocusHasData[(gFocusWriteIdx - j + FOCUS_BUFFER_COUNT) % FOCUS_BUFFER_COUNT] = false;
 
             // Sky/invalid depth: focus toward maxDepth so sky comes into focus
             float targetDepth;
@@ -105,6 +113,7 @@ static void UpdateAutoFocus(const DustFrameContext* ctx, const DustHostAPI* host
             float alpha = 1.0f - expf(-dt * gDOFConfig.autoFocusSpeed);
             gCurrentFocusDepth += (targetDepth - gCurrentFocusDepth) * alpha;
         }
+        break;
     }
 
     // Step 2: Issue copy into the WRITE buffer for next frame to read
@@ -131,7 +140,7 @@ static void UpdateAutoFocus(const DustFrameContext* ctx, const DustHostAPI* host
     depthTex->Release();
 
     gFocusHasData[gFocusWriteIdx] = true;
-    gFocusWriteIdx = 1 - gFocusWriteIdx;  // swap for next frame
+    gFocusWriteIdx = (gFocusWriteIdx + 1) % FOCUS_BUFFER_COUNT;  // advance the ring
 }
 
 // Get the resolved focus distance (auto or manual)

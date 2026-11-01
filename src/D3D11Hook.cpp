@@ -830,12 +830,57 @@ static void RunInteropSpike(ID3D11DeviceContext* ctx)
 // Extract camera basis vectors from the game's deferred lighting PS constant buffer.
 // The inverse view matrix sits at register c8 (offset 128 bytes / 32 floats).
 // Camera axes are the COLUMNS of the inverse view matrix (= rows of the view matrix).
-// Double-buffered staging: CopyResource into slot N this frame, Map slot N-1
-// (which the GPU finished long ago). Eliminates the CPU-GPU sync stall that
-// was blocking the pipeline every frame.
-static ID3D11Buffer* gCameraStagingCBs[2] = {};
-static int gCameraStagingSlot = 0;
-static bool gCameraStagingReady = false; // false until first copy has been issued
+//
+// GPU readback through a RING of staging buffers, read without stalling (DO_NOT_WAIT).
+// It used to be TWO slots, reading the one copied on the previous frame. When the GPU is the
+// bottleneck (1440p+, heavy effects) the CPU runs up to DXGI's max frame latency (3) frames ahead,
+// so last frame's copy is NEVER finished when we look: every Map failed and the camera data FROZE
+// at the last successful read, indefinitely. Anything that resynchronised CPU and GPU (a screenshot,
+// opening an overlay, VSync, DOF autofocus's blocking readback, a driver change) refreshed it once.
+// Every effect reconstructing view space from it (SSAO, RTGI, ...) then used a stale camera: AO
+// "inverting"/glowing and shadows darkening on camera turns, fixed by a screenshot and pointing
+// the way the camera faced at that moment (GitHub #21, Discord "Weird SSAO", #help 2026-10-28).
+// With kCameraRing >= max frame latency + 1 the oldest slot is always complete, so a read
+// never fails twice in a row; we take the NEWEST completed slot (normally last frame's, as before).
+static const int kCameraRing = 4;
+static ID3D11Buffer* gCameraStagingCBs[kCameraRing] = {};
+static uint64_t gCameraStagingFrame[kCameraRing] = {};   // frame the slot was filled (0 = never)
+static uint64_t gCameraCopySerial = 0;                    // monotonically increasing copy counter
+static uint64_t gCameraLastReadSerial = 0;                // serial of the copy currently in gCameraData
+static int gCameraMissStreak = 0;                         // consecutive frames with no completed slot
+
+static void ReleaseCameraStaging()
+{
+    for (int i = 0; i < kCameraRing; i++)
+    {
+        if (gCameraStagingCBs[i]) { gCameraStagingCBs[i]->Release(); gCameraStagingCBs[i] = nullptr; }
+        gCameraStagingFrame[i] = 0;
+    }
+}
+
+static bool ApplyCameraMatrix(const float* m)
+{
+    for (int i = 0; i < 16; i++)
+        if (!isfinite(m[i])) return false;
+
+    memcpy(gCameraData.inverseView, m, 64);
+    gCameraData.camRight[0]   = m[0]; gCameraData.camRight[1]   = m[4]; gCameraData.camRight[2]   = m[8];
+    gCameraData.camUp[0]      = m[1]; gCameraData.camUp[1]      = m[5]; gCameraData.camUp[2]      = m[9];
+    gCameraData.camForward[0] = m[2]; gCameraData.camForward[1] = m[6]; gCameraData.camForward[2] = m[10];
+    gCameraData.camPosition[0] = m[12]; gCameraData.camPosition[1] = m[13]; gCameraData.camPosition[2] = m[14];
+    // Projection params (API v8) from the OGRE camera — real near/far/fov for effects (RTGI)
+    // and the upscaler. Left 0 if the camera walk isn't reachable this frame.
+    float camN = 0.0f, camF = 0.0f, camFov = 0.0f;
+    if (CameraAccess_GetCameraParams(&camN, &camF, &camFov))
+    {
+        gCameraData.nearZ = camN;
+        gCameraData.farZ  = camF;
+        gCameraData.tanHalfFov = tanf(camFov * 0.5f);
+    }
+    gCameraData.valid = 1;
+    gCameraDataExtracted = true;
+    return true;
+}
 
 static void ExtractCameraData(ID3D11DeviceContext* ctx)
 {
@@ -854,13 +899,7 @@ static void ExtractCameraData(ID3D11DeviceContext* ctx)
         D3D11_BUFFER_DESC stagingDesc;
         gCameraStagingCBs[0]->GetDesc(&stagingDesc);
         if (stagingDesc.ByteWidth != cbDesc.ByteWidth)
-        {
-            gCameraStagingCBs[0]->Release();
-            gCameraStagingCBs[1]->Release();
-            gCameraStagingCBs[0] = nullptr;
-            gCameraStagingCBs[1] = nullptr;
-            gCameraStagingReady = false;
-        }
+            ReleaseCameraStaging();
     }
 
     if (!gCameraStagingCBs[0])
@@ -870,71 +909,61 @@ static void ExtractCameraData(ID3D11DeviceContext* ctx)
         sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         sd.BindFlags = 0;
         sd.MiscFlags = 0;
-        gDevice->CreateBuffer(&sd, nullptr, &gCameraStagingCBs[0]);
-        gDevice->CreateBuffer(&sd, nullptr, &gCameraStagingCBs[1]);
-        if (!gCameraStagingCBs[0] || !gCameraStagingCBs[1])
+        bool ok = true;
+        for (int i = 0; i < kCameraRing && ok; i++)
+            ok = SUCCEEDED(gDevice->CreateBuffer(&sd, nullptr, &gCameraStagingCBs[i])) && gCameraStagingCBs[i];
+        if (!ok)
         {
-            // Partial failure: drop BOTH slots so the next frame retries creation from a
-            // clean state (a lone slot 0 would gate this branch off forever and leak).
-            if (gCameraStagingCBs[0]) { gCameraStagingCBs[0]->Release(); gCameraStagingCBs[0] = nullptr; }
-            if (gCameraStagingCBs[1]) { gCameraStagingCBs[1]->Release(); gCameraStagingCBs[1] = nullptr; }
-            gCameraStagingReady = false;
+            // Partial failure: drop every slot so the next frame retries from a clean state.
+            ReleaseCameraStaging();
             psCB->Release();
             return;
         }
     }
-    if (!gCameraStagingCBs[0] || !gCameraStagingCBs[1]) { psCB->Release(); return; }
 
-    int writeSlot = gCameraStagingSlot;
-    int readSlot = 1 - writeSlot;
-
-    // Copy this frame's CB into the write slot (async, no stall)
-    ctx->CopyResource(gCameraStagingCBs[writeSlot], psCB);
-    psCB->Release();
-
-    // Read LAST frame's data from the other slot (GPU finished it long ago)
-    if (gCameraStagingReady)
+    // Read FIRST (before this frame's copy lands in a slot): newest completed slot wins.
+    // Slots are visited newest -> oldest by fill serial; DO_NOT_WAIT never stalls the render thread.
+    bool got = false;
     {
-        D3D11_MAPPED_SUBRESOURCE mapped;
-        // DO_NOT_WAIT: never block the render thread on the GPU. If the GPU has not finished last
-        // frame's copy yet (it is more than a frame behind), keep the camera data we already have
-        // (it is one frame old by design; a miss makes it two). A blocking map here forced CPU<->GPU
-        // lockstep whenever the GPU lagged: the sawtooth frame graph.
-        const HRESULT mapHr = ctx->Map(gCameraStagingCBs[readSlot], 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
-        if (SUCCEEDED(mapHr))
+        int order[kCameraRing];
+        int n = 0;
+        for (int i = 0; i < kCameraRing; i++)
+            if (gCameraStagingFrame[i] != 0 && gCameraStagingFrame[i] > gCameraLastReadSerial) order[n++] = i;
+        for (int a = 1; a < n; a++)   // insertion sort, newest first (n <= 4)
+            for (int b = a; b > 0 && gCameraStagingFrame[order[b]] > gCameraStagingFrame[order[b - 1]]; b--)
+            { int t = order[b]; order[b] = order[b - 1]; order[b - 1] = t; }
+
+        for (int k = 0; k < n && !got; k++)
         {
+            const int slot = order[k];
+            // Last resort (should not happen with the ring >= frame latency + 1): after two missed
+            // frames, wait for the OLDEST pending copy instead of keeping a stale camera.
+            const bool block = (gCameraMissStreak >= 2) && (k == n - 1);
+            D3D11_MAPPED_SUBRESOURCE mapped;
+            const HRESULT hr = ctx->Map(gCameraStagingCBs[slot], 0, D3D11_MAP_READ,
+                                        block ? 0 : D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+            if (FAILED(hr)) continue;   // DXGI_ERROR_WAS_STILL_DRAWING: try an older slot
             float m[16];
             memcpy(m, (float*)mapped.pData + 32, 64); // c8 offset
-            ctx->Unmap(gCameraStagingCBs[readSlot], 0);
-
-            bool valid = true;
-            for (int i = 0; i < 16; i++)
-                if (!isfinite(m[i])) { valid = false; break; }
-
-            if (valid)
-            {
-                memcpy(gCameraData.inverseView, m, 64);
-                gCameraData.camRight[0]   = m[0]; gCameraData.camRight[1]   = m[4]; gCameraData.camRight[2]   = m[8];
-                gCameraData.camUp[0]      = m[1]; gCameraData.camUp[1]      = m[5]; gCameraData.camUp[2]      = m[9];
-                gCameraData.camForward[0] = m[2]; gCameraData.camForward[1] = m[6]; gCameraData.camForward[2] = m[10];
-                gCameraData.camPosition[0] = m[12]; gCameraData.camPosition[1] = m[13]; gCameraData.camPosition[2] = m[14];
-                // Projection params (API v8) from the OGRE camera — real near/far/fov for effects (RTGI)
-                // and the upscaler. Left 0 if the camera walk isn't reachable this frame.
-                float camN = 0.0f, camF = 0.0f, camFov = 0.0f;
-                if (CameraAccess_GetCameraParams(&camN, &camF, &camFov))
-                {
-                    gCameraData.nearZ = camN;
-                    gCameraData.farZ  = camF;
-                    gCameraData.tanHalfFov = tanf(camFov * 0.5f);
-                }
-                gCameraData.valid = 1;
-                gCameraDataExtracted = true;
-            }
+            ctx->Unmap(gCameraStagingCBs[slot], 0);
+            gCameraLastReadSerial = gCameraStagingFrame[slot];   // anything older is now stale
+            got = ApplyCameraMatrix(m);
+        }
+        if (n > 0)
+        {
+            if (got) gCameraMissStreak = 0;
+            else if (++gCameraMissStreak == 3)
+                Log("Camera: no completed camera readback for 3 frames (GPU far behind) - forcing a wait next time");
         }
     }
 
-    gCameraStagingSlot = readSlot;
-    gCameraStagingReady = true;
+    // Copy this frame's CB into the slot holding the oldest (or no) data.
+    int writeSlot = 0;
+    for (int i = 1; i < kCameraRing; i++)
+        if (gCameraStagingFrame[i] < gCameraStagingFrame[writeSlot]) writeSlot = i;
+    ctx->CopyResource(gCameraStagingCBs[writeSlot], psCB);
+    gCameraStagingFrame[writeSlot] = ++gCameraCopySerial;
+    psCB->Release();
 }
 
 // ==================== Original function pointers ====================
