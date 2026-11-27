@@ -406,8 +406,21 @@ static void OnOverlayOpen(HWND hWnd)
 
 
 
-    // Save cursor clip rect and release it so the cursor can move freely
+    // Save cursor clip rect and release it so the cursor can move freely.
+    // An unclipped cursor reports the whole desktop as its clip rect. That is NOT a rect to restore:
+    // in a DPI-virtualised process (Kenshi on a scaled display, e.g. 4K at 200%) GetClipCursor answers
+    // in logical pixels (0,0,1920,1080) while ClipCursor takes physical ones, so "restoring" it locked
+    // the cursor into the top-left quarter of the screen after the menu closed. Only a real clip
+    // (smaller than the desktop, as measured in the same units) is saved.
     gHadClipRect = (GetClipCursor(&gSavedClipRect) != 0);
+    if (gHadClipRect)
+    {
+        const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        const int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN), vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if (gSavedClipRect.left <= vx && gSavedClipRect.top <= vy &&
+            gSavedClipRect.right >= vx + vw && gSavedClipRect.bottom >= vy + vh)
+            gHadClipRect = false;
+    }
     ClipCursor(nullptr);
 
     // Show system cursor
@@ -444,9 +457,11 @@ static void OnOverlayClose()
         memset(gGameKeyHeld, 0, sizeof(gGameKeyHeld));
     }
 
-    // Restore cursor clipping (game usually clips cursor to window)
+    // Restore cursor clipping if the game had really clipped it (see OnOverlayOpen)
     if (gHadClipRect)
         ClipCursor(&gSavedClipRect);
+    else
+        ClipCursor(nullptr);
 
     // Hide system cursor (game manages its own)
     while (ShowCursor(FALSE) >= 0) {}
