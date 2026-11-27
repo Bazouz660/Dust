@@ -2233,8 +2233,11 @@ static void PollToggleKeyFallback()
     const bool foreground = gHWnd && GetForegroundWindow() == GetAncestor(gHWnd, GA_ROOT);
     const bool down = foreground && (GetAsyncKeyState(key) & 0x8000) != 0;
 
-    if (down && !sDown)
-        gToggleSeenByWndProc = false;          // a new press: wait for the window procedure's verdict
+    // The window procedure can run BEFORE this poll first sees the key down (the message pump runs
+    // ahead of the present), so its verdict is never cleared on the down edge: only once the key
+    // has been seen up, i.e. after the press it belongs to is over.
+    if (!down && !sDown)
+        gToggleSeenByWndProc = false;
     else if (!down && sDown && foreground && !gToggleSeenByWndProc)
     {
         static bool sLogged = false;
@@ -2546,9 +2549,13 @@ void Render()
                 ++shown;
             }
 
-            static int sEffectListDiagFrame = 0;
-            if ((sEffectListDiagFrame++ % 120) == 0)
+            // Logged when the picture changes, not on a frame counter: the main menu runs at
+            // 1000+ fps, where "every 120 frames" filled the log with identical lines.
+            static int sLoggedInitialized = -1, sLoggedShown = -1;
+            if (initializedCount != sLoggedInitialized || shown != sLoggedShown)
             {
+                sLoggedInitialized = initializedCount;
+                sLoggedShown = shown;
                 Log("GUI effect list: count=%zu initialized=%d shown=%d filter='%s' avail=(%.1f, %.1f) first='%s'",
                     count, initializedCount, shown, sFilterBuf, effectsAvail.x, effectsAvail.y,
                     firstInitializedName ? firstInitializedName : "<none>");
