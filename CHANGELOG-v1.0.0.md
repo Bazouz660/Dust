@@ -1,7 +1,7 @@
 ## v1.0.0
 
 **Ambient occlusion and GI**
-- SSAO is rebuilt on Intel XeGTAO: the radius is in world units, depth is read as the ray distance the game actually stores, and horizons are tested against smooth geometry. No more darkening at the screen edges or halos following texture detail, and it costs about 25% less
+- SSAO is rebuilt on Intel XeGTAO: the radius is in world units, depth is read as the ray distance the game actually stores, and horizons are tested against smooth geometry. No more darkening at the screen edges or halos following texture detail
 - SSIL and RTGI rebuild positions from the same ray-distance depth, and SSIL tests its hemisphere against the smooth normal
 - Fixed AO, RTGI and shadows going very dark or inverted until a screenshot, an overlay or a VSync change "fixed" them (#21, #24): the camera readback froze whenever the GPU ran behind the CPU, most often at high resolutions
 - DOF autofocus no longer stalls the CPU
@@ -31,7 +31,7 @@
 - A warning is shown when two copies of Dust are installed (Workshop and manual)
 
 **Effects**
-- Kuwahara compiles under Proton again
+- Kuwahara no longer uses a shader function that Proton's compiler lacks
 - Film grain and deband no longer turn into a fixed pattern after hours of play
 - Without temporal AA, film grain, vignette, chromatic aberration and letterbox run before SMAA, as in v0.7.6
 

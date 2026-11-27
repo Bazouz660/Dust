@@ -188,7 +188,7 @@ jobs:
           set -e
           git clone https://github.com/optiscaler/FidelityFX-FSR2-DX11.git external/FSR2-DX11
           git -C external/FSR2-DX11 checkout f2e3f86
-          ( cd external/FSR2-DX11/build && cmd //c BuildLibs.bat )
+          ( cd external/FSR2-DX11/build && cmd //c ".\BuildLibs.bat" )
           # BuildLibs.bat MOVES the libs into the repo-level bin/ once built (src/Dust.vcxproj looks
           # there first). Testing only the pre-move path failed this step on every release, and
           # continue-on-error hid it: no release shipped FSR2 until this was caught (2026-11).
