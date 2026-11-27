@@ -225,11 +225,34 @@ float DustCascadeShadow(float4 shadowParams, float4x4 shadowViewMat,
 }
 )hlsl";
 
+// Needs the game's own RTWShadow (rtwshadows.hlsl, included by every deferred variant), so it is
+// kept out of the self-contained RTW source that the offline tests compile on its own.
+constexpr char RtwSelect[] = R"hlsl(
+// The call site used to be "enabled ? DustRTWShadow(...) : RTWShadow(...)". HLSL evaluates both
+// sides of ?:, so the game's own 3x3 PCF (nine shadow-map reads and their warp lookups) ran on
+// every pixel on top of Dust's filter, and Dust's filter ran when it was switched off. A real
+// branch on the uniform runs only the selected one: same image, about 10% off the sun pass.
+float DustRTWShadowSelect(sampler2D shadowMap, sampler2D warpMap, float4x4 shadowMatrix,
+                          float3 worldPosition, float depthBias, float edgeBias,
+                          float2 screenPosition, float3 normal, float cameraDistance,
+                          float shadowRange)
+{
+    [branch]
+    if (dustShadowEnabled > 0.5)
+    {
+        return DustRTWShadow(shadowMap, warpMap, shadowMatrix, worldPosition, depthBias, edgeBias,
+                             screenPosition, normal, cameraDistance, shadowRange);
+    }
+    return RTWShadow(shadowMap, warpMap, shadowMatrix, worldPosition, depthBias, edgeBias);
+}
+)hlsl";
+
 inline std::string Build(bool workshopSteepBias)
 {
     std::string source = Parameters;
     source += RTWShadowShader::Source(workshopSteepBias);
     source += Cascades;
+    source += RtwSelect;
     return source;
 }
 }

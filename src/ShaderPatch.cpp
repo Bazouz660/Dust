@@ -190,10 +190,10 @@ static std::string PatchDeferredShader(const std::string& src)
         std::string originalCall = result.substr(funcStart, closeParen - funcStart + 1);
         std::string params = result.substr(openParen + 1, closeParen - openParen - 1);
 
+        // DustRTWShadowSelect branches on dustShadowEnabled (see RTWShadowShader.h): a ?: here
+        // evaluated the vanilla filter and Dust's on every pixel.
         std::string newExpr =
-            "(dustShadowEnabled > 0.5) "
-            "? DustRTWShadow(" + params + ", pixel.xy, normal, distance, shadow_range) "
-            ": " + originalCall;
+            "DustRTWShadowSelect(" + params + ", pixel.xy, normal, distance, shadow_range)";
 
         result.replace(funcStart, closeParen - funcStart + 1, newExpr);
         Log("ShaderPatch: redirected RTWShadow -> conditional DustRTWShadow");
