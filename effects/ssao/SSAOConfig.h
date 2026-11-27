@@ -27,6 +27,8 @@ struct SSAOConfig
 
     // Blur
     float blurSharpness = 0.01f;
+    int   legacySamples = 4;         // old "Samples" key (directions); replaced by "Slices"
+    float legacyNormalDetail = 1.0f; // old "NormalDetail" key; replaced by "CavityDetail"
 
     // Camera
     float tanHalfFov = 0.5218f;

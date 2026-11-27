@@ -87,7 +87,9 @@ static bool CreateParamsTexture(ID3D11Device* device)
     desc.Height = 1;
     desc.MipLevels = 1;
     desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_R8_UNORM;
+    // .r = Direct Light AO amount, .g = 255: the "Dust bound this" flag the patched deferred
+    // shaders test, so a frame without these bindings falls back to vanilla lighting.
+    desc.Format = DXGI_FORMAT_R8G8_UNORM;
     desc.SampleDesc.Count = 1;
     desc.Usage = D3D11_USAGE_DYNAMIC;
     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -119,8 +121,9 @@ static void UpdateParamsTexture(ID3D11DeviceContext* ctx)
     HRESULT hr = ctx->Map(gParamsTex, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
     if (SUCCEEDED(hr))
     {
-        uint8_t val = (uint8_t)(gSSAOConfig.directLightOcclusion * 255.0f + 0.5f);
-        *(uint8_t*)mapped.pData = val;
+        uint8_t* px = (uint8_t*)mapped.pData;
+        px[0] = (uint8_t)(gSSAOConfig.directLightOcclusion * 255.0f + 0.5f);
+        px[1] = 255;
         ctx->Unmap(gParamsTex, 0);
     }
 }
@@ -284,13 +287,18 @@ static DustSettingDesc gSettingsArray[] = {
     // XeGTAO (2026-11). The radius is physical now, in metres: the old Radius key held depth01
     // values (0.005 = ~60 m, only bounded by Max Screen Radius), so it is a new key and the old
     // one stays hidden for INI compatibility.
-    { "Radius",             DUST_SETTING_FLOAT, &gSSAOConfig.radiusMetres,        0.1f,    5.0f,   "RadiusMeters",   nullptr, "How far around a surface occluders count, in metres (about the size of a person = 1.8)", DUST_PERF_LOW },
+    // Every key whose MEANING changed got a new name, flagged PRESET_DEFAULT: a preset or SSAO.ini
+    // saved by v0.7.6.x has none of them, so it loads the new defaults instead of being reported
+    // "outdated", inheriting the previous preset's values, or reusing an old number on a new scale
+    // (old Samples = directions, 4-12: the same number as slices is twice the work; old Normal
+    // Detail = 1 steered the whole horizon search, now it only scales the cavity term).
+    { "Radius",             DUST_SETTING_FLOAT, &gSSAOConfig.radiusMetres,        0.1f,    5.0f,   "RadiusMeters",   nullptr, "How far around a surface occluders count, in metres (about the size of a person = 1.8)", DUST_PERF_LOW, DUST_SETTING_FLAG_PRESET_DEFAULT },
     { "Strength",           DUST_SETTING_FLOAT, &gSSAOConfig.aoStrength,          0.2f,    4.0f,   "Strength",       nullptr, "How dark occluded areas get",                                  DUST_PERF_NONE },
-    { "Thickness",          DUST_SETTING_FLOAT, &gSSAOConfig.thickness,           0.0f,    1.0f,   "Thickness",      nullptr, "Treat thin objects (grass, poles, fences) as thin: they darken less behind them", DUST_PERF_NONE },
+    { "Thickness",          DUST_SETTING_FLOAT, &gSSAOConfig.thickness,           0.0f,    1.0f,   "Thickness",      nullptr, "Treat thin objects (grass, poles, fences) as thin: they darken less behind them", DUST_PERF_NONE, DUST_SETTING_FLAG_PRESET_DEFAULT },
     { "Max Depth",          DUST_SETTING_FLOAT, &gSSAOConfig.aoMaxDepth,          0.01f,   1.0f,   "MaxDepth",       nullptr, "Maximum depth to apply occlusion",                             DUST_PERF_MEDIUM },
-    { "Normal Detail",     DUST_SETTING_FLOAT, &gSSAOConfig.normalDetail,        0.0f,    1.0f,   "NormalDetail",   nullptr, "Darken texture detail (bumps, cracks) in the occlusion. It no longer affects how far the occlusion reaches", DUST_PERF_NONE },
+    { "Normal Detail",     DUST_SETTING_FLOAT, &gSSAOConfig.normalDetail,        0.0f,    1.0f,   "CavityDetail",   nullptr, "Darken texture detail (bumps, cracks) in the occlusion. It no longer affects how far the occlusion reaches", DUST_PERF_NONE, DUST_SETTING_FLAG_PRESET_DEFAULT },
     { "Direct Light AO",   DUST_SETTING_FLOAT, &gSSAOConfig.directLightOcclusion, 0.0f,    1.0f,   "DirectLightAO",  nullptr, "How much AO affects directly lit areas",                       DUST_PERF_NONE },
-    { "Samples",            DUST_SETTING_INT,   &gSSAOConfig.sampleCount,         1.0f,    9.0f,   "Samples",        nullptr, "Number of sampling slices per pixel (each covers two directions)", DUST_PERF_HIGH },
+    { "Samples",            DUST_SETTING_INT,   &gSSAOConfig.sampleCount,         1.0f,    9.0f,   "Slices",         nullptr, "Number of sampling slices per pixel (each covers two directions)", DUST_PERF_HIGH, DUST_SETTING_FLAG_PRESET_DEFAULT },
     { "Steps",              DUST_SETTING_INT,   &gSSAOConfig.stepCount,           2.0f,    6.0f,   "Steps",          nullptr, "Number of samples along each direction",                       DUST_PERF_HIGH },
     { "Debug View",         DUST_SETTING_BOOL,  &gSSAOConfig.debugView,           0.0f,    1.0f,   "DebugView",      nullptr, "Show raw ambient occlusion before compositing",                DUST_PERF_NONE },
     // Hidden settings: not shown in GUI but persisted in INI
@@ -305,6 +313,9 @@ static DustSettingDesc gSettingsArray[] = {
     { "Legacy Max Screen Radius", DUST_SETTING_HIDDEN_FLOAT, &gSSAOConfig.maxScreenRadius, 0.005f, 0.2f,  "MaxScreenRadius" },
     { "Legacy Min Screen Radius", DUST_SETTING_HIDDEN_FLOAT, &gSSAOConfig.minScreenRadius, 0.0001f, 0.01f, "MinScreenRadius" },
     { "Legacy Blur Sharpness",  DUST_SETTING_HIDDEN_FLOAT, &gSSAOConfig.blurSharpness,   0.0f,    0.1f,   "BlurSharpness" },
+    // Renamed keys (see above). Recognised so old files report no unknown key; never required.
+    { "Legacy Samples",         DUST_SETTING_HIDDEN_INT,   &gSSAOConfig.legacySamples,      1.0f, 12.0f,  "Samples",      nullptr, nullptr, DUST_PERF_NONE, DUST_SETTING_FLAG_PRESET_OPTIONAL },
+    { "Legacy Normal Detail",   DUST_SETTING_HIDDEN_FLOAT, &gSSAOConfig.legacyNormalDetail, 0.0f, 1.0f,   "NormalDetail", nullptr, nullptr, DUST_PERF_NONE, DUST_SETTING_FLAG_PRESET_OPTIONAL },
 };
 
 // No OnSettingChanged needed — values are read live each frame by SSAORenderer

@@ -675,6 +675,10 @@ static bool ProbeSelectedUpscaler()
     return ok;
 }
 
+// True while a temporal resolve (DLAA/FSR) is selected AND able to run, as of the last RunUpscaler.
+// The POST_TONEMAP dispatch splits around the resolve only then (see HookedDraw).
+static bool sTemporalResolveUsable = false;
+
 static void RunUpscaler(ID3D11DeviceContext* ctx)
 {
     ReadUpscalerConfig();
@@ -686,6 +690,7 @@ static void RunUpscaler(ID3D11DeviceContext* ctx)
     // feeding MVs to a resolve that never runs only costs GPU time. The availability read is the last
     // probe of the active backend; a GUI backend switch re-probes below and the gate follows next frame.
     const bool upsUsable = sUpsEnabled && sUpsActiveBackend == sUpsBackend && BackendAvailable(sUpsBackend);
+    sTemporalResolveUsable = upsUsable;
     const bool mvNeeded = upsUsable || MotionVectors::DebugVizEnabled();
     GeometryCapture::SetCaptureFlags(mvNeeded && gCaptureGeometryWanted ? DUST_CAPTURE_GEOMETRY : 0);
     if (mvNeeded != sMvFeederActive)
@@ -1565,10 +1570,12 @@ static ID3D11ShaderResourceView* GetLvWhiteSRV()
     if (gLvWhiteSRV || !gDevice) return gLvWhiteSRV;
     D3D11_TEXTURE2D_DESC td = {};
     td.Width = 1; td.Height = 1; td.MipLevels = 1; td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_R8_UNORM; td.SampleDesc.Count = 1;
+    // RG, both 255: .r = "no occlusion", .g = the "Dust bound this" flag the patched shaders test
+    // when this texture stands in for SSAO's params texture (see ShaderPatch.cpp).
+    td.Format = DXGI_FORMAT_R8G8_UNORM; td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_IMMUTABLE; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-    uint8_t val = 255;
-    D3D11_SUBRESOURCE_DATA sd = {}; sd.pSysMem = &val; sd.SysMemPitch = 1;
+    uint8_t val[2] = { 255, 255 };
+    D3D11_SUBRESOURCE_DATA sd = {}; sd.pSysMem = val; sd.SysMemPitch = 2;
     ID3D11Texture2D* tex = nullptr;
     if (SUCCEEDED(gDevice->CreateTexture2D(&td, &sd, &tex)) && tex)
     {
@@ -2394,12 +2401,16 @@ static void STDMETHODCALLTYPE HookedDraw(
 
         // POST: effects that operate after the draw. At POST_TONEMAP the temporal AA resolve sits in
         // the middle: effects flagged DUST_FLAG_AFTER_TEMPORAL_AA (grain, vignette, CA, letterbox) run
-        // after it, so DLAA/FSR don't average their per-frame pattern away (#19). With the upscaler
-        // off the resolve is a no-op and the order is the same as a single dispatch.
+        // after it, so DLAA/FSR don't average their per-frame pattern away (#19). Without a temporal
+        // resolve there is nothing to split around: everything runs in one dispatch, in priority order,
+        // exactly as in v0.7.6.2 (grain/vignette/CA/letterbox BEFORE SMAA, which then smooths them).
+        // The decision is latched once so each effect runs exactly once on the frame the upscaler is
+        // switched on or off.
         fctx.timing = DUST_TIMING_POST;
         const bool tonemapPoint = (result.point == InjectionPoint::POST_TONEMAP);
-        gEffectLoader.DispatchPost(dip, &fctx, tonemapPoint ? EffectLoader::TemporalAAPhase::BeforeAA
-                                                            : EffectLoader::TemporalAAPhase::All);
+        const bool splitAroundAA = tonemapPoint && sTemporalResolveUsable;
+        gEffectLoader.DispatchPost(dip, &fctx, splitAroundAA ? EffectLoader::TemporalAAPhase::BeforeAA
+                                                             : EffectLoader::TemporalAAPhase::All);
 
         // Shader-injected motion vectors: the velocity RT is filled during the real GBuffer pass
         // (see HookedOMSetRenderTargets + ShaderPatch). Here we only blit the debug viz over the
@@ -2407,7 +2418,8 @@ static void STDMETHODCALLTYPE HookedDraw(
         if (tonemapPoint)
         {
             RunUpscaler(pThis);                  // DLSS DLAA resolve (no-op unless [Upscaling] DLSS=1)
-            gEffectLoader.DispatchPost(dip, &fctx, EffectLoader::TemporalAAPhase::AfterAA);
+            if (splitAroundAA)
+                gEffectLoader.DispatchPost(dip, &fctx, EffectLoader::TemporalAAPhase::AfterAA);
             RunInteropSpike(pThis);              // FSR3/4 D3D12 interop spike (no-op unless D3D12InteropSpike=1)
             MotionVectors::InjDebugBlit(pThis);  // MV debug viz (only if ShowMotionVectors=1)
             MotionVectors::InjEndFrame();

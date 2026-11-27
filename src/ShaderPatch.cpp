@@ -124,8 +124,12 @@ static std::string PatchDeferredShader(const std::string& src)
 
     std::string inject2 =
         "// [Dust] Ambient occlusion\n"
-        "\tfloat ao = tex2D(aoMap, texCoord).r;\n"
-        "\tfloat directAO = tex2D(aoParams, texCoord).r;\n"
+        "\t// aoParams.g is 1 whenever Dust bound its textures. An unbound slot reads 0: without\n"
+        "\t// this test a frame Dust did not feed (plugin missing or failed, device never captured)\n"
+        "\t// multiplied all ambient light by 0 (pitch-black shadows).\n"
+        "\tfloat2 dustAoParams = tex2D(aoParams, texCoord).rg;\n"
+        "\tfloat ao = lerp(1.0, tex2D(aoMap, texCoord).r, dustAoParams.g);\n"
+        "\tfloat directAO = dustAoParams.r;\n"
         "\tenvLight.diffuse *= ao;\n"
         "\tenvLight.specular *= ao;\n"
         "\tfloat directFade = lerp(1.0, ao, directAO);\n"
@@ -352,10 +356,12 @@ static std::string PatchLightVolumeShader(const std::string& src)
     posApply += strlen(anchorApply);
     result.insert(posApply,
         "\n\t// [Dust] Direct-light AO for point/spot lights\n"
-        "\tfloat aoLV = dustLvAoTex.Sample(dustLvAoSamp, texCoord).r;\n"
-        "\tfloat directAOLV = dustLvAoParamsTex.Sample(dustLvAoSamp, texCoord).r;\n"
-        "\tcolor *= lerp(1.0, aoLV, directAOLV);\n"
-        "\tcolor *= dustLvRtgiAoTex.Sample(dustLvAoSamp, texCoord).r;  // RTGI AO (white when off)");
+        "\t// .g of the params texture is 1 whenever Dust bound these slots; unbound reads 0 and\n"
+        "\t// leaves the light untouched instead of black.\n"
+        "\tfloat2 paramsLV = dustLvAoParamsTex.Sample(dustLvAoSamp, texCoord).rg;\n"
+        "\tfloat aoLV = lerp(1.0, dustLvAoTex.Sample(dustLvAoSamp, texCoord).r, paramsLV.g);\n"
+        "\tcolor *= lerp(1.0, aoLV, paramsLV.r);\n"
+        "\tcolor *= lerp(1.0, dustLvRtgiAoTex.Sample(dustLvAoSamp, texCoord).r, paramsLV.g);  // RTGI AO (white when off)");
 
     return result;
 }
