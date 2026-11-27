@@ -98,6 +98,8 @@ bool gInitialized = false;
 bool gOverlayVisible = false;
 static volatile bool gResizeInProgress = false;
 static HWND gHWnd = nullptr;
+// Set whenever DustWndProc consumed a press of the toggle key. PollToggleKeyFallback reads and clears it.
+static bool gToggleSeenByWndProc = false;
 static float gOsDpiScale = 1.0f;   // window's OS/monitor DPI scale, captured at init
 static bool gFontRebuildPending = false;  // rebuild atlas at top of next Render (scale/language changed)
 static bool gLanguageReloadPending = false;
@@ -464,6 +466,7 @@ static LRESULT CALLBACK DustWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
         }
         gWaitingForKey = false;
         gWaitingForEffectsKey = false;
+        gToggleSeenByWndProc = true;   // this press bound the key; it must not also toggle on release
         return 0;
     }
 
@@ -471,6 +474,7 @@ static LRESULT CALLBACK DustWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
                        (int)wParam == gFwConfig.toggleKey && !(lParam & 0x40000000);
     if (isToggleMsg)
     {
+        gToggleSeenByWndProc = true;
         gOverlayVisible = !gOverlayVisible;
         if (gOverlayVisible)
             OnOverlayOpen(hWnd);
@@ -2191,10 +2195,54 @@ bool RecreateBackBuffer(IDXGISwapChain* swapChain)
     return true;
 }
 
+// The overlay toggle normally arrives as WM_KEYDOWN in DustWndProc. On some setups that message never
+// reaches the game window (#26: menu initialised, "Press F11" toast shown, F11 does nothing), because
+// a keyboard hook or a later window subclass swallows it. Once per present, watch the physical key:
+// a press that was held and released while the game is in the foreground WITHOUT the window procedure
+// seeing it toggles the overlay here. Acting on release (the message pump runs between two presents)
+// means a press the window procedure did handle can never toggle twice.
+static void PollToggleKeyFallback()
+{
+    static bool sDown = false;
+    static int  sKey = 0;
+
+    const int key = gFwConfig.toggleKey;
+    if (key <= 0 || key > 255 || gWaitingForKey || gWaitingForEffectsKey || key != sKey)
+    {
+        sKey = key;
+        sDown = false;
+        gToggleSeenByWndProc = false;
+        return;
+    }
+
+    const bool foreground = gHWnd && GetForegroundWindow() == GetAncestor(gHWnd, GA_ROOT);
+    const bool down = foreground && (GetAsyncKeyState(key) & 0x8000) != 0;
+
+    if (down && !sDown)
+        gToggleSeenByWndProc = false;          // a new press: wait for the window procedure's verdict
+    else if (!down && sDown && foreground && !gToggleSeenByWndProc)
+    {
+        static bool sLogged = false;
+        if (!sLogged)
+        {
+            sLogged = true;
+            Log("GUI: %s was pressed but its key message never reached the game window "
+                "(keyboard hook or another window subclass); toggling the menu from the key state instead",
+                VKKeyName(key));
+        }
+        gOverlayVisible = !gOverlayVisible;
+        if (gOverlayVisible) OnOverlayOpen(gHWnd);
+        else                 OnOverlayClose();
+    }
+    sDown = down;
+}
+
 void Render()
 {
     if (!gInitialized || gResizeInProgress) return;
     if (!gDevice || !gContext || !gBackBufferRTV) return;
+
+    PollToggleKeyFallback();
 
     // Deferred preset auto-load: GUI can start before effects are initialized
     // (DustBoot provides the swap chain before device capture / effect init).
