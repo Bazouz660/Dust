@@ -394,7 +394,16 @@ float DustRtwFilterVisibility(sampler2D shadowMap, sampler2D warpMap, DustRtwRec
         visible += occluded ? 0.0 : 1.0;
     }
 
-    return visible / taps;
+    // A wide penumbra is laid on the lit side of the caster's outline only: the half that
+    // falls inside the outline goes fully dark. A shadow map holds one surface per texel,
+    // so under a caster's outline whatever stands below it (a character under a roof) is not
+    // in the map at all; with a penumbra centred on the outline, that ground was up to half
+    // lit and those shadows stopped dead at the outline. Outside it the map has them, and
+    // the layers above keep them crisp. Kernels near the antialiasing floor are unchanged.
+    float visibility = visible / taps;
+    float2 radiusRatio = filterRadius / layers.baseRadius;
+    float wide = saturate(max(radiusRatio.x, radiusRatio.y) * 0.5 - 1.0);
+    return lerp(visibility, saturate(visibility * 2.0 - 1.0), wide);
 }
 
 float DustRTWShadow(sampler2D shadowMap, sampler2D warpMap, float4x4 shadowMatrix,

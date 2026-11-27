@@ -438,9 +438,11 @@ static void TestBlockerLayers(ShadowFixture& fixture)
     std::puts("RTW PCSS: a near object keeps its crisp shadow inside a far caster's penumbra");
 }
 
-// The penumbra fades out on BOTH sides of the edge. The blocker search used to lose the
-// caster part-way through the lit side, which ended the penumbra in a hard rim there.
-static void TestPenumbraIsTwoSided(ShadowFixture& fixture)
+// A wide penumbra lies on the lit side of the caster's outline and fades out smoothly there (the
+// blocker search used to lose the caster part-way through, which ended it in a hard rim). Under
+// the outline it is fully dark: the map has no record of what stands below the caster, so that
+// ground must not be left half lit.
+static void TestPenumbraLiesOutsideTheOutline(ShadowFixture& fixture)
 {
     SceneParams scene;
     scene.slope = 0;
@@ -454,6 +456,7 @@ static void TestPenumbraIsTwoSided(ShadowFixture& fixture)
     for (UINT y = 0; y < EffectShaderProbe::H; ++y)
     {
         int litSide = 0, darkSide = 0;
+        float largestStep = 0;
         for (UINT x = 0; x < width; ++x)
         {
             float v = image[y * width + x][0];
@@ -461,10 +464,14 @@ static void TestPenumbraIsTwoSided(ShadowFixture& fixture)
             {
                 (x >= width / 2 ? litSide : darkSide)++;
             }
+            if (x > 0)
+            {
+                largestStep = (std::max)(largestStep, std::fabs(v - image[y * width + x - 1][0]));
+            }
         }
-        assert(litSide >= 2 && std::abs(litSide - darkSide) <= 2);
+        assert(litSide >= 2 && darkSide <= 1 && largestStep <= 0.5f);
     }
-    std::puts("RTW PCSS: penumbrae fade out on both sides of the edge");
+    std::puts("RTW PCSS: a wide penumbra fades out on the lit side of the outline and is dark under it");
 }
 
 // Max Penumbra caps the soft edge in world units, whatever the caster's height.
@@ -549,7 +556,7 @@ int main(int argc, char** argv)
     TestReceiverSlope(fixture);
     TestContactHardening(fixture);
     TestDistantSurfacesIgnored(fixture);
-    TestPenumbraIsTwoSided(fixture);
+    TestPenumbraLiesOutsideTheOutline(fixture);
     TestBlockerLayers(fixture);
     TestMaxPenumbra(fixture);
 }
