@@ -9,8 +9,8 @@ struct SSAOConfig
     bool enabled = true;
 
     // AO generation (XeGTAO)
-    float radiusMetres = 1.0f;       // world-space radius (Kenshi units / 10)
-    float aoStrength = 1.2f;         // final visibility power = Strength * 1.25
+    float radiusMetres = 3.0f;       // world-space radius (Kenshi units / 10)
+    float aoStrength = 2.5f;         // final visibility power = Strength * 1.25
     float thickness = 0.6f;          // XeGTAO thin-occluder compensation (grass, poles, thin walls)
 
     // Legacy (pre-XeGTAO) keys: still read from old INIs so they load, no longer used.
