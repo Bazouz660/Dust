@@ -9,8 +9,8 @@ struct SSAOConfig
     bool enabled = true;
 
     // AO generation (XeGTAO)
-    float radiusMetres = 3.0f;       // world-space radius (Kenshi units / 10)
-    float aoStrength = 2.5f;         // final visibility power = Strength * 1.25
+    float radiusMetres = 1.0f;       // world-space radius (Kenshi units / 10)
+    float aoStrength = 1.2f;         // final visibility power = Strength * 1.25
     float thickness = 0.6f;          // XeGTAO thin-occluder compensation (grass, poles, thin walls)
 
     // Legacy (pre-XeGTAO) keys: still read from old INIs so they load, no longer used.
@@ -39,6 +39,7 @@ struct SSAOConfig
     // Performance
     int sampleCount = 3;    // GTAO slices (1-9), each = two opposite directions
     int stepCount = 3;      // Steps per slice side (2-6)
+    int denoisePasses = 2;  // XeGTAO edge-aware 3x3 passes (1-6); a wide radius needs more
 
     // Debug
     bool debugView = false;

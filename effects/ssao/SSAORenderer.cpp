@@ -111,7 +111,6 @@ static const float kFalloffRange = 0.615f;
 static const float kSampleDistributionPower = 2.0f;
 static const float kDepthMipSamplingOffset = 3.30f;
 static const float kDenoiseBeta = 1.2f;
-static const int   kDenoisePasses = 2;   // no TAA: XeGTAO recommends 2+
 
 // ==================== Helpers ====================
 
@@ -416,10 +415,13 @@ ID3D11ShaderResourceView* RenderAO(ID3D11DeviceContext* ctx,
     ctx->CSSetShaderResources(0, 3, nullSRVs);
 
     // 3. Denoise (ping-pong; the last pass writes the final AO)
+    // No temporal accumulation here, so the passes do all the smoothing: XeGTAO recommends 2 or
+    // more, and a wide radius spreads the same samples thinner and needs more.
+    const int denoisePasses = (std::min)((std::max)(gSSAOConfig.denoisePasses, 1), 6);
     int src = 0;
-    for (int p = 0; p < kDenoisePasses; p++)
+    for (int p = 0; p < denoisePasses; p++)
     {
-        const bool last = (p == kDenoisePasses - 1);
+        const bool last = (p == denoisePasses - 1);
         ctx->CSSetShader(last ? gDenoiseLastCS : gDenoiseCS, nullptr, 0);
         ID3D11ShaderResourceView* dnSRVs[2] = { gWorkSRV[src], gEdgesSRV };
         ctx->CSSetShaderResources(0, 2, dnSRVs);

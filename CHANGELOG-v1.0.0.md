@@ -7,7 +7,8 @@
 - DOF autofocus no longer stalls the CPU
 - Lighting no longer turns pitch black (shadowed areas and characters black, point lights off) when the SSAO effect cannot start or Dust never hooks the renderer: the patched game shaders fall back to the game's own lighting
 - SSAO settings whose meaning changed have new names, so presets saved with v0.7.6 load the new defaults for them instead of being reported as outdated
-- SSAO defaults and shipped presets use a 3 m radius and strength 2.5, which restores the darkening v0.7.6 gave around objects. The uniform darkening v0.7.6 also put on open flat ground was an error of the old method and is not reproduced
+- The shipped presets lower the auto-exposure floor (Min Auto EV -1.006 to -1.2): daylight scenes get back the overall brightness of v0.7.6, whose SSAO darkened open flat ground by mistake. The new SSAO darkens around objects as much as before and leaves flat ground alone
+- New SSAO setting Denoise (smoothing passes, default 2): a wide Radius spreads the samples thinner and needs more passes to stay free of grain
 
 **Temporal AA and upscalers**
 - Film grain, vignette, chromatic aberration and letterbox run after DLAA/FSR, so temporal AA no longer erases the grain (#19)

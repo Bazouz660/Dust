@@ -300,6 +300,7 @@ static DustSettingDesc gSettingsArray[] = {
     { "Direct Light AO",   DUST_SETTING_FLOAT, &gSSAOConfig.directLightOcclusion, 0.0f,    1.0f,   "DirectLightAO",  nullptr, "How much AO affects directly lit areas",                       DUST_PERF_NONE },
     { "Samples",            DUST_SETTING_INT,   &gSSAOConfig.sampleCount,         1.0f,    9.0f,   "Slices",         nullptr, "Number of sampling slices per pixel (each covers two directions)", DUST_PERF_HIGH, DUST_SETTING_FLAG_PRESET_DEFAULT },
     { "Steps",              DUST_SETTING_INT,   &gSSAOConfig.stepCount,           2.0f,    6.0f,   "Steps",          nullptr, "Number of samples along each direction",                       DUST_PERF_HIGH },
+    { "Denoise",            DUST_SETTING_INT,   &gSSAOConfig.denoisePasses,       1.0f,    6.0f,   "DenoisePasses",  nullptr, "Edge-aware smoothing passes over the occlusion. More removes grain (a wide Radius needs more) and softens fine detail", DUST_PERF_LOW, DUST_SETTING_FLAG_PRESET_DEFAULT },
     { "Debug View",         DUST_SETTING_BOOL,  &gSSAOConfig.debugView,           0.0f,    1.0f,   "DebugView",      nullptr, "Show raw ambient occlusion before compositing",                DUST_PERF_NONE },
     // Hidden settings: not shown in GUI but persisted in INI
     { "Depth Fade Start",   DUST_SETTING_HIDDEN_FLOAT, &gSSAOConfig.depthFadeStart, 0.0f, 1.0f,   "DepthFadeStart" },
