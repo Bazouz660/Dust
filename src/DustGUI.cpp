@@ -897,6 +897,14 @@ static void DrawUpscalingSection()
     }
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("%s", LocOr("tip:Upscaling", "Temporal anti-aliasing / upscaling. DLAA = NVIDIA RTX only (DLSS at native resolution, best quality). FSR2 = any GPU (native D3D11). FSR3 / FSR4 = any DX12 GPU via a D3D12 side-device; FSR4 needs a Radeon RX 9000. Disabled = off."));
+    // Said in the panel, not only in a tooltip: users kept reporting "DLSS/FSR changes nothing, GPU
+    // usage goes up", expecting a lower render resolution and more FPS.
+    if (sel != 0)
+    {
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextDisabled("%s", DustLoc::T("Runs at native resolution: a cleaner, steadier image, not more FPS."));
+        ImGui::PopTextWrapPos();
+    }
 
     // Selected but unable to run: say WHY (wrong GPU vendor / wrapper renaming the GPU, old driver,
     // backend missing from this build, ...). Nothing is applied for an unavailable backend: no jitter,
@@ -2224,9 +2232,11 @@ static void PollToggleKeyFallback()
     const int key = gFwConfig.toggleKey;
     if (key <= 0 || key > 255 || gWaitingForKey || gWaitingForEffectsKey || key != sKey)
     {
+        // Key being rebound, or just rebound: the press that chose it is still held. Mark it as
+        // handled so its release does not toggle the menu; the flag clears once the key is up.
         sKey = key;
         sDown = false;
-        gToggleSeenByWndProc = false;
+        gToggleSeenByWndProc = true;
         return;
     }
 

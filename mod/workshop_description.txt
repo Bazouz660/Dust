@@ -40,7 +40,7 @@ The mod is also built as a plugin framework. Effects are separate DLLs, so anyon
 [list]
 [*] [b]In-game settings (F11)[/b]: Tweak every effect in real-time with sliders, save your settings, reset anytime
 [*] [b]Preset system[/b]: Quick-switch between Low, Medium, High, and Ultra presets (plus cinematic and stylized variants), share custom presets within the community
-[*] [b]DLSS / FSR upscaling & DLAA[/b]: Vendor-selectable temporal super-resolution and anti-aliasing with real motion vectors; backend auto-filtered by your GPU
+[*] [b]Temporal anti-aliasing (DLAA / FSR)[/b]: DLSS and FSR used at native resolution for a cleaner, steadier image with real motion vectors. It is anti-aliasing, not a performance upscaler: it does not raise FPS. Backend auto-filtered by your GPU
 [*] [b]Performance overlay[/b]: See exactly how much GPU time each effect costs
 [*] [b]Hot-reloadable configs[/b]: Edit .ini files while the game is running
 [*] [b]Plugin system[/b]: Effects are separate DLLs, anyone can create and share new ones
