@@ -47,7 +47,9 @@ float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target
     {
         float depth = depthTex.SampleLevel(pointClamp, uv, 0);
         // Kenshi clears sky depth to zero. Treat it as the far endpoint.
-        if (!(depth > 0.0) || !isfinite(depth)) depth = 1.0;
+        // No isfinite(): Proton's vkd3d-shader lacks it. !(x > 0) already catches NaN, and +Inf
+        // saturates in the smoothstep below.
+        if (!(depth > 0.0)) depth = 1.0;
         float start = min(depthStart, depthEnd);
         float end = max(depthStart, depthEnd);
         float t = smoothstep(start, max(end, start + 1e-5), depth);

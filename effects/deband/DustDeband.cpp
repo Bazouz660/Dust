@@ -135,7 +135,8 @@ static void DebandPostExecute(const DustFrameContext* ctx, const DustHostAPI* ho
     cb.range = gDebandConfig.range;
     cb.intensity = gDebandConfig.intensity;
     cb.skyDepthThreshold = gDebandConfig.skyDepthThreshold;
-    cb.frameIndex = (uint32_t)(ctx->frameIndex & 0xFFFFFFFF);
+    // Wrapped: the shader hashes (float)frameIndex, which loses precision after hours of frames.
+    cb.frameIndex = (uint32_t)(ctx->frameIndex % 4096);
     cb.debugView = gDebandConfig.debugView ? 1 : 0;
     cb.skyOnly = gDebandConfig.skyOnly ? 1 : 0;
     host->UpdateConstantBuffer(ctx->context, gCB, &cb, sizeof(cb));

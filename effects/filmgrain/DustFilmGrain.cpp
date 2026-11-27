@@ -128,7 +128,9 @@ static void FilmGrainPostExecute(const DustFrameContext* ctx, const DustHostAPI*
     cb.invViewportSize[1] = 1.0f / (float)gHeight;
     cb.intensity = gFilmGrainConfig.intensity;
     cb.grainSize = gFilmGrainConfig.size;
-    cb.frameIndex = (uint32_t)(ctx->frameIndex & 0xFFFFFFFF);
+    // Wrapped: the shader hashes (float)frameIndex, and a float loses the fractional bits the hash
+    // needs after a few hours of frames (the grain turns into a fixed pattern).
+    cb.frameIndex = (uint32_t)(ctx->frameIndex % 4096);
     cb.colored = gFilmGrainConfig.colored ? 1 : 0;
     cb.debugView = gFilmGrainConfig.debugView ? 1 : 0;
     host->UpdateConstantBuffer(ctx->context, gCB, &cb, sizeof(cb));
