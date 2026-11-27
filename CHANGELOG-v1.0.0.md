@@ -7,6 +7,7 @@
 - DOF autofocus no longer stalls the CPU
 - Lighting no longer turns pitch black (shadowed areas and characters black, point lights off) when the SSAO effect cannot start or Dust never hooks the renderer: the patched game shaders fall back to the game's own lighting
 - SSAO settings whose meaning changed have new names, so presets saved with v0.7.6 load the new defaults for them instead of being reported as outdated
+- SSAO defaults and shipped presets use a 3 m radius and strength 2.5, which restores the darkening v0.7.6 gave around objects. The uniform darkening v0.7.6 also put on open flat ground was an error of the old method and is not reproduced
 
 **Temporal AA and upscalers**
 - Film grain, vignette, chromatic aberration and letterbox run after DLAA/FSR, so temporal AA no longer erases the grain (#19)
@@ -17,6 +18,8 @@
 **Shadows**
 - The RTWSM sun pass runs either Dust's shadow filter or the game's, no longer both on every pixel: same image, 10% cheaper with PCSS and 36% without
 - RTW caster tessellation uses one segment per warp cell, never below the game's own factor: close views no longer tessellate everything at the maximum (about 6x fewer domain shader invocations)
+- New option Shadows > Half Resolution (RTWSM with PCSS, off by default): the shadow term is computed at half resolution and upsampled per surface. The sun pass costs about half as much (0.61 to 0.29 ms at 1440p on an RTX 4090); shadow edges are slightly softer
+- A wide RTWSM penumbra now lies outside the caster's outline and is fully dark under it. The shadow of a character standing under a larger soft shadow no longer stops dead in half-lit ground, and soft shadows read about half as wide as before for the same Light Size
 
 **Menu**
 - The menu toggle key still works when its key message never reaches the game window (#26)
