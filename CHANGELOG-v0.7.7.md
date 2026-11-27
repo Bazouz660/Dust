@@ -16,6 +16,7 @@
 
 **Menu**
 - The menu toggle key still works when its key message never reaches the game window (#26)
+- Closing the menu no longer locks the cursor into a quarter of the screen on scaled displays (4K at 200%)
 - An empty effect list is explained: effects start in a loaded game, not in the main menu, and a real failure says so (#22)
 - Menu text falls back to Tahoma, Arial, then Kenshi's own font, so Cyrillic renders under Proton (#23)
 - NVIDIA Smooth Motion is detected, with a warning in the menu (#20)
