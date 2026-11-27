@@ -406,11 +406,16 @@ float DustRtwFilterVisibility(sampler2D shadowMap, sampler2D warpMap, DustRtwRec
     return lerp(visibility, saturate(visibility * 2.0 - 1.0), wide);
 }
 
-float DustRTWShadow(sampler2D shadowMap, sampler2D warpMap, float4x4 shadowMatrix,
-                    float3 worldPosition, float depthBias, float edgeBias, float2 screenPosition,
-                    float3 normal, float cameraDistance, float shadowRange)
+// shadowPosition and its receiver-plane gradient come from the caller, which may sit inside
+// per-pixel flow control where screen-space derivatives are not available.
+float DustRTWShadowAt(sampler2D shadowMap, sampler2D warpMap, float4x4 shadowMatrix,
+                      float3 shadowPosition, float2 gradient, float depthBias, float edgeBias,
+                      float2 screenPosition, float3 normal, float cameraDistance, float shadowRange)
 {
-    DustRtwReceiver receiver = DustRtwCreateReceiver(warpMap, shadowMatrix, worldPosition);
+    DustRtwReceiver receiver;
+    receiver.position = shadowPosition;
+    receiver.warpedUV = DustGetOffsetLocationS(warpMap, shadowPosition.xy, receiver.warpScale);
+    receiver.gradient = gradient;
     float bias =
         DustRtwReceiverBias(receiver, depthBias, edgeBias, normal, cameraDistance, shadowRange);
     DustRtwLayers layers =
@@ -437,6 +442,16 @@ float DustRTWShadow(sampler2D shadowMap, sampler2D warpMap, float4x4 shadowMatri
                                               tapRotation + 1.0, layers.farRadius, bias, 1e30);
     }
     return visibility;
+}
+
+float DustRTWShadow(sampler2D shadowMap, sampler2D warpMap, float4x4 shadowMatrix,
+                    float3 worldPosition, float depthBias, float edgeBias, float2 screenPosition,
+                    float3 normal, float cameraDistance, float shadowRange)
+{
+    float3 shadowPosition = mul(shadowMatrix, float4(worldPosition, 1)).xyz;
+    return DustRTWShadowAt(shadowMap, warpMap, shadowMatrix, shadowPosition,
+                           DustRtwReceiverGradient(shadowPosition), depthBias, edgeBias,
+                           screenPosition, normal, cameraDistance, shadowRange);
 }
 )hlsl";
 

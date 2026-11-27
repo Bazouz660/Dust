@@ -37,6 +37,8 @@ namespace D3D11Hook
     // vanilla size; when the override differs, replacement textures are
     // created and their views swapped in at bind time starting next frame.
     void SetShadowAtlasResolution(UINT size);
+    // Half-resolution sun shadows (RTW): replay the sun draw into a half-size target first.
+    void SetSunShadowHalfResolution(bool wanted);
     UINT GetShadowAtlasResolution();
     // Vanilla atlas size the game requested (0 until the atlas exists).
     UINT GetShadowBaseResolution();

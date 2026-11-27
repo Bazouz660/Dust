@@ -34,6 +34,7 @@ cbuffer DustFrameParams : register(b8)
     float2 dustJitterPx;
     float dustFrame;
     float dustTemporal;
+    float dustShadowPass;   // half-resolution shadows: 1 = the half-size prepass, 2 = the pass that reads it
 };
 )hlsl";
 
@@ -232,24 +233,66 @@ constexpr char RtwSelect[] = R"hlsl(
 // sides of ?:, so the game's own 3x3 PCF (nine shadow-map reads and their warp lookups) ran on
 // every pixel on top of Dust's filter, and Dust's filter ran when it was switched off. A real
 // branch on the uniform runs only the selected one: same image, about 10% off the sun pass.
+//
+// Half-resolution shadows (Shadows > Half Resolution). The host draws the sun pass twice: first
+// into a half-size target with dustShadowPass = 1, where main_fs stops right after the shadow
+// term and writes (visibility, G-buffer depth); then normally with dustShadowPass = 2, where each
+// pixel blends the four half-size results around it that lie on its own surface (depth within
+// 1%). A pixel with none (silhouettes, thin objects) computes its shadow in full, as before.
+#if DUST_SHADOW_HALF_RES
+Texture2D<float4> dustShadowHalf : register(t11);
+#endif
+
 float DustRTWShadowSelect(sampler2D shadowMap, sampler2D warpMap, float4x4 shadowMatrix,
                           float3 worldPosition, float depthBias, float edgeBias,
                           float2 screenPosition, float3 normal, float cameraDistance,
-                          float shadowRange)
+                          float shadowRange, float depth)
 {
     [branch]
     if (dustShadowEnabled > 0.5)
     {
-        return DustRTWShadow(shadowMap, warpMap, shadowMatrix, worldPosition, depthBias, edgeBias,
-                             screenPosition, normal, cameraDistance, shadowRange);
+        // The receiver plane is differentiated here, outside the per-pixel branch below.
+        float3 shadowPosition = mul(shadowMatrix, float4(worldPosition, 1)).xyz;
+        float2 gradient = DustRtwReceiverGradient(shadowPosition);
+#if DUST_SHADOW_HALF_RES
+        [branch]
+        if (dustShadowPass > 1.5)
+        {
+            float2 halfPosition = screenPosition * 0.5 - 0.5;
+            int2 cell = int2(floor(halfPosition));
+            float2 blend = halfPosition - floor(halfPosition);
+            float2 s00 = dustShadowHalf.Load(int3(cell, 0)).xy;
+            float2 s10 = dustShadowHalf.Load(int3(cell + int2(1, 0), 0)).xy;
+            float2 s01 = dustShadowHalf.Load(int3(cell + int2(0, 1), 0)).xy;
+            float2 s11 = dustShadowHalf.Load(int3(cell + int2(1, 1), 0)).xy;
+            float4 visibility = float4(s00.x, s10.x, s01.x, s11.x);
+            float4 depths = float4(s00.y, s10.y, s01.y, s11.y);
+            float4 sameSurface = abs(depths - depth) < depth * 0.01 ? 1.0 : 0.0;
+            float4 weights = float4((1 - blend.x) * (1 - blend.y), blend.x * (1 - blend.y),
+                                    (1 - blend.x) * blend.y, blend.x * blend.y) * sameSurface;
+            float total = dot(weights, 1.0);
+            [branch]
+            if (total > 1e-4)
+            {
+                return dot(visibility, weights) / total;
+            }
+        }
+#endif
+        return DustRTWShadowAt(shadowMap, warpMap, shadowMatrix, shadowPosition, gradient,
+                               depthBias, edgeBias, screenPosition, normal, cameraDistance,
+                               shadowRange);
     }
     return RTWShadow(shadowMap, warpMap, shadowMatrix, worldPosition, depthBias, edgeBias);
 }
 )hlsl";
 
-inline std::string Build(bool workshopSteepBias)
+// halfResolution: main_fs has the anchors the half-resolution prepass needs (see ShaderPatch.cpp).
+// The half-size texture is declared only then, and the host recognises such a shader by its name.
+inline std::string Build(bool workshopSteepBias, bool halfResolution = false)
 {
-    std::string source = Parameters;
+    std::string source = halfResolution ? "#define DUST_SHADOW_HALF_RES 1\n"
+                                        : "#define DUST_SHADOW_HALF_RES 0\n";
+    source += Parameters;
     source += RTWShadowShader::Source(workshopSteepBias);
     source += Cascades;
     source += RtwSelect;

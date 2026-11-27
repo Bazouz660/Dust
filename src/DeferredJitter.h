@@ -22,6 +22,8 @@ struct FrameParams
     float jitterX, jitterY;   // this frame's G-buffer viewport jitter in pixels
     float frame;              // frame counter modulo 64 while temporal AA accumulates, else 0
     float temporal;           // 1 while a temporal AA / upscaler is integrating frames
+    float shadowPass;         // half-resolution shadows: 1 = the half-size prepass, 2 = the pass that reads it
+    float pad[3];
 };
 
 inline const char* Declaration()
@@ -31,6 +33,7 @@ inline const char* Declaration()
            "\tfloat2 dustJitterPx;\n"
            "\tfloat dustFrame;\n"
            "\tfloat dustTemporal;\n"
+           "\tfloat dustShadowPass;\n"
            "};\n\n";
 }
 

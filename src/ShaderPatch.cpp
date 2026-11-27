@@ -158,11 +158,18 @@ static std::string PatchDeferredShader(const std::string& src)
     if (workshopSteepBias)
         Log("ShaderPatch: detected workshop steep bias mod, skipping internal steep bias");
 
+    // Half-resolution shadows replay this shader into a half-size target and stop it right after
+    // the shadow term, which needs these three statements as the game wrote them. A deferred.hlsl
+    // rewritten by another mod may lack them: it then gets full-resolution shadows only.
+    const bool halfResolution = result.find("shadow = RTWShadow(") != std::string::npos &&
+                                result.find("float depth = tex2D(gBuf2") != std::string::npos &&
+                                result.find("out float oDepth") != std::string::npos;
+
     const char* anchor3 = "void main_vs (";
     size_t pos3 = result.find(anchor3);
     if (pos3 != std::string::npos)
     {
-        const std::string shadowSource = ShadowShaderSource::Build(workshopSteepBias);
+        const std::string shadowSource = ShadowShaderSource::Build(workshopSteepBias, halfResolution);
         result.insert(pos3, shadowSource);
         Log("ShaderPatch: injected DustShadowParams cbuffer + DustRTWShadow + DustCascadeShadow");
     }
@@ -197,9 +204,20 @@ static std::string PatchDeferredShader(const std::string& src)
         // DustRTWShadowSelect branches on dustShadowEnabled (see RTWShadowShader.h): a ?: here
         // evaluated the vanilla filter and Dust's on every pixel.
         std::string newExpr =
-            "DustRTWShadowSelect(" + params + ", pixel.xy, normal, distance, shadow_range)";
+            "DustRTWShadowSelect(" + params + ", pixel.xy, normal, distance, shadow_range, " +
+            (halfResolution ? "depth" : "0.0") + ")";
 
         result.replace(funcStart, closeParen - funcStart + 1, newExpr);
+        if (halfResolution)
+        {
+            const size_t statementEnd = result.find(';', funcStart + newExpr.size());
+            if (statementEnd != std::string::npos)
+            {
+                result.insert(statementEnd + 1,
+                    "\n\t\t// [Dust] half-resolution shadow prepass: the shadow term is all it needs\n"
+                    "\t\tif (dustShadowPass > 0.5 && dustShadowPass < 1.5) { oDepth = 0.0; return float4(shadow, depth, 0.0, 1.0); }");
+            }
+        }
         Log("ShaderPatch: redirected RTWShadow -> conditional DustRTWShadow");
         Log("ShaderPatch: original call: %s", originalCall.c_str());
     }

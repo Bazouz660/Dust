@@ -72,7 +72,7 @@
 extern "C" {
 #endif
 
-#define DUST_API_VERSION 9
+#define DUST_API_VERSION 10
 
 // Injection points in the rendering pipeline
 typedef enum DustInjectionPoint {
@@ -228,6 +228,15 @@ typedef struct DustHostAPI {
     // Call once per frame while SSAO is active (pass its white fallback + params when
     // disabled). NULL clears. Takes precedence over the snapshot. Requires apiVersion >= 7.
     void (*SetLightVolumeSsaoAo)(ID3D11ShaderResourceView* ao, ID3D11ShaderResourceView* params);
+
+    // === API v10 additions ===
+
+    // Half-resolution sun shadows (RTWSM): the host draws the patched sun pass into a half-size
+    // target first and the real pass upsamples it per surface, computing in full only where no
+    // half-size sample lies on the pixel's surface. Takes effect on the next frame; ignored in
+    // CSM / no-shadow modes and for a deferred shader another mod has rewritten.
+    // Requires apiVersion >= 10.
+    void (*SetSunShadowHalfResolution)(int enabled);
 } DustHostAPI;
 
 // Performance impact hint for a single setting (API v3.2+).

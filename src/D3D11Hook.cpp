@@ -1695,7 +1695,8 @@ static UINT ResolveAoSlot(ID3D11DeviceContext* ctx, uint32_t baseSlot)
 static ID3D11Buffer* gSunFrameParamsCB = nullptr;
 
 // Returns true if the buffer is bound and must be unbound after the draw.
-static bool BindSunFrameParams(ID3D11DeviceContext* ctx)
+// shadowPass / jitterScale: see DrawSunShadowHalfPrepass below (0 and 1 for the ordinary draw).
+static bool BindSunFrameParams(ID3D11DeviceContext* ctx, float shadowPass = 0.0f, float jitterScale = 1.0f)
 {
     if (!gSunFrameParamsCB)
     {
@@ -1715,10 +1716,11 @@ static bool BindSunFrameParams(ID3D11DeviceContext* ctx)
     float jx = 0, jy = 0;
     GetTemporalJitter(jx, jy);
     const bool temporal = (jx != 0.0f || jy != 0.0f);
-    params.jitterX = jx;
-    params.jitterY = jy;
+    params.jitterX = jx * jitterScale;
+    params.jitterY = jy * jitterScale;
     params.frame = temporal ? (float)(gFrameIndex % 64) : 0.0f;
     params.temporal = temporal ? 1.0f : 0.0f;
+    params.shadowPass = shadowPass;
     D3D11_MAPPED_SUBRESOURCE map = {};
     if (FAILED(ctx->Map(gSunFrameParamsCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) return false;
     memcpy(map.pData, &params, sizeof(params));
@@ -1739,6 +1741,158 @@ static void UnbindSunFrameParams(ID3D11DeviceContext* ctx)
         ctx->PSSetConstantBuffers(DeferredJitter::Slot, 1, &empty);
     }
     if (current) current->Release();
+}
+
+// ---- Half-resolution sun shadows -------------------------------------------------------------
+// The patched RTW sun shader (ShadowShaderSource.h, DustRTWShadowSelect) can take its shadow term
+// from a half-size texture. To fill it, the game's own sun draw is issued once more just before
+// the real one, unchanged except for the target (half-size, no depth), the viewport and
+// dustShadowPass = 1, which makes main_fs return (visibility, depth) right after the shadow term.
+// Same shader object, same constants, same textures: nothing to keep in sync with the game, and
+// it works when the bytecode comes from OGRE's microcode cache.
+static std::atomic<bool> gSunShadowHalfWanted{false};                 // set by the Shadows plugin
+static std::unordered_set<ID3D11PixelShader*> gSunShadowHalfPS;       // guarded by gLightVolumeMutex
+static ID3D11Texture2D*          gSunShadowHalfTex = nullptr;
+static ID3D11RenderTargetView*   gSunShadowHalfRTV = nullptr;
+static ID3D11ShaderResourceView* gSunShadowHalfSRV = nullptr;
+static UINT gSunShadowHalfW = 0, gSunShadowHalfH = 0;
+static const UINT kSunShadowHalfSlot = 11;    // Texture2D dustShadowHalf : register(t11)
+
+void SetSunShadowHalfResolution(bool wanted)
+{
+    gSunShadowHalfWanted.store(wanted, std::memory_order_relaxed);
+}
+
+static bool EnsureSunShadowHalfTarget(UINT width, UINT height)
+{
+    if (gSunShadowHalfRTV && gSunShadowHalfW == width && gSunShadowHalfH == height) return true;
+    if (gSunShadowHalfSRV) { gSunShadowHalfSRV->Release(); gSunShadowHalfSRV = nullptr; }
+    if (gSunShadowHalfRTV) { gSunShadowHalfRTV->Release(); gSunShadowHalfRTV = nullptr; }
+    if (gSunShadowHalfTex) { gSunShadowHalfTex->Release(); gSunShadowHalfTex = nullptr; }
+    gSunShadowHalfW = gSunShadowHalfH = 0;
+    if (!gDevice || !width || !height) return false;
+
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R16G16_FLOAT;      // visibility, G-buffer depth
+    desc.SampleDesc.Count = 1;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    if (FAILED(gDevice->CreateTexture2D(&desc, nullptr, &gSunShadowHalfTex)) ||
+        FAILED(gDevice->CreateRenderTargetView(gSunShadowHalfTex, nullptr, &gSunShadowHalfRTV)) ||
+        FAILED(gDevice->CreateShaderResourceView(gSunShadowHalfTex, nullptr, &gSunShadowHalfSRV)))
+    {
+        if (gSunShadowHalfSRV) { gSunShadowHalfSRV->Release(); gSunShadowHalfSRV = nullptr; }
+        if (gSunShadowHalfRTV) { gSunShadowHalfRTV->Release(); gSunShadowHalfRTV = nullptr; }
+        if (gSunShadowHalfTex) { gSunShadowHalfTex->Release(); gSunShadowHalfTex = nullptr; }
+        Log("Half-resolution shadows: could not create the %ux%u target", width, height);
+        return false;
+    }
+    gSunShadowHalfW = width;
+    gSunShadowHalfH = height;
+    Log("Half-resolution shadows: %ux%u target created", width, height);
+    return true;
+}
+
+// Called at POST_LIGHTING just before the game's sun draw. Returns true when the half-size
+// texture was filled and is bound at t11: the caller then binds the frame params with
+// shadowPass = 2 for the real draw and calls UnbindSunShadowHalf after it.
+static bool DrawSunShadowHalfPrepass(ID3D11DeviceContext* ctx, UINT vertexCount, UINT startVertex)
+{
+    if (!gSunShadowHalfWanted.load(std::memory_order_relaxed)) return false;
+
+    // Only the sun shader that declares the half-size texture has the early return.
+    ID3D11PixelShader* ps = nullptr;
+    ctx->PSGetShader(&ps, nullptr, nullptr);
+    if (!ps) return false;
+    bool capable;
+    {
+        std::lock_guard<std::mutex> lock(gLightVolumeMutex);
+        capable = gSunShadowHalfPS.count(ps) != 0;
+    }
+    ps->Release();
+    if (!capable)
+    {
+        static bool sLoggedShader = false;
+        if (!sLoggedShader)
+        {
+            sLoggedShader = true;
+            size_t known;
+            { std::lock_guard<std::mutex> lock(gLightVolumeMutex); known = gSunShadowHalfPS.size(); }
+            Log("Half-resolution shadows: the sun shader in use cannot run the prepass (%zu capable shader(s) known); shadows stay full resolution", known);
+        }
+        return false;
+    }
+
+    ID3D11RenderTargetView* rtvs[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    ID3D11DepthStencilView* dsv = nullptr;
+    ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, &dsv);
+    D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+    UINT viewportCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    ctx->RSGetViewports(&viewportCount, viewports);
+
+    // The sun pass covers the whole HDR target; anything else is not the draw this was built for.
+    bool done = rtvs[0] && viewportCount >= 1 &&
+                viewports[0].TopLeftX == 0.0f && viewports[0].TopLeftY == 0.0f &&
+                viewports[0].Width == (float)gWidth && viewports[0].Height == (float)gHeight &&
+                EnsureSunShadowHalfTarget((gWidth + 1) / 2, (gHeight + 1) / 2) &&
+                // The half-size pixels are two full-size pixels wide, and so is the per-pixel ray
+                // step the jitter correction multiplies: half the jitter is the same offset.
+                BindSunFrameParams(ctx, 1.0f, 0.5f);
+    if (done)
+    {
+        ID3D11BlendState* blend = nullptr;
+        FLOAT blendFactor[4] = {};
+        UINT sampleMask = 0;
+        ctx->OMGetBlendState(&blend, blendFactor, &sampleMask);
+
+        ID3D11ShaderResourceView* none = nullptr;
+        oPSSetShaderResources(ctx, kSunShadowHalfSlot, 1, &none);
+        oOMSetRenderTargets(ctx, 1, &gSunShadowHalfRTV, nullptr);
+        D3D11_VIEWPORT half = { 0.0f, 0.0f, (float)gSunShadowHalfW, (float)gSunShadowHalfH, 0.0f, 1.0f };
+        oRSSetViewports(ctx, 1, &half);
+        ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+        // Sky pixels are clipped by the shader: depth -1 never matches a surface.
+        const FLOAT cleared[4] = { 1.0f, -1.0f, 0.0f, 0.0f };
+        ctx->ClearRenderTargetView(gSunShadowHalfRTV, cleared);
+
+        oDraw(ctx, vertexCount, startVertex);
+
+        oOMSetRenderTargets(ctx, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtvs, dsv);
+        oRSSetViewports(ctx, viewportCount, viewports);
+        ctx->OMSetBlendState(blend, blendFactor, sampleMask);
+        if (blend) blend->Release();
+        oPSSetShaderResources(ctx, kSunShadowHalfSlot, 1, &gSunShadowHalfSRV);
+
+        static bool sLogged = false;
+        if (!sLogged)
+        {
+            sLogged = true;
+            Log("Half-resolution shadows: prepass active (%ux%u)", gSunShadowHalfW, gSunShadowHalfH);
+        }
+    }
+    else
+    {
+        static bool sLoggedState = false;
+        if (!sLoggedState)
+        {
+            sLoggedState = true;
+            Log("Half-resolution shadows: prepass skipped (viewport %.1f,%.1f %.1fx%.1f, target %ux%u); shadows stay full resolution",
+                viewportCount ? viewports[0].TopLeftX : -1.0f, viewportCount ? viewports[0].TopLeftY : -1.0f,
+                viewportCount ? viewports[0].Width : -1.0f, viewportCount ? viewports[0].Height : -1.0f, gWidth, gHeight);
+        }
+    }
+    for (ID3D11RenderTargetView* rtv : rtvs) if (rtv) rtv->Release();
+    if (dsv) dsv->Release();
+    return done;
+}
+
+static void UnbindSunShadowHalf(ID3D11DeviceContext* ctx)
+{
+    ID3D11ShaderResourceView* none = nullptr;
+    oPSSetShaderResources(ctx, kSunShadowHalfSlot, 1, &none);
 }
 
 // Snapshot whatever the SSAO plugin bound (logically) at s8/s9 for the sun pass. Called
@@ -1941,6 +2095,21 @@ static HRESULT STDMETHODCALLTYPE HookedCreatePixelShader(
             {
                 std::lock_guard<std::mutex> lock(gLightVolumeMutex);
                 gLightVolumePS.insert(*ppPixelShader);
+            }
+
+            // The RTW sun shader that can run as its own half-resolution shadow prepass: it is
+            // the only shader that declares this texture (name kept in the reflection chunk).
+            {
+                const char* p = (const char*)pShaderBytecode;
+                static const char kMark[] = "dustShadowHalf";
+                const size_t mlen = sizeof(kMark) - 1;
+                bool isSunHalf = false;
+                if (BytecodeLength >= mlen)
+                    for (size_t i = 0, n = BytecodeLength - mlen; i <= n; ++i)
+                        if (memcmp(p + i, kMark, mlen) == 0) { isSunHalf = true; break; }
+                std::lock_guard<std::mutex> lock(gLightVolumeMutex);
+                if (isSunHalf) gSunShadowHalfPS.insert(*ppPixelShader);
+                else           gSunShadowHalfPS.erase(*ppPixelShader);   // address reused by another shader
             }
 
             // Water pixel shaders: exact hash from the compile hook, or (bytecode served from
@@ -2392,12 +2561,15 @@ static void STDMETHODCALLTYPE HookedDraw(
         else if (result.point == InjectionPoint::POST_FOG)
             gLvAoReady = false;
 
-        const bool sunFrameParams = result.point == InjectionPoint::POST_LIGHTING && BindSunFrameParams(pThis);
+        const bool sunPass = result.point == InjectionPoint::POST_LIGHTING;
+        const bool sunShadowHalf = sunPass && DrawSunShadowHalfPrepass(pThis, VertexCount, StartVertexLocation);
+        const bool sunFrameParams = sunPass && BindSunFrameParams(pThis, sunShadowHalf ? 2.0f : 0.0f);
 
         // Execute the game's original draw call
         oDraw(pThis, VertexCount, StartVertexLocation);
 
-        if (sunFrameParams) UnbindSunFrameParams(pThis);
+        if (sunShadowHalf) UnbindSunShadowHalf(pThis);
+        if (sunFrameParams || sunShadowHalf) UnbindSunFrameParams(pThis);
 
         // POST: effects that operate after the draw. At POST_TONEMAP the temporal AA resolve sits in
         // the middle: effects flagged DUST_FLAG_AFTER_TEMPORAL_AA (grain, vignette, CA, letterbox) run

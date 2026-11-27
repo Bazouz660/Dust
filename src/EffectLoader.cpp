@@ -412,6 +412,7 @@ void EffectLoader::BuildHostAPI()
     hostAPI_.GetShadowBaseResolution  = D3D11Hook::GetShadowBaseResolution;
     hostAPI_.SetCascadeLambda         = PssmDetour::SetLambda;
     hostAPI_.SetShadowRange           = HostSetShadowRange;
+    hostAPI_.SetSunShadowHalfResolution = [](int enabled) { D3D11Hook::SetSunShadowHalfResolution(enabled != 0); };
 
     // v6 additions
     hostAPI_.SetLightVolumeAoTexture  = D3D11Hook::SetLightVolumeAoTexture;

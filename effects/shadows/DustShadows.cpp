@@ -29,6 +29,7 @@ struct ShadowConfig {
     float lightSize         = 1.0f;   // RTW PCSS: tan(angular radius) * 100 (the sun is about 0.47)
     float maxPenumbra       = 2.0f;   // RTW PCSS: widest penumbra radius, world units
     bool  pcssEnabled       = true;   // RTW PCSS toggle
+    bool  halfResolution    = false;  // RTW: shadow term computed at half resolution, upsampled per surface
     bool  cliffFix          = false;  // off by default: previous always-on caused
                                       // close-range vertical shadows to disappear
     float cliffFixDistance  = 0.10f;  // fraction of shadow range where the bias
@@ -457,6 +458,10 @@ static void ShadowPreExecute(const DustFrameContext* ctx, const DustHostAPI* hos
     else if (atlasRes >=  8192.0f) data.rtwQuality = 8.0f;
     else                           data.rtwQuality = 12.0f;
 
+    // Half resolution pays off only where the filter is expensive, i.e. with PCSS.
+    if (host->apiVersion >= 10 && host->SetSunShadowHalfResolution)
+        host->SetSunShadowHalfResolution(gConfig.enabled && gConfig.pcssEnabled && gConfig.halfResolution);
+
     host->UpdateConstantBuffer(ctx->context, gCB, &data, sizeof(data));
     // Bind to b7: b2 collides with CSM's auto-allocated $Globals cbuffer
     // (which holds the csmParams arrays). See ShaderPatch.cpp for details.
@@ -564,6 +569,7 @@ static DustSettingDesc gSettings[] = {
     { "Light Size",          DUST_SETTING_FLOAT, &gConfig.lightSize,        0.5f, 10.0f, "LightSize",        nullptr, "Apparent light source size for contact-hardening shadows (RTWSM PCSS). Independent of shadow-map resolution.",                                                                                                     DUST_PERF_NONE   },
     { "Max Penumbra",        DUST_SETTING_FLOAT, &gConfig.maxPenumbra,      0.25f, 20.0f, "MaxPenumbra",      nullptr, "Widest penumbra radius in world units (RTWSM PCSS). A shadow map holds one surface per texel, so inside a tall caster's soft edge the crisp shadows of objects standing under it are missing; keeping soft edges narrow keeps that zone thin. Lower is also faster.", DUST_PERF_NONE   },
     { "PCSS",                DUST_SETTING_BOOL,  &gConfig.pcssEnabled,      0.0f, 1.0f,  "PCSS",             nullptr, "Enable Percentage-Closer Soft Shadows for RTWSM (distance-based softness).",                                                                                                  DUST_PERF_MEDIUM },
+    { "Half Resolution",     DUST_SETTING_BOOL,  &gConfig.halfResolution,   0.0f, 1.0f,  "HalfResolution",   nullptr, "Compute RTWSM shadows at half resolution and upsample them (PCSS only). About half the cost of the shadow filtering; shadow edges get slightly softer and their grain coarser.", DUST_PERF_NONE, DUST_SETTING_FLAG_PRESET_DEFAULT },
     { "Cliff Shadow Fix",    DUST_SETTING_BOOL,  &gConfig.cliffFix,         0.0f, 1.0f,  "CliffFix",         nullptr, "Reduce shadow acne on steep cliffs and vertical faces (RTWSM only). Can make close-range vertical shadows fade out. Integration of Crunk Aint Dead's Cliff Face Shadow Fix mod.", DUST_PERF_NONE },
     { "Cliff Fix Distance",  DUST_SETTING_FLOAT, &gConfig.cliffFixDistance, 0.0f, 1.0f,  "CliffFixDistance", nullptr, "Fraction of shadow range where the cliff fix smoothly ramps in (higher = preserves more close-range vertical shadows).",                                                    DUST_PERF_NONE },
 
